@@ -173,4 +173,8 @@ The project uses strict basedpyright, ruff (preview, with `E,F,W,I,UP,B,SIM,RUF`
 
 ## License
 
-No license file yet — all rights reserved until I add one.
+[AGPL-3.0-or-later](LICENSE). If you run a modified version of this on a server that other people interact with — including over a network — you have to make your modifications available to those users under the same license. See the LICENSE file for the full text.
+
+### Commercial / alternative licensing
+
+If AGPL doesn't work for you, a copy under a different license is negotiable. The price is somewhere between **\$1 and \$1,000,000**, depending on how the negotiation goes. Open an issue or email the author.
