@@ -1,11 +1,18 @@
-"""Fetch and render huddle transcripts from the Slack API."""
+"""Fetch and render huddle transcripts from the Slack API.
+
+Slack returns transcripts as Slack Blocks JSON via the undocumented
+`include_transcription=true` form param on `files.info`. We validate the
+response into typed Pydantic models so the renderer never touches `dict[str, Any]`.
+"""
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Protocol
+from typing import Protocol
 
 import httpx
+
+from .models import FilesInfoResponse, HuddleTranscription
 
 log = logging.getLogger(__name__)
 
@@ -19,11 +26,7 @@ def fetch_transcript_markdown(
     transcript_file_id: str,
     users: _UserResolver | None = None,
 ) -> str | None:
-    """Fetch a huddle transcript and render it as markdown.
-
-    Uses the undocumented `include_transcription=true` parameter on files.info
-    which returns the transcript as Slack Blocks JSON in `huddle_transcription`.
-    """
+    """Fetch a huddle transcript and render it as markdown."""
     try:
         resp = httpx.post(
             "https://slack.com/api/files.info",
@@ -35,49 +38,52 @@ def fetch_transcript_markdown(
             timeout=30.0,
         )
         resp.raise_for_status()
-        data = resp.json()
-    except Exception:
-        log.warning("Failed to fetch transcript %s", transcript_file_id, exc_info=True)
+    except httpx.HTTPError as e:
+        log.warning("Failed to fetch transcript %s: %s", transcript_file_id, e)
         return None
 
-    if not data.get("ok"):
-        log.warning("files.info failed for transcript %s: %s", transcript_file_id, data.get("error"))
+    try:
+        parsed = FilesInfoResponse.model_validate(resp.json())
+    except ValueError as e:
+        log.warning("Transcript validation failed for %s: %s", transcript_file_id, e)
         return None
 
-    transcription = data.get("file", {}).get("huddle_transcription")
-    if not transcription:
+    if not parsed.ok or parsed.file is None:
+        log.warning(
+            "files.info ok=False for transcript %s: %s",
+            transcript_file_id,
+            parsed.error,
+        )
+        return None
+
+    transcription = parsed.file.huddle_transcription
+    if transcription is None:
         return None
 
     return _render_blocks(transcription, users)
 
 
-def _render_blocks(transcription: dict[str, Any], users: _UserResolver | None) -> str:
-    """Convert Slack Blocks transcript JSON to markdown."""
-    blocks = transcription.get("blocks", {})
-    elements = blocks.get("elements", [])
-
+def _render_blocks(
+    transcription: HuddleTranscription,
+    users: _UserResolver | None,
+) -> str:
+    """Convert the typed transcript blocks to markdown."""
     lines: list[str] = []
 
-    for section in elements:
-        if section.get("type") != "rich_text_section":
+    for section in transcription.blocks.elements:
+        if section.type != "rich_text_section":
             continue
 
         parts: list[str] = []
-        for el in section.get("elements", []):
-            el_type = el.get("type", "")
-
-            if el_type == "user":
-                user_id = el.get("user_id", "")
-                name = users.get_display_name(user_id) if users else user_id
+        for el in section.elements:
+            if el.type == "user":
+                name = users.get_display_name(el.user_id) if users else el.user_id
                 parts.append(f"**@{name}**")
-
-            elif el_type == "text":
-                text = el.get("text", "")
-                style = el.get("style", {})
-                if style.get("bold"):
-                    parts.append(f"**{text.strip()}**")
+            elif el.type == "text":
+                if el.style.bold:
+                    parts.append(f"**{el.text.strip()}**")
                 else:
-                    parts.append(text)
+                    parts.append(el.text)
 
         line = "".join(parts).strip()
         if line:

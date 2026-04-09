@@ -1,20 +1,30 @@
-"""Slack Web API client."""
+"""Slack Web API client.
+
+Pydantic at the I/O boundary: every Slack response is validated into a typed
+model before it leaves this module. Downstream code never sees `dict[str, Any]`.
+"""
 
 from __future__ import annotations
 
 import logging
 import time
-from typing import Any
+from typing import TypeVar
 
 import httpx
+from pydantic import BaseModel
 
 from .models import (
     Channel,
-    Edited,
-    FileAttachment,
+    ConversationsHistoryResponse,
+    ConversationsListResponse,
+    ConversationsRepliesResponse,
+    FilesInfoResponse,
     HuddleInfo,
+    JsonObject,
     Message,
-    Reaction,
+    SearchFile,
+    SearchFilesResponse,
+    SlackFile,
     Thread,
 )
 
@@ -23,30 +33,72 @@ log = logging.getLogger(__name__)
 _BASE_URL = "https://slack.com/api"
 _PAGE_DELAY = 0.1  # Internal apps get generous rate limits
 
+_T = TypeVar("_T", bound=BaseModel)
 
-class RateLimitedError(Exception):
+# Slack ok=False values that mean "stop, this won't recover"
+_FATAL_BODY_ERRORS = frozenset({"token_revoked", "invalid_auth", "account_inactive"})
+
+
+# === Exception hierarchy ===
+
+
+class SlackAPIError(Exception):
+    """Base for all Slack-API-related errors raised by this module."""
+
+
+class RateLimitedError(SlackAPIError):
     def __init__(self, retry_after: float | None = None) -> None:
         self.retry_after = retry_after
         super().__init__(f"Rate limited (retry_after={retry_after})")
 
 
-class FatalAPIError(Exception):
-    """401/403 — stop retrying."""
+class FatalAPIError(SlackAPIError):
+    """401/403 or unrecoverable body error — stop retrying."""
+
+
+# === Client ===
 
 
 class SlackClient:
-    """Synchronous client for Slack Web API."""
+    """Synchronous client for the Slack Web API."""
 
     def __init__(self, token: str) -> None:
         self._token = token
 
-    def _get(self, method: str, params: dict[str, str] | None = None) -> Any:
+    @property
+    def token(self) -> str:
+        """Read-only access for modules that make their own httpx calls (canvas, transcript)."""
+        return self._token
+
+    def _get_raw(
+        self,
+        method: str,
+        params: dict[str, str] | None = None,
+    ) -> JsonObject:
+        """Low-level GET. Handles HTTP/body errors, returns parsed JSON dict."""
         resp = httpx.get(
             f"{_BASE_URL}/{method}",
             params=params,
             headers={"Authorization": f"Bearer {self._token}"},
             timeout=30.0,
         )
+        return self._handle_response(resp, method)
+
+    def _post_raw(
+        self,
+        method: str,
+        data: dict[str, str] | None = None,
+    ) -> JsonObject:
+        """POST variant for endpoints that take a form body."""
+        resp = httpx.post(
+            f"{_BASE_URL}/{method}",
+            data=data,
+            headers={"Authorization": f"Bearer {self._token}"},
+            timeout=30.0,
+        )
+        return self._handle_response(resp, method)
+
+    def _handle_response(self, resp: httpx.Response, method: str) -> JsonObject:
         if resp.status_code == 429:
             retry_after_raw = resp.headers.get("retry-after")
             retry_after = float(retry_after_raw) if retry_after_raw else None
@@ -54,13 +106,35 @@ class SlackClient:
         if resp.status_code in (401, 403):
             raise FatalAPIError(f"HTTP {resp.status_code} on {method}")
         resp.raise_for_status()
-        data = resp.json()
-        if not data.get("ok"):
-            error = data.get("error", "unknown")
-            if error in ("token_revoked", "invalid_auth", "account_inactive"):
+        body: JsonObject = resp.json()
+        ok = body.get("ok")
+        if ok is not True:
+            error_val = body.get("error", "unknown")
+            error = error_val if isinstance(error_val, str) else "unknown"
+            if error in _FATAL_BODY_ERRORS:
                 raise FatalAPIError(f"Slack API error: {error}")
             log.warning("Slack API error on %s: %s", method, error)
-        return data
+        return body
+
+    def _get(
+        self,
+        method: str,
+        params: dict[str, str] | None,
+        response_type: type[_T],
+    ) -> _T:
+        """Typed GET — validates the response into the given Pydantic model."""
+        return response_type.model_validate(self._get_raw(method, params))
+
+    def _post(
+        self,
+        method: str,
+        data: dict[str, str] | None,
+        response_type: type[_T],
+    ) -> _T:
+        """Typed POST — validates the response into the given Pydantic model."""
+        return response_type.model_validate(self._post_raw(method, data))
+
+    # === High-level methods ===
 
     def list_conversations(
         self,
@@ -77,10 +151,9 @@ class SlackClient:
             }
             if cursor:
                 params["cursor"] = cursor
-            data = self._get("conversations.list", params)
-            for ch in data.get("channels", []):
-                channels.append(_parse_channel(ch))
-            cursor = data.get("response_metadata", {}).get("next_cursor", "")
+            resp = self._get("conversations.list", params, ConversationsListResponse)
+            channels.extend(resp.channels)
+            cursor = resp.response_metadata.next_cursor
             if not cursor:
                 break
             time.sleep(_PAGE_DELAY)
@@ -107,18 +180,33 @@ class SlackClient:
                 params["latest"] = latest
             if cursor:
                 params["cursor"] = cursor
-            data = self._get("conversations.history", params)
-            for msg in data.get("messages", []):
-                messages.append(parse_message(msg))
-            if not data.get("has_more", False):
+            resp = self._get(
+                "conversations.history", params, ConversationsHistoryResponse,
+            )
+            messages.extend(resp.messages)
+            if not resp.has_more:
                 break
-            cursor = data.get("response_metadata", {}).get("next_cursor", "")
+            cursor = resp.response_metadata.next_cursor
             if not cursor:
                 break
             time.sleep(_PAGE_DELAY)
         # API returns newest first; reverse to chronological
         messages.reverse()
         return messages
+
+    def get_history_page(
+        self,
+        channel_id: str,
+        cursor: str = "",
+    ) -> ConversationsHistoryResponse:
+        """Fetch a single page of conversation history (used by backfill)."""
+        params: dict[str, str] = {
+            "channel": channel_id,
+            "limit": "200",
+        }
+        if cursor:
+            params["cursor"] = cursor
+        return self._get("conversations.history", params, ConversationsHistoryResponse)
 
     def get_replies(self, channel_id: str, thread_ts: str) -> Thread:
         """Fetch all replies in a thread."""
@@ -132,12 +220,13 @@ class SlackClient:
             }
             if cursor:
                 params["cursor"] = cursor
-            data = self._get("conversations.replies", params)
-            for msg in data.get("messages", []):
-                messages.append(parse_message(msg))
-            if not data.get("has_more", False):
+            resp = self._get(
+                "conversations.replies", params, ConversationsRepliesResponse,
+            )
+            messages.extend(resp.messages)
+            if not resp.has_more:
                 break
-            cursor = data.get("response_metadata", {}).get("next_cursor", "")
+            cursor = resp.response_metadata.next_cursor
             if not cursor:
                 break
             time.sleep(_PAGE_DELAY)
@@ -148,59 +237,47 @@ class SlackClient:
 
         return Thread(parent=messages[0], replies=tuple(messages[1:]))
 
-    def get_file_info(self, file_id: str) -> dict[str, Any]:
-        """Get file metadata including download URLs and huddle info."""
-        data = self._get("files.info", {"file": file_id})
-        return data.get("file", {})
+    def get_file_info(self, file_id: str) -> SlackFile | None:
+        """Get file metadata. Returns None if Slack reports the file is missing."""
+        resp = self._get("files.info", {"file": file_id}, FilesInfoResponse)
+        return resp.file
 
     def get_huddle_info(self, file_id: str) -> HuddleInfo | None:
         """Get huddle info from a canvas file."""
-        file_data = self.get_file_info(file_id)
-        if not file_data.get("is_huddle_canvas"):
+        f = self.get_file_info(file_id)
+        if f is None or not f.is_huddle_canvas:
             return None
         return HuddleInfo(
             canvas_file_id=file_id,
-            transcript_file_id=file_data.get("huddle_transcript_file_id"),
-            date_start=file_data.get("huddle_date_start", 0),
-            date_end=file_data.get("huddle_date_end", 0),
+            transcript_file_id=f.huddle_transcript_file_id,
+            date_start=f.huddle_date_start,
+            date_end=f.huddle_date_end,
         )
 
-    def search_huddle_canvases(self) -> list[dict[str, Any]]:
-        """Search for all huddle note canvases."""
-        results: list[dict[str, Any]] = []
+    def search_huddle_canvases(self) -> list[SearchFile]:
+        """Search for all huddle note canvases. Returns typed SearchFile records."""
+        out: list[SearchFile] = []
         page = 1
         while True:
-            data = self._get("search.files", {
-                "query": "Huddle notes",
-                "sort": "timestamp",
-                "sort_dir": "desc",
-                "count": "100",
-                "page": str(page),
-            })
-            matches = data.get("files", {}).get("matches", [])
-            if not matches:
+            resp = self._get(
+                "search.files",
+                {
+                    "query": "Huddle notes",
+                    "sort": "timestamp",
+                    "sort_dir": "desc",
+                    "count": "100",
+                    "page": str(page),
+                },
+                SearchFilesResponse,
+            )
+            if not resp.files.matches:
                 break
-            results.extend(matches)
-            total = data.get("files", {}).get("total", 0)
-            if len(results) >= total:
+            out.extend(resp.files.matches)
+            if len(out) >= resp.files.total:
                 break
             page += 1
             time.sleep(_PAGE_DELAY)
-        return results
-
-    def get_history_page(
-        self,
-        channel_id: str,
-        cursor: str = "",
-    ) -> dict[str, Any]:
-        """Fetch a single page of conversation history (for backfill)."""
-        params: dict[str, str] = {
-            "channel": channel_id,
-            "limit": "200",
-        }
-        if cursor:
-            params["cursor"] = cursor
-        return self._get("conversations.history", params)
+        return out
 
     def download_file(self, url: str) -> bytes:
         """Download a file from Slack using authentication."""
@@ -212,64 +289,3 @@ class SlackClient:
         )
         resp.raise_for_status()
         return resp.content
-
-
-def _parse_channel(data: dict[str, Any]) -> Channel:
-    return Channel(
-        id=data["id"],
-        name=data.get("name", data["id"]),
-        is_private=data.get("is_private", False),
-        is_im=data.get("is_im", False),
-        is_mpim=data.get("is_mpim", False),
-        topic=data.get("topic", {}).get("value", ""),
-        purpose=data.get("purpose", {}).get("value", ""),
-        num_members=data.get("num_members", 0),
-        is_member=data.get("is_member", False),
-        im_user_id=data.get("user"),
-    )
-
-
-def parse_message(data: dict[str, Any]) -> Message:
-    reactions = tuple(
-        Reaction(
-            name=r["name"],
-            count=r.get("count", 0),
-            users=tuple(r.get("users", [])),
-        )
-        for r in data.get("reactions", [])
-    )
-
-    files = tuple(
-        FileAttachment(
-            id=f["id"],
-            name=f.get("name", ""),
-            title=f.get("title", ""),
-            filetype=f.get("filetype", ""),
-            mimetype=f.get("mimetype", ""),
-            size=f.get("size", 0),
-            url_private=f.get("url_private", ""),
-            url_private_download=f.get("url_private_download", ""),
-            is_huddle_canvas=f.get("is_huddle_canvas", False),
-            huddle_transcript_file_id=f.get("huddle_transcript_file_id"),
-        )
-        for f in data.get("files", [])
-    )
-
-    edited_raw = data.get("edited")
-    edited = (
-        Edited(user=edited_raw["user"], ts=edited_raw["ts"])
-        if edited_raw
-        else None
-    )
-
-    return Message(
-        ts=data["ts"],
-        user=data.get("user", data.get("bot_id", "unknown")),
-        text=data.get("text", ""),
-        thread_ts=data.get("thread_ts"),
-        reply_count=data.get("reply_count", 0),
-        reactions=reactions,
-        files=files,
-        edited=edited,
-        subtype=data.get("subtype"),
-    )

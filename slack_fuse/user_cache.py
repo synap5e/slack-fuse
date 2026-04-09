@@ -1,4 +1,8 @@
-"""User ID → display name resolution with persistent disk cache."""
+"""User ID → display name resolution with persistent disk cache.
+
+I/O boundary models live in `models.py`; this file validates every Slack
+response into one of those models so the rest of the cache logic is fully typed.
+"""
 
 from __future__ import annotations
 
@@ -6,14 +10,21 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Any
 
 import httpx
+
+from .models import (
+    BotsInfoResponse,
+    JsonObject,
+    UsersInfoResponse,
+    UsersListResponse,
+)
 
 log = logging.getLogger(__name__)
 
 _CACHE_PATH = Path.home() / ".cache" / "slack-fuse" / "users.json"
 _TTL = 86400.0  # 24 hours
+_BASE_URL = "https://slack.com/api"
 
 
 class UserCache:
@@ -32,9 +43,15 @@ class UserCache:
     def _load_from_disk(self) -> None:
         if _CACHE_PATH.exists():
             try:
-                data = json.loads(_CACHE_PATH.read_text())
-                self._users = data.get("users", {})
-                self._loaded_at = data.get("loaded_at", 0.0)
+                data: JsonObject = json.loads(_CACHE_PATH.read_text())
+                raw_users = data.get("users", {})
+                if isinstance(raw_users, dict):
+                    self._users = {
+                        k: v for k, v in raw_users.items() if isinstance(v, str)
+                    }
+                loaded_at = data.get("loaded_at", 0.0)
+                if isinstance(loaded_at, (int, float)):
+                    self._loaded_at = float(loaded_at)
                 log.info("Loaded %d users from disk cache", len(self._users))
             except (json.JSONDecodeError, KeyError):
                 log.warning("Corrupt user cache, starting fresh")
@@ -42,51 +59,47 @@ class UserCache:
     def _save_to_disk(self) -> None:
         _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
         _CACHE_PATH.write_text(
-            json.dumps({"users": self._users, "loaded_at": self._loaded_at})
+            json.dumps({"users": self._users, "loaded_at": self._loaded_at}),
         )
 
-    def _api_get(self, path: str, params: dict[str, str] | None = None) -> Any:
+    def _get_json(self, path: str, params: dict[str, str] | None = None) -> JsonObject:
         resp = httpx.get(
-            f"https://slack.com/api{path}",
+            f"{_BASE_URL}{path}",
             params=params,
             headers={"Authorization": f"Bearer {self._token}"},
             timeout=15.0,
         )
         resp.raise_for_status()
-        return resp.json()
+        body: JsonObject = resp.json()
+        return body
 
-    def _fetch_user(self, user_id: str) -> str | None:
-        """Fetch a single user's or bot's display name from the API."""
+    def _fetch_user(self, user_id: str) -> str:
+        """Fetch a single user's or bot's display name from the API.
+
+        Caches misses (returns the raw id) so we don't retry on every lookup.
+        """
         try:
             if user_id.startswith("B"):
-                # Bot ID — use bots.info
-                data = self._api_get("/bots.info", {"bot": user_id})
-                if not data.get("ok"):
-                    # Cache the miss so we don't retry
-                    self._users[user_id] = user_id
-                    self._save_to_disk()
-                    return user_id
-                bot = data.get("bot", {})
-                name = bot.get("name", user_id)
-            else:
-                data = self._api_get("/users.info", {"user": user_id})
-                if not data.get("ok"):
-                    self._users[user_id] = user_id
-                    self._save_to_disk()
-                    return user_id
-                user = data["user"]
-                profile = user.get("profile", {})
-                name = (
-                    profile.get("display_name")
-                    or profile.get("real_name")
-                    or user.get("name", user_id)
+                bot_resp = BotsInfoResponse.model_validate(
+                    self._get_json("/bots.info", {"bot": user_id}),
                 )
+                if not bot_resp.ok or bot_resp.bot is None:
+                    name = user_id
+                else:
+                    name = bot_resp.bot.name or user_id
+            else:
+                user_resp = UsersInfoResponse.model_validate(
+                    self._get_json("/users.info", {"user": user_id}),
+                )
+                if not user_resp.ok or user_resp.user is None:
+                    name = user_id
+                else:
+                    name = user_resp.user.display() or user_id
             self._users[user_id] = name
             self._save_to_disk()
             return name
-        except Exception:
-            log.warning("Failed to fetch user/bot %s", user_id, exc_info=True)
-            # Cache the ID itself so we don't retry
+        except (httpx.HTTPError, ValueError) as e:
+            log.warning("Failed to fetch user/bot %s: %s", user_id, e)
             self._users[user_id] = user_id
             self._save_to_disk()
             return user_id
@@ -104,25 +117,20 @@ class UserCache:
                 params: dict[str, str] = {"limit": "200"}
                 if cursor:
                     params["cursor"] = cursor
-                data = self._api_get("/users.list", params)
-                if not data.get("ok"):
-                    log.warning("users.list failed: %s", data.get("error"))
+                resp = UsersListResponse.model_validate(
+                    self._get_json("/users.list", params),
+                )
+                if not resp.ok:
+                    log.warning("users.list failed: %s", resp.error)
                     break
-                for member in data.get("members", []):
-                    uid = member["id"]
-                    profile = member.get("profile", {})
-                    name = (
-                        profile.get("display_name")
-                        or profile.get("real_name")
-                        or member.get("name", uid)
-                    )
-                    self._users[uid] = name
+                for member in resp.members:
+                    self._users[member.id] = member.display()
                     count += 1
-                cursor = data.get("response_metadata", {}).get("next_cursor", "")
+                cursor = resp.response_metadata.next_cursor
                 if not cursor:
                     break
-        except Exception:
-            log.warning("Error populating user cache", exc_info=True)
+        except (httpx.HTTPError, ValueError) as e:
+            log.warning("Error populating user cache: %s", e)
 
         self._loaded_at = time.time()
         self._save_to_disk()
@@ -133,5 +141,4 @@ class UserCache:
         name = self._users.get(user_id)
         if name is not None:
             return name
-        fetched = self._fetch_user(user_id)
-        return fetched or user_id
+        return self._fetch_user(user_id)

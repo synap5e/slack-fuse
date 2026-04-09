@@ -29,13 +29,57 @@ dev = [
 [tool.basedpyright]
 pythonVersion = "3.12"
 typeCheckingMode = "strict"
+reportUnusedCallResult = false
+reportImplicitStringConcatenation = false
+reportUnannotatedClassAttribute = false
+reportUnknownLambdaType = false
+include = ["slack_fuse", "tests"]
+exclude = ["**/__pycache__", "**/.venv", "**/.ruff_cache"]
 
 [tool.ruff]
+line-length = 120
 preview = true
 target-version = "py312"
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+select = [
+    "E",        # pycodestyle
+    "F",        # pyflakes
+    "W",        # pycodestyle warnings
+    "I",        # isort
+    "UP",       # pyupgrade
+    "B",        # flake8-bugbear
+    "SIM",      # flake8-simplify
+    "RUF",      # ruff-specific
+    "BLE001",   # broad exceptions
+    "C901",     # cyclomatic complexity
+    "E402",     # import not at top of file
+    "PLC0415",  # import not at top of file (pylint)
+    "PLR0913",  # too many function args
+    "PLR0916",  # too many boolean expressions
+    "PLR0917",  # too many positional args
+    "PLR1702",  # too many nested blocks
+]
+ignore = [
+    "SIM108",   # ternary is NOT simpler than if blocks
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+"tests/*.py" = ["BLE001"]
+# CLI entrypoint defers heavy imports (pyfuse3, trio) until the mount subcommand
+# actually runs — see ~/docs/dev/python/README.md "Lazy imports" section.
+"slack_fuse/__main__.py" = ["PLC0415"]
+
+[tool.ruff.lint.isort]
+force-single-line = false
+combine-as-imports = true
+split-on-trailing-comma = true
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

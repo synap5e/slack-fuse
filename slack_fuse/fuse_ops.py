@@ -11,6 +11,7 @@ import time
 import pyfuse3
 
 from .inode_map import InodeMap
+from .models import HuddleIndexEntry
 from .store import SlackStore
 
 log = logging.getLogger(__name__)
@@ -124,7 +125,7 @@ class SlackFuseOps(pyfuse3.Operations):
                 ]
         return self._list_dir_impl(real_path)
 
-    def _list_dir_impl(
+    def _list_dir_impl(  # noqa: C901  (path-depth dispatch hub; branches don't decompose cleanly)
         self, path: str,
     ) -> list[tuple[str, bool]]:
         """List directory entries as (name, is_dir) tuples."""
@@ -237,22 +238,22 @@ class SlackFuseOps(pyfuse3.Operations):
 
         # /huddles/ — list months
         if depth == 1:
-            months = sorted({e["month"] for e in index}, reverse=True)
+            months = sorted({e.month for e in index}, reverse=True)
             return [(m, True) for m in months]
 
         # /huddles/<YYYY-MM>/ — list days
         if depth == 2:
             month = parts[1]
-            days = sorted({e["day"] for e in index if e["month"] == month}, reverse=True)
+            days = sorted({e.day for e in index if e.month == month}, reverse=True)
             return [(d, True) for d in days]
 
         # /huddles/<YYYY-MM>/<DD>/ — list huddle dirs
         if depth == 3:
             month, day = parts[1], parts[2]
             return [
-                (e["slug"], True)
+                (e.slug, True)
                 for e in index
-                if e["month"] == month and e["day"] == day
+                if e.month == month and e.day == day
             ]
 
         # /huddles/<YYYY-MM>/<DD>/<slug>/ — huddle content
@@ -261,7 +262,7 @@ class SlackFuseOps(pyfuse3.Operations):
             if entry is None:
                 return []
             result: list[tuple[str, bool]] = [("notes.md", False)]
-            data = self._store.get_huddle_by_canvas_id(entry["canvas_file_id"])
+            data = self._store.get_huddle_by_canvas_id(entry.canvas_file_id)
             if data and data[2] is not None:
                 result.append(("transcript.md", False))
             return result
@@ -270,10 +271,10 @@ class SlackFuseOps(pyfuse3.Operations):
 
     def _find_huddle_index_entry(
         self, month: str, day: str, slug: str,
-    ) -> dict[str, str] | None:
+    ) -> HuddleIndexEntry | None:
         index = self._store.get_huddle_index()
         for e in index:
-            if e["month"] == month and e["day"] == day and e["slug"] == slug:
+            if e.month == month and e.day == day and e.slug == slug:
                 return e
         return None
 
@@ -286,9 +287,7 @@ class SlackFuseOps(pyfuse3.Operations):
             return False
         if parts[0] not in _CONV_ROOTS:
             return False
-        if parts[5] != "huddles" or parts[7] != "index":
-            return False
-        return True
+        return parts[5] == "huddles" and parts[7] == "index"
 
     # === File content ===
 
@@ -299,7 +298,7 @@ class SlackFuseOps(pyfuse3.Operations):
                 return self._resolve_content_impl(real_path)
         return self._resolve_content_impl(real_path)
 
-    def _resolve_content_impl(self, path: str) -> bytes | None:
+    def _resolve_content_impl(self, path: str) -> bytes | None:  # noqa: C901  (path-depth dispatch hub)
         parts = self._parse_path(path)
         depth = len(parts)
 
@@ -312,7 +311,7 @@ class SlackFuseOps(pyfuse3.Operations):
             entry = self._find_huddle_index_entry(parts[1], parts[2], parts[3])
             if entry is None:
                 return None
-            data = self._store.get_huddle_by_canvas_id(entry["canvas_file_id"])
+            data = self._store.get_huddle_by_canvas_id(entry.canvas_file_id)
             if data is None:
                 return None
             _info, notes_md, transcript_md = data
@@ -398,7 +397,7 @@ class SlackFuseOps(pyfuse3.Operations):
                 return self._is_dir_impl(real_path)
         return self._is_dir_impl(real_path)
 
-    def _is_dir_impl(self, path: str) -> bool:
+    def _is_dir_impl(self, path: str) -> bool:  # noqa: C901  (path-depth dispatch hub)
         parts = self._parse_path(path)
         depth = len(parts)
         if depth == 0:
@@ -542,7 +541,10 @@ class SlackFuseOps(pyfuse3.Operations):
         # We're at: /channels/<slug>/<YYYY-MM>/<DD>/<thread>/huddles/<huddle>/index
         # Target:   /huddles/<YYYY-MM>/<DD>/<slug>
         # 7 levels up to root, then huddles/...
-        target = f"../../../../../../../huddles/{index_entry['month']}/{index_entry['day']}/{index_entry['slug']}"
+        target = (
+            f"../../../../../../../huddles/{index_entry.month}"
+            f"/{index_entry.day}/{index_entry.slug}"
+        )
         return target.encode()
 
     async def readdir(

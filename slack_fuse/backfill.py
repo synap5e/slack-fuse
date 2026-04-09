@@ -12,13 +12,12 @@ import logging
 import random
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
 
 import trio
 
-from .api import FatalAPIError, RateLimitedError, SlackClient, parse_message
+from .api import FatalAPIError, RateLimitedError, SlackClient
 from .disk_cache import put_day_messages
-from .models import message_to_dict
+from .models import JsonObject, Message
 from .store import ChannelEntry, SlackStore
 
 log = logging.getLogger(__name__)
@@ -120,14 +119,14 @@ async def _backfill_channel(
     cursor = ""
     page = 0
     total_msgs = 0
-    by_date: dict[str, list[dict[str, Any]]] = {}
+    by_date: dict[str, list[Message]] = {}
 
     while True:
         if page > 0:
             await trio.sleep(random.uniform(_MIN_SLEEP, _MAX_SLEEP))
 
         try:
-            data = client.get_history_page(channel_id, cursor)
+            resp = client.get_history_page(channel_id, cursor)
         except RateLimitedError as e:
             wait = (e.retry_after or 60) + random.uniform(10, 30)
             log.warning(
@@ -138,34 +137,30 @@ async def _backfill_channel(
             await trio.sleep(wait)
             continue
 
-        for msg_raw in data.get("messages", []):
+        for msg in resp.messages:
             try:
-                ts = float(msg_raw["ts"])
+                ts = float(msg.ts)
                 dt = datetime.fromtimestamp(ts, tz=UTC).astimezone()
                 date_str = dt.strftime("%Y-%m-%d")
-                by_date.setdefault(date_str, []).append(msg_raw)
+                by_date.setdefault(date_str, []).append(msg)
                 total_msgs += 1
-            except (ValueError, KeyError, OSError):
+            except (ValueError, OSError):
                 pass
 
         page += 1
 
-        if not data.get("has_more", False):
+        if not resp.has_more:
             break
-        cursor = data.get("response_metadata", {}).get("next_cursor", "")
+        cursor = resp.response_metadata.next_cursor
         if not cursor:
             break
 
     # API returns newest-first within each page; reverse each day to chronological
     all_dates: set[str] = set()
-    for date_str, raw_msgs in by_date.items():
-        raw_msgs.reverse()
-        parsed = [parse_message(m) for m in raw_msgs]
-        put_day_messages(
-            channel_id,
-            date_str,
-            [message_to_dict(m) for m in parsed],
-        )
+    for date_str, day_msgs in by_date.items():
+        day_msgs.reverse()
+        dumped: list[JsonObject] = [m.model_dump(mode="json") for m in day_msgs]
+        put_day_messages(channel_id, date_str, dumped)
         all_dates.add(date_str)
 
     # Update store's known dates so new dates appear in directory listings

@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from . import mrkdwn
-from .models import Channel, DayMessages, Message, Thread
+from .models import Channel, Message, Thread
 
 if TYPE_CHECKING:
     from .user_cache import UserCache
@@ -164,7 +164,7 @@ def _render_message(
 def _ts_to_time(ts: str) -> str:
     """Convert Slack timestamp to HH:MM."""
     try:
-        dt = datetime.fromtimestamp(float(ts), tz=timezone.utc).astimezone()
+        dt = datetime.fromtimestamp(float(ts), tz=UTC).astimezone()
         return dt.strftime("%H:%M")
     except (ValueError, OSError):
         return ts
@@ -173,7 +173,7 @@ def _ts_to_time(ts: str) -> str:
 def _ts_to_date(ts: str) -> str:
     """Convert Slack timestamp to YYYY-MM-DD."""
     try:
-        dt = datetime.fromtimestamp(float(ts), tz=timezone.utc).astimezone()
+        dt = datetime.fromtimestamp(float(ts), tz=UTC).astimezone()
         return dt.strftime("%Y-%m-%d")
     except (ValueError, OSError):
         return "unknown"

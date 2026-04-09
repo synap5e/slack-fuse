@@ -1,10 +1,17 @@
-"""Disk cache for Slack data that survives restarts."""
+"""Disk cache for Slack data that survives restarts.
+
+JSON files keyed by channel/date/thread_ts/canvas_file_id. Contents are
+opaque `JsonObject` to this module — typed validation happens in `store.py`
+where the relevant Pydantic model is known.
+"""
 
 from __future__ import annotations
 
 import json
 import logging
 from pathlib import Path
+
+from .models import JsonObject
 
 log = logging.getLogger(__name__)
 
@@ -44,8 +51,8 @@ def put_huddle(canvas_file_id: str, notes_md: str | None, transcript_md: str | N
 # === Day messages ===
 # Keyed by (channel_id, date_str). Old messages (>7 days) are effectively immutable.
 
-def get_day_messages(channel_id: str, date_str: str) -> list[dict[str, object]] | None:
-    """Load cached day messages. Returns list of raw message dicts or None."""
+def get_day_messages(channel_id: str, date_str: str) -> list[JsonObject] | None:
+    """Load cached day messages. Returns list of raw JSON objects or None."""
     path = _CACHE_DIR / "messages" / channel_id / f"{date_str}.json"
     if not path.exists():
         return None
@@ -55,7 +62,7 @@ def get_day_messages(channel_id: str, date_str: str) -> list[dict[str, object]] 
         return None
 
 
-def put_day_messages(channel_id: str, date_str: str, messages: list[dict[str, object]]) -> None:
+def put_day_messages(channel_id: str, date_str: str, messages: list[JsonObject]) -> None:
     """Cache day messages to disk."""
     d = _CACHE_DIR / "messages" / channel_id
     _ensure_dir(d)
@@ -65,8 +72,8 @@ def put_day_messages(channel_id: str, date_str: str, messages: list[dict[str, ob
 # === Threads ===
 # Keyed by (channel_id, thread_ts). Old threads are effectively immutable.
 
-def get_thread(channel_id: str, thread_ts: str) -> list[dict[str, object]] | None:
-    """Load cached thread. Returns list of raw message dicts (parent + replies) or None."""
+def get_thread(channel_id: str, thread_ts: str) -> list[JsonObject] | None:
+    """Load cached thread. Returns list of raw JSON objects (parent + replies) or None."""
     safe_ts = thread_ts.replace(".", "-")
     path = _CACHE_DIR / "threads" / channel_id / f"{safe_ts}.json"
     if not path.exists():
@@ -77,7 +84,7 @@ def get_thread(channel_id: str, thread_ts: str) -> list[dict[str, object]] | Non
         return None
 
 
-def put_thread(channel_id: str, thread_ts: str, messages: list[dict[str, object]]) -> None:
+def put_thread(channel_id: str, thread_ts: str, messages: list[JsonObject]) -> None:
     """Cache thread to disk."""
     safe_ts = thread_ts.replace(".", "-")
     d = _CACHE_DIR / "threads" / channel_id
@@ -87,7 +94,7 @@ def put_thread(channel_id: str, thread_ts: str, messages: list[dict[str, object]
 
 # === Channel list ===
 
-def get_channel_list() -> list[dict[str, object]] | None:
+def get_channel_list() -> list[JsonObject] | None:
     """Load cached channel list."""
     path = _CACHE_DIR / "channels.json"
     if not path.exists():
@@ -98,7 +105,7 @@ def get_channel_list() -> list[dict[str, object]] | None:
         return None
 
 
-def put_channel_list(channels: list[dict[str, object]]) -> None:
+def put_channel_list(channels: list[JsonObject]) -> None:
     """Cache channel list to disk."""
     _ensure_dir(_CACHE_DIR)
     (_CACHE_DIR / "channels.json").write_text(json.dumps(channels))
@@ -106,7 +113,7 @@ def put_channel_list(channels: list[dict[str, object]]) -> None:
 
 # === Huddle index ===
 
-def get_huddle_index() -> list[dict[str, str]] | None:
+def get_huddle_index() -> list[JsonObject] | None:
     """Load cached huddle index."""
     path = _CACHE_DIR / "huddle_index.json"
     if not path.exists():
@@ -117,7 +124,7 @@ def get_huddle_index() -> list[dict[str, str]] | None:
         return None
 
 
-def put_huddle_index(entries: list[dict[str, str]]) -> None:
+def put_huddle_index(entries: list[JsonObject]) -> None:
     """Cache huddle index to disk."""
     _ensure_dir(_CACHE_DIR)
     (_CACHE_DIR / "huddle_index.json").write_text(json.dumps(entries))
