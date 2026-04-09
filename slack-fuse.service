@@ -1,0 +1,30 @@
+# Copy to ~/.config/systemd/user/slack-fuse.service
+#
+# Install:
+#   cp slack-fuse.service ~/.config/systemd/user/slack-fuse.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now slack-fuse
+#
+# Force refresh:
+#   systemctl --user kill -s USR1 slack-fuse
+
+[Unit]
+Description=Slack FUSE filesystem
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=%h/agentic/slack-fuse
+EnvironmentFile=%h/agentic/slack-fuse/.env
+ExecStart=%h/agentic/slack-fuse/.venv/bin/slack-fuse mount
+ExecStop=/usr/bin/fusermount3 -u %h/views/slack
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
