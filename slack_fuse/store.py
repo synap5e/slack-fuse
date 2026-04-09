@@ -298,6 +298,19 @@ class SlackStore:
             return _RECENT_MSG_TTL
         return _OLD_MSG_TTL if date < today else _RECENT_MSG_TTL
 
+    def _thread_ttl(self, thread_ts: str) -> float:
+        """TTL for a thread, based on its parent message's local date.
+
+        Same today-vs-not-today policy as `_date_ttl`. New replies on a
+        thread that started before today are extremely rare; locking such
+        threads avoids re-fetching them on every grep.
+        """
+        try:
+            dt = datetime.fromtimestamp(float(thread_ts), tz=UTC).astimezone()
+        except (ValueError, OSError):
+            return _RECENT_MSG_TTL
+        return _OLD_MSG_TTL if dt.date() < datetime.now().astimezone().date() else _RECENT_MSG_TTL
+
     def get_day_messages(self, channel_id: str, date_str: str) -> list[Message]:
         """Get messages for a channel on a specific date."""
         key = (channel_id, date_str)
@@ -405,15 +418,23 @@ class SlackStore:
     # === Threads ===
 
     def get_thread(self, channel_id: str, thread_ts: str) -> Thread | None:
-        """Get a thread, cached."""
+        """Get a thread, cached.
+
+        Today's threads use a 5-minute in-memory TTL (new replies still
+        possible). Threads whose parent message is from a previous local
+        day get an infinite TTL: once they're in the in-memory or disk
+        cache, they're served forever and never re-fetched.
+        """
         key = (channel_id, thread_ts)
+        ttl = self._thread_ttl(thread_ts)
+
         cached = self._thread_cache.get(key)
         if cached is not None:
             age = time.monotonic() - cached.fetched_at
-            if age < _RECENT_MSG_TTL:
+            if age < ttl:
                 return cached.thread
 
-        # Try disk cache
+        # Disk cache fallback (cached_only or empty in-memory).
         disk_msgs = disk_cache.get_thread(channel_id, thread_ts)
         if disk_msgs is not None and (self._cached_only or cached is None):
             messages = [Message.model_validate(m) for m in disk_msgs]

@@ -115,14 +115,18 @@ rg keyword ~/views/slack/.cached-only/channels/
 
 ## Background backfill
 
-Disabled by default. Set `SLACK_FUSE_BACKFILL=true` to enable a background task that slowly paginates full history for every member channel into the disk cache:
+Disabled by default. Set `SLACK_FUSE_BACKFILL=true` to enable a background task that slowly walks every member channel and pulls its full history into the disk cache. Per channel, two phases:
 
-- Long random sleeps (30–180s) between API pages and between channels.
+1. **Day backfill** — paginate `conversations.history`, write each day's messages to `~/.cache/slack-fuse/messages/<channel_id>/<YYYY-MM-DD>.json`. Long random sleeps (30-180s) between pages and channels. Marker: `~/.cache/slack-fuse/backfill/<channel_id>.done`.
+2. **Thread backfill** — walk those cached day files, find every message with `reply_count > 0`, and fetch the replies via `conversations.replies`. Shorter sleeps (2-8s) since the calls are cheap. Skips threads already on disk so an interrupted run resumes cleanly. Marker: `~/.cache/slack-fuse/backfill/<channel_id>.threads.done`.
+
+After both phases run for a channel, `rg`-ing its `feed.md` and `thread.md` files becomes a pure disk walk.
+
+Other behavior:
+
 - Skips channels whose name contains `notification`, `alert`, or `prod-alerts`.
-- Per-channel completion tracked at `~/.cache/slack-fuse/backfill/<channel_id>.done` so progress resumes across restarts.
 - Rate-limit responses trigger a wait + jitter and the page is retried.
-
-Re-backfill a single channel by deleting its `.done` marker.
+- Re-day-backfill a channel by deleting its `.done` marker; re-thread-backfill by deleting its `.threads.done` marker.
 
 ## Caching
 

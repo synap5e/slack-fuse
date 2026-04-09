@@ -19,7 +19,8 @@ import pytest
 
 from slack_fuse import disk_cache, store
 from slack_fuse.api import FatalAPIError, RateLimitedError, SlackClient
-from slack_fuse.store import _OLD_MSG_TTL, _RECENT_MSG_TTL, SlackStore
+from slack_fuse.models import Message, Thread
+from slack_fuse.store import _OLD_MSG_TTL, _RECENT_MSG_TTL, SlackStore, _CachedThread
 from slack_fuse.user_cache import UserCache
 
 from .stubs import (
@@ -181,3 +182,55 @@ def test_date_ttl_arbitrary_past_date_is_locked(fresh_store: SlackStore) -> None
 def test_date_ttl_invalid_date_falls_back_to_recent(fresh_store: SlackStore) -> None:
     """Garbage date string should not crash; treat it as recent (safe default)."""
     assert fresh_store._date_ttl("not-a-date") == _RECENT_MSG_TTL
+
+
+# === _thread_ttl: same boundary, but on a Slack ts (float-as-string) ===
+
+
+def _local_ts_offset(days: int) -> str:
+    """Return a Slack-style ts string for a moment offset from `now` in local tz."""
+    moment = datetime.now().astimezone() - timedelta(days=days)
+    return f"{moment.timestamp():.6f}"
+
+
+def test_thread_ttl_today_parent_is_recent(fresh_store: SlackStore) -> None:
+    assert fresh_store._thread_ttl(_local_ts_offset(0)) == _RECENT_MSG_TTL
+
+
+def test_thread_ttl_yesterday_parent_is_locked(fresh_store: SlackStore) -> None:
+    assert fresh_store._thread_ttl(_local_ts_offset(1)) == _OLD_MSG_TTL
+
+
+def test_thread_ttl_old_parent_is_locked(fresh_store: SlackStore) -> None:
+    assert fresh_store._thread_ttl(_local_ts_offset(30)) == _OLD_MSG_TTL
+
+
+def test_thread_ttl_invalid_ts_falls_back_to_recent(fresh_store: SlackStore) -> None:
+    assert fresh_store._thread_ttl("not-a-float") == _RECENT_MSG_TTL
+
+
+# === get_thread: old threads survive past 5-minute mark ===
+
+
+def test_get_thread_old_thread_in_memory_does_not_expire(
+    fresh_store: SlackStore,
+) -> None:
+    """Once an old thread is in memory, the 5-min TTL doesn't apply.
+
+    Regression: previously the in-memory cache used a hardcoded 5-min TTL,
+    so an old thread would expire and re-hit the API. With _thread_ttl,
+    old threads have inf TTL.
+    """
+    yesterday_ts = _local_ts_offset(1)
+    parent = Message.model_validate({"ts": yesterday_ts, "user": "U1"})
+    thread = Thread(parent=parent, replies=())
+
+    # Backdate the in-memory entry by an hour — way past _RECENT_MSG_TTL.
+    one_hour_ago = time.monotonic() - 3600
+    fresh_store._thread_cache["C1", yesterday_ts] = _CachedThread(
+        thread=thread, fetched_at=one_hour_ago,
+    )
+
+    # Should still return from in-memory because the thread is old.
+    result = fresh_store.get_thread("C1", yesterday_ts)
+    assert result is thread
