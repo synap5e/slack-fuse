@@ -83,7 +83,7 @@ def cmd_mount(args: argparse.Namespace) -> None:
 
     pyfuse3.init(ops, str(mountpoint), fuse_options)
 
-    backfill_enabled = _env_bool("SLACK_FUSE_BACKFILL", default=True)
+    backfill_enabled = _env_bool("SLACK_FUSE_BACKFILL", default=False)
     logging.getLogger(__name__).info(
         "Backfill: %s", "enabled" if backfill_enabled else "disabled",
     )

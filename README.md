@@ -43,7 +43,7 @@ $EDITOR .env
 | `SLACK_USER_TOKEN` | yes | — | User token (`xoxc-`/`xoxp-`). Mount reads what you can read. |
 | `SLACK_APP_TOKEN` | no | — | App-level token (`xapp-`) for socket-mode features. |
 | `SLACK_BOT_TOKEN` | no | — | Reserved; currently unused. |
-| `SLACK_FUSE_BACKFILL` | no | `true` | Enable the background history backfill task. Accepts `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`. |
+| `SLACK_FUSE_BACKFILL` | no | `false` | Enable the background history backfill task. Accepts `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`. |
 
 `SLACK_USER_TOKEN` may also be supplied via `~/.config/slack-fuse/config.json` if you'd rather keep it out of `.env`.
 
@@ -115,14 +115,14 @@ rg keyword ~/views/slack/.cached-only/channels/
 
 ## Background backfill
 
-When `SLACK_FUSE_BACKFILL=true` (the default), the mount spawns a background task that slowly paginates full history for every member channel into the disk cache:
+Disabled by default. Set `SLACK_FUSE_BACKFILL=true` to enable a background task that slowly paginates full history for every member channel into the disk cache:
 
 - Long random sleeps (30–180s) between API pages and between channels.
 - Skips channels whose name contains `notification`, `alert`, or `prod-alerts`.
 - Per-channel completion tracked at `~/.cache/slack-fuse/backfill/<channel_id>.done` so progress resumes across restarts.
 - Rate-limit responses trigger a wait + jitter and the page is retried.
 
-Set `SLACK_FUSE_BACKFILL=false` to disable. Re-backfill a single channel by deleting its `.done` marker.
+Re-backfill a single channel by deleting its `.done` marker.
 
 ## Caching
 
