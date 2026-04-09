@@ -13,9 +13,9 @@ Per ~/docs/dev/python/pydantic-io-boundaries.md:
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, cast
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AliasPath, BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
 # === Recursive JSON types ===
 
@@ -29,9 +29,23 @@ type JsonObject = dict[str, JsonValue]
 
 
 class _FrozenModel(BaseModel):
-    """Base for immutable domain + wire models. Tolerates extra fields from Slack."""
+    """Base for immutable domain + wire models. Tolerates extra fields from Slack.
 
-    model_config = ConfigDict(frozen=True, extra="ignore")
+    `populate_by_name=True` lets fields be set by either their canonical name
+    *or* their `validation_alias` — needed so disk-cache round-trips work
+    (we dump as canonical names, then re-validate the dump).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="ignore", populate_by_name=True)
+
+
+def _none_to_empty_str(v: object) -> object:
+    """BeforeValidator: coerce a literal None to empty string.
+
+    Used on `Channel.topic`/`purpose` because Slack sometimes sends
+    `topic: {value: null}` and we expose `topic: str` not `str | None`.
+    """
+    return "" if v is None else v
 
 
 # === Domain models (also serve as wire models for nested data) ===
@@ -63,7 +77,7 @@ class Edited(_FrozenModel):
 
 class Message(_FrozenModel):
     ts: str
-    user: str
+    user: str = "unknown"
     text: str = ""
     thread_ts: str | None = None
     reply_count: int = 0
@@ -74,14 +88,20 @@ class Message(_FrozenModel):
 
     @model_validator(mode="before")
     @classmethod
-    def _resolve_user(cls, data: object) -> object:
+    def _strip_falsy_user(cls, data: object) -> object:
+        """If `user` is None/empty, strip it so the default chain falls through to bot_id.
+
+        Slack's wire format omits `user` entirely for bot/system messages, but
+        sometimes sends `user: null` alongside `bot_id`. Both should resolve to
+        the bot id (or `"unknown"` if neither is present).
+        """
         if not isinstance(data, dict):
             return data
-        d: dict[str, Any] = data  # pyright: ignore[reportUnknownVariableType]
-        if not d.get("user"):
-            out: dict[str, Any] = {**d}
-            out["user"] = d.get("bot_id") or "unknown"
-            return out
+        d = cast("dict[str, object]", data)
+        user = d.get("user")
+        if user in (None, ""):
+            bot_id = d.get("bot_id")
+            return {**d, "user": bot_id if isinstance(bot_id, str) and bot_id else "unknown"}
         return d
 
 
@@ -96,32 +116,34 @@ class Channel(_FrozenModel):
     is_private: bool = False
     is_im: bool = False
     is_mpim: bool = False
-    topic: str = ""
-    purpose: str = ""
+    # AliasPath flattens Slack's nested {value, creator, last_set} shape;
+    # the BeforeValidator coerces a literal `null` value to "".
+    topic: Annotated[str, BeforeValidator(_none_to_empty_str)] = Field(
+        default="", validation_alias=AliasPath("topic", "value"),
+    )
+    purpose: Annotated[str, BeforeValidator(_none_to_empty_str)] = Field(
+        default="", validation_alias=AliasPath("purpose", "value"),
+    )
     num_members: int = 0
     is_member: bool = False
     im_user_id: str | None = None
 
     @model_validator(mode="before")
     @classmethod
-    def _flatten_wire_shape(cls, data: object) -> object:
+    def _name_and_im_user(cls, data: object) -> object:
+        """Two cross-field rules that don't fit declarative aliases:
+
+        1. `name` falls back to `id` when missing OR empty (truthy check —
+           `AliasChoices` is presence-based and would keep an empty string).
+        2. `im_user_id` is populated from the wire `user` field, but only
+           when `is_im=True` (cross-field; `validation_alias` can't see siblings).
+        """
         if not isinstance(data, dict):
             return data
-        d: dict[str, Any] = data  # pyright: ignore[reportUnknownVariableType]
-        out: dict[str, Any] = {**d}
-        # Slack wire format nests topic/purpose: {value, creator, last_set}
-        topic = out.get("topic")
-        if isinstance(topic, dict):
-            t: dict[str, Any] = topic  # pyright: ignore[reportUnknownVariableType]
-            out["topic"] = t.get("value", "") or ""
-        purpose = out.get("purpose")
-        if isinstance(purpose, dict):
-            p: dict[str, Any] = purpose  # pyright: ignore[reportUnknownVariableType]
-            out["purpose"] = p.get("value", "") or ""
-        # Channel name may be missing for IMs; fall back to id
+        d = cast("dict[str, object]", data)
+        out: dict[str, object] = {**d}
         if not out.get("name"):
             out["name"] = out.get("id", "")
-        # Slack wire format uses `user` for the IM partner; we expose it as `im_user_id`
         if "im_user_id" not in out and out.get("is_im") and out.get("user"):
             out["im_user_id"] = out["user"]
         return out

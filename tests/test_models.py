@@ -87,8 +87,10 @@ def test_channel_round_trip_via_model_dump_json() -> None:
     [
         ({"ts": "1.0", "bot_id": "B999"}, "B999"),
         ({"ts": "1.0", "user": None, "bot_id": "B7"}, "B7"),
+        ({"ts": "1.0", "user": "", "bot_id": "B8"}, "B8"),
         ({"ts": "1.0", "text": "hi"}, "unknown"),
         ({"ts": "1.0", "user": "U1", "bot_id": "B1"}, "U1"),
+        ({"ts": "1.0", "user": "", "bot_id": ""}, "unknown"),
     ],
 )
 def test_message_user_fallback_chain(payload: dict[str, object], expected_user: str) -> None:
