@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Iterator
+from datetime import datetime, timedelta
 from typing import Any
 
 import httpx
@@ -18,7 +19,7 @@ import pytest
 
 from slack_fuse import disk_cache, store
 from slack_fuse.api import FatalAPIError, RateLimitedError, SlackClient
-from slack_fuse.store import SlackStore
+from slack_fuse.store import _OLD_MSG_TTL, _RECENT_MSG_TTL, SlackStore
 from slack_fuse.user_cache import UserCache
 
 from .stubs import (
@@ -155,3 +156,28 @@ def test_force_refresh_clears_fatal_state(fresh_store: SlackStore) -> None:
 
     assert fresh_store.is_auth_fatal is False
     assert fresh_store._api_call(_returning("ok")) == "ok"
+
+
+# === _date_ttl: today vs. earlier local-day boundary ===
+
+
+def _local_date_offset(days: int) -> str:
+    """Return a YYYY-MM-DD string offset from today's local date."""
+    return (datetime.now().astimezone() - timedelta(days=days)).strftime("%Y-%m-%d")
+
+
+def test_date_ttl_today_is_recent(fresh_store: SlackStore) -> None:
+    assert fresh_store._date_ttl(_local_date_offset(0)) == _RECENT_MSG_TTL
+
+
+def test_date_ttl_yesterday_is_locked_forever(fresh_store: SlackStore) -> None:
+    assert fresh_store._date_ttl(_local_date_offset(1)) == _OLD_MSG_TTL
+
+
+def test_date_ttl_arbitrary_past_date_is_locked(fresh_store: SlackStore) -> None:
+    assert fresh_store._date_ttl(_local_date_offset(30)) == _OLD_MSG_TTL
+
+
+def test_date_ttl_invalid_date_falls_back_to_recent(fresh_store: SlackStore) -> None:
+    """Garbage date string should not crash; treat it as recent (safe default)."""
+    assert fresh_store._date_ttl("not-a-date") == _RECENT_MSG_TTL

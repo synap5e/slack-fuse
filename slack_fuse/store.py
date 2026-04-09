@@ -41,9 +41,8 @@ log = logging.getLogger(__name__)
 
 # Cache TTLs
 _CHANNEL_LIST_TTL = 1800.0  # 30 minutes — channel list rarely changes
-_RECENT_MSG_TTL = 300.0  # 5 minutes for messages < 7 days old
-_OLD_MSG_TTL = float("inf")  # messages > 7 days cached indefinitely
-_OLD_THRESHOLD_DAYS = 7
+_RECENT_MSG_TTL = 300.0  # 5 minutes — applies to today's messages (still being written)
+_OLD_MSG_TTL = float("inf")  # any earlier local day is locked forever (see _date_ttl)
 _HUDDLE_INDEX_TTL = 1800.0  # 30 minutes
 
 # Backoff
@@ -279,15 +278,25 @@ class SlackStore:
     # === Messages ===
 
     def _date_ttl(self, date_str: str) -> float:
-        """Return cache TTL for a given date."""
+        """Return cache TTL for a given date.
+
+        Today (in the system's local timezone) → recent TTL: messages may
+        still be posted/edited, so we re-poll every 5 minutes.
+
+        Any earlier local date → infinite TTL: served from disk forever
+        on the assumption that yesterday's messages aren't being edited.
+
+        Local time matters: a UTC midnight boundary would land in the
+        middle of a PST workday and lock messages while they were still
+        being written. The user's local midnight (NZ) maps to ~04:00 PST,
+        comfortably after the previous PST workday ends.
+        """
         try:
-            date = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=UTC)
-            age_days = (datetime.now(UTC) - date).days
-            if age_days > _OLD_THRESHOLD_DAYS:
-                return _OLD_MSG_TTL
+            date = datetime.strptime(date_str, "%Y-%m-%d").date()
+            today = datetime.now().astimezone().date()
         except ValueError:
-            pass
-        return _RECENT_MSG_TTL
+            return _RECENT_MSG_TTL
+        return _OLD_MSG_TTL if date < today else _RECENT_MSG_TTL
 
     def get_day_messages(self, channel_id: str, date_str: str) -> list[Message]:
         """Get messages for a channel on a specific date."""

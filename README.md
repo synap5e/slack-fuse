@@ -134,8 +134,8 @@ In-memory TTLs:
 |---|---|
 | Channel list | 30 min (background refresh) |
 | Huddle index | 30 min |
-| Recent messages (≤7 days) | 5 min |
-| Old messages (>7 days) | indefinite |
+| Today's messages (system local date) | 5 min |
+| Any earlier local date | indefinite |
 
 Force refresh:
 
