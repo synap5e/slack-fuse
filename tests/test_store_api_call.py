@@ -48,7 +48,7 @@ def deterministic_jitter(monkeypatch: pytest.MonkeyPatch) -> None:
 def fresh_store(monkeypatch: pytest.MonkeyPatch) -> Iterator[SlackStore]:
     monkeypatch.setattr(UserCache, "_load_from_disk", stub_load_from_disk)
     client = SlackClient(token="xoxp-fake")
-    users = UserCache(token="xoxp-fake")
+    users = UserCache(client.http)
     yield SlackStore(client=client, users=users)
 
 

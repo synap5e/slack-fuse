@@ -64,11 +64,24 @@ class SlackClient:
 
     def __init__(self, token: str) -> None:
         self._token = token
+        self._http = httpx.Client(
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=30.0,
+        )
 
     @property
     def token(self) -> str:
         """Read-only access for modules that make their own httpx calls (canvas, transcript)."""
         return self._token
+
+    @property
+    def http(self) -> httpx.Client:
+        """Shared HTTP client for modules that need authenticated requests."""
+        return self._http
+
+    def close(self) -> None:
+        """Close the underlying HTTP client."""
+        self._http.close()
 
     def _get_raw(
         self,
@@ -76,12 +89,7 @@ class SlackClient:
         params: dict[str, str] | None = None,
     ) -> JsonObject:
         """Low-level GET. Handles HTTP/body errors, returns parsed JSON dict."""
-        resp = httpx.get(
-            f"{_BASE_URL}/{method}",
-            params=params,
-            headers={"Authorization": f"Bearer {self._token}"},
-            timeout=30.0,
-        )
+        resp = self._http.get(f"{_BASE_URL}/{method}", params=params)
         return self._handle_response(resp, method)
 
     def _post_raw(
@@ -90,12 +98,7 @@ class SlackClient:
         data: dict[str, str] | None = None,
     ) -> JsonObject:
         """POST variant for endpoints that take a form body."""
-        resp = httpx.post(
-            f"{_BASE_URL}/{method}",
-            data=data,
-            headers={"Authorization": f"Bearer {self._token}"},
-            timeout=30.0,
-        )
+        resp = self._http.post(f"{_BASE_URL}/{method}", data=data)
         return self._handle_response(resp, method)
 
     def _handle_response(self, resp: httpx.Response, method: str) -> JsonObject:
@@ -282,14 +285,3 @@ class SlackClient:
             page += 1
             time.sleep(_PAGE_DELAY)
         return out
-
-    def download_file(self, url: str) -> bytes:
-        """Download a file from Slack using authentication."""
-        resp = httpx.get(
-            url,
-            headers={"Authorization": f"Bearer {self._token}"},
-            timeout=60.0,
-            follow_redirects=True,
-        )
-        resp.raise_for_status()
-        return resp.content

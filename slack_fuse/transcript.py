@@ -22,24 +22,22 @@ class _UserResolver(Protocol):
 
 
 def fetch_transcript_markdown(
-    token: str,
+    http: httpx.Client,
     transcript_file_id: str,
     users: _UserResolver | None = None,
 ) -> str | None:
     """Fetch a huddle transcript and render it as markdown."""
     try:
-        resp = httpx.post(
+        resp = http.post(
             "https://slack.com/api/files.info",
-            headers={"Authorization": f"Bearer {token}"},
             data={
                 "file": transcript_file_id,
                 "include_transcription": "true",
             },
-            timeout=30.0,
         )
         resp.raise_for_status()
     except httpx.HTTPError as e:
-        log.warning("Failed to fetch transcript %s: %s", transcript_file_id, e)
+        log.warning("Failed to fetch transcript %s: %s", transcript_file_id, type(e).__name__)
         return None
 
     try:

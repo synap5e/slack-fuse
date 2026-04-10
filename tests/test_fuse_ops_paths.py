@@ -33,7 +33,7 @@ def ops(monkeypatch: pytest.MonkeyPatch) -> Iterator[SlackFuseOps]:
     monkeypatch.setattr(disk_cache, "get_known_dates", stub_get_known_dates)
     monkeypatch.setattr(UserCache, "_load_from_disk", stub_load_from_disk)
     client = SlackClient(token="xoxp-fake")
-    users = UserCache(token="xoxp-fake")
+    users = UserCache(client.http)
     yield SlackFuseOps(SlackStore(client=client, users=users), trio.CapacityLimiter(1))
 
 

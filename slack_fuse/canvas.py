@@ -24,7 +24,7 @@ class _UserResolver(Protocol):
 
 
 def fetch_canvas_markdown(
-    token: str,
+    http: httpx.Client,
     file_id: str,
     user_resolver: _UserResolver | None = None,
 ) -> str | None:
@@ -34,15 +34,13 @@ def fetch_canvas_markdown(
     We parse it to produce readable markdown.
     """
     try:
-        info_resp = httpx.get(
+        info_resp = http.get(
             "https://slack.com/api/files.info",
-            headers={"Authorization": f"Bearer {token}"},
             params={"file": file_id},
-            timeout=15.0,
         )
         info_resp.raise_for_status()
     except httpx.HTTPError as e:
-        log.warning("files.info failed for %s: %s", file_id, e)
+        log.warning("files.info failed for %s: %s", file_id, type(e).__name__)
         return None
 
     parsed = FilesInfoResponse.model_validate(info_resp.json())
@@ -55,14 +53,9 @@ def fetch_canvas_markdown(
         return None
 
     try:
-        page_resp = httpx.get(
-            url,
-            headers={"Authorization": f"Bearer {token}"},
-            follow_redirects=True,
-            timeout=30.0,
-        )
+        page_resp = http.get(url, follow_redirects=True)
     except httpx.HTTPError as e:
-        log.warning("Canvas download failed for %s: %s", file_id, e)
+        log.warning("Canvas download failed for %s: %s", file_id, type(e).__name__)
         return None
     if page_resp.status_code != 200:
         log.warning(

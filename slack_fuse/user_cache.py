@@ -34,8 +34,8 @@ class UserCache:
     trigger an immediate API fetch.
     """
 
-    def __init__(self, token: str) -> None:
-        self._token = token
+    def __init__(self, http: httpx.Client) -> None:
+        self._http = http
         self._users: dict[str, str] = {}  # user_id -> display_name
         self._loaded_at: float = 0.0
         self._load_from_disk()
@@ -61,12 +61,7 @@ class UserCache:
         )
 
     def _get_json(self, path: str, params: dict[str, str] | None = None) -> JsonObject:
-        resp = httpx.get(
-            f"{_BASE_URL}{path}",
-            params=params,
-            headers={"Authorization": f"Bearer {self._token}"},
-            timeout=15.0,
-        )
+        resp = self._http.get(f"{_BASE_URL}{path}", params=params)
         resp.raise_for_status()
         body: JsonObject = resp.json()
         return body

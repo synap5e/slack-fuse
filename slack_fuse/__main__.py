@@ -64,7 +64,7 @@ def cmd_mount(args: argparse.Namespace) -> None:
 
     tokens = load_tokens()
     client = SlackClient(tokens.user_token)
-    users = UserCache(tokens.user_token)
+    users = UserCache(client.http)
     users.populate()
 
     store = SlackStore(client, users)

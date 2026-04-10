@@ -680,11 +680,11 @@ class SlackStore:
                     elif _cached_only_depth.get() > 0:
                         continue  # Skip uncached huddles
                     else:
-                        md = fetch_canvas_markdown(self._client.token, f.id, self._users)
+                        md = fetch_canvas_markdown(self._client.http, f.id, self._users)
                         transcript = None
                         if f.huddle_transcript_file_id:
                             transcript = fetch_transcript_markdown(
-                                self._client.token,
+                                self._client.http,
                                 f.huddle_transcript_file_id,
                                 self._users,
                             )
@@ -818,11 +818,11 @@ class SlackStore:
             date_start=file_info.huddle_date_start,
             date_end=file_info.huddle_date_end,
         )
-        md = fetch_canvas_markdown(self._client.token, canvas_file_id, self._users)
+        md = fetch_canvas_markdown(self._client.http, canvas_file_id, self._users)
         transcript: str | None = None
         if file_info.huddle_transcript_file_id:
             transcript = fetch_transcript_markdown(
-                self._client.token,
+                self._client.http,
                 file_info.huddle_transcript_file_id,
                 self._users,
             )
