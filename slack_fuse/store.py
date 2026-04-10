@@ -9,6 +9,7 @@ import random
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Iterator
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TypeVar
@@ -57,6 +58,10 @@ _BACKOFF_MAX = 900.0
 _BACKOFF_JITTER = 0.25
 
 _T = TypeVar("_T")
+
+# Per-task flag: ref-counted depth so nested cached_only_mode() calls work,
+# and trio task isolation means archive_all's flag doesn't leak to FUSE callbacks.
+_cached_only_depth: ContextVar[int] = ContextVar("cached_only_depth", default=0)
 
 
 @dataclass
@@ -146,7 +151,6 @@ class SlackStore:
         self._client = client
         self._users = users
         self._backoff = _BackoffState()
-        self._cached_only = False
 
         # Channel list cache
         self._channels: dict[str, ChannelEntry] = {}  # channel_id -> entry
@@ -202,14 +206,20 @@ class SlackStore:
             if cached_dates:
                 self._known_dates[ch_id] = cached_dates
 
+    @staticmethod
     @contextlib.contextmanager
-    def cached_only_mode(self) -> Iterator[None]:
-        """Suppress all API calls — only serve data already in cache."""
-        self._cached_only = True
+    def cached_only_mode() -> Iterator[None]:
+        """Suppress all API calls — only serve data already in cache.
+
+        Uses a ContextVar so each trio task has its own flag. Archive's
+        long-running cached_only pass won't leak to FUSE callbacks
+        running in other tasks. Ref-counted for safe nesting.
+        """
+        token = _cached_only_depth.set(_cached_only_depth.get() + 1)
         try:
             yield
         finally:
-            self._cached_only = False
+            _cached_only_depth.reset(token)
 
     def _api_call(self, fn: Callable[[], _T]) -> _T | None:
         """Run a typed API call, recording backoff state on failure.
@@ -217,7 +227,7 @@ class SlackStore:
         Returns None when in cached_only mode, currently backed off, or on
         any recoverable error. Fatal errors set a permanent backoff flag.
         """
-        if self._cached_only or self._backoff.is_backed_off:
+        if _cached_only_depth.get() > 0 or self._backoff.is_backed_off:
             return None
         try:
             result = fn()
@@ -338,7 +348,7 @@ class SlackStore:
 
         # Try disk cache (especially valuable for old messages)
         disk_msgs = disk_cache.get_day_messages(channel_id, date_str)
-        if disk_msgs is not None and (self._cached_only or self._date_ttl(date_str) == _OLD_MSG_TTL):
+        if disk_msgs is not None and (_cached_only_depth.get() > 0 or self._date_ttl(date_str) == _OLD_MSG_TTL):
             messages = [Message.model_validate(m) for m in disk_msgs]
             self._day_cache[key] = _CachedDay(
                 messages=messages,
@@ -347,7 +357,7 @@ class SlackStore:
             )
             return messages
 
-        if self._cached_only:
+        if _cached_only_depth.get() > 0:
             return cached.messages if cached else []
 
         # Compute time window for the date in LOCAL timezone
@@ -400,10 +410,10 @@ class SlackStore:
         On first access, fetches recent history (1 page) to discover dates.
         Always includes today (unless in cached_only mode).
         """
-        if channel_id not in self._known_dates and not self._cached_only:
+        if channel_id not in self._known_dates and not _cached_only_depth.get() > 0:
             self._discover_recent_dates(channel_id)
         dates = self._known_dates.get(channel_id, set()).copy()
-        if not self._cached_only:
+        if not _cached_only_depth.get() > 0:
             today = datetime.now(UTC).astimezone().strftime("%Y-%m-%d")
             dates.add(today)
         return sorted(dates, reverse=True)
@@ -461,7 +471,7 @@ class SlackStore:
 
         # Disk cache fallback (cached_only or empty in-memory).
         disk_msgs = disk_cache.get_thread(channel_id, thread_ts)
-        if disk_msgs is not None and (self._cached_only or cached is None):
+        if disk_msgs is not None and (_cached_only_depth.get() > 0 or cached is None):
             messages = [Message.model_validate(m) for m in disk_msgs]
             if messages:
                 thread = Thread(parent=messages[0], replies=tuple(messages[1:]))
@@ -471,7 +481,7 @@ class SlackStore:
                 )
                 return thread
 
-        if self._cached_only:
+        if _cached_only_depth.get() > 0:
             return cached.thread if cached else None
 
         log.info(
@@ -667,7 +677,7 @@ class SlackStore:
                     disk_huddle = disk_cache.get_huddle(f.id)
                     if disk_huddle is not None:
                         md, transcript = disk_huddle
-                    elif self._cached_only:
+                    elif _cached_only_depth.get() > 0:
                         continue  # Skip uncached huddles
                     else:
                         md = fetch_canvas_markdown(self._client.token, f.id, self._users)

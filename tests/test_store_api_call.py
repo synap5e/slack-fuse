@@ -135,6 +135,18 @@ def test_cached_only_mode_resets_after_exception(fresh_store: SlackStore) -> Non
     assert fresh_store._api_call(_returning("after")) == "after"
 
 
+def test_cached_only_mode_nested_ref_counting(fresh_store: SlackStore) -> None:
+    """Nested cached_only_mode should stay cached until ALL exits."""
+    with fresh_store.cached_only_mode():
+        assert fresh_store._api_call(_returning("x")) is None
+        with fresh_store.cached_only_mode():
+            assert fresh_store._api_call(_returning("x")) is None
+        # Still cached — outer context still active
+        assert fresh_store._api_call(_returning("x")) is None
+    # Now fully exited
+    assert fresh_store._api_call(_returning("ok")) == "ok"
+
+
 def test_already_backed_off_short_circuits_without_invoking(
     fresh_store: SlackStore,
 ) -> None:
