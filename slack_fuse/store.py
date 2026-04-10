@@ -47,6 +47,15 @@ _RECENT_MSG_TTL = 300.0  # 5 minutes — applies to today's messages (still bein
 _OLD_MSG_TTL = float("inf")  # any earlier local day is locked forever (see _date_ttl)
 _HUDDLE_INDEX_TTL = 1800.0  # 30 minutes
 
+# Thread activity-based TTL tiers (keyed on age of last reply)
+_THREAD_AGE_1H = 3600.0
+_THREAD_AGE_24H = 86400.0
+_THREAD_AGE_7D = 604800.0
+_THREAD_TTL_VERY_RECENT = 60.0  # last reply < 1h ago
+_THREAD_TTL_RECENT = 600.0  # last reply < 24h ago
+_THREAD_TTL_MID_FRACTION = 0.05  # last reply < 7d ago: 5% of age …
+_THREAD_TTL_MID_MIN = 1800.0  # … with a 30-minute floor
+
 # Render cache: rendered markdown bytes keyed by kind + ids. LRU-capped so a
 # full grep of the tree doesn't OOM. Old days/threads are effectively
 # immutable, so entries stay valid for their full TTL (infinite).
@@ -330,18 +339,32 @@ class SlackStore:
             return _RECENT_MSG_TTL
         return _OLD_MSG_TTL if date < today else _RECENT_MSG_TTL
 
-    def _thread_ttl(self, thread_ts: str) -> float:
-        """TTL for a thread, based on its parent message's local date.
+    def _thread_ttl(self, thread_ts: str, last_reply_ts: str | None) -> float:
+        """Activity-based TTL for a thread.
 
-        Same today-vs-not-today policy as `_date_ttl`. New replies on a
-        thread that started before today are extremely rare; locking such
-        threads avoids re-fetching them on every grep.
+        Uses the last reply's timestamp to determine how aggressively to
+        re-poll. Falls back to the parent's ts when no cached thread data
+        exists yet.
+
+        | Last reply age | TTL              |
+        |----------------|------------------|
+        | < 1 hour       | 60s              |
+        | < 24 hours     | 10 min           |
+        | < 7 days       | 5% of age (>=30m)|
+        | >= 7 days      | inf              |
         """
+        reference_ts = last_reply_ts or thread_ts
         try:
-            dt = datetime.fromtimestamp(float(thread_ts), tz=UTC).astimezone()
-        except (ValueError, OSError):
-            return _RECENT_MSG_TTL
-        return _OLD_MSG_TTL if dt.date() < datetime.now().astimezone().date() else _RECENT_MSG_TTL
+            age = time.time() - float(reference_ts)
+        except ValueError:
+            return _THREAD_TTL_VERY_RECENT
+        if age < _THREAD_AGE_1H:
+            return _THREAD_TTL_VERY_RECENT
+        if age < _THREAD_AGE_24H:
+            return _THREAD_TTL_RECENT
+        if age < _THREAD_AGE_7D:
+            return max(age * _THREAD_TTL_MID_FRACTION, _THREAD_TTL_MID_MIN)
+        return _OLD_MSG_TTL
 
     def get_day_messages(self, channel_id: str, date_str: str) -> list[Message]:
         """Get messages for a channel on a specific date."""
@@ -408,7 +431,21 @@ class SlackStore:
             [m.model_dump(mode="json") for m in messages],
         )
         disk_cache.put_known_dates(channel_id, self._known_dates[channel_id])
+
+        self._invalidate_stale_threads(channel_id, messages)
         return messages
+
+    def _invalidate_stale_threads(self, channel_id: str, messages: list[Message]) -> None:
+        """Evict cached threads whose latest_reply is behind the API's."""
+        for msg in messages:
+            if msg.reply_count > 0 and msg.latest_reply:
+                tkey = (channel_id, msg.thread_ts or msg.ts)
+                cached_thread = self._thread_cache.get(tkey)
+                if cached_thread is not None:
+                    cached_last = _last_reply_ts(cached_thread.thread)
+                    if cached_last and msg.latest_reply > cached_last:
+                        del self._thread_cache[tkey]
+                        self._invalidate_thread_renders(channel_id, msg.thread_ts or msg.ts)
 
     def get_known_dates(self, channel_id: str) -> list[str]:
         """Return dates with messages for a channel.
@@ -459,17 +496,17 @@ class SlackStore:
     # === Threads ===
 
     def get_thread(self, channel_id: str, thread_ts: str) -> Thread | None:
-        """Get a thread, cached.
+        """Get a thread, cached with activity-based TTL.
 
-        Today's threads use a 5-minute in-memory TTL (new replies still
-        possible). Threads whose parent message is from a previous local
-        day get an infinite TTL: once they're in the in-memory or disk
-        cache, they're served forever and never re-fetched.
+        TTL is determined by the age of the last reply in the cached
+        thread (see `_thread_ttl`). Threads with recent activity are
+        re-polled aggressively; threads idle for 7+ days get infinite TTL.
         """
         key = (channel_id, thread_ts)
-        ttl = self._thread_ttl(thread_ts)
-
         cached = self._thread_cache.get(key)
+        last_reply = _last_reply_ts(cached.thread) if cached else None
+        ttl = self._thread_ttl(thread_ts, last_reply)
+
         if cached is not None:
             age = time.monotonic() - cached.fetched_at
             if age < ttl:
@@ -604,9 +641,11 @@ class SlackStore:
                 return b""
             return render_thread_snapshot(thread, entry.channel, self._users).encode()
 
+        cached = self._thread_cache.get((channel_id, thread_ts))
+        last_reply = _last_reply_ts(cached.thread) if cached else None
         return self._render_cached(
             f"thr-ch:{channel_id}:{thread_ts}",
-            self._thread_ttl(thread_ts),
+            self._thread_ttl(thread_ts, last_reply),
             _do,
         )
 
@@ -620,9 +659,11 @@ class SlackStore:
                 return b""
             return render_thread_feed(thread, entry.channel, self._users).encode()
 
+        cached = self._thread_cache.get((channel_id, thread_ts))
+        last_reply = _last_reply_ts(cached.thread) if cached else None
         return self._render_cached(
             f"thr-fd:{channel_id}:{thread_ts}",
-            self._thread_ttl(thread_ts),
+            self._thread_ttl(thread_ts, last_reply),
             _do,
         )
 
@@ -902,6 +943,11 @@ class SlackStore:
 
 
 # === Helpers ===
+
+
+def _last_reply_ts(thread: Thread) -> str | None:
+    """Timestamp of the thread's most recent reply, or None if no replies."""
+    return thread.replies[-1].ts if thread.replies else None
 
 
 def _shares_to_context(file_info: SlackFile, fallback_channels: tuple[str, ...]) -> tuple[str, str]:

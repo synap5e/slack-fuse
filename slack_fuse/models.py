@@ -79,6 +79,7 @@ class Message(_FrozenModel):
     text: str = ""
     thread_ts: str | None = None
     reply_count: int = 0
+    latest_reply: str | None = None
     reactions: tuple[Reaction, ...] = ()
     files: tuple[FileAttachment, ...] = ()
     edited: Edited | None = None
