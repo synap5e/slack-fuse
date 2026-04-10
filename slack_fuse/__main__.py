@@ -98,11 +98,12 @@ def cmd_mount(args: argparse.Namespace) -> None:
 
     async def _run() -> None:
         async with trio.open_nursery() as nursery:
-            nursery.start_soon(pyfuse3.main)
             nursery.start_soon(_periodic_refresh)
             nursery.start_soon(archive_all, store)
             if backfill_enabled:
                 nursery.start_soon(backfill_all, client, store)
+            await pyfuse3.main()
+            nursery.cancel_scope.cancel()
 
     try:
         trio.run(_run)
