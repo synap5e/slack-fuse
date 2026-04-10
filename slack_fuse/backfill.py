@@ -84,7 +84,7 @@ def _should_skip(channel_name: str) -> bool:
 # === Top-level loop ===
 
 
-async def backfill_all(client: SlackClient, store: SlackStore) -> None:
+async def backfill_all(client: SlackClient, store: SlackStore, limiter: trio.CapacityLimiter) -> None:
     """Slowly backfill full history (days + thread replies) for all member channels."""
     # Let normal startup settle first
     await trio.sleep(30)
@@ -93,7 +93,8 @@ async def backfill_all(client: SlackClient, store: SlackStore) -> None:
 
     all_channels: dict[str, ChannelEntry] = {}
     for kind in ("channels", "dms", "group-dms", "other-channels"):
-        all_channels.update(store.list_channels(kind=kind))
+        channels = await trio.to_thread.run_sync(lambda k=kind: store.list_channels(kind=k), limiter=limiter)
+        all_channels.update(channels)
 
     to_do: list[tuple[str, ChannelEntry]] = []
     skipped = 0
@@ -118,10 +119,10 @@ async def backfill_all(client: SlackClient, store: SlackStore) -> None:
         log.info("Backfill: [%d/%d] %s", i + 1, len(to_do), entry.channel.name)
         try:
             if not _is_day_backfilled(ch_id):
-                await _day_backfill_channel(client, store, ch_id, entry.channel.name)
+                await _day_backfill_channel(client, store, ch_id, entry.channel.name, limiter)
                 _mark_day_backfilled(ch_id)
             if not _are_threads_backfilled(ch_id):
-                await _thread_backfill_channel(client, ch_id, entry.channel.name)
+                await _thread_backfill_channel(client, ch_id, entry.channel.name, limiter)
                 _mark_threads_backfilled(ch_id)
         except FatalAPIError:
             log.error("Backfill: fatal API error, stopping")
@@ -146,6 +147,7 @@ async def _day_backfill_channel(
     store: SlackStore,
     channel_id: str,
     channel_name: str,
+    limiter: trio.CapacityLimiter,
 ) -> None:
     """Paginate full history for one channel and write to disk cache."""
     cursor = ""
@@ -158,7 +160,10 @@ async def _day_backfill_channel(
             await trio.sleep(random.uniform(_DAY_MIN_SLEEP, _DAY_MAX_SLEEP))
 
         try:
-            resp = client.get_history_page(channel_id, cursor)
+            resp = await trio.to_thread.run_sync(
+                lambda c=cursor: client.get_history_page(channel_id, c),
+                limiter=limiter,
+            )
         except RateLimitedError as e:
             wait = (e.retry_after or 60) + random.uniform(10, 30)
             log.warning(
@@ -245,6 +250,7 @@ async def _thread_backfill_channel(
     client: SlackClient,
     channel_id: str,
     channel_name: str,
+    limiter: trio.CapacityLimiter,
 ) -> None:
     """Fetch replies for every uncached thread parent in this channel.
 
@@ -271,7 +277,10 @@ async def _thread_backfill_channel(
             await trio.sleep(random.uniform(_THREAD_MIN_SLEEP, _THREAD_MAX_SLEEP))
 
         try:
-            thread = client.get_replies(channel_id, thread_ts)
+            thread = await trio.to_thread.run_sync(
+                lambda ts=thread_ts: client.get_replies(channel_id, ts),
+                limiter=limiter,
+            )
         except RateLimitedError as e:
             wait = (e.retry_after or 60) + random.uniform(10, 30)
             log.warning(

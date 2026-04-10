@@ -72,7 +72,10 @@ def cmd_mount(args: argparse.Namespace) -> None:
     # Preload channel list so first ls is instant
     store.list_channels(kind="channels")
 
-    ops = SlackFuseOps(store)
+    # Serializes all sync store/API work to a single worker thread so
+    # the trio event loop stays responsive and shared state stays safe.
+    store_limiter = trio.CapacityLimiter(1)
+    ops = SlackFuseOps(store, store_limiter)
 
     fuse_options: set[str] = {"fsname=slack-fuse", "ro"}
     if args.debug:
@@ -94,14 +97,17 @@ def cmd_mount(args: argparse.Namespace) -> None:
     async def _periodic_refresh() -> None:
         while True:
             await trio.sleep(_REFRESH_INTERVAL)
-            store.list_channels(kind="channels")
+            await trio.to_thread.run_sync(
+                lambda: store.list_channels(kind="channels"),
+                limiter=store_limiter,
+            )
 
     async def _run() -> None:
         async with trio.open_nursery() as nursery:
             nursery.start_soon(_periodic_refresh)
             nursery.start_soon(archive_all, store)
             if backfill_enabled:
-                nursery.start_soon(backfill_all, client, store)
+                nursery.start_soon(backfill_all, client, store, store_limiter)
             await pyfuse3.main()
             nursery.cancel_scope.cancel()
 

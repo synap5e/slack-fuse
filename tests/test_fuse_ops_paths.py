@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 
 import pytest
+import trio
 
 from slack_fuse import disk_cache
 from slack_fuse.api import SlackClient
@@ -33,7 +34,7 @@ def ops(monkeypatch: pytest.MonkeyPatch) -> Iterator[SlackFuseOps]:
     monkeypatch.setattr(UserCache, "_load_from_disk", stub_load_from_disk)
     client = SlackClient(token="xoxp-fake")
     users = UserCache(token="xoxp-fake")
-    yield SlackFuseOps(SlackStore(client=client, users=users))
+    yield SlackFuseOps(SlackStore(client=client, users=users), trio.CapacityLimiter(1))
 
 
 @pytest.mark.parametrize(

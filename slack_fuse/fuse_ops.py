@@ -9,6 +9,7 @@ import stat
 import time
 
 import pyfuse3
+import trio
 
 from .inode_map import InodeMap
 from .models import HuddleIndexEntry
@@ -90,10 +91,11 @@ def _date_str(month: str, day: str) -> str:
 class SlackFuseOps(pyfuse3.Operations):
     """Read-only FUSE operations for Slack."""
 
-    def __init__(self, store: SlackStore) -> None:
+    def __init__(self, store: SlackStore, limiter: trio.CapacityLimiter) -> None:
         super().__init__()
         self._store = store
         self._inodes = InodeMap()
+        self._limiter = limiter
 
     def _parse_path(self, path: str) -> list[str]:
         stripped = path.strip("/")
@@ -432,18 +434,21 @@ class SlackFuseOps(pyfuse3.Operations):
         if path is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
 
-        real_path, _ = self._strip_cached_prefix(path)
-        if self._is_index_backlink(self._parse_path(real_path)):
-            return _make_symlink_attr(inode)
+        def _sync() -> pyfuse3.EntryAttributes | None:
+            real_path, _ = self._strip_cached_prefix(path)
+            if self._is_index_backlink(self._parse_path(real_path)):
+                return _make_symlink_attr(inode)
+            if self._is_dir(path):
+                return _make_dir_attr(inode)
+            content = self._resolve_content(path)
+            if content is not None:
+                return _make_file_attr(inode, len(content))
+            return None
 
-        if self._is_dir(path):
-            return _make_dir_attr(inode)
-
-        content = self._resolve_content(path)
-        if content is not None:
-            return _make_file_attr(inode, len(content))
-
-        raise pyfuse3.FUSEError(errno.ENOENT)
+        result = await trio.to_thread.run_sync(_sync, limiter=self._limiter)
+        if result is None:
+            raise pyfuse3.FUSEError(errno.ENOENT)
+        return result
 
     async def lookup(
         self,
@@ -458,32 +463,33 @@ class SlackFuseOps(pyfuse3.Operations):
         child_name = name.decode("utf-8", errors="surrogateescape")
         child_path = f"/{child_name}" if parent_path == "/" else f"{parent_path}/{child_name}"
 
-        entries = self._list_dir(parent_path)
-        found = False
-        is_dir = False
-        for entry_name, entry_is_dir in entries:
-            if entry_name == child_name:
-                found = True
-                is_dir = entry_is_dir
-                break
+        def _sync() -> pyfuse3.EntryAttributes | None:
+            entries = self._list_dir(parent_path)
+            found = False
+            is_dir = False
+            for entry_name, entry_is_dir in entries:
+                if entry_name == child_name:
+                    found = True
+                    is_dir = entry_is_dir
+                    break
+            if not found:
+                return None
 
-        if not found:
+            inode = self._inodes.get_or_create(child_path)
+            real_child, _ = self._strip_cached_prefix(child_path)
+            if self._is_index_backlink(self._parse_path(real_child)):
+                return _make_symlink_attr(inode)
+            if is_dir:
+                return _make_dir_attr(inode)
+            content = self._resolve_content(child_path)
+            if content is not None:
+                return _make_file_attr(inode, len(content))
+            return None
+
+        result = await trio.to_thread.run_sync(_sync, limiter=self._limiter)
+        if result is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
-
-        inode = self._inodes.get_or_create(child_path)
-
-        real_child, _ = self._strip_cached_prefix(child_path)
-        if self._is_index_backlink(self._parse_path(real_child)):
-            return _make_symlink_attr(inode)
-
-        if is_dir:
-            return _make_dir_attr(inode)
-
-        content = self._resolve_content(child_path)
-        if content is not None:
-            return _make_file_attr(inode, len(content))
-
-        raise pyfuse3.FUSEError(errno.ENOENT)
+        return result
 
     async def opendir(  # pyright: ignore[reportIncompatibleMethodOverride]
         self,
@@ -500,39 +506,40 @@ class SlackFuseOps(pyfuse3.Operations):
         if path is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
 
-        real_path, _ = self._strip_cached_prefix(path)
-        parts = self._parse_path(real_path)
-        if not self._is_index_backlink(parts):
-            raise pyfuse3.FUSEError(errno.EINVAL)
+        def _sync() -> bytes | None:
+            real_path, _ = self._strip_cached_prefix(path)
+            parts = self._parse_path(real_path)
+            if not self._is_index_backlink(parts):
+                return None
 
-        # Resolve the channel-tree huddle to its index entry
-        entry = self._store.get_channel_by_slug(parts[1])
-        if entry is None:
+            entry = self._store.get_channel_by_slug(parts[1])
+            if entry is None:
+                return None
+            cid = entry.channel.id
+
+            date = _date_str(parts[2], parts[3])
+            thread_slugs = self._store.get_thread_slugs(cid, date)
+            thread_ts = thread_slugs.get(parts[4])
+            if thread_ts is None:
+                return None
+
+            huddles = self._store.get_huddles_for_thread(cid, thread_ts)
+            huddle_data = huddles.get(parts[6])
+            if huddle_data is None:
+                return None
+
+            canvas_id = huddle_data[0].canvas_file_id
+            index_entry = self._store.find_huddle_index_entry_by_canvas(canvas_id)
+            if index_entry is None:
+                return None
+
+            target = f"../../../../../../../huddles/{index_entry.month}/{index_entry.day}/{index_entry.slug}"
+            return target.encode()
+
+        result = await trio.to_thread.run_sync(_sync, limiter=self._limiter)
+        if result is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
-        cid = entry.channel.id
-
-        date = _date_str(parts[2], parts[3])
-        thread_slugs = self._store.get_thread_slugs(cid, date)
-        thread_ts = thread_slugs.get(parts[4])
-        if thread_ts is None:
-            raise pyfuse3.FUSEError(errno.ENOENT)
-
-        huddles = self._store.get_huddles_for_thread(cid, thread_ts)
-        huddle_data = huddles.get(parts[6])
-        if huddle_data is None:
-            raise pyfuse3.FUSEError(errno.ENOENT)
-
-        canvas_id = huddle_data[0].canvas_file_id
-        index_entry = self._store.find_huddle_index_entry_by_canvas(canvas_id)
-        if index_entry is None:
-            raise pyfuse3.FUSEError(errno.ENOENT)
-
-        # Build relative path from huddle dir back to /huddles/<month>/<day>/<slug>
-        # We're at: /channels/<slug>/<YYYY-MM>/<DD>/<thread>/huddles/<huddle>/index
-        # Target:   /huddles/<YYYY-MM>/<DD>/<slug>
-        # 7 levels up to root, then huddles/...
-        target = f"../../../../../../../huddles/{index_entry.month}/{index_entry.day}/{index_entry.slug}"
-        return target.encode()
+        return result
 
     async def readdir(
         self,
@@ -544,31 +551,29 @@ class SlackFuseOps(pyfuse3.Operations):
         if path is None:
             return
 
-        entries = self._list_dir(path)
+        def _sync() -> list[tuple[str, pyfuse3.EntryAttributes, int]]:
+            entries = self._list_dir(path)
+            result: list[tuple[str, pyfuse3.EntryAttributes, int]] = []
+            for idx, (name, is_dir) in enumerate(entries):
+                if idx < start_id:
+                    continue
+                child_path = f"/{name}" if path == "/" else f"{path}/{name}"
+                child_inode = self._inodes.get_or_create(child_path)
+                real_child, _ = self._strip_cached_prefix(child_path)
+                if self._is_index_backlink(self._parse_path(real_child)):
+                    attr = _make_symlink_attr(child_inode)
+                elif is_dir:
+                    attr = _make_dir_attr(child_inode)
+                else:
+                    content = self._resolve_content(child_path)
+                    size = len(content) if content is not None else 0
+                    attr = _make_file_attr(child_inode, size)
+                result.append((name, attr, idx + 1))
+            return result
 
-        for idx, (name, is_dir) in enumerate(entries):
-            if idx < start_id:
-                continue
-
-            child_path = f"/{name}" if path == "/" else f"{path}/{name}"
-            child_inode = self._inodes.get_or_create(child_path)
-
-            real_child, _ = self._strip_cached_prefix(child_path)
-            if self._is_index_backlink(self._parse_path(real_child)):
-                attr = _make_symlink_attr(child_inode)
-            elif is_dir:
-                attr = _make_dir_attr(child_inode)
-            else:
-                content = self._resolve_content(child_path)
-                size = len(content) if content is not None else 0
-                attr = _make_file_attr(child_inode, size)
-
-            if not pyfuse3.readdir_reply(
-                token,
-                name.encode("utf-8"),
-                attr,
-                idx + 1,
-            ):
+        computed = await trio.to_thread.run_sync(_sync, limiter=self._limiter)
+        for name, attr, next_id in computed:
+            if not pyfuse3.readdir_reply(token, name.encode("utf-8"), attr, next_id):
                 break
 
     async def open(
@@ -593,7 +598,11 @@ class SlackFuseOps(pyfuse3.Operations):
         path = self._inodes.get_path(fh)
         if path is None:
             raise pyfuse3.FUSEError(errno.EIO)
-        content = self._resolve_content(path)
+
+        def _sync() -> bytes | None:
+            return self._resolve_content(path)
+
+        content = await trio.to_thread.run_sync(_sync, limiter=self._limiter)
         if content is None:
             raise pyfuse3.FUSEError(errno.EIO)
         return content[off : off + size]
