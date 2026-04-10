@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from pathlib import Path
 
@@ -56,9 +57,9 @@ class UserCache:
 
     def _save_to_disk(self) -> None:
         _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _CACHE_PATH.write_text(
-            json.dumps({"users": self._users, "loaded_at": self._loaded_at}),
-        )
+        tmp = _CACHE_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"users": self._users, "loaded_at": self._loaded_at}))
+        os.replace(tmp, _CACHE_PATH)
 
     def _get_json(self, path: str, params: dict[str, str] | None = None) -> JsonObject:
         resp = self._http.get(f"{_BASE_URL}{path}", params=params)

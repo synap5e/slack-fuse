@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 
 from .models import JsonObject
@@ -20,6 +21,13 @@ _CACHE_DIR = Path.home() / ".cache" / "slack-fuse"
 
 def _ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
+
+
+def _atomic_write_text(path: Path, data: str) -> None:
+    """Write data to a file atomically via temp + rename."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(data)
+    os.replace(tmp, path)
 
 
 # === Huddle content (notes.md, transcript.md) ===
@@ -44,9 +52,9 @@ def put_huddle(canvas_file_id: str, notes_md: str | None, transcript_md: str | N
         return
     d = _CACHE_DIR / "huddles" / canvas_file_id
     _ensure_dir(d)
-    (d / "notes.md").write_text(notes_md)
+    _atomic_write_text(d / "notes.md", notes_md)
     if transcript_md is not None:
-        (d / "transcript.md").write_text(transcript_md)
+        _atomic_write_text(d / "transcript.md", transcript_md)
 
 
 # === Day messages ===
@@ -68,7 +76,7 @@ def put_day_messages(channel_id: str, date_str: str, messages: list[JsonObject])
     """Cache day messages to disk."""
     d = _CACHE_DIR / "messages" / channel_id
     _ensure_dir(d)
-    (d / f"{date_str}.json").write_text(json.dumps(messages))
+    _atomic_write_text(d / f"{date_str}.json", json.dumps(messages))
 
 
 # === Threads ===
@@ -92,7 +100,7 @@ def put_thread(channel_id: str, thread_ts: str, messages: list[JsonObject]) -> N
     safe_ts = thread_ts.replace(".", "-")
     d = _CACHE_DIR / "threads" / channel_id
     _ensure_dir(d)
-    (d / f"{safe_ts}.json").write_text(json.dumps(messages))
+    _atomic_write_text(d / f"{safe_ts}.json", json.dumps(messages))
 
 
 # === Channel list ===
@@ -112,7 +120,7 @@ def get_channel_list() -> list[JsonObject] | None:
 def put_channel_list(channels: list[JsonObject]) -> None:
     """Cache channel list to disk."""
     _ensure_dir(_CACHE_DIR)
-    (_CACHE_DIR / "channels.json").write_text(json.dumps(channels))
+    _atomic_write_text(_CACHE_DIR / "channels.json", json.dumps(channels))
 
 
 # === Huddle index ===
@@ -132,7 +140,7 @@ def get_huddle_index() -> list[JsonObject] | None:
 def put_huddle_index(entries: list[JsonObject]) -> None:
     """Cache huddle index to disk."""
     _ensure_dir(_CACHE_DIR)
-    (_CACHE_DIR / "huddle_index.json").write_text(json.dumps(entries))
+    _atomic_write_text(_CACHE_DIR / "huddle_index.json", json.dumps(entries))
 
 
 # === Known dates per channel ===
@@ -153,7 +161,7 @@ def put_known_dates(channel_id: str, dates: set[str]) -> None:
     """Cache known dates for a channel."""
     d = _CACHE_DIR / "known_dates"
     _ensure_dir(d)
-    (d / f"{channel_id}.json").write_text(json.dumps(sorted(dates)))
+    _atomic_write_text(d / f"{channel_id}.json", json.dumps(sorted(dates)))
 
 
 def _read_text(path: Path) -> str | None:
