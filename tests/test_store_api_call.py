@@ -18,7 +18,7 @@ import httpx
 import pytest
 
 from slack_fuse import disk_cache, store
-from slack_fuse.api import FatalAPIError, RateLimitedError, SlackClient
+from slack_fuse.api import FatalAPIError, RateLimitedError, SlackAPIError, SlackClient
 from slack_fuse.models import Message, Thread
 from slack_fuse.store import _OLD_MSG_TTL, _RECENT_MSG_TTL, SlackStore, _CachedThread
 from slack_fuse.user_cache import UserCache
@@ -247,3 +247,27 @@ def test_get_thread_old_thread_in_memory_does_not_expire(
     # Should still return from in-memory because the thread is old.
     result = fresh_store.get_thread("C1", yesterday_ts)
     assert result is thread
+
+
+# === Rate-limit jitter: must never produce a delay below retry_after ===
+
+
+def test_rate_limit_jitter_never_goes_below_retry_after(fresh_store: SlackStore) -> None:
+    """record_rate_limit uses positive-only jitter, so the computed
+    `until` is always >= monotonic() + retry_after."""
+    before = time.monotonic()
+    fresh_store._backoff.record_rate_limit(retry_after=10.0)
+    # Even with deterministic random (0.5), jitter should only be additive
+    assert fresh_store._backoff.until >= before + 10.0
+
+
+# === SlackAPIError (non-fatal ok=false) is caught by _api_call ===
+
+
+def test_api_call_catches_slack_api_error(fresh_store: SlackStore) -> None:
+    """Non-fatal SlackAPIError should be caught and recorded as a failure."""
+    result = fresh_store._api_call(_raising(SlackAPIError("non-fatal: too_many_attachments")))
+    assert result is None
+    assert fresh_store._backoff.is_backed_off
+    # Should NOT be fatal
+    assert not fresh_store.is_auth_fatal

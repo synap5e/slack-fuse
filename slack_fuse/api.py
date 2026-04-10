@@ -104,7 +104,10 @@ class SlackClient:
     def _handle_response(self, resp: httpx.Response, method: str) -> JsonObject:
         if resp.status_code == 429:
             retry_after_raw = resp.headers.get("retry-after")
-            retry_after = float(retry_after_raw) if retry_after_raw else None
+            try:
+                retry_after = float(retry_after_raw) if retry_after_raw else None
+            except ValueError:
+                retry_after = None
             raise RateLimitedError(retry_after)
         if resp.status_code in (401, 403):
             raise FatalAPIError(f"HTTP {resp.status_code} on {method}")
@@ -116,7 +119,7 @@ class SlackClient:
             error = error_val if isinstance(error_val, str) else "unknown"
             if error in _FATAL_BODY_ERRORS:
                 raise FatalAPIError(f"Slack API error: {error}")
-            log.warning("Slack API error on %s: %s", method, error)
+            raise SlackAPIError(f"Slack API error on {method}: {error}")
         return body
 
     def _get(

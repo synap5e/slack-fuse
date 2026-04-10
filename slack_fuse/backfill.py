@@ -84,6 +84,29 @@ def _should_skip(channel_name: str) -> bool:
 # === Top-level loop ===
 
 
+def _filter_channels(
+    all_channels: dict[str, ChannelEntry],
+) -> list[tuple[str, ChannelEntry]]:
+    """Return channels that still need backfill work, logging stats."""
+    to_do: list[tuple[str, ChannelEntry]] = []
+    skipped = 0
+    fully_done = 0
+    for ch_id, entry in all_channels.items():
+        if _should_skip(entry.channel.name):
+            skipped += 1
+        elif _is_day_backfilled(ch_id) and _are_threads_backfilled(ch_id):
+            fully_done += 1
+        else:
+            to_do.append((ch_id, entry))
+    log.info(
+        "Backfill: %d channels to process (%d skipped, %d already complete)",
+        len(to_do),
+        skipped,
+        fully_done,
+    )
+    return to_do
+
+
 async def backfill_all(client: SlackClient, store: SlackStore, limiter: trio.CapacityLimiter) -> None:
     """Slowly backfill full history (days + thread replies) for all member channels."""
     # Let normal startup settle first
@@ -96,24 +119,7 @@ async def backfill_all(client: SlackClient, store: SlackStore, limiter: trio.Cap
         channels = await trio.to_thread.run_sync(lambda k=kind: store.list_channels(kind=k), limiter=limiter)
         all_channels.update(channels)
 
-    to_do: list[tuple[str, ChannelEntry]] = []
-    skipped = 0
-    fully_done = 0
-    for ch_id, entry in all_channels.items():
-        if _should_skip(entry.channel.name):
-            skipped += 1
-            continue
-        if _is_day_backfilled(ch_id) and _are_threads_backfilled(ch_id):
-            fully_done += 1
-            continue
-        to_do.append((ch_id, entry))
-
-    log.info(
-        "Backfill: %d channels to process (%d skipped, %d already complete)",
-        len(to_do),
-        skipped,
-        fully_done,
-    )
+    to_do = _filter_channels(all_channels)
 
     for i, (ch_id, entry) in enumerate(to_do):
         log.info("Backfill: [%d/%d] %s", i + 1, len(to_do), entry.channel.name)
@@ -122,8 +128,9 @@ async def backfill_all(client: SlackClient, store: SlackStore, limiter: trio.Cap
                 await _day_backfill_channel(client, store, ch_id, entry.channel.name, limiter)
                 _mark_day_backfilled(ch_id)
             if not _are_threads_backfilled(ch_id):
-                await _thread_backfill_channel(client, ch_id, entry.channel.name, limiter)
-                _mark_threads_backfilled(ch_id)
+                complete = await _thread_backfill_channel(client, ch_id, entry.channel.name, limiter)
+                if complete:
+                    _mark_threads_backfilled(ch_id)
         except FatalAPIError:
             log.error("Backfill: fatal API error, stopping")
             return
@@ -251,16 +258,17 @@ async def _thread_backfill_channel(
     channel_id: str,
     channel_name: str,
     limiter: trio.CapacityLimiter,
-) -> None:
+) -> bool:
     """Fetch replies for every uncached thread parent in this channel.
 
     Idempotent: skips threads already on disk, so an interrupted run picks
-    up where it left off on the next pass.
+    up where it left off on the next pass. Returns True only if every thread
+    was fetched successfully.
     """
     parents = _collect_thread_parents(channel_id)
     if not parents:
         log.info("Backfill: %s — no threads to fetch", channel_name)
-        return
+        return True
 
     to_fetch = [ts for ts in parents if disk_cache.get_thread(channel_id, ts) is None]
     already = len(parents) - len(to_fetch)
@@ -272,6 +280,7 @@ async def _thread_backfill_channel(
     )
 
     fetched = 0
+    skipped = 0
     for i, thread_ts in enumerate(to_fetch):
         if i > 0:
             await trio.sleep(random.uniform(_THREAD_MIN_SLEEP, _THREAD_MAX_SLEEP))
@@ -289,6 +298,7 @@ async def _thread_backfill_channel(
                 wait,
             )
             await trio.sleep(wait)
+            skipped += 1
             continue
         except FatalAPIError:
             raise
@@ -299,6 +309,7 @@ async def _thread_backfill_channel(
                 channel_name,
                 exc_info=True,
             )
+            skipped += 1
             continue
 
         all_msgs = [thread.parent, *thread.replies]
@@ -306,4 +317,5 @@ async def _thread_backfill_channel(
         disk_cache.put_thread(channel_id, thread_ts, dumped)
         fetched += 1
 
-    log.info("Backfill: %s — threads complete (%d fetched)", channel_name, fetched)
+    log.info("Backfill: %s — threads complete (%d fetched, %d skipped)", channel_name, fetched, skipped)
+    return skipped == 0

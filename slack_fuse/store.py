@@ -17,7 +17,7 @@ from typing import TypeVar
 import httpx
 
 from . import disk_cache, mrkdwn
-from .api import FatalAPIError, RateLimitedError, SlackClient
+from .api import FatalAPIError, RateLimitedError, SlackAPIError, SlackClient
 from .canvas import fetch_canvas_markdown
 from .models import (
     Channel,
@@ -87,7 +87,9 @@ class _BackoffState:
             self.delay = retry_after
         else:
             self.delay = min(max(self.delay * 2, _BACKOFF_INITIAL), _BACKOFF_MAX)
-        jitter = self.delay * _BACKOFF_JITTER * (2 * random.random() - 1)
+        # Positive-only jitter: Slack mandates retry_after as a minimum wait,
+        # so negative jitter could cause us to retry too early → 429 loop.
+        jitter = self.delay * _BACKOFF_JITTER * random.random()
         self.until = time.monotonic() + self.delay + jitter
 
     def record_fatal(self) -> None:
@@ -236,6 +238,10 @@ class SlackStore:
             return None
         except FatalAPIError:
             self._backoff.record_fatal()
+            return None
+        except SlackAPIError as e:
+            log.warning("Slack API error: %s", e)
+            self._backoff.record_failure()
             return None
         except httpx.TimeoutException:
             log.warning("Timeout on API call")
