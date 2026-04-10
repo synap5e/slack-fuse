@@ -34,40 +34,65 @@ def test_collect_thread_parents_empty_when_no_cache_dir(messages_dir: Path) -> N
 
 
 def test_collect_thread_parents_finds_threads_with_replies(messages_dir: Path) -> None:
-    _write_day(messages_dir, "C1", "2026-04-08", [
-        {"ts": "1.0", "user": "U1", "text": "thread parent", "thread_ts": "1.0", "reply_count": 3},
-        {"ts": "2.0", "user": "U1", "text": "plain message", "reply_count": 0},
-        {"ts": "3.0", "user": "U2", "text": "another thread", "thread_ts": "3.0", "reply_count": 1},
-    ])
+    _write_day(
+        messages_dir,
+        "C1",
+        "2026-04-08",
+        [
+            {"ts": "1.0", "user": "U1", "text": "thread parent", "thread_ts": "1.0", "reply_count": 3},
+            {"ts": "2.0", "user": "U1", "text": "plain message", "reply_count": 0},
+            {"ts": "3.0", "user": "U2", "text": "another thread", "thread_ts": "3.0", "reply_count": 1},
+        ],
+    )
     parents = backfill._collect_thread_parents("C1")
     assert parents == ["1.0", "3.0"]
 
 
 def test_collect_thread_parents_skips_messages_without_replies(messages_dir: Path) -> None:
-    _write_day(messages_dir, "C1", "2026-04-08", [
-        {"ts": "1.0", "user": "U1", "text": "no replies"},
-        {"ts": "2.0", "user": "U1", "text": "explicitly zero", "reply_count": 0},
-    ])
+    _write_day(
+        messages_dir,
+        "C1",
+        "2026-04-08",
+        [
+            {"ts": "1.0", "user": "U1", "text": "no replies"},
+            {"ts": "2.0", "user": "U1", "text": "explicitly zero", "reply_count": 0},
+        ],
+    )
     assert backfill._collect_thread_parents("C1") == []
 
 
 def test_collect_thread_parents_skips_replies_themselves(messages_dir: Path) -> None:
     """A reply has thread_ts != ts. Don't treat it as a parent."""
-    _write_day(messages_dir, "C1", "2026-04-08", [
-        {"ts": "1.0", "user": "U1", "text": "parent", "thread_ts": "1.0", "reply_count": 2},
-        {"ts": "1.5", "user": "U2", "text": "reply", "thread_ts": "1.0", "reply_count": 0},
-    ])
+    _write_day(
+        messages_dir,
+        "C1",
+        "2026-04-08",
+        [
+            {"ts": "1.0", "user": "U1", "text": "parent", "thread_ts": "1.0", "reply_count": 2},
+            {"ts": "1.5", "user": "U2", "text": "reply", "thread_ts": "1.0", "reply_count": 0},
+        ],
+    )
     assert backfill._collect_thread_parents("C1") == ["1.0"]
 
 
 def test_collect_thread_parents_dedupes_across_days(messages_dir: Path) -> None:
     """The same thread parent could appear in multiple day files (rare but possible)."""
-    _write_day(messages_dir, "C1", "2026-04-07", [
-        {"ts": "1.0", "user": "U1", "text": "parent", "thread_ts": "1.0", "reply_count": 1},
-    ])
-    _write_day(messages_dir, "C1", "2026-04-08", [
-        {"ts": "1.0", "user": "U1", "text": "parent", "thread_ts": "1.0", "reply_count": 1},
-    ])
+    _write_day(
+        messages_dir,
+        "C1",
+        "2026-04-07",
+        [
+            {"ts": "1.0", "user": "U1", "text": "parent", "thread_ts": "1.0", "reply_count": 1},
+        ],
+    )
+    _write_day(
+        messages_dir,
+        "C1",
+        "2026-04-08",
+        [
+            {"ts": "1.0", "user": "U1", "text": "parent", "thread_ts": "1.0", "reply_count": 1},
+        ],
+    )
     assert backfill._collect_thread_parents("C1") == ["1.0"]
 
 
@@ -75,9 +100,11 @@ def test_collect_thread_parents_tolerates_corrupt_files(messages_dir: Path) -> N
     d = messages_dir / "C1"
     d.mkdir(parents=True, exist_ok=True)
     (d / "garbage.json").write_text("not json")
-    (d / "2026-04-08.json").write_text(json.dumps([
-        {"ts": "1.0", "user": "U1", "text": "ok", "thread_ts": "1.0", "reply_count": 1},
-    ]))
+    (d / "2026-04-08.json").write_text(
+        json.dumps([
+            {"ts": "1.0", "user": "U1", "text": "ok", "thread_ts": "1.0", "reply_count": 1},
+        ])
+    )
     assert backfill._collect_thread_parents("C1") == ["1.0"]
 
 
@@ -92,8 +119,10 @@ def test_collect_thread_parents_tolerates_non_dict_entries(messages_dir: Path) -
     # Mixed list — _collect_thread_parents has to skip non-dict entries silently.
     d = messages_dir / "C1"
     d.mkdir(parents=True, exist_ok=True)
-    (d / "2026-04-08.json").write_text(json.dumps([
-        "garbage",
-        {"ts": "1.0", "user": "U1", "thread_ts": "1.0", "reply_count": 1},
-    ]))
+    (d / "2026-04-08.json").write_text(
+        json.dumps([
+            "garbage",
+            {"ts": "1.0", "user": "U1", "thread_ts": "1.0", "reply_count": 1},
+        ])
+    )
     assert backfill._collect_thread_parents("C1") == ["1.0"]

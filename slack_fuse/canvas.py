@@ -66,7 +66,9 @@ def fetch_canvas_markdown(
         return None
     if page_resp.status_code != 200:
         log.warning(
-            "Canvas download failed for %s: HTTP %d", file_id, page_resp.status_code,
+            "Canvas download failed for %s: HTTP %d",
+            file_id,
+            page_resp.status_code,
         )
         return None
 

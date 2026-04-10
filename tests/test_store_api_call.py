@@ -228,7 +228,8 @@ def test_get_thread_old_thread_in_memory_does_not_expire(
     # Backdate the in-memory entry by an hour — way past _RECENT_MSG_TTL.
     one_hour_ago = time.monotonic() - 3600
     fresh_store._thread_cache["C1", yesterday_ts] = _CachedThread(
-        thread=thread, fetched_at=one_hour_ago,
+        thread=thread,
+        fetched_at=one_hour_ago,
     )
 
     # Should still return from in-memory because the thread is old.

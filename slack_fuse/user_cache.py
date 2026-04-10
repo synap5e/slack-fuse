@@ -46,9 +46,7 @@ class UserCache:
                 data: JsonObject = json.loads(_CACHE_PATH.read_text())
                 raw_users = data.get("users", {})
                 if isinstance(raw_users, dict):
-                    self._users = {
-                        k: v for k, v in raw_users.items() if isinstance(v, str)
-                    }
+                    self._users = {k: v for k, v in raw_users.items() if isinstance(v, str)}
                 loaded_at = data.get("loaded_at", 0.0)
                 if isinstance(loaded_at, (int, float)):
                     self._loaded_at = float(loaded_at)

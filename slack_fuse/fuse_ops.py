@@ -94,14 +94,14 @@ class SlackFuseOps(pyfuse3.Operations):
         super().__init__()
         self._store = store
         self._inodes = InodeMap()
-        self._content: dict[int, bytes] = {}
 
     def _parse_path(self, path: str) -> list[str]:
         stripped = path.strip("/")
         return stripped.split("/") if stripped else []
 
     def _strip_cached_prefix(
-        self, path: str,
+        self,
+        path: str,
     ) -> tuple[str, bool]:
         """Strip .cached-only prefix. Returns (real_path, is_cached_only)."""
         parts = self._parse_path(path)
@@ -120,13 +120,12 @@ class SlackFuseOps(pyfuse3.Operations):
             with self._store.cached_only_mode():
                 entries = self._list_dir_impl(real_path)
                 # Don't nest .cached-only inside itself
-                return [
-                    e for e in entries if e[0] != ".cached-only"
-                ]
+                return [e for e in entries if e[0] != ".cached-only"]
         return self._list_dir_impl(real_path)
 
     def _list_dir_impl(  # noqa: C901  (path-depth dispatch hub; branches don't decompose cleanly)
-        self, path: str,
+        self,
+        path: str,
     ) -> list[tuple[str, bool]]:
         """List directory entries as (name, is_dir) tuples."""
         parts = self._parse_path(path)
@@ -250,11 +249,7 @@ class SlackFuseOps(pyfuse3.Operations):
         # /huddles/<YYYY-MM>/<DD>/ — list huddle dirs
         if depth == 3:
             month, day = parts[1], parts[2]
-            return [
-                (e.slug, True)
-                for e in index
-                if e.month == month and e.day == day
-            ]
+            return [(e.slug, True) for e in index if e.month == month and e.day == day]
 
         # /huddles/<YYYY-MM>/<DD>/<slug>/ — huddle content
         if depth == 4:
@@ -270,7 +265,10 @@ class SlackFuseOps(pyfuse3.Operations):
         return []
 
     def _find_huddle_index_entry(
-        self, month: str, day: str, slug: str,
+        self,
+        month: str,
+        day: str,
+        slug: str,
     ) -> HuddleIndexEntry | None:
         index = self._store.get_huddle_index()
         for e in index:
@@ -303,11 +301,7 @@ class SlackFuseOps(pyfuse3.Operations):
         depth = len(parts)
 
         # /huddles/<YYYY-MM>/<DD>/<slug>/notes.md or transcript.md (non-threaded)
-        if (
-            depth == 5
-            and parts[0] == "huddles"
-            and parts[4] in ("notes.md", "transcript.md")
-        ):
+        if depth == 5 and parts[0] == "huddles" and parts[4] in ("notes.md", "transcript.md"):
             entry = self._find_huddle_index_entry(parts[1], parts[2], parts[3])
             if entry is None:
                 return None
@@ -447,7 +441,6 @@ class SlackFuseOps(pyfuse3.Operations):
 
         content = self._resolve_content(path)
         if content is not None:
-            self._content[inode] = content
             return _make_file_attr(inode, len(content))
 
         raise pyfuse3.FUSEError(errno.ENOENT)
@@ -463,9 +456,7 @@ class SlackFuseOps(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.ENOENT)
 
         child_name = name.decode("utf-8", errors="surrogateescape")
-        child_path = (
-            f"/{child_name}" if parent_path == "/" else f"{parent_path}/{child_name}"
-        )
+        child_path = f"/{child_name}" if parent_path == "/" else f"{parent_path}/{child_name}"
 
         entries = self._list_dir(parent_path)
         found = False
@@ -490,7 +481,6 @@ class SlackFuseOps(pyfuse3.Operations):
 
         content = self._resolve_content(child_path)
         if content is not None:
-            self._content[inode] = content
             return _make_file_attr(inode, len(content))
 
         raise pyfuse3.FUSEError(errno.ENOENT)
@@ -541,10 +531,7 @@ class SlackFuseOps(pyfuse3.Operations):
         # We're at: /channels/<slug>/<YYYY-MM>/<DD>/<thread>/huddles/<huddle>/index
         # Target:   /huddles/<YYYY-MM>/<DD>/<slug>
         # 7 levels up to root, then huddles/...
-        target = (
-            f"../../../../../../../huddles/{index_entry.month}"
-            f"/{index_entry.day}/{index_entry.slug}"
-        )
+        target = f"../../../../../../../huddles/{index_entry.month}/{index_entry.day}/{index_entry.slug}"
         return target.encode()
 
     async def readdir(
@@ -563,9 +550,7 @@ class SlackFuseOps(pyfuse3.Operations):
             if idx < start_id:
                 continue
 
-            child_path = (
-                f"/{name}" if path == "/" else f"{path}/{name}"
-            )
+            child_path = f"/{name}" if path == "/" else f"{path}/{name}"
             child_inode = self._inodes.get_or_create(child_path)
 
             real_child, _ = self._strip_cached_prefix(child_path)
@@ -576,8 +561,6 @@ class SlackFuseOps(pyfuse3.Operations):
             else:
                 content = self._resolve_content(child_path)
                 size = len(content) if content is not None else 0
-                if content is not None:
-                    self._content[child_inode] = content
                 attr = _make_file_attr(child_inode, size)
 
             if not pyfuse3.readdir_reply(
@@ -597,26 +580,27 @@ class SlackFuseOps(pyfuse3.Operations):
         path = self._inodes.get_path(inode)
         if path is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
-
-        if inode not in self._content:
-            content = self._resolve_content(path)
-            if content is None:
-                raise pyfuse3.FUSEError(errno.ENOENT)
-            self._content[inode] = content
-
+        # Don't render here — read() will hit the store's render cache.
         fi = pyfuse3.FileInfo()
         fi.fh = inode  # pyright: ignore[reportAttributeAccessIssue]
-        fi.keep_cache = False  # Fresh content on each open
+        # Let the kernel cache between reads. Freshness is bounded by the
+        # store's render TTL (5 min for today, infinite for older dates),
+        # which matches our message/thread cache semantics.
+        fi.keep_cache = True  # pyright: ignore[reportAttributeAccessIssue]
         return fi
 
     async def read(self, fh: int, off: int, size: int) -> bytes:
-        content = self._content.get(fh)
+        path = self._inodes.get_path(fh)
+        if path is None:
+            raise pyfuse3.FUSEError(errno.EIO)
+        content = self._resolve_content(path)
         if content is None:
             raise pyfuse3.FUSEError(errno.EIO)
         return content[off : off + size]
 
     async def statfs(
-        self, ctx: pyfuse3.RequestContext,
+        self,
+        ctx: pyfuse3.RequestContext,
     ) -> pyfuse3.StatvfsData:
         stat_info = pyfuse3.StatvfsData()
         stat_info.f_bsize = 4096

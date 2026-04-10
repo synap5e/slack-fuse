@@ -181,7 +181,9 @@ class SlackClient:
             if cursor:
                 params["cursor"] = cursor
             resp = self._get(
-                "conversations.history", params, ConversationsHistoryResponse,
+                "conversations.history",
+                params,
+                ConversationsHistoryResponse,
             )
             messages.extend(resp.messages)
             if not resp.has_more:
@@ -221,7 +223,9 @@ class SlackClient:
             if cursor:
                 params["cursor"] = cursor
             resp = self._get(
-                "conversations.replies", params, ConversationsRepliesResponse,
+                "conversations.replies",
+                params,
+                ConversationsRepliesResponse,
             )
             messages.extend(resp.messages)
             if not resp.has_more:

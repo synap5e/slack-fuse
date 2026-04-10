@@ -27,10 +27,7 @@ def load_tokens() -> SlackTokens:
         app_token = app_token or config.get("app_token")
 
     if not user_token:
-        msg = (
-            "SLACK_USER_TOKEN not set. "
-            "Set it in the environment or in ~/.config/slack-fuse/config.json"
-        )
+        msg = "SLACK_USER_TOKEN not set. Set it in the environment or in ~/.config/slack-fuse/config.json"
         raise RuntimeError(msg)
 
     return SlackTokens(

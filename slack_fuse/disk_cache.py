@@ -25,6 +25,7 @@ def _ensure_dir(path: Path) -> None:
 # === Huddle content (notes.md, transcript.md) ===
 # Keyed by canvas_file_id. Immutable once created.
 
+
 def get_huddle(canvas_file_id: str) -> tuple[str | None, str | None] | None:
     """Load cached huddle content. Returns (notes_md, transcript_md) or None."""
     d = _CACHE_DIR / "huddles" / canvas_file_id
@@ -51,6 +52,7 @@ def put_huddle(canvas_file_id: str, notes_md: str | None, transcript_md: str | N
 # === Day messages ===
 # Keyed by (channel_id, date_str). Old messages (>7 days) are effectively immutable.
 
+
 def get_day_messages(channel_id: str, date_str: str) -> list[JsonObject] | None:
     """Load cached day messages. Returns list of raw JSON objects or None."""
     path = _CACHE_DIR / "messages" / channel_id / f"{date_str}.json"
@@ -71,6 +73,7 @@ def put_day_messages(channel_id: str, date_str: str, messages: list[JsonObject])
 
 # === Threads ===
 # Keyed by (channel_id, thread_ts). Old threads are effectively immutable.
+
 
 def get_thread(channel_id: str, thread_ts: str) -> list[JsonObject] | None:
     """Load cached thread. Returns list of raw JSON objects (parent + replies) or None."""
@@ -94,6 +97,7 @@ def put_thread(channel_id: str, thread_ts: str, messages: list[JsonObject]) -> N
 
 # === Channel list ===
 
+
 def get_channel_list() -> list[JsonObject] | None:
     """Load cached channel list."""
     path = _CACHE_DIR / "channels.json"
@@ -113,6 +117,7 @@ def put_channel_list(channels: list[JsonObject]) -> None:
 
 # === Huddle index ===
 
+
 def get_huddle_index() -> list[JsonObject] | None:
     """Load cached huddle index."""
     path = _CACHE_DIR / "huddle_index.json"
@@ -131,6 +136,7 @@ def put_huddle_index(entries: list[JsonObject]) -> None:
 
 
 # === Known dates per channel ===
+
 
 def get_known_dates(channel_id: str) -> set[str] | None:
     """Load cached known dates for a channel."""

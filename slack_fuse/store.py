@@ -7,6 +7,7 @@ import html as html_mod
 import logging
 import random
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -44,6 +45,11 @@ _CHANNEL_LIST_TTL = 1800.0  # 30 minutes — channel list rarely changes
 _RECENT_MSG_TTL = 300.0  # 5 minutes — applies to today's messages (still being written)
 _OLD_MSG_TTL = float("inf")  # any earlier local day is locked forever (see _date_ttl)
 _HUDDLE_INDEX_TTL = 1800.0  # 30 minutes
+
+# Render cache: rendered markdown bytes keyed by kind + ids. LRU-capped so a
+# full grep of the tree doesn't OOM. Old days/threads are effectively
+# immutable, so entries stay valid for their full TTL (infinite).
+_RENDER_CACHE_CAP = 50000
 
 # Backoff
 _BACKOFF_INITIAL = 30.0
@@ -106,6 +112,14 @@ class _CachedThread:
 
 
 @dataclass
+class _CachedRender:
+    """Cached rendered markdown bytes."""
+
+    data: bytes
+    fetched_at: float  # monotonic
+
+
+@dataclass
 class ChannelEntry:
     """A channel with its computed slug."""
 
@@ -153,6 +167,11 @@ class SlackStore:
         # Top-level huddle index
         self._huddle_index: list[HuddleIndexEntry] | None = None
         self._huddle_index_time: float = 0.0
+
+        # Rendered-markdown cache (LRU, bounded). Avoids re-running
+        # mrkdwn.convert + user resolution + yaml frontmatter on every
+        # readdir/lookup/open. Keyed by f"<kind>:<channel_id>:<ident>".
+        self._render_cache: OrderedDict[str, _CachedRender] = OrderedDict()
 
         # Load from disk cache
         self._load_disk_cache()
@@ -247,10 +266,7 @@ class SlackStore:
         kind: "channels" (joined, non-DM), "dms", "group-dms", "other-channels"
         """
         self._refresh_channels()
-        return {
-            cid: e for cid, e in self._channels.items()
-            if self._matches_kind(e.channel, kind)
-        }
+        return {cid: e for cid, e in self._channels.items() if self._matches_kind(e.channel, kind)}
 
     @staticmethod
     def _matches_kind(ch: Channel, kind: str) -> bool:
@@ -322,12 +338,12 @@ class SlackStore:
 
         # Try disk cache (especially valuable for old messages)
         disk_msgs = disk_cache.get_day_messages(channel_id, date_str)
-        if disk_msgs is not None and (
-            self._cached_only or self._date_ttl(date_str) == _OLD_MSG_TTL
-        ):
+        if disk_msgs is not None and (self._cached_only or self._date_ttl(date_str) == _OLD_MSG_TTL):
             messages = [Message.model_validate(m) for m in disk_msgs]
             self._day_cache[key] = _CachedDay(
-                messages=messages, fetched_at=time.monotonic(), date=date_str,
+                messages=messages,
+                fetched_at=time.monotonic(),
+                date=date_str,
             )
             return messages
 
@@ -356,17 +372,24 @@ class SlackStore:
             if disk_msgs is not None:
                 messages = [Message.model_validate(m) for m in disk_msgs]
                 self._day_cache[key] = _CachedDay(
-                    messages=messages, fetched_at=time.monotonic(), date=date_str,
+                    messages=messages,
+                    fetched_at=time.monotonic(),
+                    date=date_str,
                 )
                 return messages
             return cached.messages if cached else []
 
         self._day_cache[key] = _CachedDay(
-            messages=messages, fetched_at=time.monotonic(), date=date_str,
+            messages=messages,
+            fetched_at=time.monotonic(),
+            date=date_str,
         )
+        self._invalidate_day_renders(channel_id, date_str)
         self._known_dates.setdefault(channel_id, set()).add(date_str)
         disk_cache.put_day_messages(
-            channel_id, date_str, [m.model_dump(mode="json") for m in messages],
+            channel_id,
+            date_str,
+            [m.model_dump(mode="json") for m in messages],
         )
         disk_cache.put_known_dates(channel_id, self._known_dates[channel_id])
         return messages
@@ -412,7 +435,9 @@ class SlackStore:
             key = (channel_id, date_str)
             if key not in self._day_cache:
                 self._day_cache[key] = _CachedDay(
-                    messages=day_msgs, fetched_at=time.monotonic(), date=date_str,
+                    messages=day_msgs,
+                    fetched_at=time.monotonic(),
+                    date=date_str,
                 )
 
     # === Threads ===
@@ -441,7 +466,8 @@ class SlackStore:
             if messages:
                 thread = Thread(parent=messages[0], replies=tuple(messages[1:]))
                 self._thread_cache[key] = _CachedThread(
-                    thread=thread, fetched_at=time.monotonic(),
+                    thread=thread,
+                    fetched_at=time.monotonic(),
                 )
                 return thread
 
@@ -460,53 +486,129 @@ class SlackStore:
             return cached.thread if cached else None
 
         self._thread_cache[key] = _CachedThread(thread=thread, fetched_at=time.monotonic())
+        self._invalidate_thread_renders(channel_id, thread_ts)
         # Persist to disk
         all_msgs = [thread.parent, *thread.replies]
         disk_cache.put_thread(
-            channel_id, thread_ts, [m.model_dump(mode="json") for m in all_msgs],
+            channel_id,
+            thread_ts,
+            [m.model_dump(mode="json") for m in all_msgs],
         )
         return thread
 
     # === Rendered content ===
 
+    def _render_cached(
+        self,
+        key: str,
+        ttl: float,
+        render_fn: Callable[[], bytes],
+    ) -> bytes:
+        """Return cached render bytes, or render + cache under LRU cap."""
+        now = time.monotonic()
+        cached = self._render_cache.get(key)
+        if cached is not None and now - cached.fetched_at < ttl:
+            self._render_cache.move_to_end(key)
+            return cached.data
+        data = render_fn()
+        self._render_cache[key] = _CachedRender(data=data, fetched_at=now)
+        self._render_cache.move_to_end(key)
+        while len(self._render_cache) > _RENDER_CACHE_CAP:
+            self._render_cache.popitem(last=False)
+        return data
+
+    def _invalidate_day_renders(self, channel_id: str, date_str: str) -> None:
+        self._render_cache.pop(f"day-ch:{channel_id}:{date_str}", None)
+        self._render_cache.pop(f"day-fd:{channel_id}:{date_str}", None)
+
+    def _invalidate_thread_renders(self, channel_id: str, thread_ts: str) -> None:
+        self._render_cache.pop(f"thr-ch:{channel_id}:{thread_ts}", None)
+        self._render_cache.pop(f"thr-fd:{channel_id}:{thread_ts}", None)
+
     def render_channel_info(self, channel_id: str) -> bytes:
         """Render channel metadata markdown."""
-        entry = self._channels.get(channel_id)
-        if entry is None:
-            return b""
-        return render_channel_metadata(entry.channel, self._users).encode()
+
+        def _do() -> bytes:
+            entry = self._channels.get(channel_id)
+            if entry is None:
+                return b""
+            return render_channel_metadata(entry.channel, self._users).encode()
+
+        return self._render_cached(f"info:{channel_id}:", _CHANNEL_LIST_TTL, _do)
 
     def render_day_channel(self, channel_id: str, date_str: str) -> bytes:
         """Render channel.md snapshot for a date."""
-        entry = self._channels.get(channel_id)
-        if entry is None:
-            return b""
-        messages = self.get_day_messages(channel_id, date_str)
-        return render_day_snapshot(entry.channel, date_str, messages, self._users).encode()
+
+        def _do() -> bytes:
+            entry = self._channels.get(channel_id)
+            if entry is None:
+                return b""
+            messages = self.get_day_messages(channel_id, date_str)
+            return render_day_snapshot(
+                entry.channel,
+                date_str,
+                messages,
+                self._users,
+            ).encode()
+
+        return self._render_cached(
+            f"day-ch:{channel_id}:{date_str}",
+            self._date_ttl(date_str),
+            _do,
+        )
 
     def render_day_feed(self, channel_id: str, date_str: str) -> bytes:
         """Render feed.md for a date."""
-        entry = self._channels.get(channel_id)
-        if entry is None:
-            return b""
-        messages = self.get_day_messages(channel_id, date_str)
-        return render_day_feed(entry.channel, date_str, messages, self._users).encode()
+
+        def _do() -> bytes:
+            entry = self._channels.get(channel_id)
+            if entry is None:
+                return b""
+            messages = self.get_day_messages(channel_id, date_str)
+            return render_day_feed(
+                entry.channel,
+                date_str,
+                messages,
+                self._users,
+            ).encode()
+
+        return self._render_cached(
+            f"day-fd:{channel_id}:{date_str}",
+            self._date_ttl(date_str),
+            _do,
+        )
 
     def render_thread_snapshot(self, channel_id: str, thread_ts: str) -> bytes:
         """Render thread.md snapshot."""
-        entry = self._channels.get(channel_id)
-        thread = self.get_thread(channel_id, thread_ts)
-        if entry is None or thread is None:
-            return b""
-        return render_thread_snapshot(thread, entry.channel, self._users).encode()
+
+        def _do() -> bytes:
+            entry = self._channels.get(channel_id)
+            thread = self.get_thread(channel_id, thread_ts)
+            if entry is None or thread is None:
+                return b""
+            return render_thread_snapshot(thread, entry.channel, self._users).encode()
+
+        return self._render_cached(
+            f"thr-ch:{channel_id}:{thread_ts}",
+            self._thread_ttl(thread_ts),
+            _do,
+        )
 
     def render_thread_feed(self, channel_id: str, thread_ts: str) -> bytes:
         """Render thread feed.md."""
-        entry = self._channels.get(channel_id)
-        thread = self.get_thread(channel_id, thread_ts)
-        if entry is None or thread is None:
-            return b""
-        return render_thread_feed(thread, entry.channel, self._users).encode()
+
+        def _do() -> bytes:
+            entry = self._channels.get(channel_id)
+            thread = self.get_thread(channel_id, thread_ts)
+            if entry is None or thread is None:
+                return b""
+            return render_thread_feed(thread, entry.channel, self._users).encode()
+
+        return self._render_cached(
+            f"thr-fd:{channel_id}:{thread_ts}",
+            self._thread_ttl(thread_ts),
+            _do,
+        )
 
     def get_thread_slugs(self, channel_id: str, date_str: str) -> dict[str, str]:
         """Return slug -> thread_ts for threads starting on this date."""
@@ -528,7 +630,9 @@ class SlackStore:
     # === Huddles ===
 
     def get_huddles_for_thread(
-        self, channel_id: str, thread_ts: str,
+        self,
+        channel_id: str,
+        thread_ts: str,
     ) -> dict[str, tuple[HuddleInfo, str | None, str | None]]:
         """Return slug -> (HuddleInfo, canvas_markdown, transcript_markdown) for huddles in a thread."""
         thread = self.get_thread(channel_id, thread_ts)
@@ -538,7 +642,9 @@ class SlackStore:
         return self._find_huddles_in_messages(all_msgs)
 
     def get_huddles_for_day(
-        self, channel_id: str, date_str: str,
+        self,
+        channel_id: str,
+        date_str: str,
     ) -> dict[str, tuple[HuddleInfo, str | None, str | None]]:
         """Return slug -> huddle bundle for channel-level huddles on a day."""
         messages = self.get_day_messages(channel_id, date_str)
@@ -547,7 +653,8 @@ class SlackStore:
         return self._find_huddles_in_messages(top_level)
 
     def _find_huddles_in_messages(
-        self, messages: list[Message],
+        self,
+        messages: list[Message],
     ) -> dict[str, tuple[HuddleInfo, str | None, str | None]]:
         """Find huddle canvas attachments in messages and fetch their content."""
         huddles: dict[str, tuple[HuddleInfo, str | None, str | None]] = {}
@@ -591,10 +698,7 @@ class SlackStore:
     def get_huddle_index(self) -> list[HuddleIndexEntry]:
         """Return all huddle canvases as HuddleIndexEntry rows."""
         now = time.monotonic()
-        if (
-            self._huddle_index is not None
-            and now - self._huddle_index_time < _HUDDLE_INDEX_TTL
-        ):
+        if self._huddle_index is not None and now - self._huddle_index_time < _HUDDLE_INDEX_TTL:
             return self._huddle_index
 
         log.info("Searching for huddle canvases")
@@ -671,7 +775,8 @@ class SlackStore:
         return _shares_to_context(file_info, match.channels)
 
     def get_huddle_by_canvas_id(
-        self, canvas_file_id: str,
+        self,
+        canvas_file_id: str,
     ) -> tuple[HuddleInfo, str | None, str | None] | None:
         """Get or fetch huddle content by canvas file ID. Returns (info, notes_md, transcript_md)."""
         cached = self._huddle_cache.get(canvas_file_id)
@@ -707,7 +812,9 @@ class SlackStore:
         transcript: str | None = None
         if file_info.huddle_transcript_file_id:
             transcript = fetch_transcript_markdown(
-                self._client.token, file_info.huddle_transcript_file_id, self._users,
+                self._client.token,
+                file_info.huddle_transcript_file_id,
+                self._users,
             )
         bundle = (info, md, transcript)
         self._huddle_cache[canvas_file_id] = bundle
@@ -755,10 +862,7 @@ class SlackStore:
         if huddle_slug is None:
             return None
 
-        return (
-            f"{entry.conv_root}/{entry.channel_slug}/{entry.month}/{entry.day}"
-            f"/{thread_slug}/huddles/{huddle_slug}"
-        )
+        return f"{entry.conv_root}/{entry.channel_slug}/{entry.month}/{entry.day}/{thread_slug}/huddles/{huddle_slug}"
 
     def merge_known_dates(self, channel_id: str, dates: set[str]) -> None:
         """Merge discovered dates into known dates (used by backfill)."""
@@ -776,6 +880,7 @@ class SlackStore:
         self._huddle_cache.clear()
         self._huddle_index = None
         self._huddle_index_time = 0.0
+        self._render_cache.clear()
         self._backoff = _BackoffState()
         log.info("Force refresh: all caches cleared")
 

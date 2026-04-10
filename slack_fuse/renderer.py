@@ -81,7 +81,7 @@ def render_thread_snapshot(
     lines = [
         "---",
         f"channel: {channel.name}",
-        f"thread_ts: \"{thread.parent.ts}\"",
+        f'thread_ts: "{thread.parent.ts}"',
         f"reply_count: {len(thread.replies)}",
         f"date: {date}",
         "---\n",
@@ -104,7 +104,7 @@ def render_thread_feed(
     lines = [
         "---",
         f"channel: {channel.name}",
-        f"thread_ts: \"{thread.parent.ts}\"",
+        f'thread_ts: "{thread.parent.ts}"',
         f"date: {date}",
         "type: feed",
         "---\n",

@@ -236,12 +236,7 @@ def _collect_thread_parents(channel_id: str) -> list[str]:
             ts = d.get("ts")
             thread_ts = d.get("thread_ts")
             reply_count = d.get("reply_count", 0)
-            if (
-                isinstance(ts, str)
-                and isinstance(reply_count, int)
-                and reply_count > 0
-                and thread_ts == ts
-            ):
+            if isinstance(ts, str) and isinstance(reply_count, int) and reply_count > 0 and thread_ts == ts:
                 seen.add(ts)
     return sorted(seen)
 

@@ -19,9 +19,7 @@ from pydantic import AliasPath, BaseModel, BeforeValidator, ConfigDict, Field, m
 
 # === Recursive JSON types ===
 
-type JsonValue = (
-    str | int | float | bool | dict[str, "JsonValue"] | list["JsonValue"] | None
-)
+type JsonValue = str | int | float | bool | dict[str, "JsonValue"] | list["JsonValue"] | None
 type JsonObject = dict[str, JsonValue]
 
 
@@ -119,10 +117,12 @@ class Channel(_FrozenModel):
     # AliasPath flattens Slack's nested {value, creator, last_set} shape;
     # the BeforeValidator coerces a literal `null` value to "".
     topic: Annotated[str, BeforeValidator(_none_to_empty_str)] = Field(
-        default="", validation_alias=AliasPath("topic", "value"),
+        default="",
+        validation_alias=AliasPath("topic", "value"),
     )
     purpose: Annotated[str, BeforeValidator(_none_to_empty_str)] = Field(
-        default="", validation_alias=AliasPath("purpose", "value"),
+        default="",
+        validation_alias=AliasPath("purpose", "value"),
     )
     num_members: int = 0
     is_member: bool = False

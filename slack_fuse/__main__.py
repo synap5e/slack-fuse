@@ -38,6 +38,7 @@ def cmd_mount(args: argparse.Namespace) -> None:
     import trio
 
     from .api import SlackClient
+    from .archive import archive_all
     from .auth import load_tokens
     from .backfill import backfill_all
     from .fuse_ops import SlackFuseOps
@@ -49,6 +50,7 @@ def cmd_mount(args: argparse.Namespace) -> None:
 
     # Clean stale mount if present (e.g. after a crash)
     import subprocess as _sp
+
     _sp.run(["fusermount3", "-uz", str(mountpoint)], capture_output=True)
 
     logging.basicConfig(
@@ -85,7 +87,8 @@ def cmd_mount(args: argparse.Namespace) -> None:
 
     backfill_enabled = _env_bool("SLACK_FUSE_BACKFILL", default=False)
     logging.getLogger(__name__).info(
-        "Backfill: %s", "enabled" if backfill_enabled else "disabled",
+        "Backfill: %s",
+        "enabled" if backfill_enabled else "disabled",
     )
 
     async def _periodic_refresh() -> None:
@@ -97,6 +100,7 @@ def cmd_mount(args: argparse.Namespace) -> None:
         async with trio.open_nursery() as nursery:
             nursery.start_soon(pyfuse3.main)
             nursery.start_soon(_periodic_refresh)
+            nursery.start_soon(archive_all, store)
             if backfill_enabled:
                 nursery.start_soon(backfill_all, client, store)
 
@@ -136,7 +140,9 @@ def main() -> None:
         help=f"Mount point (default: {_default_mountpoint()})",
     )
     mount_parser.add_argument(
-        "--debug", action="store_true", help="Enable debug logging",
+        "--debug",
+        action="store_true",
+        help="Enable debug logging",
     )
     mount_parser.set_defaults(func=cmd_mount)
 
