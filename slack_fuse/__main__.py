@@ -132,6 +132,31 @@ def cmd_unmount(args: argparse.Namespace) -> None:
     print(f"Unmounted {args.mountpoint}")
 
 
+def cmd_resolve(args: argparse.Namespace) -> None:
+    """Resolve a Slack permalink to a FUSE path."""
+    from .api import SlackAPIError, SlackClient
+    from .auth import load_tokens
+    from .resolve import resolve_permalink
+    from .user_cache import UserCache
+
+    mountpoint = os.path.expanduser(args.mountpoint)
+    tokens = load_tokens()
+    client = SlackClient(tokens.user_token)
+    users = UserCache(client.http)
+
+    try:
+        path = resolve_permalink(args.url, mountpoint, client, users)
+        print(path)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except SlackAPIError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        client.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="slack-fuse",
@@ -161,6 +186,15 @@ def main() -> None:
         help=f"Mount point (default: {_default_mountpoint()})",
     )
     unmount_parser.set_defaults(func=cmd_unmount)
+
+    resolve_parser = sub.add_parser("resolve", help="Resolve a Slack permalink to a FUSE path")
+    resolve_parser.add_argument("url", help="Slack permalink URL")
+    resolve_parser.add_argument(
+        "--mountpoint",
+        default=_default_mountpoint(),
+        help=f"Mount point (default: {_default_mountpoint()})",
+    )
+    resolve_parser.set_defaults(func=cmd_resolve)
 
     args = parser.parse_args()
     args.func(args)

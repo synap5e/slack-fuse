@@ -269,6 +269,10 @@ class ResponseMetadata(BaseModel):
     next_cursor: str = ""
 
 
+class ConversationsInfoResponse(_SlackResponse):
+    channel: Channel | None = None
+
+
 class ConversationsListResponse(_SlackResponse):
     channels: list[Channel] = Field(default_factory=list)
     response_metadata: ResponseMetadata = Field(default_factory=ResponseMetadata)

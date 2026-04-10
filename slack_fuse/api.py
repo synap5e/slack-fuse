@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from .models import (
     Channel,
     ConversationsHistoryResponse,
+    ConversationsInfoResponse,
     ConversationsListResponse,
     ConversationsRepliesResponse,
     FilesInfoResponse,
@@ -164,6 +165,13 @@ class SlackClient:
                 break
             time.sleep(_PAGE_DELAY)
         return channels
+
+    def get_channel_info(self, channel_id: str) -> Channel:
+        """Fetch info for a single channel by ID."""
+        resp = self._get("conversations.info", {"channel": channel_id}, ConversationsInfoResponse)
+        if resp.channel is None:
+            raise SlackAPIError(f"conversations.info returned no channel for {channel_id}")
+        return resp.channel
 
     def get_history(
         self,
