@@ -17,6 +17,7 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
+# Edit these paths to match where you cloned the repo and ran `uv sync`.
 WorkingDirectory=%h/agentic/slack-fuse
 EnvironmentFile=%h/agentic/slack-fuse/.env
 ExecStart=%h/agentic/slack-fuse/.venv/bin/slack-fuse mount

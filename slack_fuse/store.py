@@ -318,10 +318,10 @@ class SlackStore:
         Any earlier local date → infinite TTL: served from disk forever
         on the assumption that yesterday's messages aren't being edited.
 
-        Local time matters: a UTC midnight boundary would land in the
-        middle of a PST workday and lock messages while they were still
-        being written. The user's local midnight (NZ) maps to ~04:00 PST,
-        comfortably after the previous PST workday ends.
+        Local time matters: a UTC midnight boundary would land mid-workday
+        for users far from UTC and lock messages while they were still
+        being written. Using the system's local timezone means the cutover
+        happens at the user's own midnight.
         """
         try:
             date = datetime.strptime(date_str, "%Y-%m-%d").date()

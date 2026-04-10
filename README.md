@@ -72,7 +72,7 @@ systemctl --user daemon-reload
 systemctl --user enable --now slack-fuse
 ```
 
-The service uses `EnvironmentFile=%h/agentic/slack-fuse/.env`, restarts on failure with a 10s delay, and unmounts cleanly on stop.
+Edit the `WorkingDirectory`, `EnvironmentFile`, and `ExecStart` paths in the service file to match where you cloned the repo. The defaults assume `~/agentic/slack-fuse`. The service restarts on failure with a 10s delay and unmounts cleanly on stop.
 
 ```bash
 systemctl --user status slack-fuse
@@ -170,7 +170,7 @@ rg keyword ~/views/slack/.cached-only/    # offline grep, no API calls
 uv run ruff check .
 uv run ruff format .
 uv run basedpyright            # strict type checking
-uv run pytest                  # tests dir is currently empty
+uv run pytest
 ```
 
 The project uses strict basedpyright, ruff (preview, with `E,F,W,I,UP,B,SIM,RUF` enabled), frozen dataclasses for domain models, and trio for async I/O. See `CLAUDE.md` for a module map.
