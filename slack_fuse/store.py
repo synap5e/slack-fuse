@@ -12,7 +12,7 @@ from collections.abc import Callable, Iterator
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TypeVar
+from typing import Any, TypeVar
 
 import httpx
 
@@ -56,10 +56,12 @@ _THREAD_TTL_RECENT = 600.0  # last reply < 24h ago
 _THREAD_TTL_MID_FRACTION = 0.05  # last reply < 7d ago: 5% of age …
 _THREAD_TTL_MID_MIN = 1800.0  # … with a 30-minute floor
 
-# Render cache: rendered markdown bytes keyed by kind + ids. LRU-capped so a
-# full grep of the tree doesn't OOM. Old days/threads are effectively
-# immutable, so entries stay valid for their full TTL (infinite).
-_RENDER_CACHE_CAP = 50000
+# In-memory cache caps. All three are LRU: oldest-accessed entries are evicted
+# when the cap is reached. Evicted entries reload from disk cache on next
+# access, so eviction only costs a disk read, not an API call.
+_DAY_CACHE_CAP = 2000
+_THREAD_CACHE_CAP = 5000
+_RENDER_CACHE_CAP = 10000
 
 # Backoff
 _BACKOFF_INITIAL = 30.0
@@ -167,11 +169,11 @@ class SlackStore:
         self._channels: dict[str, ChannelEntry] = {}  # channel_id -> entry
         self._channel_list_time: float = 0.0
 
-        # Message cache: (channel_id, date_str) -> cached day
-        self._day_cache: dict[tuple[str, str], _CachedDay] = {}
+        # Message cache: (channel_id, date_str) -> cached day (LRU-bounded)
+        self._day_cache: OrderedDict[tuple[str, str], _CachedDay] = OrderedDict()
 
-        # Thread cache: (channel_id, thread_ts) -> cached thread
-        self._thread_cache: dict[tuple[str, str], _CachedThread] = {}
+        # Thread cache: (channel_id, thread_ts) -> cached thread (LRU-bounded)
+        self._thread_cache: OrderedDict[tuple[str, str], _CachedThread] = OrderedDict()
 
         # Track which dates we've fetched per channel
         self._known_dates: dict[str, set[str]] = {}  # channel_id -> set of date strings
@@ -373,6 +375,7 @@ class SlackStore:
         if cached is not None:
             age = time.monotonic() - cached.fetched_at
             if age < self._date_ttl(date_str):
+                self._day_cache.move_to_end(key)
                 return cached.messages
 
         # Try disk cache (especially valuable for old messages)
@@ -384,6 +387,7 @@ class SlackStore:
                 fetched_at=time.monotonic(),
                 date=date_str,
             )
+            _evict_lru(self._day_cache, _DAY_CACHE_CAP)
             return messages
 
         if _cached_only_depth.get() > 0:
@@ -415,6 +419,7 @@ class SlackStore:
                     fetched_at=time.monotonic(),
                     date=date_str,
                 )
+                _evict_lru(self._day_cache, _DAY_CACHE_CAP)
                 return messages
             return cached.messages if cached else []
 
@@ -423,6 +428,7 @@ class SlackStore:
             fetched_at=time.monotonic(),
             date=date_str,
         )
+        _evict_lru(self._day_cache, _DAY_CACHE_CAP)
         self._invalidate_day_renders(channel_id, date_str)
         self._known_dates.setdefault(channel_id, set()).add(date_str)
         disk_cache.put_day_messages(
@@ -492,6 +498,7 @@ class SlackStore:
                     fetched_at=time.monotonic(),
                     date=date_str,
                 )
+        _evict_lru(self._day_cache, _DAY_CACHE_CAP)
 
     # === Threads ===
 
@@ -510,6 +517,7 @@ class SlackStore:
         if cached is not None:
             age = time.monotonic() - cached.fetched_at
             if age < ttl:
+                self._thread_cache.move_to_end(key)
                 return cached.thread
 
         # Disk cache fallback (cached_only or empty in-memory).
@@ -522,6 +530,7 @@ class SlackStore:
                     thread=thread,
                     fetched_at=time.monotonic(),
                 )
+                _evict_lru(self._thread_cache, _THREAD_CACHE_CAP)
                 return thread
 
         if _cached_only_depth.get() > 0:
@@ -539,6 +548,7 @@ class SlackStore:
             return cached.thread if cached else None
 
         self._thread_cache[key] = _CachedThread(thread=thread, fetched_at=time.monotonic())
+        _evict_lru(self._thread_cache, _THREAD_CACHE_CAP)
         self._invalidate_thread_renders(channel_id, thread_ts)
         # Persist to disk
         all_msgs = [thread.parent, *thread.replies]
@@ -566,8 +576,7 @@ class SlackStore:
         data = render_fn()
         self._render_cache[key] = _CachedRender(data=data, fetched_at=now)
         self._render_cache.move_to_end(key)
-        while len(self._render_cache) > _RENDER_CACHE_CAP:
-            self._render_cache.popitem(last=False)
+        _evict_lru(self._render_cache, _RENDER_CACHE_CAP)
         return data
 
     def _invalidate_day_renders(self, channel_id: str, date_str: str) -> None:
@@ -943,6 +952,12 @@ class SlackStore:
 
 
 # === Helpers ===
+
+
+def _evict_lru[V](cache: OrderedDict[Any, V], cap: int) -> None:
+    """Remove oldest entries until the cache is at or below cap."""
+    while len(cache) > cap:
+        cache.popitem(last=False)
 
 
 def _last_reply_ts(thread: Thread) -> str | None:
