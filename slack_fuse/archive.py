@@ -22,9 +22,12 @@ Layout mirrors the FUSE mount::
         group-dms/...
         other-channels/...
 
-Idempotent and resumable: skips files already on disk. Runs
-``cached_only_mode()`` to guarantee no API traffic — only already-cached
-data makes it into the archive.
+Idempotent and resumable: skips files already on disk. After all files for
+a day are written, a ``.done`` marker is placed in the day directory so
+future passes skip it entirely without loading day messages from disk.
+This prevents repeated Pydantic object churn for the full history on every
+10-minute pass. Runs ``cached_only_mode()`` to guarantee no API traffic —
+only already-cached data makes it into the archive.
 """
 
 from __future__ import annotations
@@ -44,6 +47,11 @@ _ARCHIVE_DIR = Path.home() / ".cache" / "slack-fuse" / "archive"
 # Re-scan cadence. Picks up newly-locked-in data (yesterday rolls over at
 # local midnight) and any channels that the backfill has just completed.
 _SCAN_INTERVAL = 600.0  # 10 minutes
+
+# Marker written inside a day dir after all its files are archived.
+# Future passes skip the whole day without loading messages from disk,
+# avoiding repeated Pydantic churn across the full history.
+_DONE_MARKER = ".done"
 
 # Kinds to archive. Mirrors the FUSE mount's conv roots.
 _KINDS = ("channels", "dms", "group-dms", "other-channels")
@@ -110,6 +118,12 @@ async def _archive_channel(
         day = date[8:]
         day_dir = _ARCHIVE_DIR / kind / slug / month / day
 
+        # Skip days that were fully archived in a previous pass.
+        # This avoids loading day messages from disk just to re-check
+        # that all files still exist — the main source of allocator churn.
+        if (day_dir / _DONE_MARKER).exists():
+            continue
+
         written += await _archive_day_files(store, channel_id, date, day_dir)
         written += await _archive_threads_for_day(
             store,
@@ -117,6 +131,11 @@ async def _archive_channel(
             date,
             day_dir,
         )
+
+        # Write the marker so future passes skip this day entirely.
+        # Only write if day_dir was created (i.e., there was actual content).
+        if day_dir.exists():
+            (day_dir / _DONE_MARKER).touch()
 
     return written
 
