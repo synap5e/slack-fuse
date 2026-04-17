@@ -19,13 +19,30 @@ import httpx
 from . import disk_cache, mrkdwn
 from .api import FatalAPIError, RateLimitedError, SlackAPIError, SlackClient
 from .canvas import fetch_canvas_markdown
+from .events import (
+    DayAppend,
+    DayBumpParent,
+    DayDelete,
+    DayEvent,
+    DayReplace,
+    ThreadAppend,
+    ThreadDelete,
+    ThreadEvent,
+    ThreadReplace,
+    cap_log,
+    merge_day,
+    merge_thread,
+)
+from .invalidation import InvalidationSink
 from .models import (
+    CHANNEL_LIST_EVENT_TYPES,
     Channel,
     HuddleIndexEntry,
     HuddleInfo,
     Message,
     SearchFile,
     SlackFile,
+    SocketEventPayload,
     Thread,
 )
 from .renderer import (
@@ -190,8 +207,22 @@ class SlackStore:
         # readdir/lookup/open. Keyed by f"<kind>:<channel_id>:<ident>".
         self._render_cache: OrderedDict[str, _CachedRender] = OrderedDict()
 
+        # Socket-mode event logs (in-memory only, per-key).
+        # Populated by apply_event(); drained when the matching snapshot is
+        # refetched; flushed wholesale on socket gap/unclean close.
+        self._day_events: dict[tuple[str, str], list[DayEvent]] = {}
+        self._thread_events: dict[tuple[str, str], list[ThreadEvent]] = {}
+
+        # Optional sink that drops kernel page-cache pages when an event
+        # lands. Wired from __main__ after fuse_ops is constructed.
+        self._sink: InvalidationSink | None = None
+
         # Load from disk cache
         self._load_disk_cache()
+
+    def set_invalidator(self, sink: InvalidationSink) -> None:
+        """Register a sink that drops kernel-cached pages when events mutate state."""
+        self._sink = sink
 
     def _load_disk_cache(self) -> None:
         """Warm in-memory caches from disk."""
@@ -318,6 +349,25 @@ class SlackStore:
         entry = self._channels.get(channel_id)
         return entry.channel.name if entry else channel_id
 
+    def conv_root_for(self, channel_id: str) -> str | None:
+        """Top-level directory name that hosts this channel ("channels"/"dms"/...)."""
+        entry = self._channels.get(channel_id)
+        if entry is None:
+            return None
+        ch = entry.channel
+        if ch.is_im:
+            return "dms"
+        if ch.is_mpim:
+            return "group-dms"
+        if ch.is_member:
+            return "channels"
+        return "other-channels"
+
+    def slug_for(self, channel_id: str) -> str | None:
+        """Directory slug for a channel, or None if we haven't seen it yet."""
+        entry = self._channels.get(channel_id)
+        return entry.slug if entry else None
+
     # === Messages ===
 
     def _date_ttl(self, date_str: str) -> float:
@@ -369,7 +419,20 @@ class SlackStore:
         return _OLD_MSG_TTL
 
     def get_day_messages(self, channel_id: str, date_str: str) -> list[Message]:
-        """Get messages for a channel on a specific date."""
+        """Get messages for a channel on a specific date.
+
+        Returns the base snapshot merged with any in-memory event log entries
+        for this key. A refetch (when TTL has expired) drains the log, since
+        the API response supersedes any buffered events.
+        """
+        base = self._day_messages_base(channel_id, date_str)
+        events = self._day_events.get((channel_id, date_str))
+        if not events:
+            return base
+        return merge_day(base, events)
+
+    def _day_messages_base(self, channel_id: str, date_str: str) -> list[Message]:
+        """Snapshot path: returns cached or freshly-fetched messages for the day."""
         key = (channel_id, date_str)
         cached = self._day_cache.get(key)
         if cached is not None:
@@ -438,6 +501,8 @@ class SlackStore:
         )
         disk_cache.put_known_dates(channel_id, self._known_dates[channel_id])
 
+        # API response supersedes any buffered events for this key.
+        self._day_events.pop(key, None)
         self._invalidate_stale_threads(channel_id, messages)
         return messages
 
@@ -505,10 +570,19 @@ class SlackStore:
     def get_thread(self, channel_id: str, thread_ts: str) -> Thread | None:
         """Get a thread, cached with activity-based TTL.
 
-        TTL is determined by the age of the last reply in the cached
-        thread (see `_thread_ttl`). Threads with recent activity are
-        re-polled aggressively; threads idle for 7+ days get infinite TTL.
+        Returns the base snapshot merged with any in-memory event log entries
+        for this thread. A refetch (when TTL has expired) drains the log.
         """
+        base = self._thread_base(channel_id, thread_ts)
+        if base is None:
+            return None
+        events = self._thread_events.get((channel_id, thread_ts))
+        if not events:
+            return base
+        return merge_thread(base, events)
+
+    def _thread_base(self, channel_id: str, thread_ts: str) -> Thread | None:
+        """Snapshot path for a thread: cached, disk-warmed, or freshly fetched."""
         key = (channel_id, thread_ts)
         cached = self._thread_cache.get(key)
         last_reply = _last_reply_ts(cached.thread) if cached else None
@@ -557,6 +631,8 @@ class SlackStore:
             thread_ts,
             [m.model_dump(mode="json") for m in all_msgs],
         )
+        # API response supersedes any buffered events for this thread.
+        self._thread_events.pop(key, None)
         return thread
 
     # === Rendered content ===
@@ -947,8 +1023,169 @@ class SlackStore:
         self._huddle_index = None
         self._huddle_index_time = 0.0
         self._render_cache.clear()
+        self._day_events.clear()
+        self._thread_events.clear()
         self._backoff = _BackoffState()
         log.info("Force refresh: all caches cleared")
+
+    # === Socket-mode push liveness ===
+
+    def invalidate_channel_list(self) -> None:
+        """Force the next list_channels() to refetch."""
+        self._channel_list_time = 0.0
+        if self._sink is not None:
+            self._sink.channel_list_changed()
+
+    def flush_event_logs(self) -> None:
+        """Drop all in-memory event logs AND the snapshots keyed with events.
+
+        Called by the socket-mode task on an unclean close or when the gap
+        between last-seen-event and reconnect exceeds the trust threshold.
+        We evict matching day/thread caches so the next read falls through
+        to the snapshot fetch path (honouring the existing polling TTL).
+        """
+        day_keys = list(self._day_events.keys())
+        thread_keys = list(self._thread_events.keys())
+        for channel_id, date_str in day_keys:
+            self._invalidate_day_renders(channel_id, date_str)
+            self._day_cache.pop((channel_id, date_str), None)
+            if self._sink is not None:
+                self._sink.day_changed(channel_id, date_str)
+        for channel_id, thread_ts in thread_keys:
+            self._invalidate_thread_renders(channel_id, thread_ts)
+            self._thread_cache.pop((channel_id, thread_ts), None)
+            if self._sink is not None:
+                self._sink.thread_changed(channel_id, thread_ts)
+        self._day_events.clear()
+        self._thread_events.clear()
+        if day_keys or thread_keys:
+            log.info(
+                "Flushed event logs (%d day keys, %d thread keys)",
+                len(day_keys),
+                len(thread_keys),
+            )
+
+    def apply_event(self, event: SocketEventPayload) -> None:
+        """Dispatch a socket-mode event to the right per-key log.
+
+        Sync method — called from the socket-mode task via
+        `trio.to_thread.run_sync` with the shared CapacityLimiter, so it
+        sees the same serialized view of store state as FUSE callbacks.
+        """
+        if event.type == "message":
+            self._apply_message_event(event)
+            return
+        if event.type in CHANNEL_LIST_EVENT_TYPES:
+            self.invalidate_channel_list()
+
+    def _apply_message_event(self, event: SocketEventPayload) -> None:
+        channel_id = event.channel
+        if not channel_id:
+            return
+        if event.subtype == "message_changed":
+            self._apply_message_changed(channel_id, event)
+            return
+        if event.subtype == "message_deleted":
+            self._apply_message_deleted(channel_id, event)
+            return
+        self._apply_new_message(channel_id, event)
+
+    def _apply_new_message(self, channel_id: str, event: SocketEventPayload) -> None:
+        ts = event.ts
+        if not ts:
+            return
+        msg = Message(
+            ts=ts,
+            user=event.user or "unknown",
+            text=event.text,
+            thread_ts=event.thread_ts,
+            subtype=event.subtype,
+        )
+        is_reply = event.thread_ts is not None and event.thread_ts != ts
+        if is_reply and event.thread_ts is not None:
+            thread_ts = event.thread_ts
+            parent_date = _ts_to_local_date(thread_ts)
+            self._append_thread_event(channel_id, thread_ts, ThreadAppend(message=msg))
+            if parent_date is not None:
+                self._append_day_event(
+                    channel_id,
+                    parent_date,
+                    DayBumpParent(parent_ts=thread_ts, delta_count=1, latest_reply=ts),
+                )
+            # thread_broadcast: also shows up in the day feed for ts's own day.
+            if event.subtype == "thread_broadcast":
+                own_date = _ts_to_local_date(ts)
+                if own_date is not None:
+                    self._append_day_event(channel_id, own_date, DayAppend(message=msg))
+                    self._mark_date_known(channel_id, own_date)
+            return
+        own_date = _ts_to_local_date(ts)
+        if own_date is None:
+            return
+        self._append_day_event(channel_id, own_date, DayAppend(message=msg))
+        self._mark_date_known(channel_id, own_date)
+
+    def _apply_message_changed(self, channel_id: str, event: SocketEventPayload) -> None:
+        new_msg = event.message
+        if new_msg is None:
+            return
+        if new_msg.thread_ts is not None and new_msg.thread_ts != new_msg.ts:
+            self._append_thread_event(
+                channel_id,
+                new_msg.thread_ts,
+                ThreadReplace(message=new_msg),
+            )
+            return
+        day = _ts_to_local_date(new_msg.ts)
+        if day is None:
+            return
+        self._append_day_event(channel_id, day, DayReplace(message=new_msg))
+
+    def _apply_message_deleted(self, channel_id: str, event: SocketEventPayload) -> None:
+        deleted_ts = event.deleted_ts
+        if not deleted_ts:
+            return
+        prev = event.previous_message
+        if prev is not None and prev.thread_ts is not None and prev.thread_ts != deleted_ts:
+            thread_ts = prev.thread_ts
+            self._append_thread_event(channel_id, thread_ts, ThreadDelete(ts=deleted_ts))
+            parent_date = _ts_to_local_date(thread_ts)
+            if parent_date is not None:
+                self._append_day_event(
+                    channel_id,
+                    parent_date,
+                    DayBumpParent(parent_ts=thread_ts, delta_count=-1, latest_reply=None),
+                )
+            return
+        ts_for_date = prev.ts if prev is not None else deleted_ts
+        day = _ts_to_local_date(ts_for_date)
+        if day is None:
+            return
+        self._append_day_event(channel_id, day, DayDelete(ts=deleted_ts))
+
+    def _append_day_event(self, channel_id: str, date_str: str, event: DayEvent) -> None:
+        key = (channel_id, date_str)
+        log_entries = self._day_events.setdefault(key, [])
+        log_entries.append(event)
+        cap_log(log_entries)
+        self._invalidate_day_renders(channel_id, date_str)
+        if self._sink is not None:
+            self._sink.day_changed(channel_id, date_str)
+
+    def _append_thread_event(self, channel_id: str, thread_ts: str, event: ThreadEvent) -> None:
+        key = (channel_id, thread_ts)
+        log_entries = self._thread_events.setdefault(key, [])
+        log_entries.append(event)
+        cap_log(log_entries)
+        self._invalidate_thread_renders(channel_id, thread_ts)
+        if self._sink is not None:
+            self._sink.thread_changed(channel_id, thread_ts)
+
+    def _mark_date_known(self, channel_id: str, date_str: str) -> None:
+        existing = self._known_dates.setdefault(channel_id, set())
+        if date_str not in existing:
+            existing.add(date_str)
+            disk_cache.put_known_dates(channel_id, existing)
 
 
 # === Helpers ===
@@ -993,3 +1230,10 @@ def _ts_to_time(ts: str) -> str:
         return dt.strftime("%H%M")
     except (ValueError, OSError):
         return ts
+
+
+def _ts_to_local_date(ts: str) -> str | None:
+    try:
+        return datetime.fromtimestamp(float(ts), tz=UTC).astimezone().strftime("%Y-%m-%d")
+    except (ValueError, OSError):
+        return None

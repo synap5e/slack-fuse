@@ -42,6 +42,7 @@ exclude = ["**/__pycache__", "**/.venv", "**/.ruff_cache"]
 line-length = 120
 preview = true
 target-version = "py312"
+extend-exclude = ["docs"]
 
 [tool.ruff.lint]
 select = [

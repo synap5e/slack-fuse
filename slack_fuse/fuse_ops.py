@@ -7,6 +7,7 @@ import logging
 import os
 import stat
 import time
+from datetime import UTC, datetime
 
 import pyfuse3
 import trio
@@ -96,6 +97,11 @@ class SlackFuseOps(pyfuse3.Operations):
         self._store = store
         self._inodes = InodeMap()
         self._limiter = limiter
+
+    @property
+    def inodes(self) -> InodeMap:
+        """Read-only accessor so `__main__` can wire the invalidation sink."""
+        return self._inodes
 
     def _parse_path(self, path: str) -> list[str]:
         stripped = path.strip("/")
@@ -622,3 +628,88 @@ class SlackFuseOps(pyfuse3.Operations):
         stat_info.f_favail = 0
         stat_info.f_namemax = 255
         return stat_info
+
+
+class InodeInvalidator:
+    """InvalidationSink: translates store events into pyfuse3 cache drops.
+
+    The store calls these methods from the worker thread (apply_event is
+    dispatched via `trio.to_thread.run_sync`). That's the right place to
+    call `invalidate_inode` from — it can block on writeback and must not
+    run on the FUSE event-loop thread.
+
+    For new directory entries (new channels, new threads, new days) the
+    textbook API is `invalidate_entry_async(parent, name)`. We pair the
+    inode drop with an entry-async call on the parent so a fresh `ls`
+    surfaces newcomers even if the parent dir was already cached.
+    """
+
+    def __init__(self, inodes: InodeMap, store: SlackStore) -> None:
+        self._inodes = inodes
+        self._store = store
+
+    def day_changed(self, channel_id: str, date_str: str) -> None:
+        conv_root = self._store.conv_root_for(channel_id)
+        slug = self._store.slug_for(channel_id)
+        if conv_root is None or slug is None:
+            return
+        if len(date_str) != 10 or date_str[4] != "-" or date_str[7] != "-":
+            return
+        month = date_str[:7]
+        day = date_str[8:]
+        day_dir = f"/{conv_root}/{slug}/{month}/{day}"
+        self._invalidate_path(f"{day_dir}/channel.md")
+        self._invalidate_path(f"{day_dir}/feed.md")
+        # Also drop the day dir inode so a re-readdir picks up new threads.
+        self._invalidate_path(day_dir)
+        # And the month dir (in case this is a newly-discovered day).
+        self._invalidate_path(f"/{conv_root}/{slug}/{month}")
+
+    def thread_changed(self, channel_id: str, thread_ts: str) -> None:
+        conv_root = self._store.conv_root_for(channel_id)
+        slug = self._store.slug_for(channel_id)
+        if conv_root is None or slug is None:
+            return
+        date_str = _ts_to_local_date(thread_ts)
+        if date_str is None:
+            return
+        month = date_str[:7]
+        day = date_str[8:]
+        thread_slug = self._resolve_thread_slug(channel_id, date_str, thread_ts)
+        if thread_slug is None:
+            # Thread dir isn't materialized yet — poke the day dir so a
+            # fresh readdir can discover it.
+            self._invalidate_path(f"/{conv_root}/{slug}/{month}/{day}")
+            return
+        thread_dir = f"/{conv_root}/{slug}/{month}/{day}/{thread_slug}"
+        self._invalidate_path(f"{thread_dir}/thread.md")
+        self._invalidate_path(f"{thread_dir}/feed.md")
+        self._invalidate_path(thread_dir)
+
+    def channel_list_changed(self) -> None:
+        # Drop every conv-root dir so readdir refetches membership.
+        for root in _CONV_ROOTS:
+            self._invalidate_path(f"/{root}")
+
+    def _resolve_thread_slug(self, channel_id: str, date_str: str, thread_ts: str) -> str | None:
+        slugs = self._store.get_thread_slugs(channel_id, date_str)
+        for slug, ts in slugs.items():
+            if ts == thread_ts:
+                return slug
+        return None
+
+    def _invalidate_path(self, path: str) -> None:
+        inode = self._inodes.get_inode(path)
+        if inode is None:
+            return
+        try:
+            pyfuse3.invalidate_inode(inode)  # pyright: ignore[reportArgumentType]
+        except OSError as exc:
+            log.debug("invalidate_inode(%d) for %s failed: %s", inode, path, exc)
+
+
+def _ts_to_local_date(ts: str) -> str | None:
+    try:
+        return datetime.fromtimestamp(float(ts), tz=UTC).astimezone().strftime("%Y-%m-%d")
+    except (ValueError, OSError):
+        return None

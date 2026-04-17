@@ -41,7 +41,7 @@ def cmd_mount(args: argparse.Namespace) -> None:
     from .archive import archive_all
     from .auth import load_tokens
     from .backfill import backfill_all
-    from .fuse_ops import SlackFuseOps
+    from .fuse_ops import InodeInvalidator, SlackFuseOps
     from .store import SlackStore
     from .user_cache import UserCache
 
@@ -77,6 +77,10 @@ def cmd_mount(args: argparse.Namespace) -> None:
     store_limiter = trio.CapacityLimiter(1)
     ops = SlackFuseOps(store, store_limiter)
 
+    # Wire the invalidation sink so events trigger kernel page-cache drops.
+    # Has to happen after ops is constructed so we share its InodeMap.
+    store.set_invalidator(InodeInvalidator(ops.inodes, store))
+
     fuse_options: set[str] = {"fsname=slack-fuse", "ro"}
     if args.debug:
         fuse_options.add("debug")
@@ -108,6 +112,16 @@ def cmd_mount(args: argparse.Namespace) -> None:
             nursery.start_soon(archive_all, store)
             if backfill_enabled:
                 nursery.start_soon(backfill_all, client, store, store_limiter)
+            if tokens.app_token:
+                from .socket_mode import run_socket_mode
+
+                nursery.start_soon(
+                    run_socket_mode,
+                    store,
+                    tokens.app_token,
+                    client.http,
+                    store_limiter,
+                )
             await pyfuse3.main()
             nursery.cancel_scope.cancel()
 

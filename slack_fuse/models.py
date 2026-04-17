@@ -312,6 +312,109 @@ class BotsInfoResponse(_SlackResponse):
     bot: BotInfo | None = None
 
 
+class AppsConnectionsOpenResponse(_SlackResponse):
+    """apps.connections.open — returns the websocket URL for a Socket Mode session."""
+
+    url: str = ""
+
+
+# === Socket Mode envelopes + event payload ===
+
+
+class SocketEventPayload(_FrozenModel):
+    """Inner `event` object from an events_api envelope.
+
+    Covers both `message` events (with all subtypes we care about) and the
+    channel-structure events that drive channel-list invalidation. We dispatch
+    by `(type, subtype)` rather than using a discriminated union because the
+    interesting fields overlap heavily and many event types we only use as
+    invalidation triggers.
+
+    The `_flatten_channel` validator handles the wire-format quirk where
+    `channel_created` carries a nested channel object instead of a string id —
+    we only need the id for invalidation, so we flatten it here.
+    """
+
+    type: str
+    subtype: str | None = None
+    channel: str = ""
+    channel_type: str = ""
+    ts: str = ""
+    user: str = ""
+    text: str = ""
+    thread_ts: str | None = None
+    hidden: bool = False
+    message: Message | None = None
+    previous_message: Message | None = None
+    deleted_ts: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _flatten_channel(cls, data: object) -> object:
+        if not isinstance(data, dict):
+            return data
+        d = cast("dict[str, object]", data)
+        ch = d.get("channel")
+        if isinstance(ch, dict):
+            ch_id = cast("dict[str, object]", ch).get("id")
+            return {**d, "channel": ch_id if isinstance(ch_id, str) else ""}
+        return d
+
+
+class EventsApiPayload(_FrozenModel):
+    """The `payload` field of an events_api envelope."""
+
+    event: SocketEventPayload
+
+
+class SocketEnvelope(_FrozenModel):
+    """Any frame from the Slack Socket Mode websocket.
+
+    Fields are optional because envelope shape varies by `type`:
+    - `hello` carries `num_connections` (and debug info we ignore)
+    - `disconnect` carries `reason`
+    - `events_api` / `slash_commands` / `interactive` carry `envelope_id`
+      (and events_api also carries `payload.event`)
+
+    We validate the whole frame here and dispatch by `type` in socket_mode.py.
+    """
+
+    type: str
+    envelope_id: str | None = None
+    reason: str = ""
+    num_connections: int = 0
+    payload: EventsApiPayload | None = None
+
+
+# Reasons Slack sends on a `disconnect` envelope that are part of a graceful
+# handoff — the server expects us to open a new socket before acknowledging
+# this one. On these, we must NOT flush the event log.
+GRACEFUL_DISCONNECT_REASONS: frozenset[str] = frozenset({
+    "refresh_requested",
+    "warning",
+    "link_disabled",
+})
+
+
+# Inner event types that should invalidate the channel-list cache.
+# All of these are user-scope events the install is subscribed to.
+CHANNEL_LIST_EVENT_TYPES: frozenset[str] = frozenset({
+    "channel_created",
+    "channel_rename",
+    "channel_archive",
+    "channel_unarchive",
+    "channel_deleted",
+    "channel_left",
+    "member_joined_channel",
+    "member_left_channel",
+    "group_archive",
+    "group_unarchive",
+    "group_rename",
+    "group_deleted",
+    "im_created",
+})
+
+
 # === Internal index ===
 
 

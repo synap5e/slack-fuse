@@ -24,6 +24,9 @@ User-facing docs are in `README.md`. This file is for navigating the codebase.
 | `slack_fuse/transcript.py` | `fetch_transcript_markdown`: hits `files.info?include_transcription=true` to pull huddle transcripts as Slack Blocks JSON, validates into `HuddleTranscription` + nested rich-text models, then renders to markdown. Returns `None` on failure (logged) so a missing transcript never breaks a directory listing. |
 | `slack_fuse/user_cache.py` | `UserCache`: bulk-fetches workspace users at startup (`populate()`), provides `get_display_name(user_id)` used by renderer/canvas/transcript. Validates `users.list`/`users.info`/`bots.info` responses via Pydantic at the boundary. Persists to disk so restarts are cheap. |
 | `slack_fuse/slug.py` | `slugify(text)` — lowercase, ASCII, dashes for everything else. |
+| `slack_fuse/socket_mode.py` | `run_socket_mode`: trio task that maintains a Slack Socket Mode websocket. Calls `apps.connections.open` via the shared `httpx.Client` to get a wss URL, then `trio_websocket.open_websocket_url`. Each `events_api` envelope is acked and dispatched to `store.apply_event` via `trio.to_thread.run_sync` (shared `CapacityLimiter(1)`). Reconnects with exponential backoff (2s → 5min). Slack `disconnect` envelopes with `reason in GRACEFUL_DISCONNECT_REASONS` reconnect cleanly without flushing the event log; any other close calls `store.flush_event_logs()` so the next read falls through to the polling-TTL fetch path. Gated on `SLACK_APP_TOKEN` being present. |
+| `slack_fuse/events.py` | In-memory event log types and pure merge helpers. Frozen dataclasses (`DayAppend`/`DayReplace`/`DayDelete`/`DayBumpParent`, `ThreadAppend`/`ThreadReplace`/`ThreadDelete`) — not Pydantic because they don't cross an I/O boundary. `merge_day(base, events)` and `merge_thread(base, events)` are pure: take a snapshot list/Thread + a sequence of events, return the materialized view. Bounded per-key by `EVENT_LOG_CAP=500` via `cap_log`. |
+| `slack_fuse/invalidation.py` | `InvalidationSink` Protocol with `day_changed` / `thread_changed` / `channel_list_changed`. Lets `SlackStore` notify the FUSE layer when an event mutates a cache key without importing `pyfuse3`. Implemented by `fuse_ops.InodeInvalidator`, which resolves the cache key to one or more FUSE paths (e.g. `/<conv_root>/<slug>/<YYYY-MM>/<DD>/{channel,feed}.md`), looks up inodes via `InodeMap.get_inode`, and calls `pyfuse3.invalidate_inode` on each — required because `fi.keep_cache=True` in `open()` means the kernel will otherwise serve stale buffered bytes after the render cache is updated. |
 | `slack_fuse/adapters/` | Currently empty (just `__init__.py`). Reserved namespace. |
 | `tests/` | `pytest`/`pytest-trio` configured. Tests cover: `_api_call` backoff state machine, `cached_only_mode` (incl. nesting), `_date_ttl`/`_thread_ttl` boundaries, path parsing in `fuse_ops`, `_collect_thread_parents`, disk cache round-tripping, model parsing. |
 
@@ -63,6 +66,27 @@ Use `uv add` / `uv remove` to mutate dependencies — never `uv pip install` aga
 - Force refresh by sending `SIGUSR1` to the process. The handler calls `store.force_refresh()`.
 - The `.cached-only/` prefix is implemented via `store.cached_only_mode()` (a `ContextVar[int]` context manager, ref-counted and per-trio-task). Anything new in `fuse_ops` that fetches data must go through `_strip_cached_prefix` + `cached_only_mode()`, otherwise `.cached-only/` will silently start hitting the API.
 
+## Socket Mode
+
+Push liveness for today's data, alongside the polling TTLs (which stay as the correctness floor).
+
+**App config (one-time, in the Slack app admin UI):**
+- Socket Mode → **Enable Socket Mode**.
+- Event Subscriptions → **Subscribe to events on behalf of users**:
+  - `message.channels` / `message.groups` / `message.im` / `message.mpim`
+  - `channel_created` / `channel_rename` / `channel_archive` / `channel_unarchive`
+  - `member_joined_channel` / `member_left_channel`
+  - `group_archive` / `group_unarchive` / `group_rename` / `group_deleted`
+  - `im_created`
+- Required scopes (already granted on the user token): `channels:history`, `groups:history`, `im:history`, `mpim:history` for message events; `channels:read` / `groups:read` / `im:read` / `mpim:read` for the structural events.
+- Bot token (`xoxb-…`) need only exist with any scope — Socket Mode requires the app to have a bot user, but every event we subscribe to is user-scope so coverage is gated by what the user can see, not the bot.
+
+**Coverage:** public channels you've joined, private channels, DMs, group DMs. `other-channels/` (public not-joined) stays on TTL polling — user-scope events don't fire for channels the user isn't a member of.
+
+**Limits:** 10 concurrent socket connections per app (we use 1). 30,000 events/workspace/hour on the Events API. Inbound socket-mode frames are not rate-limited.
+
+**Tokens needed:** `SLACK_APP_TOKEN=xapp-…` with `connections:write` (drives `apps.connections.open`). If unset, the socket-mode task is skipped and the mount falls back to polling-only.
+
 ## Things not to do
 
 - Don't commit `.env`. It's gitignored, but double-check `git status` before any commit.
@@ -70,6 +94,7 @@ Use `uv add` / `uv remove` to mutate dependencies — never `uv pip install` aga
 - Don't introduce mutable dataclasses for the domain models — `disk_cache` round-tripping and the renderer assume frozen tuples.
 - Don't replace `cached_only_mode()`'s ContextVar with a plain instance attribute. The ContextVar ensures per-task isolation so archive's long-running pass doesn't leak to FUSE callbacks.
 - Don't remove the `pyright: ignore` comments on pyfuse3 attribute assignments — they're load-bearing because pyfuse3's stubs are incomplete.
+- Don't drop the `store.set_invalidator(InodeInvalidator(...))` wiring in `__main__.py`. Without it, `fi.keep_cache=True` in `fuse_ops.open()` lets the kernel serve stale buffered bytes after socket-mode events, so live messages won't appear in `cat` until the polling TTL expires.
 
 ## Related docs
 
