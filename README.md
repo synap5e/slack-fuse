@@ -41,8 +41,8 @@ $EDITOR .env
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
 | `SLACK_USER_TOKEN` | yes | — | User token (`xoxc-`/`xoxp-`). Mount reads what you can read. |
-| `SLACK_APP_TOKEN` | no | — | App-level token (`xapp-`) for socket-mode features. |
-| `SLACK_BOT_TOKEN` | no | — | Reserved; currently unused. |
+| `SLACK_APP_TOKEN` | no | — | App-level token (`xapp-…`, scope `connections:write`). Enables push liveness via Socket Mode — see "Live updates" below. Absent → mount runs polling-only. |
+| `SLACK_BOT_TOKEN` | no | — | Bot token (`xoxb-…`). Slack requires an app to have a bot user for Socket Mode, but every event slack-fuse subscribes to is user-scope, so the bot token's scopes don't matter. Any scope is fine. |
 | `SLACK_FUSE_BACKFILL` | no | `false` | Enable the background history backfill task. Accepts `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`. |
 
 `SLACK_USER_TOKEN` may also be supplied via `~/.config/slack-fuse/config.json` if you'd rather keep it out of `.env`.
@@ -128,17 +128,38 @@ Other behavior:
 - Rate-limit responses trigger a wait + jitter and the page is retried.
 - Re-day-backfill a channel by deleting its `.done` marker; re-thread-backfill by deleting its `.threads.done` marker.
 
+## Live updates (Socket Mode, optional)
+
+If `SLACK_APP_TOKEN` is set, slack-fuse opens a Slack Socket Mode websocket and merges push events into the in-memory caches on the fly — new messages, edits, deletes, threaded replies, and channel-list changes reflect in `cat` output within ~2 seconds of the post, no polling wait. Polling TTLs stay in place as the correctness floor.
+
+One-time app config (in the Slack app admin UI at `https://api.slack.com/apps`):
+
+1. **Socket Mode → Enable Socket Mode**.
+2. **Event Subscriptions → Enable Events**, then under **Subscribe to events on behalf of users** add:
+   - `message.channels`, `message.groups`, `message.im`, `message.mpim`
+   - `channel_created`, `channel_rename`, `channel_archive`, `channel_unarchive`
+   - `member_joined_channel`, `member_left_channel`
+   - `group_archive`, `group_unarchive`, `group_rename`, `group_deleted`
+   - `im_created`
+3. Generate an app-level token with `connections:write` and put it in `.env` as `SLACK_APP_TOKEN`.
+4. Required user-token scopes (`channels:history` / `groups:history` / `im:history` / `mpim:history` plus the matching `*:read` for structural events) are already standard `xoxp-…` scopes — if your user token can list channels and read history, you're done.
+
+**Coverage.** Public channels you've joined, private channels, DMs, group DMs. `other-channels/` (public channels you're *not* in) stays on TTL polling — Slack doesn't deliver events for channels the user isn't a member of.
+
+**Without the token.** If `SLACK_APP_TOKEN` is unset, the socket task doesn't start and the mount behaves exactly like a polling-only build: today's messages refresh every 5 minutes, channel list every 30.
+
 ## Caching
 
 Disk cache lives at `~/.cache/slack-fuse/` and survives restarts. Channel list, huddle index, day messages, threads, known dates per channel, and backfill markers all persist there.
 
-In-memory TTLs:
+In-memory TTLs (these are the polling floor; push events via Socket Mode beat them when configured):
 
 | Data | TTL |
 |---|---|
-| Channel list | 30 min (background refresh) |
+| Channel list | 30 min |
 | Huddle index | 30 min |
 | Today's messages (system local date) | 5 min |
+| Active threads | 1 min → 10 min → proportional, based on last-reply age |
 | Any earlier local date | indefinite |
 
 Force refresh:
