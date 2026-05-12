@@ -12,7 +12,9 @@ from pathlib import Path
 
 
 def _default_mountpoint() -> str:
-    return os.environ.get("SLACK_FUSE_MOUNTPOINT") or os.path.expanduser("~/views/slack")
+    from .auth import load_mountpoint
+
+    return load_mountpoint() or os.path.expanduser("~/views/slack")
 
 
 _REFRESH_INTERVAL = 1800  # 30 minutes, matches _CHANNEL_LIST_TTL

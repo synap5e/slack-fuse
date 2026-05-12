@@ -33,6 +33,26 @@ def _parse_env_file(path: Path) -> dict[str, str]:
     return result
 
 
+def load_mountpoint() -> str | None:
+    """Resolve the FUSE mountpoint from env, .env, or ~/.config/slack-fuse/config.json.
+
+    Returns the first non-empty value found, with `~` expanded. Returns None if
+    none of the sources have it set, leaving the caller free to apply its own
+    default. Mirrors `load_tokens()`'s precedence so a `.env` next to the
+    install picks up overrides when subshells don't inherit the user systemd
+    environment (e.g. `environment.d` only reaches PAM-launched shells).
+    """
+    raw = os.environ.get("SLACK_FUSE_MOUNTPOINT")
+    if not raw:
+        raw = _parse_env_file(_ENV_PATH).get("SLACK_FUSE_MOUNTPOINT")
+    if not raw and _CONFIG_PATH.exists():
+        config = json.loads(_CONFIG_PATH.read_text())
+        raw = config.get("mountpoint") or config.get("SLACK_FUSE_MOUNTPOINT")
+    if not raw:
+        return None
+    return os.path.expanduser(raw)
+
+
 def load_tokens() -> SlackTokens:
     """Load Slack tokens from environment variables, falling back to .env or config file."""
     user_token = os.environ.get("SLACK_USER_TOKEN")
