@@ -42,8 +42,10 @@ $EDITOR .env
 |---|---|---|---|
 | `SLACK_USER_TOKEN` | yes | — | User token (`xoxc-`/`xoxp-`). Mount reads what you can read. |
 | `SLACK_APP_TOKEN` | no | — | App-level token (`xapp-…`, scope `connections:write`). Enables push liveness via Socket Mode — see "Live updates" below. Absent → mount runs polling-only. |
+| `SLACK_WORKSPACE_URL` | no | — | Workspace base URL (e.g. `https://comfy-org.slack.com`). Required only for channel-root permalinks via `slack-fuse permalink`. |
 | `SLACK_BOT_TOKEN` | no | — | Bot token (`xoxb-…`). Slack requires an app to have a bot user for Socket Mode, but every event slack-fuse subscribes to is user-scope, so the bot token's scopes don't matter. Any scope is fine. |
 | `SLACK_FUSE_BACKFILL` | no | `false` | Enable the background history backfill task. Accepts `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`. |
+| `SLACK_FUSE_MOUNTPOINT` | no | `~/views/slack` | Override the default mountpoint used by `slack-fuse mount`, `resolve`, `permalink`. Useful when the FUSE mount lives somewhere other than the user's home (e.g. a top-level `/views/slack`). |
 
 `SLACK_USER_TOKEN` may also be supplied via `~/.config/slack-fuse/config.json` if you'd rather keep it out of `.env`.
 
@@ -104,6 +106,9 @@ journalctl --user -u slack-fuse -n 30 --no-pager
 ```
 
 Channel directory names are slugified. Thread slugs come from the first message (with user mentions resolved into names) so a plain `ls` is often enough to find what you want.
+
+`uv run slack-fuse resolve <slack-url>` returns the FUSE path for a Slack message permalink.
+`uv run slack-fuse permalink <fuse-path>` returns the Slack permalink URL for a FUSE path. Pass `--ts <message_ts>` to permalink a specific message in a day or thread file.
 
 ## `.cached-only/` — offline mode
 

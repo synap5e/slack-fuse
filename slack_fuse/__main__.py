@@ -12,7 +12,7 @@ from pathlib import Path
 
 
 def _default_mountpoint() -> str:
-    return os.path.expanduser("~/views/slack")
+    return os.environ.get("SLACK_FUSE_MOUNTPOINT") or os.path.expanduser("~/views/slack")
 
 
 _REFRESH_INTERVAL = 1800  # 30 minutes, matches _CHANNEL_LIST_TTL
@@ -171,6 +171,38 @@ def cmd_resolve(args: argparse.Namespace) -> None:
         client.close()
 
 
+def cmd_permalink(args: argparse.Namespace) -> None:
+    """Resolve a FUSE path to a Slack permalink."""
+    from .api import SlackAPIError, SlackClient
+    from .auth import load_tokens
+    from .permalink import resolve_path_to_permalink
+    from .user_cache import UserCache
+
+    mountpoint = os.path.expanduser(args.mountpoint)
+    tokens = load_tokens()
+    client = SlackClient(tokens.user_token)
+    users = UserCache(client.http)
+
+    try:
+        url = resolve_path_to_permalink(
+            args.path,
+            mountpoint,
+            client,
+            users,
+            tokens.workspace_url,
+            ts=args.ts,
+        )
+        print(url)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except SlackAPIError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        client.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="slack-fuse",
@@ -209,6 +241,16 @@ def main() -> None:
         help=f"Mount point (default: {_default_mountpoint()})",
     )
     resolve_parser.set_defaults(func=cmd_resolve)
+
+    permalink_parser = sub.add_parser("permalink", help="Resolve a FUSE path to a Slack permalink")
+    permalink_parser.add_argument("path", help="FUSE path (or path under .cached-only/)")
+    permalink_parser.add_argument("--ts", help="Specific message ts (required for day files; refines threads)")
+    permalink_parser.add_argument(
+        "--mountpoint",
+        default=_default_mountpoint(),
+        help=f"Mount point (default: {_default_mountpoint()})",
+    )
+    permalink_parser.set_defaults(func=cmd_permalink)
 
     args = parser.parse_args()
     args.func(args)

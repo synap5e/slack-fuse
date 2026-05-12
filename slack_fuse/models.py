@@ -291,6 +291,11 @@ class ConversationsRepliesResponse(_SlackResponse):
     response_metadata: ResponseMetadata = Field(default_factory=ResponseMetadata)
 
 
+class ChatGetPermalinkResponse(_SlackResponse):
+    permalink: str = ""
+    channel: str = ""
+
+
 class FilesInfoResponse(_SlackResponse):
     file: SlackFile | None = None
 

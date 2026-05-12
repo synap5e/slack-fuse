@@ -15,6 +15,7 @@ from pydantic import BaseModel
 
 from .models import (
     Channel,
+    ChatGetPermalinkResponse,
     ConversationsHistoryResponse,
     ConversationsInfoResponse,
     ConversationsListResponse,
@@ -254,6 +255,15 @@ class SlackClient:
             return Thread(parent=parent)
 
         return Thread(parent=messages[0], replies=tuple(messages[1:]))
+
+    def get_permalink(self, channel_id: str, message_ts: str) -> str:
+        """Fetch Slack's canonical permalink for a message."""
+        resp = self._get(
+            "chat.getPermalink",
+            {"channel": channel_id, "message_ts": message_ts},
+            ChatGetPermalinkResponse,
+        )
+        return resp.permalink
 
     def get_file_info(self, file_id: str) -> SlackFile | None:
         """Get file metadata. Returns None if Slack reports the file is missing."""

@@ -14,18 +14,21 @@ if TYPE_CHECKING:
 
 def render_channel_metadata(channel: Channel, users: UserCache | None = None) -> str:
     """Render channel.md at the channel root level (topic, purpose, etc)."""
-    lines = [f"# #{channel.name}\n"]
+    channel_type = _channel_type_label(channel)
+    lines = [
+        "---",
+        f"channel: {channel.name}",
+        f"channel_id: {channel.id}",
+        f"type: {_channel_type_token(channel)}",
+        "---\n",
+        f"# #{channel.name}\n",
+    ]
     if channel.topic:
         lines.append(f"**Topic**: {mrkdwn.convert(channel.topic, users)}\n")
     if channel.purpose:
         lines.append(f"**Purpose**: {mrkdwn.convert(channel.purpose, users)}\n")
     if channel.num_members:
         lines.append(f"**Members**: {channel.num_members}\n")
-    channel_type = "Private Channel" if channel.is_private else "Channel"
-    if channel.is_im:
-        channel_type = "Direct Message"
-    elif channel.is_mpim:
-        channel_type = "Group DM"
     lines.append(f"**Type**: {channel_type}\n")
     return "\n".join(lines)
 
@@ -40,6 +43,7 @@ def render_day_snapshot(
     lines = [
         "---",
         f"channel: {channel.name}",
+        f"channel_id: {channel.id}",
         f"date: {date}",
         "---\n",
     ]
@@ -60,6 +64,7 @@ def render_day_feed(
     lines = [
         "---",
         f"channel: {channel.name}",
+        f"channel_id: {channel.id}",
         f"date: {date}",
         "type: feed",
         "---\n",
@@ -81,6 +86,7 @@ def render_thread_snapshot(
     lines = [
         "---",
         f"channel: {channel.name}",
+        f"channel_id: {channel.id}",
         f'thread_ts: "{thread.parent.ts}"',
         f"reply_count: {len(thread.replies)}",
         f"date: {date}",
@@ -104,6 +110,7 @@ def render_thread_feed(
     lines = [
         "---",
         f"channel: {channel.name}",
+        f"channel_id: {channel.id}",
         f'thread_ts: "{thread.parent.ts}"',
         f"date: {date}",
         "type: feed",
@@ -115,6 +122,26 @@ def render_thread_feed(
         lines.append(_render_message(reply, users))
 
     return "\n".join(lines)
+
+
+def _channel_type_label(channel: Channel) -> str:
+    if channel.is_im:
+        return "Direct Message"
+    if channel.is_mpim:
+        return "Group DM"
+    if channel.is_private:
+        return "Private Channel"
+    return "Channel"
+
+
+def _channel_type_token(channel: Channel) -> str:
+    if channel.is_im:
+        return "im"
+    if channel.is_mpim:
+        return "mpim"
+    if channel.is_private:
+        return "private"
+    return "channel"
 
 
 def _render_message(

@@ -15,6 +15,7 @@ _ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 class SlackTokens:
     user_token: str
     app_token: str | None = None
+    workspace_url: str | None = None
 
 
 def _parse_env_file(path: Path) -> dict[str, str]:
@@ -36,16 +37,19 @@ def load_tokens() -> SlackTokens:
     """Load Slack tokens from environment variables, falling back to .env or config file."""
     user_token = os.environ.get("SLACK_USER_TOKEN")
     app_token = os.environ.get("SLACK_APP_TOKEN")
+    workspace_url = os.environ.get("SLACK_WORKSPACE_URL")
 
-    if not user_token:
+    if not user_token or not app_token or not workspace_url:
         env_vars = _parse_env_file(_ENV_PATH)
-        user_token = env_vars.get("SLACK_USER_TOKEN")
+        user_token = user_token or env_vars.get("SLACK_USER_TOKEN")
         app_token = app_token or env_vars.get("SLACK_APP_TOKEN")
+        workspace_url = workspace_url or env_vars.get("SLACK_WORKSPACE_URL")
 
-    if not user_token and _CONFIG_PATH.exists():
+    if (not user_token or not app_token or not workspace_url) and _CONFIG_PATH.exists():
         config = json.loads(_CONFIG_PATH.read_text())
-        user_token = config.get("user_token")
+        user_token = user_token or config.get("user_token")
         app_token = app_token or config.get("app_token")
+        workspace_url = workspace_url or config.get("workspace_url") or config.get("SLACK_WORKSPACE_URL")
 
     if not user_token:
         msg = "SLACK_USER_TOKEN not set. Set it in the environment or in ~/.config/slack-fuse/config.json"
@@ -54,4 +58,5 @@ def load_tokens() -> SlackTokens:
     return SlackTokens(
         user_token=user_token,
         app_token=app_token if app_token and not app_token.startswith("xapp-your") else None,
+        workspace_url=workspace_url.rstrip("/") if workspace_url else None,
     )

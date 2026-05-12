@@ -15,7 +15,13 @@ from slack_fuse.canvas import _html_to_markdown
 from slack_fuse.inode_map import InodeMap
 from slack_fuse.models import Channel, HuddleTranscription, Message, Thread
 from slack_fuse.mrkdwn import convert
-from slack_fuse.renderer import render_channel_metadata, render_day_snapshot, render_thread_snapshot
+from slack_fuse.renderer import (
+    render_channel_metadata,
+    render_day_feed,
+    render_day_snapshot,
+    render_thread_feed,
+    render_thread_snapshot,
+)
 from slack_fuse.slug import slugify
 from slack_fuse.transcript import _render_blocks
 
@@ -157,6 +163,8 @@ def test_renderer_channel_metadata_variants() -> None:
     mpim = Channel.model_validate({"id": "G1", "name": "g", "is_mpim": True})
 
     assert "Channel" in render_channel_metadata(public)
+    assert "channel_id: C1" in render_channel_metadata(public)
+    assert "type: channel" in render_channel_metadata(public)
     assert "**Members**: 42" in render_channel_metadata(public)
     assert "**Topic**: T" in render_channel_metadata(public)
     assert "Private Channel" in render_channel_metadata(private)
@@ -183,7 +191,8 @@ def test_renderer_day_snapshot_renders_message_features() -> None:
         }),
     ]
     out = render_day_snapshot(ch, "2026-04-09", msgs)
-    assert "---\nchannel: general\ndate: 2026-04-09" in out
+    assert "---\nchannel: general\nchannel_id: C1\ndate: 2026-04-09" in out
+    assert "channel_id: C1" in render_day_feed(ch, "2026-04-09", msgs)
     assert "(edited" in out
     assert ":thumbsup: 3" in out
     assert "diagram.png" in out
@@ -203,6 +212,8 @@ def test_renderer_thread_snapshot_includes_parent_label_and_metadata() -> None:
     reply = Message.model_validate({"ts": "1700000050.000200", "user": "U2", "text": "reply"})
     out = render_thread_snapshot(Thread(parent=parent, replies=(reply,)), ch)
     assert "(parent)" in out
+    assert "channel_id: C1" in out
+    assert "channel_id: C1" in render_thread_feed(Thread(parent=parent, replies=(reply,)), ch)
     assert "reply_count: 1" in out
     assert 'thread_ts: "1700000000.000100"' in out
 
