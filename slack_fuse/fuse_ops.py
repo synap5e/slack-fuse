@@ -89,6 +89,26 @@ def _date_str(month: str, day: str) -> str:
     return f"{month}-{day}"
 
 
+def _is_valid_month(month: str) -> bool:
+    if len(month) != 7:
+        return False
+    try:
+        datetime.strptime(month, "%Y-%m")
+    except ValueError:
+        return False
+    return True
+
+
+def _is_valid_date_parts(month: str, day: str) -> bool:
+    if len(day) != 2:
+        return False
+    try:
+        date = datetime.strptime(_date_str(month, day), "%Y-%m-%d").date()
+    except ValueError:
+        return False
+    return date <= datetime.now().astimezone().date()
+
+
 class SlackFuseOps(pyfuse3.Operations):
     """Read-only FUSE operations for Slack."""
 
@@ -429,6 +449,31 @@ class SlackFuseOps(pyfuse3.Operations):
             return False
         return False
 
+    def _lookup_unlisted_child(self, child_path: str, inode: int) -> pyfuse3.EntryAttributes | None:
+        """Permit direct traversal into valid uncached date paths.
+
+        Normal readdir output stays cache-backed. This fallback is only for
+        path lookup, so a resolved permalink can walk to an uncached day and
+        let the day directory listing fetch/materialize its contents.
+        """
+        real_child, cached_only = self._strip_cached_prefix(child_path)
+        if cached_only:
+            return None
+        parts = self._parse_path(real_child)
+        if self._is_direct_conversation_date_dir(parts):
+            return _make_dir_attr(inode)
+        return None
+
+    def _is_direct_conversation_date_dir(self, parts: list[str]) -> bool:
+        if len(parts) not in (3, 4) or parts[0] not in _CONV_ROOTS:
+            return False
+        entry = self._store.get_channel_by_slug(parts[1])
+        if entry is None or self._store.conv_root_for(entry.channel.id) != parts[0]:
+            return False
+        if len(parts) == 3:
+            return _is_valid_month(parts[2])
+        return _is_valid_month(parts[2]) and _is_valid_date_parts(parts[2], parts[3])
+
     # === FUSE operations ===
 
     async def getattr(
@@ -479,7 +524,8 @@ class SlackFuseOps(pyfuse3.Operations):
                     is_dir = entry_is_dir
                     break
             if not found:
-                return None
+                inode = self._inodes.get_or_create(child_path)
+                return self._lookup_unlisted_child(child_path, inode)
 
             inode = self._inodes.get_or_create(child_path)
             real_child, _ = self._strip_cached_prefix(child_path)

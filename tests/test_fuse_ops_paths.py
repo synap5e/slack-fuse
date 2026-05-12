@@ -7,6 +7,7 @@ instance. We give it a real (stub-backed) SlackStore so type checking is happy.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Iterator
 
 import pytest
@@ -15,7 +16,8 @@ import trio
 from slack_fuse import disk_cache
 from slack_fuse.api import SlackClient
 from slack_fuse.fuse_ops import SlackFuseOps
-from slack_fuse.store import SlackStore
+from slack_fuse.models import Channel
+from slack_fuse.store import ChannelEntry, SlackStore
 from slack_fuse.user_cache import UserCache
 
 from .stubs import (
@@ -117,3 +119,19 @@ def test_list_dir_cached_only_root_strips_self(ops: SlackFuseOps) -> None:
     names = [name for name, _ in entries]
     assert ".cached-only" not in names
     assert "channels" in names
+
+
+def test_lookup_unlisted_valid_month_and_day_dirs(ops: SlackFuseOps) -> None:
+    channel = Channel.model_validate({"id": "C1", "name": "general", "is_member": True})
+    ops._store._channels["C1"] = ChannelEntry(channel=channel, slug="general")
+    ops._store._channel_list_time = time.monotonic()
+
+    month_inode = ops.inodes.get_or_create("/channels/general/2020-01")
+    day_inode = ops.inodes.get_or_create("/channels/general/2020-01/02")
+    invalid_inode = ops.inodes.get_or_create("/channels/general/2020-02/31")
+    cached_only_inode = ops.inodes.get_or_create("/.cached-only/channels/general/2020-01/02")
+
+    assert ops._lookup_unlisted_child("/channels/general/2020-01", month_inode) is not None
+    assert ops._lookup_unlisted_child("/channels/general/2020-01/02", day_inode) is not None
+    assert ops._lookup_unlisted_child("/channels/general/2020-02/31", invalid_inode) is None
+    assert ops._lookup_unlisted_child("/.cached-only/channels/general/2020-01/02", cached_only_inode) is None
