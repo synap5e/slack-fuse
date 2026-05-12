@@ -8,7 +8,7 @@ import logging
 import random
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -174,6 +174,30 @@ def _build_slug(channel: Channel, users: UserCache, slug_counts: dict[str, int])
     return base_slug if count == 0 else f"{base_slug}-{count + 1}"
 
 
+def _is_dormant_dm(
+    channel: Channel,
+    day_events: dict[tuple[str, str], list[DayEvent]],
+    thread_events: dict[tuple[str, str], list[ThreadEvent]],
+) -> bool:
+    """True if this is a DM that's been backfilled and has nothing in it.
+
+    Hides Slack's auto-created shells for users you've never actually
+    messaged (often duplicates of someone you DO talk to). A DM where
+    every cached day file is ``[]`` and backfill has run is genuinely
+    empty on Slack's side. In-memory events take precedence so a
+    just-arrived first message un-hides the DM until next refresh.
+    """
+    if not channel.is_im:
+        return False
+    if not disk_cache.is_backfilled(channel.id):
+        return False
+    if disk_cache.has_any_messages(channel.id):
+        return False
+    if any(cid == channel.id for cid, _ in day_events):
+        return False
+    return all(cid != channel.id for cid, _ in thread_events)
+
+
 class SlackStore:
     """Caching layer between Slack API and FUSE ops."""
 
@@ -229,11 +253,8 @@ class SlackStore:
         # Channel list
         cached_channels = disk_cache.get_channel_list()
         if cached_channels:
-            slug_counts: dict[str, int] = {}
-            for ch_data in cached_channels:
-                ch = Channel.model_validate(ch_data)
-                slug = _build_slug(ch, self._users, slug_counts)
-                self._channels[ch.id] = ChannelEntry(channel=ch, slug=slug)
+            channels = [Channel.model_validate(c) for c in cached_channels]
+            self._channels = self._build_channel_entries(channels)
             self._channel_list_time = time.monotonic()
             log.info("Loaded %d channels from disk cache", len(self._channels))
 
@@ -306,17 +327,33 @@ class SlackStore:
         channels = self._api_call(self._client.list_conversations)
         if channels is None:
             return
-        slug_counts: dict[str, int] = {}
-        new_entries: dict[str, ChannelEntry] = {}
-        for ch in channels:
-            slug = _build_slug(ch, self._users, slug_counts)
-            new_entries[ch.id] = ChannelEntry(channel=ch, slug=slug)
-        self._channels = new_entries
+        self._channels = self._build_channel_entries(channels)
         self._channel_list_time = now
-        disk_cache.put_channel_list(
-            [e.channel.model_dump(mode="json") for e in new_entries.values()],
-        )
-        log.info("Loaded %d channels", len(new_entries))
+        # Persist the full list (not the filtered set) — the filter is
+        # disk-state-dependent and we want to re-evaluate it on the next
+        # restart rather than freezing the current view.
+        disk_cache.put_channel_list([c.model_dump(mode="json") for c in channels])
+        log.info("Loaded %d channels (%d visible)", len(channels), len(self._channels))
+
+    def _build_channel_entries(
+        self,
+        channels: Iterable[Channel],
+    ) -> dict[str, ChannelEntry]:
+        """Assign slugs, dropping DMs that are backfilled-and-empty.
+
+        Filtering before slug-dedup lets a real DM reclaim a bare slug
+        (e.g. ``jacob-segal`` instead of ``jacob-segal-2``) when Slack
+        has multiple user accounts with the same display name and only
+        one is actively used.
+        """
+        slug_counts: dict[str, int] = {}
+        entries: dict[str, ChannelEntry] = {}
+        for ch in channels:
+            if _is_dormant_dm(ch, self._day_events, self._thread_events):
+                continue
+            slug = _build_slug(ch, self._users, slug_counts)
+            entries[ch.id] = ChannelEntry(channel=ch, slug=slug)
+        return entries
 
     def list_channels(self, *, kind: str = "channels") -> dict[str, ChannelEntry]:
         """Return channel_id -> ChannelEntry, filtered by kind.
@@ -493,13 +530,18 @@ class SlackStore:
         )
         _evict_lru(self._day_cache, _DAY_CACHE_CAP)
         self._invalidate_day_renders(channel_id, date_str)
-        self._known_dates.setdefault(channel_id, set()).add(date_str)
-        disk_cache.put_day_messages(
-            channel_id,
-            date_str,
-            [m.model_dump(mode="json") for m in messages],
-        )
-        disk_cache.put_known_dates(channel_id, self._known_dates[channel_id])
+        # Only persist if the API actually returned something. Persisting
+        # empty results pollutes known_dates: `get_known_dates` always
+        # injects "today", so every day a user opens a dormant DM
+        # accumulates one more phantom date that never goes away.
+        if messages:
+            self._known_dates.setdefault(channel_id, set()).add(date_str)
+            disk_cache.put_day_messages(
+                channel_id,
+                date_str,
+                [m.model_dump(mode="json") for m in messages],
+            )
+            disk_cache.put_known_dates(channel_id, self._known_dates[channel_id])
 
         # API response supersedes any buffered events for this key.
         self._day_events.pop(key, None)

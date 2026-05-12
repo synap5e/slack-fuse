@@ -125,3 +125,32 @@ def test_corrupt_files_return_none_instead_of_raising(
     fn_name, args = getter_args
     fn = getattr(disk_cache, fn_name)
     assert fn(*args) is None
+
+
+def test_has_any_messages_false_for_missing_dir() -> None:
+    assert disk_cache.has_any_messages("C-never-seen") is False
+
+
+def test_has_any_messages_false_when_all_files_empty(cache_dir: Path) -> None:
+    d = cache_dir / "messages" / "C1"
+    d.mkdir(parents=True)
+    (d / "2026-04-01.json").write_text("[]")
+    (d / "2026-04-02.json").write_text("[]")
+    assert disk_cache.has_any_messages("C1") is False
+
+
+def test_has_any_messages_true_when_one_file_has_content(cache_dir: Path) -> None:
+    d = cache_dir / "messages" / "C1"
+    d.mkdir(parents=True)
+    (d / "2026-04-01.json").write_text("[]")
+    msgs = [Message.model_validate({"ts": "1.0", "user": "U1"})]
+    disk_cache.put_day_messages("C1", "2026-04-02", [m.model_dump(mode="json") for m in msgs])
+    assert disk_cache.has_any_messages("C1") is True
+
+
+def test_is_backfilled_reads_marker(cache_dir: Path) -> None:
+    assert disk_cache.is_backfilled("C1") is False
+    backfill_dir = cache_dir / "backfill"
+    backfill_dir.mkdir(parents=True)
+    (backfill_dir / "C1.done").touch()
+    assert disk_cache.is_backfilled("C1") is True

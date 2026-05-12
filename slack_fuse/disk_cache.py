@@ -79,6 +79,30 @@ def put_day_messages(channel_id: str, date_str: str, messages: list[JsonObject])
     _atomic_write_text(d / f"{date_str}.json", json.dumps(messages))
 
 
+def has_any_messages(channel_id: str) -> bool:
+    """True if any cached day for this channel has at least one message.
+
+    Short-circuits on the first non-empty file. Used by the DM filter to
+    decide whether a channel is a real conversation or a dormant shell.
+    A 2-byte file (``[]``) doesn't count — those accumulate from empty
+    API responses for never-used DMs.
+    """
+    d = _CACHE_DIR / "messages" / channel_id
+    if not d.exists():
+        return False
+    return any(f.suffix == ".json" and f.stat().st_size > 2 for f in d.iterdir())
+
+
+def is_backfilled(channel_id: str) -> bool:
+    """True if the day-history backfill has completed for this channel.
+
+    Marker is written by ``backfill.py`` after a full pagination sweep.
+    Until it exists we don't know whether a channel is truly empty or
+    just unscanned.
+    """
+    return (_CACHE_DIR / "backfill" / f"{channel_id}.done").exists()
+
+
 # === Threads ===
 # Keyed by (channel_id, thread_ts). Old threads are effectively immutable.
 
