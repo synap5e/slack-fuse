@@ -8,11 +8,21 @@ from ._slug_helpers import (
     conv_root as _conv_root,
     find_channel as _find_channel,
     find_thread_slug as _find_thread_slug,
-    load_day_messages as _load_day_messages,
     ts_to_local_date as _ts_to_local_date,
 )
 from .api import SlackClient
 from .user_cache import UserCache
+
+
+class PermalinkResolutionError(LookupError):
+    """Raised when a permalink can't be mapped to a specific FUSE path.
+
+    Distinct from ``ValueError`` (unparseable URL): the URL parsed fine
+    but the target (a thread, typically) isn't reachable from current
+    cache state. Callers that care about thread-vs-channel distinctions
+    should treat this as a hard miss rather than silently accepting a
+    channel-level fallback.
+    """
 
 
 def parse_permalink(url: str) -> tuple[str, str | None, str | None]:
@@ -68,18 +78,25 @@ def resolve_permalink(
         return f"{mountpoint}/{root}/{channel_slug}"
 
     if thread_ts:
-        # Thread reply: directory is under the parent's date
+        # Thread reply: directory is under the parent's date. Use the
+        # thread_ts's date regardless of the reply's own ts — a reply
+        # sent on a later date still lives under the parent's day dir.
         month, day = _ts_to_local_date(thread_ts)
         date_str = f"{month}-{day}"
         slug = _find_thread_slug(channel_id, thread_ts, date_str, client, users)
         if slug:
             return f"{mountpoint}/{root}/{channel_slug}/{month}/{day}/{slug}/thread.md"
-        # Thread slug not resolvable, fall through to channel.md for the right date.
-        # If we only have thread_ts (no message_ts), use the thread's date.
-        if message_ts is not None:
-            month, day = _ts_to_local_date(message_ts)
-        _load_day_messages(channel_id, f"{month}-{day}", client)
-        return f"{mountpoint}/{root}/{channel_slug}/{month}/{day}/channel.md"
+        # The URL explicitly named a thread (?thread_ts=...) but our
+        # cached view of the parent's day doesn't show it as a thread
+        # parent. Most likely the day cache is stale (replies arrived
+        # after first fetch). Surface the miss instead of silently
+        # returning the day's channel.md — the caller asked for a
+        # specific thread and a channel-level fallback hides the bug.
+        msg = (
+            f"thread {thread_ts} not found in {channel_slug} on {date_str}; "
+            f"cached parent may be stale"
+        )
+        raise PermalinkResolutionError(msg)
 
     # message_ts is set, thread_ts is None: check if message is itself a thread parent
     assert message_ts is not None  # narrowed by the channel-only check above

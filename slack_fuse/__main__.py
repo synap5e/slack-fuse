@@ -152,7 +152,7 @@ def cmd_resolve(args: argparse.Namespace) -> None:
     """Resolve a Slack permalink to a FUSE path."""
     from .api import SlackAPIError, SlackClient
     from .auth import load_tokens
-    from .resolve import resolve_permalink
+    from .resolve import PermalinkResolutionError, resolve_permalink
     from .user_cache import UserCache
 
     mountpoint = os.path.expanduser(args.mountpoint)
@@ -163,6 +163,9 @@ def cmd_resolve(args: argparse.Namespace) -> None:
     try:
         path = resolve_permalink(args.url, mountpoint, client, users)
         print(path)
+    except PermalinkResolutionError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(2)
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)

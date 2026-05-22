@@ -155,6 +155,98 @@ def test_resolve_caches_api_fetched_day(monkeypatch: pytest.MonkeyPatch) -> None
     assert known_date_writes["C1"] == {date_str}
 
 
+def test_resolve_thread_reply_uses_parent_date_not_reply_date(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bug 1: a thread reply URL with a thread_ts on a different day must
+    land under the parent's date, not the reply's date.
+
+    Reply ts 1777968798.279369 = May 5 UTC
+    Parent ts 1777491885.581959 = Apr 29 UTC
+    Resolver was overriding month/day with the reply's date in the
+    fallback path; with the parent on disk it should now land in the
+    parent's day's thread dir.
+    """
+    channel = Channel.model_validate({"id": "C1", "name": "general", "is_member": True})
+    parent_ts = "1777491885.581959"
+    reply_ts = "1777968798.279369"
+    parent = Message(
+        ts=parent_ts,
+        user="U1",
+        text="Bug under discussion",
+        thread_ts=parent_ts,
+        reply_count=1,
+    )
+
+    parent_month, parent_day = resolve._ts_to_local_date(parent_ts)
+    parent_date_str = f"{parent_month}-{parent_day}"
+
+    def cached_channel_list() -> list[JsonObject]:
+        return [cast("JsonObject", channel.model_dump(mode="json"))]
+
+    def cached_day_messages(channel_id: str, date_str: str) -> list[JsonObject] | None:
+        if channel_id == "C1" and date_str == parent_date_str:
+            return [cast("JsonObject", parent.model_dump(mode="json"))]
+        return None
+
+    monkeypatch.setattr(UserCache, "_load_from_disk", stub_load_from_disk)
+    monkeypatch.setattr(_slug_helpers, "get_channel_list", cached_channel_list)
+    monkeypatch.setattr(_slug_helpers, "get_day_messages", cached_day_messages)
+
+    client = SlackClient(token="xoxp-fake")
+    users = UserCache(client.http)
+
+    try:
+        path = resolve.resolve_permalink(
+            f"https://workspace.slack.com/archives/C1/p{reply_ts.replace('.', '')}"
+            f"?thread_ts={parent_ts}&cid=C1",
+            "/mnt/slack",
+            client,
+            users,
+        )
+    finally:
+        client.close()
+
+    assert path == f"/mnt/slack/channels/general/{parent_month}/{parent_day}/bug-under-discussion/thread.md"
+
+
+def test_resolve_thread_url_raises_when_slug_unresolvable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bug 2: a URL that explicitly names a thread must not silently
+    fall back to channel.md. The caller asked for a thread, so a miss
+    is a hard error so they can react (refresh, retry, surface to user)."""
+    channel = Channel.model_validate({"id": "C1", "name": "general", "is_member": True})
+
+    # No replies in the cached parent message → slug map won't see it as a thread.
+    parent_ts = "1777491885.581959"
+    plain_parent = Message(ts=parent_ts, user="U1", text="No replies yet")
+
+    def cached_channel_list() -> list[JsonObject]:
+        return [cast("JsonObject", channel.model_dump(mode="json"))]
+
+    def cached_day_messages(_channel_id: str, _date_str: str) -> list[JsonObject] | None:
+        return [cast("JsonObject", plain_parent.model_dump(mode="json"))]
+
+    monkeypatch.setattr(UserCache, "_load_from_disk", stub_load_from_disk)
+    monkeypatch.setattr(_slug_helpers, "get_channel_list", cached_channel_list)
+    monkeypatch.setattr(_slug_helpers, "get_day_messages", cached_day_messages)
+
+    client = SlackClient(token="xoxp-fake")
+    users = UserCache(client.http)
+
+    try:
+        with pytest.raises(resolve.PermalinkResolutionError, match=parent_ts):
+            _ = resolve.resolve_permalink(
+                f"https://workspace.slack.com/archives/C1/p1777968798279369?thread_ts={parent_ts}&cid=C1",
+                "/mnt/slack",
+                client,
+                users,
+            )
+    finally:
+        client.close()
+
+
 def test_resolve_channel_only_url_returns_channel_dir(monkeypatch: pytest.MonkeyPatch) -> None:
     """Channel-only URLs (no /p<ts>) resolve to the channel directory."""
     channel = Channel.model_validate({"id": "C1", "name": "general", "is_member": True})
