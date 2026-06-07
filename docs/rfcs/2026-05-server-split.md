@@ -1983,33 +1983,11 @@ here as a record:
 | Cross-stream race: message arrives before `user_added` | `user_added` (not just `user_renamed`) triggers `chunk_mentions` invalidation lookup. Mentions are recorded in `chunk_mentions` at chunk-write time even when resolution falls back to a UID literal, so the late-arriving `user_added` can find them. (Resolved 2026-06-07 after external review.) |
 | `trailer_decisions` table write amplification | Replaced with a JSONL log file (`~/.local/state/slack-fuse/trailer-decisions.jsonl`). Same data, zero DB write pressure on FUSE reads. (Resolved 2026-06-07 after external review.) |
 | Custom paginated snapshot frames on WS | Removed. Snapshots delivered via HTTP `/streams/<id>/snapshot?at=<offset>` with JSONL response, gzip-encoded. (Resolved 2026-06-07 after external review.) |
+| Snapshot cadence per stream-kind | **Default chosen**: every 5000 events or every 24 h per stream, whichever first; per-stream-kind override available in config. First-party instrumentation (`snapshots.payload_bytes`, `snapshots.events_covered`, `snapshots.generation_duration_ms`, `snapshot_uses` table) ships in v1 so tuning is data-driven if the default proves wrong |
+| Connection-state granularity (one row vs per-stream) | **Default chosen**: one row. Per-stream granularity is more accurate but requires `connection_state` per stream. The trailer-decisions JSONL log ships in v1 capturing per-decision context so false-positive rate is measurable. Revisit when data shows the punt was wrong |
+| Backfill abort threshold default | **Default chosen**: 20,000 messages, configurable via `BACKFILL_ABORT_AT`. The `slack-fuse-server backfill <channel> --allow-large` override handles legitimate outliers. Re-tune the default after profiling against a real workspace's message-count distribution |
 
-Still open:
-
-1. **Snapshot cadence trade-offs.** "Every 5000 events or daily" is a
-   starting point. Whether `users` and `channel-list` need their own
-   cadences (these streams are slow-moving; daily is enough) vs busy
-   `channel:<id>` streams (which might want more frequent snapshots to
-   limit catch-up replay) isn't measured. Land the defaults; tune
-   after observing real cadence. **First-party instrumentation**
-   (`snapshots.payload_bytes`, `snapshots.events_covered`,
-   `snapshots.generation_duration_ms`, `snapshot_uses` table) ships
-   in v1 so the tuning decision is data-driven when we get there.
-
-2. **Connection-state granularity.** The trailer is a single
-   per-process state ("server reachable, slurper healthy, all
-   streams caught up"). If a single specific stream is far behind but
-   everything else is current, do we mark only that stream's files
-   stale? Per-stream granularity is more accurate but requires
-   `connection_state` per stream; v1 uses one row. **Reversible
-   punt**: the trailer-decisions JSONL log ships in v1 capturing
-   per-decision context, so the false-positive rate is measurable.
-   Revisit when the data shows the punt was wrong.
-
-3. **Backfill abort threshold default.** 20,000 messages is a guess.
-   It may be too low for some legitimate channels (#engineering with
-   years of activity). Pick after profiling a real workspace; the
-   override mechanism handles outliers.
+All v1 decisions resolved. No blocking questions remain.
 
 ## Alternatives considered
 
