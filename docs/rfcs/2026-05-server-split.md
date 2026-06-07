@@ -3,7 +3,7 @@
 **Status**: Draft
 **Author**: Simon Pinfold
 **Date**: 2026-05-25
-**Last revised**: 2026-05-26
+**Last revised**: 2026-06-07
 
 ## Summary
 
@@ -287,8 +287,8 @@ catchup_window_s = 10.0
 ```
 
 Every magic number in the RFC body that names a default (snapshot
-cadence, backfill thresholds, heartbeat intervals, paginated-snapshot
-size cap, etc.) corresponds to a config key here. The body keeps the
+cadence, backfill thresholds, heartbeat intervals, per-stream queue
+size, etc.) corresponds to a config key here. The body keeps the
 numbers as docs-of-defaults; the config keys are the authoritative
 overrides.
 
@@ -337,16 +337,15 @@ channel, but at the cost of much more protocol surface area. Defer.
   "since": 184523   // last applied offset; 0 = from beginning
 }
 
-// Server → client: catch-up snapshot. Used when `since` is too far
-// behind for cheap replay. The payload is a full materialization of
-// stream state at offset `at`. After sending, the server streams
-// events with offset > at. For streams whose snapshot exceeds the
-// configured single-frame size cap, see "Paginated snapshots" below.
+// Server → client: catch-up redirect. Used when `since` is too far
+// behind for cheap replay. Tells the client to fetch the snapshot
+// over HTTP, apply it, then resume the WS subscription from `at + 1`.
+// See *Snapshot delivery via HTTP* below.
 {
-  "type": "snapshot",
+  "type": "snapshot_at",
   "stream": "channel:C0AKQ5DS0FQ",
   "at": 184500,
-  "payload": { /* opaque, stream-kind-specific */ }
+  "url": "/streams/channel%3AC0AKQ5DS0FQ/snapshot?at=184500"
 }
 
 // Server → client: an individual event. Always strictly increasing
@@ -397,9 +396,12 @@ When the server receives `subscribe { stream, since }`:
 2. **`since` > current head** → emit `error { code: since_too_high,
    head_offset }`. Indicates client state is corrupt; client should reset
    the cursor and resubscribe with `since: 0`.
-3. **`since` very old, snapshot covers `M ≥ since`** → emit `snapshot`
-   frame at offset `M`, then stream events `(M, head]`, then emit
-   `caught_up { head_offset: head }`.
+3. **`since` very old, snapshot covers `M ≥ since`** → emit
+   `snapshot_at { at: M, url }` redirect. Client fetches the snapshot
+   over HTTP (see *Snapshot delivery via HTTP*), applies as one
+   transaction, advances cursor to `M`, then resumes the WS
+   subscription with `since: M`. The server then sends events
+   `(M, head]` and `caught_up`.
 4. **`since` recent enough to replay** → stream events `(since, head]`,
    then emit `caught_up`.
 5. **`since` equal to head** → emit `caught_up` immediately. No
@@ -408,31 +410,33 @@ When the server receives `subscribe { stream, since }`:
    frames in real time.
 
 The `caught_up` frame is informational — the projector applies every
-event the same way (per-event sync apply, see *Flow control*). The
-trailer logic uses the frame to clear the "catching up after
-reconnect" degradation reason for the stream.
+event the same way. The trailer logic uses the frame to clear the
+"catching up after reconnect" degradation reason for the stream.
 
-### Paginated snapshots
+### Snapshot delivery via HTTP
 
-For streams whose snapshot at offset `M` exceeds 4 MB (a conservative
-WS-frame cap), the server emits a sequence:
+Snapshots are not delivered over the WebSocket. Multi-megabyte
+snapshot payloads multiplexed onto the WS would block live event
+delivery for every other subscribed stream — application-level
+fragmentation reinvents HTTP chunked transfer for no benefit.
 
-```jsonc
-{ "type": "snapshot_begin", "stream": "...", "at": 184500, "total_parts": 7 }
-{ "type": "snapshot_part",  "stream": "...", "at": 184500, "part": 1, "payload": { ... } }
-// ... part 2..6 ...
-{ "type": "snapshot_end",   "stream": "...", "at": 184500 }
-```
+Instead:
 
-The client buffers parts in memory, applies them as one transaction on
-`snapshot_end`, then expects events `> at`. Paginated and unpaginated
-snapshots are interchangeable from the client's POV after assembly.
+- The server exposes `GET /streams/<url-encoded-stream-id>/snapshot?at=<offset>` on the existing HTTP surface.
+- Response is **JSONL** (one current-state record per line, streamable). Standard `Content-Encoding: gzip` for compression.
+- The client streams the JSONL response into one postgres transaction (BEGIN, apply rows, COMMIT). Memory use is bounded by buffer size, not snapshot size.
+- The server emits the `snapshot_at` redirect frame on the WS when it determines a snapshot is needed; the client fetches it over a fresh HTTP connection while the WS stays open for other streams' live events.
 
-Snapshot payload format (for `channel:<id>`) is a flat list of the
-current state of every undeleted top-level message + their thread
-replies. Generation strategy: full-state rebuilds, taken on a cadence
-of every 5000 events per stream or daily, whichever comes first.
-Delta snapshots are deferred.
+Snapshot generation cadence (server): full-state rebuilds, every 5000
+events per stream or every 24 h, whichever first. Per-stream
+overrideable in config. Delta snapshots are deferred.
+
+Snapshot payload format (for `channel:<id>`) is the current state of
+every undeleted top-level message + their thread replies, one JSONL
+record per item. Format matches what the projector would have
+received as a sequence of `message` events — same shape, so the
+snapshot-apply path is "apply each line as if it were a `message`
+event," sharing the projection code with the live-event path.
 
 ### Ordering guarantees
 
@@ -450,47 +454,103 @@ Delta snapshots are deferred.
 
 ### Flow control
 
-**There is no application-level flow control.** TCP backpressure does
-the job, and the projector contract makes it work.
+The naive shape — "read a frame, apply it in one TX, read the next" —
+sounds robust but has a head-of-line blocking failure: every
+subscribed stream shares one WS connection over one TCP socket. If
+the projector is slow applying an event from stream A (DB contention,
+slow disk, big batch from catch-up), it stops reading the WS; TCP
+backpressure halts the entire connection; live events for healthy
+streams B, C, D queue behind A. The throughput-control story works,
+the fairness-across-streams story doesn't.
 
-The projector applies each event synchronously: receive an `event`
-frame, run one postgres transaction (chunk write + `chunk_mentions`
-update + `cursors.applied_offset` advance), THEN read the next WS
-frame. No in-memory event queue beyond what the OS socket buffer
-holds.
+v1 solves this with **per-stream queues and parallel applier tasks**.
 
-When the projector is slow (DB write contention, renderer CPU,
-postgres on a slow disk), the WS receive halts; the kernel's receive
-window shrinks; the server's WS send blocks. The server learns the
-client can't keep up because its send buffer is full. No protocol
-frames need to carry this information — the layers underneath already
-do.
+#### The shape
 
-This means the system **cannot reach a "client is silently lagging"
-state**. Either:
+```
+                            ┌─────────────────────────────┐
+                            │  WS receiver task           │
+                            │  reads frames as fast as    │
+                            │  TCP delivers, dispatches   │
+                            │  by stream-id               │
+                            └────┬────────────┬────────────┘
+                                 │            │
+                  ┌──────────────┘            └─────────────────┐
+                  │                                             │
+        ┌─────────▼────────┐                          ┌─────────▼────────┐
+        │ in-memory queue  │                          │ in-memory queue  │
+        │ stream A         │                          │ stream B         │
+        │ (bounded, ~256)  │                          │ (bounded, ~256)  │
+        └─────────┬────────┘                          └─────────┬────────┘
+                  │                                             │
+        ┌─────────▼────────┐                          ┌─────────▼────────┐
+        │ applier task A   │                          │ applier task B   │
+        │ one event = one  │                          │ one event = one  │
+        │ postgres TX      │                          │ postgres TX      │
+        └──────────────────┘                          └──────────────────┘
+```
 
-- The projector applies at its sustainable rate and the slurper is
-  implicitly throttled to that, or
-- The connection drops and the trailer fires for the actual reason
-  (socket closed), or
-- The initial catch-up never completes because the projector is
-  catastrophically slow (e.g. disk failure) — in which case the
-  trailer fires with `catching up after reconnect` and the user goes
-  to investigate the actual problem.
+- One `trio.Task` per active stream subscription, each owning a
+  bounded `MemorySendChannel` / `MemoryReceiveChannel` pair (cap
+  ~256 events).
+- The WS receiver task does no DB work — it routes frames into the
+  right per-stream channel.
+- Each applier task pulls from its channel and applies each event
+  synchronously to postgres (one TX per event). Different streams
+  apply concurrently — postgres handles disjoint-PK writes cheaply.
 
-**Bulk catch-up via snapshots.** A snapshot frame applies as one
-postgres transaction (paginated snapshots buffer the parts and apply
-on `snapshot_end`). This means catch-up speed is bounded by DB write
-throughput for *one big write*, not per-event. The per-event sync
-apply only governs the post-snapshot tail.
+#### What this gives us
 
-**Idempotent re-apply.** Every chunk write is `INSERT … ON CONFLICT
-DO UPDATE`. Every event's effect on the projection is deterministic
-from `(offset, payload)`. If a connection drops mid-apply, the next
-subscribe re-sends from `cursors.applied_offset` and the projector
-re-applies the partial batch harmlessly. There is no protocol-level
-"please ack" frame needed because the worst case of re-delivery is a
-no-op.
+- **No cross-stream HoL blocking.** Stream A being slow (DB
+  contention, catch-up batch) does NOT delay stream B's live events.
+  B's applier task drains its own channel at its own rate.
+- **Per-stream backpressure via bounded queues.** If stream A's
+  applier can't keep up and its queue fills, the WS receiver blocks
+  on `send`. This narrows the backpressure to stream A —
+  specifically, it prevents the WS receiver from routing more
+  events to A — but, crucially, **doesn't stop reading from the
+  socket**. The receiver keeps draining the socket and routing to
+  other streams. (Implementation: the WS receive loop uses
+  `send_nowait` with a "drop oldest in queue + log" or "block on
+  send only for this stream" policy. Trio's
+  `MemorySendChannel.send` blocks just the calling task; the
+  receiver-per-frame model means just A's routing pauses, not
+  receive.)
+- **Slow-stream visibility.** Queue depth per stream is exposed via
+  `/metrics`. A persistently-full queue means that stream's applier
+  is the bottleneck — an operator-visible signal without a
+  protocol-level lag-detection mechanism.
+
+#### What about silent lag?
+
+The "client is silently lagging" risk that the original per-event
+sync apply design eliminated re-emerges in a narrower form: a
+stream's applier might be steadily behind its queue, with the WS
+receiver continuously routing events to it. This is now
+**observable** (queue depth → /metrics → trailer logic) rather than
+detectable-only-by-monitoring-protocol.
+
+The trailer logic's third condition (initial-catch-up incomplete)
+extends to: "this stream's applied_offset is more than N events
+behind its observed head_offset" — where head_offset is the latest
+offset the WS receiver has routed to this stream's queue. Local
+state; no protocol frames needed.
+
+#### Bulk catch-up
+
+Snapshots are delivered over HTTP (see *Snapshot delivery via HTTP*),
+not through the WS queues. The snapshot fetch and apply runs in a
+separate task per stream; it advances the cursor to the snapshot's
+offset and the live applier task resumes from there.
+
+#### Idempotent re-apply
+
+Every chunk write is `INSERT … ON CONFLICT DO UPDATE`. Every event's
+effect on the projection is deterministic from `(offset, payload)`.
+If a connection drops mid-apply, the next subscribe re-sends from
+`cursors.applied_offset` and the applier re-runs the partial batch
+harmlessly. No protocol-level "please ack" frame needed because the
+worst case of re-delivery is a no-op.
 
 ### Slurper health stream
 
@@ -716,30 +776,37 @@ so contention is theoretical, but the pattern survives parallelisation
 ### Client: projections store
 
 ```sql
--- One pre-rendered markdown block per top-level message in a day.
--- Composing channel.md = ORDER BY message_ts and concat content_md.
+-- One pre-rendered markdown block per top-level message.
+-- Composing channel.md = SELECT WHERE channel_id = ? AND message_ts
+-- in [start, end), ORDER BY message_ts. No local-tz date column;
+-- the FUSE layer derives date folders at read time from message_ts +
+-- the process's local timezone, so the same events project to the
+-- same chunks on every device regardless of tz. PK supports
+-- thread-reply parent lookup by (channel_id, message_ts) directly.
 CREATE TABLE chunks (
     channel_id TEXT NOT NULL,
-    date TEXT NOT NULL,                -- 'YYYY-MM-DD' local-tz date
-    message_ts TEXT NOT NULL,          -- Slack ts
-    content_md TEXT NOT NULL,          -- output of render_message(...)
+    message_ts NUMERIC(20, 6) NOT NULL,   -- Slack ts as UTC epoch
+    content_md TEXT NOT NULL,             -- output of render_message_structural(...)
     reply_count INT NOT NULL DEFAULT 0,
-    accessed_at TIMESTAMPTZ,           -- unused in v1; v2 LRU eviction
-    PRIMARY KEY (channel_id, date, message_ts)
+    accessed_at TIMESTAMPTZ,              -- unused in v1; v2 LRU eviction
+    PRIMARY KEY (channel_id, message_ts)
 );
-CREATE INDEX chunks_lookup_idx ON chunks (channel_id, date, message_ts);
+-- PK index covers: per-day reads (range scan on message_ts), full-channel
+-- iteration, and thread-reply parent lookup (`WHERE channel_id = ?
+-- AND message_ts = $thread_ts`). No additional index needed.
 
 -- One pre-rendered block per message in a thread (parent + replies).
 CREATE TABLE thread_chunks (
     channel_id TEXT NOT NULL,
-    thread_ts TEXT NOT NULL,
-    reply_ts TEXT NOT NULL,            -- equals thread_ts for the parent row
+    thread_ts NUMERIC(20, 6) NOT NULL,
+    reply_ts NUMERIC(20, 6) NOT NULL,     -- equals thread_ts for parent
     role TEXT NOT NULL CHECK (role IN ('parent', 'reply')),
     content_md TEXT NOT NULL,
     accessed_at TIMESTAMPTZ,
     PRIMARY KEY (channel_id, thread_ts, reply_ts)
 );
-CREATE INDEX thread_chunks_lookup_idx ON thread_chunks (channel_id, thread_ts, reply_ts);
+-- PK supports per-thread read (`WHERE channel_id = ? AND thread_ts = ?
+-- ORDER BY reply_ts`). No additional index needed.
 
 -- Mirrored channel inventory + per-client tier preferences.
 CREATE TABLE channels (
@@ -776,18 +843,20 @@ CREATE TABLE cursors (
 );
 
 -- Side table: which user/channel IDs are mentioned inside which
--- chunks. Lets a `user_renamed` or `channel_renamed` event invalidate
--- the affected inodes in O(N) instead of `WHERE content_md LIKE …`
--- over the whole chunks table. Populated as chunks are written.
+-- chunks. Lets `user_added` / `user_renamed` / `channel_renamed`
+-- events invalidate the affected inodes in O(N) instead of
+-- `WHERE content_md LIKE …` over the whole chunks table. Populated
+-- as chunks are written, even when the mention falls back to a UID
+-- literal at read time (so a later `user_added` for that UID can
+-- still find and invalidate it — see cross-stream race below).
 CREATE TABLE chunk_mentions (
     channel_id TEXT NOT NULL,
-    date TEXT NOT NULL,
-    message_ts TEXT NOT NULL,
+    message_ts NUMERIC(20, 6) NOT NULL,
     mention_kind TEXT NOT NULL CHECK (mention_kind IN ('user', 'channel')),
     mentioned_id TEXT NOT NULL,
-    PRIMARY KEY (channel_id, date, message_ts, mention_kind, mentioned_id),
-    FOREIGN KEY (channel_id, date, message_ts)
-        REFERENCES chunks (channel_id, date, message_ts)
+    PRIMARY KEY (channel_id, message_ts, mention_kind, mentioned_id),
+    FOREIGN KEY (channel_id, message_ts)
+        REFERENCES chunks (channel_id, message_ts)
         ON DELETE CASCADE
 );
 CREATE INDEX chunk_mentions_lookup_idx
@@ -795,8 +864,8 @@ CREATE INDEX chunk_mentions_lookup_idx
 
 CREATE TABLE thread_chunk_mentions (
     channel_id TEXT NOT NULL,
-    thread_ts TEXT NOT NULL,
-    reply_ts TEXT NOT NULL,
+    thread_ts NUMERIC(20, 6) NOT NULL,
+    reply_ts NUMERIC(20, 6) NOT NULL,
     mention_kind TEXT NOT NULL CHECK (mention_kind IN ('user', 'channel')),
     mentioned_id TEXT NOT NULL,
     PRIMARY KEY (channel_id, thread_ts, reply_ts, mention_kind, mentioned_id),
@@ -839,27 +908,30 @@ CREATE TABLE stream_caught_up (
     at_offset BIGINT NOT NULL
 );
 
--- Log of every trailer-append-or-suppress decision. Lets us measure
--- the false-positive rate of the single-row `connection_state`
--- granularity, so the still-open "connection-state granularity"
--- question is data-driven when we revisit. Rotate weekly to bound
--- disk.
-CREATE TABLE trailer_decisions (
-    decided_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    inode BIGINT NOT NULL,
-    stream TEXT NOT NULL,
-    decision TEXT NOT NULL CHECK (decision IN ('appended', 'suppressed')),
-    reason TEXT,
-    connection_state_last_frame_at TIMESTAMPTZ,
-    connection_state_last_health TEXT,
-    stream_applied_offset BIGINT,
-    -- v1 doesn't know the server's current head per stream; NULL here
-    -- until we add per-stream head tracking. The column is here so
-    -- post-hoc analysis can backfill it from server logs if needed.
-    stream_head_offset_at_decision BIGINT
-);
-CREATE INDEX trailer_decisions_time_idx ON trailer_decisions (decided_at);
 ```
+
+**Trailer-decision telemetry lives in a log file, not a DB table.**
+Initially this RFC proposed a `trailer_decisions` row per FUSE read.
+That's a write-amplification bomb: `find` and `rg` issue thousands of
+reads per second, and per-read INSERTs serialize against the
+projector's chunk writes. Bad.
+
+Instead, the FUSE read layer appends one JSON line per decision to
+`~/.local/state/slack-fuse/trailer-decisions.jsonl`:
+
+```jsonc
+{"decided_at": "2026-06-07T16:42:11Z", "inode": 4711, "stream": "channel:C0A...",
+ "decision": "appended", "reason": "server_unreachable",
+ "connection_state_last_frame_at": "2026-06-07T13:00:00Z",
+ "connection_state_last_health": "disconnected",
+ "stream_applied_offset": 184523, "stream_head_offset_at_decision": null}
+```
+
+OS handles the buffering; append-only; logrotate-compatible. Read-time
+work is one `write(fd, line, n)` (or, if we want to be even cheaper, a
+sampled counter in memory dumped on a schedule). Same data as the
+table would have held; same retroactive analyses; zero DB write
+pressure on the FUSE read path.
 
 ### Notes on schema design
 
@@ -877,10 +949,23 @@ CREATE INDEX trailer_decisions_time_idx ON trailer_decisions (decided_at);
 - **`accessed_at` exists from day one** on `chunks` and `thread_chunks`.
   Unused in v1 (no eviction). The v2 LRU sweeper has the column waiting.
 
-- **Date strings, not dates.** `chunks.date` is `TEXT` because all the
-  ts→date conversion is already in local-tz and stored as
-  `'YYYY-MM-DD'`. PG `DATE` would force timezone reasoning at boundary
-  layers. Keep it pure-string.
+- **No stored date column on chunks.** `message_ts` is the only time
+  field, stored as `NUMERIC(20, 6)` (Slack ts = UTC epoch seconds with
+  microsecond fraction). All date-folder structure is derived at
+  FUSE-read time from the process's local timezone (see *FUSE read
+  path*). Storing a `date TEXT` would lock projections to the
+  timezone of the projector at write time, diverging the date-folder
+  layout across machines in different timezones. Cross-device
+  coherence requires deriving local dates from a single canonical UTC
+  representation — which is what we now do.
+
+- **Timezone changes require a service restart.** The FUSE process
+  caches the local TZ at startup (Python's `time.tzset` semantics).
+  If you change the system timezone while slack-fuse is running, the
+  date folders shown will reflect the old TZ until you restart.
+  Local projections don't need to be flushed — the chunks are
+  TZ-neutral; only the date-folder *view* changes — but the process
+  has to re-read the TZ.
 
 ## Projection logic (event → chunk operations)
 
@@ -904,7 +989,7 @@ separate top-level-vs-reply event kinds:
 | `channel_archived` | `UPDATE channels SET tier = 'blocked'` if `tier_source = 'auto'` |
 | `channel_unarchived` | `UPDATE channels` to re-evaluate default tier if `tier_source = 'auto'` |
 | `channel_member_changed` | `UPDATE channels`; re-evaluate default tier if `tier_source = 'auto'` |
-| `user_added` / `user_renamed` / `user_profile_changed` | `UPSERT INTO users`. For `user_renamed`: query `chunk_mentions` + `thread_chunk_mentions` with `mention_kind = 'user' AND mentioned_id = $uid` for affected `(channel_id, date, message_ts)` / `(channel_id, thread_ts, reply_ts)` tuples; `invalidate_inode` on each affected file. **No chunk rewrites required** — chunks store unresolved `<@U…>` placeholders, the next read picks up the new display name from `users`. Same pattern for `channel_renamed` with `mention_kind = 'channel'`. |
+| `user_added` / `user_renamed` / `user_profile_changed` | `UPSERT INTO users`. **All three** trigger the invalidation pass: query `chunk_mentions` + `thread_chunk_mentions` with `mention_kind = 'user' AND mentioned_id = $uid` for affected tuples; `invalidate_inode` on each affected file. `user_added` is critical because of the cross-stream race: a `message` event on a `channel:<id>` stream can arrive (and be projected, and read by FUSE) BEFORE the `user_added` event for a mentioned UID arrives on the `users` stream. The chunk stores the `<@U…>` placeholder either way; the first read renders with the UID-literal fallback and primes the kernel cache; without `user_added` invalidation, the literal would persist forever. Same pattern for `channel_added` / `channel_renamed` with `mention_kind = 'channel'`. **No chunk rewrites required** — chunks store unresolved placeholders, the next read picks up the new display name from `users`/`channels`. |
 
 Common case: top-level message arrives. One `INSERT` into `chunks`. Done.
 
@@ -916,30 +1001,61 @@ future "rebuild chunks for affected user" command can do the
 
 ## FUSE read path
 
-A read of `channels/<slug>/<YYYY-MM>/<DD>/channel.md` does:
+### Day file: `channels/<slug>/<YYYY-MM>/<DD>/channel.md`
 
 1. Resolve `slug → channel_id` via `channels` table.
-2. `SELECT content_md FROM chunks WHERE channel_id = ? AND date = ? ORDER BY message_ts`.
-3. Compose structural body: `'\n'.join(rows)`.
-4. Run `resolve_mentions(body, users_resolver, channels_resolver)`.
-5. Prepend frontmatter and append the optional staleness trailer
-   (see *Offline behaviour* below).
-6. Return bytes.
-7. (Hot only) `pyfuse3.notify_store(inode, 0, bytes)` so subsequent
-   reads come from the kernel page cache.
+2. Compute the local-tz UTC range for the requested local date:
+   `start_utc = local_midnight(date).utc_timestamp()`,
+   `end_utc = start_utc + 86400`.
+3. `SELECT content_md FROM chunks WHERE channel_id = ? AND message_ts >= ? AND message_ts < ? ORDER BY message_ts`. Range scan on PK.
+4. Compose structural body: `'\n'.join(rows)`.
+5. Run `resolve_mentions(body, users_resolver, channels_resolver)`.
+6. Prepend frontmatter (computed from `channels` row + the local date).
+7. Check staleness (see *Offline behaviour*). If degraded, append the
+   trailer.
+8. Return bytes.
+9. (Hot tier AND no trailer was appended): `pyfuse3.notify_store(inode, 0, bytes)` so subsequent reads come from the kernel page cache. Trailer-bearing bytes are **never** kernel-cached (see *Trailer / kernel-cache invariant* below).
 
-The structural renderer runs at **event-application** time, not at
-read time. The mention-resolution step is the only string work at read
-time and runs in microseconds per file. Frontmatter and concat live in
-the FUSE read path because they're cheap and stream-local.
+### Day-folder listing: `channels/<slug>/<YYYY-MM>/`
 
-Thread reads are symmetric: `SELECT content_md FROM thread_chunks WHERE
-channel_id = ? AND thread_ts = ? ORDER BY reply_ts`, then resolve
-mentions, prepend thread frontmatter, append staleness trailer.
+`SELECT DISTINCT date(to_timestamp(message_ts) AT TIME ZONE $local_tz)
+FROM chunks WHERE channel_id = ? AND message_ts >= ? AND message_ts < ?`
+with month-range bounds. Returns the days that have content. Same
+range-scan on the PK; the `AT TIME ZONE` cast is per-row but covers
+only the rows the bound has already selected, so it's cheap.
 
-Feed-style files (`feed.md`) are out of v1 scope. They're rarely read
-and the chunk-store model handles them awkwardly because feed is
-append-only while channel.md is in-place. Defer.
+### Thread file: `…/<thread-slug>/thread.md`
+
+`SELECT content_md FROM thread_chunks WHERE channel_id = ? AND
+thread_ts = ? ORDER BY reply_ts`, then mention-resolve, prepend
+thread frontmatter, apply trailer rules.
+
+### Trailer / kernel-cache invariant
+
+If a trailer was appended to the bytes being returned, the read path
+must NOT call `notify_store`. Otherwise the kernel page cache holds a
+trailer-bearing version that survives until something else triggers
+`invalidate_inode` — and for a quiet channel that next chunk-mutating
+event might never come, so the user reads "⚠ stale" forever.
+
+Belt-and-suspenders: on every transition of `connection_state` (any
+field) and on every `stream_caught_up` insert, the projector calls
+`invalidate_inode` for every inode it has ever primed via
+`notify_store`. The set of primed inodes is tracked in a small
+in-memory hash table on the FUSE/projector process; it's bounded by
+the hot-tier file count.
+
+### Renderer placement
+
+The structural renderer (`render_message_structural`) runs at
+**event-application** time, not at read time. The mention-resolution
+step is the only string work at read time — microseconds per file.
+Frontmatter, concat, and trailer-decision are cheap and stream-local.
+
+### Feed files
+
+`feed.md` is out of v1 scope. Rarely read; awkward to fit into the
+in-place chunk model. Defer.
 
 ## Offline behaviour
 
@@ -1017,27 +1133,92 @@ This is one row, primary-keyed; the lookup is negligible.
   current as of the last `caught_up` frame.
 - **The trailer always tells you how old.** Specific timestamp and
   reason, not just "may be stale."
+- **Trailer-bearing bytes never enter the kernel page cache.** A read
+  that appends the trailer SKIPS `notify_store`. Otherwise the stale
+  warning would persist past reconnection until something else
+  invalidated the inode — and for quiet channels that could be
+  forever. See *FUSE read path → Trailer / kernel-cache invariant*.
+- **On any `connection_state` transition or `stream_caught_up`
+  insert**, the projector invalidates every primed inode. Belt and
+  suspenders against the previous invariant.
 
 ## Backfill
 
 The slurper owns historical-data ingestion. Live Socket Mode events
-only cover "from when the server started"; everything older needs to be
-fetched explicitly via `conversations.history` /
-`conversations.replies` and written into the events log as `message`
-events that look identical to live ones (modulo offset position).
+only cover "from when the server started"; everything older needs to
+come from somewhere else and be written into the events log as
+`message` events that look identical to live ones (modulo offset
+position).
 
-### Two backfill paths
+### Backfill as a protocol
+
+Backfill is a `Backfiller` interface, not a function. Two v1
+implementations:
+
+| Impl | Source | Use |
+|---|---|---|
+| `LegacyCacheBackfiller` | `~/.cache/slack-fuse/` JSON files from the current single-process implementation | Run once on first server bootup to skip the API hit |
+| `SlackApiBackfiller` | `conversations.history` / `conversations.replies` | Steady-state backfill for newly-joined channels; gap-fill after the legacy data ends |
+
+The interface:
+
+```python
+class Backfiller(Protocol):
+    async def channels_to_backfill(self) -> AsyncIterator[ChannelId]: ...
+    async def messages_for_channel(
+        self,
+        channel_id: ChannelId,
+        since_ts: float | None = None,  # None = from oldest available
+    ) -> AsyncIterator[Message]: ...
+
+    @property
+    def name(self) -> str: ...  # 'legacy-cache' | 'slack-api'
+```
+
+The slurper runs them in priority order:
+
+1. **`LegacyCacheBackfiller` first** if a legacy cache is present.
+   Drains every cached channel's history into events. Cost: pure
+   disk I/O on the user's machine, zero Slack API calls.
+2. **`SlackApiBackfiller` second**. Iterates channels and asks for
+   `messages_for_channel(c, since_ts=last_event_ts_for(c))` — i.e.,
+   only the gap between the legacy cache's tip and now. For
+   channels the legacy backfill didn't cover (newly-joined since,
+   or never present), the API backfill runs from oldest.
+
+**Both writes are idempotent.** Each Backfiller produces `message`
+items; the slurper's `write_message_event` path is `INSERT INTO
+events (..., payload) ON CONFLICT DO NOTHING` keyed by
+`(stream, slack_ts)`. Re-running either backfill against an already-
+populated events table is a no-op. This means the legacy backfill
+can be re-run safely (e.g., after migration mishap), and the API
+backfill won't duplicate any message the legacy run already wrote.
+
+The dedup key is `(stream, slack_ts)` rather than `(stream, offset)`
+because offsets are server-assigned at write time. The Slack ts is
+the canonical "this message identity"; same ts = same message.
+Requires a unique constraint:
+
+```sql
+ALTER TABLE events ADD CONSTRAINT events_message_dedup
+    UNIQUE (stream, kind, (payload->>'ts')) WHERE kind = 'message';
+```
+
+(Partial unique index — only constrains `message` events; other
+event kinds may legitimately repeat.)
+
+### Two backfill paths (operationally)
 
 **(a) Automatic, on-channel-first-seen.** When `channel_added` arrives
 on the `channel-list` stream and we have no prior history for the
-channel, the slurper queues a backfill task. Throttled — backfill
-runs in a single worker, sleeps between pages, takes hours-to-days
-total on first server bootup. Yields between channels so live ingestion
-stays responsive.
+channel, the slurper queues a `SlackApiBackfiller` task for it.
+Throttled — backfill runs in a single worker, sleeps between pages,
+takes hours-to-days total on first server bootup. Yields between
+channels so live ingestion stays responsive.
 
 **(b) Manual, via the `slack-fuse-server backfill` admin command.**
 For recovery (e.g. a channel that was thought-empty but you've now
-joined and want history). Same throttling, same event-writing path.
+joined and want history) or to run the legacy importer explicitly.
 
 ### Per-channel size threshold
 
@@ -1095,14 +1276,28 @@ addition; lift it largely intact in Phase 1.
 
 ### Migration from existing disk cache
 
-Open question #16 resolved: **blow away `~/.cache/slack-fuse/` on
-first new-server bootup; take the backfill hit.** A first run may take
-a full day to complete; live ingestion via Socket Mode is unaffected
-during backfill.
+**`LegacyCacheBackfiller` reads the existing `~/.cache/slack-fuse/`
+JSON files and writes synthetic events directly into the events
+table.** Net cost: a few minutes of local disk I/O. Net benefit:
+zero Slack API calls for historical data we already have.
 
-The backfill itself doubles as a noisy-channel detector: anything that
-trips the abort threshold is exactly the kind of channel a user would
-want hidden or blocked anyway.
+The `SlackApiBackfiller` then runs second, fetching only the gap
+between the legacy cache's most-recent message per channel and the
+moment Socket Mode came up. For most channels that's a small
+window; for channels not present in the legacy cache (newly joined,
+or never cached) it's a full history fetch.
+
+Combined cost on first bootup: minutes of local disk I/O (legacy
+import) + a much smaller and bounded Slack API window (just the
+gaps). Avoids the multi-day API-driven cold start, and avoids the
+rate-limit risk of a full fresh backfill against a 300+ channel
+workspace.
+
+The backfill also doubles as a noisy-channel detector: anything that
+trips the abort threshold (`SlackApiBackfiller` path; the legacy
+importer doesn't enforce the threshold because the data's already
+local) is exactly the kind of channel a user would want hidden or
+blocked anyway.
 
 ## Renderer-as-library
 
@@ -1497,16 +1692,40 @@ runnable throughout.
 ### Phase 1: Server skeleton
 
 - New `slack_fuse_server/` package.
-- Postgres schema for events, snapshots, channels, users, stream_heads.
-- Slack API gateway (lift `SlackClient` from current codebase, no
-  changes).
-- Socket Mode driver (lift `socket_mode.py` from current codebase).
-- Backfill task (lift `backfill.py`).
-- WebSocket server with subscribe / snapshot / event frames.
+- Postgres schema for events, snapshots, channels, users, stream_heads, health_log, backfill_overrides.
+- Slack API gateway: lift `SlackClient` from the current codebase
+  approximately as-is (httpx wrapper, exception hierarchy, typed
+  responses).
+- Socket Mode driver: lift `socket_mode.py`'s connection-and-event
+  loop, but rewrite the per-event handler to write events to postgres
+  instead of into the in-memory `SlackStore`.
+- `Backfiller` protocol + `SlackApiBackfiller` implementation. The
+  current `backfill.py`'s pagination, throttling, and per-channel
+  iteration logic ports straight across; the write path changes from
+  disk-cache JSON files to postgres `events` inserts.
+- `LegacyCacheBackfiller` implementation that reads
+  `~/.cache/slack-fuse/` and writes the same `INSERT ... ON CONFLICT
+  DO NOTHING` events. Runs first on a server with a legacy cache
+  present; the API backfiller fills gaps after.
+- WebSocket server with subscribe / event / caught_up / snapshot_at /
+  error / ping / pong frames.
+- HTTP server (same port) with `/health`, `/metrics`, `/resolve`,
+  `/permalink`, `/streams/<id>/snapshot?at=<offset>`.
 - Single-binary deployment + systemd unit.
 
-Acceptance: server runs against a live Slack workspace, events land in
-postgres, a CLI client can subscribe and print events to stdout.
+**Honest scope note**: the prior draft of this phase said "lift
+`backfill.py` from current codebase" without qualification. That was
+glib — the I/O shape (write to events table, not disk cache files;
+honour the `(stream, slack_ts)` dedup constraint; emit `slurper-health`
+events for `backfill_started` / `_completed` / `_aborted`) is real
+rewrite work. The pagination algorithm and throttling parameters
+carry over; the persistence layer doesn't.
+
+Acceptance: server runs against a live Slack workspace, legacy-cache
+backfill drains the existing JSON cache into events in minutes, API
+backfill fills gaps without exceeding rate limits, Socket Mode
+delivers live events into the same table, a CLI client can subscribe
+and print events to stdout, `/metrics` returns coherent JSON.
 
 ### Phase 2: Renderer-as-library
 
@@ -1622,8 +1841,10 @@ of the phase's acceptance criteria, not a follow-up.
   postgres with expected kinds, ordering, payload shapes.
 - Integration: WebSocket protocol. Open a connection, subscribe to
   each stream kind, assert the `caught_up` boundary, error frames
-  for bogus subscribes, paginated-snapshot assembly.
-- HTTP: `/metrics`, `/health`, `/resolve`, `/permalink` smoke tests.
+  for bogus subscribes, `snapshot_at` redirect plus follow-on HTTP
+  snapshot fetch and apply.
+- HTTP: `/metrics`, `/health`, `/resolve`, `/permalink`,
+  `/streams/<id>/snapshot?at=<offset>` smoke tests.
 
 **Phase 2 (Renderer-as-library)**
 - Unit: `convert_structural` round-trip across the existing mrkdwn
@@ -1741,20 +1962,27 @@ No code merges to `main` without all phases' suites green.
 
 ## Open questions
 
-The following questions were closed by the 2026-05-26 revision and
-are kept here as a record:
+The following questions were closed by prior revisions and are kept
+here as a record:
 
 | Original question | Resolution |
 |---|---|
 | Inode stability across restarts | Persistent `inodes(path PK, inode UNIQUE GENERATED)` table on the client. Never recycled |
 | `~/views/slack/.cached-only/` | Removed in v1. The projector is always offline-capable; the prefix has no remaining meaning |
-| Migrating existing disk caches | Blow away on first server bootup. Backfill rebuilds. Backfill may take a full day; that's acceptable. Migration script not built |
-| Subscribe response semantics | Server streams events from `since`; emits `caught_up { head_offset }` at the catch-up boundary. `error { stream_not_found \| since_too_high \| auth_failed }` on protocol problems |
+| Migrating existing disk caches | `LegacyCacheBackfiller` reads the existing JSON cache and writes synthetic events. API backfiller fills only the gap. Avoids the multi-day cold start and the rate-limit risk a fresh API backfill would carry. (Revised 2026-06-07 after external review surfaced the rate-limit angle.) |
+| Subscribe response semantics | Server streams events from `since`; emits `snapshot_at` HTTP-redirect for cold catch-up, `caught_up` at the catch-up boundary, `error { stream_not_found \| since_too_high \| auth_failed }` on protocol problems |
 | Resume staleness on the client | Server retains snapshots for at least 30 days. Older clients receive a fresh snapshot at the current head; their `applied_offset` is reset |
-| Backfill ordering vs live events | Non-issue: backfill writes current-state `message` events, live writes delta events. Same-message ordering guaranteed by Socket Mode within a stream; backfill never overlaps live on the same message |
-| Detecting noisy channels for blocking | Backfill aborts at 20k messages by default (configurable) and emits `backfill_aborted` on `slurper-health`; chunk-size telemetry surfaces ongoing growth (v2) |
-| What "caught up" means in steady state (silent-lag) | **Dissolved by Flow Control design.** Per-event sync apply + TCP backpressure means the projector can't silently fall behind. Either it applies at sustainable rate (server is naturally throttled), or the connection drops (trailer fires for the actual reason). No third state. `caught_up` frame stays as informational marker for the initial-catch-up condition in the trailer logic |
-| `chunk_mentions` population during backfill | Throttled backfill cadence (30–180 s sleep between pages) dwarfs the per-chunk DB cost. Inline `chunk_mentions` write is not a bottleneck |
+| Backfill ordering vs live events | Non-issue: backfill writes current-state `message` events, live writes delta events. `(stream, slack_ts)` dedup on the `events` table makes re-application a no-op |
+| Detecting noisy channels for blocking | API backfill aborts at configurable threshold and emits `backfill_aborted` on `slurper-health`; chunk-size telemetry surfaces ongoing growth (v2) |
+| What "caught up" means in steady state (silent-lag) | **Solved by per-stream queues + parallel appliers.** WS receiver routes frames into per-stream bounded queues; one applier task per stream. Slow streams build queue depth (visible via `/metrics`) but don't block other streams' live events. No cross-stream HoL blocking |
+| `chunk_mentions` population during backfill | Throttled backfill cadence dwarfs the per-chunk DB cost. Inline `chunk_mentions` write is not a bottleneck |
+| Stored date column on chunks (TZ coherence) | **Dropped**. `chunks` PK is now `(channel_id, message_ts)` with `message_ts` as `NUMERIC(20, 6)` UTC. Local-date folders are derived at FUSE-read time from the process's local TZ. Cross-device coherence holds because chunks are TZ-neutral. Service restart required if local TZ changes. (Resolved 2026-06-07 after external review.) |
+| Missing index on `chunks (channel_id, message_ts)` for thread-reply parent lookup | PK is now `(channel_id, message_ts)` directly; no extra index needed. Redundant `chunks_lookup_idx` removed. (Resolved 2026-06-07 after external review.) |
+| Staleness-trailer kernel-cache poisoning | Trailer-bearing reads skip `notify_store`; connection-state transitions invalidate every primed inode. Two-layer guard. (Resolved 2026-06-07 after external review.) |
+| HoL blocking across streams on shared WS | Per-stream queues + parallel applier tasks. WS receiver doesn't apply, just routes. (Resolved 2026-06-07 after external review.) |
+| Cross-stream race: message arrives before `user_added` | `user_added` (not just `user_renamed`) triggers `chunk_mentions` invalidation lookup. Mentions are recorded in `chunk_mentions` at chunk-write time even when resolution falls back to a UID literal, so the late-arriving `user_added` can find them. (Resolved 2026-06-07 after external review.) |
+| `trailer_decisions` table write amplification | Replaced with a JSONL log file (`~/.local/state/slack-fuse/trailer-decisions.jsonl`). Same data, zero DB write pressure on FUSE reads. (Resolved 2026-06-07 after external review.) |
+| Custom paginated snapshot frames on WS | Removed. Snapshots delivered via HTTP `/streams/<id>/snapshot?at=<offset>` with JSONL response, gzip-encoded. (Resolved 2026-06-07 after external review.) |
 
 Still open:
 
@@ -1774,7 +2002,7 @@ Still open:
    everything else is current, do we mark only that stream's files
    stale? Per-stream granularity is more accurate but requires
    `connection_state` per stream; v1 uses one row. **Reversible
-   punt**: the `trailer_decisions` log table ships in v1 capturing
+   punt**: the trailer-decisions JSONL log ships in v1 capturing
    per-decision context, so the false-positive rate is measurable.
    Revisit when the data shows the punt was wrong.
 
@@ -1817,6 +2045,13 @@ because:
   mount).
 
 Postgres on both sides gives one operational story.
+
+**External review pushback (2026-06-07)**: an adversarial review
+called this "over-engineering" and recommended SQLite + WAL on the
+grounds that the client DB is small and ephemeral. The review didn't
+engage with the four reasons above — in particular the user is on a
+CoW filesystem where the sqlite-fragmentation point is concrete, not
+theoretical. The decision stands.
 
 ### Server-side rendering only
 
