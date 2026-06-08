@@ -118,6 +118,35 @@ def test_backfill_channel_aborts_at_threshold(server_conn: psycopg.Connection[Tu
     assert _health_kinds(server_conn) == ["backfill_started", "slack_degraded", "backfill_aborted"]
 
 
+def _health_rows(conn: psycopg.Connection[TupleRow]) -> list[tuple[str, object]]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT kind, payload FROM health_log ORDER BY id")
+        return [(str(r[0]), r[1]) for r in cur.fetchall()]
+
+
+def test_backfill_channel_emits_progress_every_n_messages(server_conn: psycopg.Connection[TupleRow]) -> None:
+    writer = OffsetWriter(server_conn, trio.CapacityLimiter(1))
+    health = HealthEmitter(writer)
+    ctx = BackfillContext(writer=writer, health=health, warn_at=1000, abort_at=20000, progress_every=2)
+
+    result = trio.run(backfill_channel, _StubBackfiller(5), ChannelId("CP"), ctx)
+
+    assert (result.messages, result.aborted) == (5, False)
+    rows = _health_rows(server_conn)
+    progress = [payload for kind, payload in rows if kind == "backfill_progress"]
+    # 5 messages, progress every 2 → emitted at the 2nd and 4th message.
+    assert progress == [
+        {"channel_id": "CP", "messages_so_far": 2},
+        {"channel_id": "CP", "messages_so_far": 4},
+    ]
+    assert [kind for kind, _ in rows] == [
+        "backfill_started",
+        "backfill_progress",
+        "backfill_progress",
+        "backfill_completed",
+    ]
+
+
 def test_backfill_channel_is_idempotent_on_rerun(server_conn: psycopg.Connection[TupleRow]) -> None:
     writer = OffsetWriter(server_conn, trio.CapacityLimiter(1))
     health = HealthEmitter(writer)
