@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import cast
 
 import httpx
 import trio
@@ -112,14 +113,13 @@ def translate_message_event(event: SocketEventPayload) -> EventRecord | None:
     ts = event.ts
     if not ts:
         return None
-    msg = Message(
-        ts=ts,
-        user=event.user or "unknown",
-        text=event.text,
-        thread_ts=event.thread_ts,
-        subtype=event.subtype,
-    )
-    return EventRecord(stream=stream, kind="message", ts=ts, payload=msg.model_dump(mode="json"), dedup=True)
+    msg_source: object
+    if event.message is not None:
+        msg_source = event.message.model_dump(mode="json")
+    else:
+        msg_source = event.model_dump(mode="json")
+    msg = Message.model_validate(msg_source)
+    return EventRecord(stream=stream, kind="message", ts=msg.ts, payload=msg.model_dump(mode="json"), dedup=True)
 
 
 def _channel_added_write(channel: Channel) -> EventRecord:
@@ -293,10 +293,45 @@ class SocketModeRunner:
             return None
 
 
+def _normalize_message_event(envelope: JsonObject) -> JsonObject:
+    """Mirror top-level `message` fields into `event.message` when omitted.
+
+    Slack's top-level `message` events carry message fields directly on the
+    `event` object, while `message_changed`/`message_deleted` place a nested
+    `message` object. `SocketEventPayload` does not declare all message-shaped
+    fields, so we inject the top-level event as `event.message` before model
+    validation to preserve the full payload via the shared `Message` model.
+    """
+    payload_raw = envelope.get("payload")
+    if not isinstance(payload_raw, dict):
+        return envelope
+    payload = cast("dict[str, object]", payload_raw)
+    event_raw = payload.get("event")
+    if not isinstance(event_raw, dict):
+        return envelope
+    event = cast("dict[str, object]", event_raw)
+    if event.get("type") != "message" or "message" in event:
+        return envelope
+    message_payload: dict[str, object] = {**event}
+    normalized_event: dict[str, object] = {**event, "message": message_payload}
+    normalized_payload: dict[str, object] = {**payload, "event": normalized_event}
+    normalized_envelope: dict[str, object] = {**envelope, "payload": normalized_payload}
+    return cast(JsonObject, normalized_envelope)
+
+
 def _parse_envelope(message: str | bytes) -> SocketEnvelope | None:
     """Validate a raw frame into a typed envelope, logging and skipping on error."""
     try:
-        return SocketEnvelope.model_validate_json(message)
+        raw = json.loads(message)
+    except json.JSONDecodeError as exc:
+        log.warning("socket-mode: envelope parse error: %s", exc)
+        return None
+    if not isinstance(raw, dict):
+        log.warning("socket-mode: envelope parse error: expected JSON object frame")
+        return None
+    normalized = _normalize_message_event(cast(JsonObject, raw))
+    try:
+        return SocketEnvelope.model_validate(normalized)
     except ValidationError as exc:
         log.warning("socket-mode: envelope parse error: %s", exc)
         return None

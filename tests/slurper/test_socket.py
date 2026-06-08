@@ -9,16 +9,20 @@ structural event, that `conversations.info` enrichment runs).
 
 from __future__ import annotations
 
+import json
+from typing import cast
+
 import httpx
 import psycopg
 import trio
 from psycopg.rows import TupleRow
 
-from slack_fuse.models import Message, SocketEventPayload
+from slack_fuse.models import JsonObject, Message, SocketEventPayload
 from slack_fuse_server.slurper.api import SlackClient
 from slack_fuse_server.slurper.health import HealthEmitter
 from slack_fuse_server.slurper.offsets import OffsetWriter
-from slack_fuse_server.slurper.socket import SocketModeRunner, translate_message_event
+from slack_fuse_server.slurper.socket import SocketModeRunner, _parse_envelope, translate_message_event
+from tests._fake_slack import load_fixtures
 
 # === Pure translation ===
 
@@ -59,6 +63,58 @@ def test_translate_message_deleted() -> None:
 
 def test_translate_missing_channel_returns_none() -> None:
     assert translate_message_event(SocketEventPayload(type="message", ts="1.0")) is None
+
+
+def test_translate_message_payload_matches_backfill_shape() -> None:
+    fixtures = load_fixtures()
+    history_fixture = fixtures["conversations.history"]
+    messages = history_fixture.get("messages")
+    assert isinstance(messages, list) and messages, "conversations.history fixture must include messages"
+    base_message = messages[0]
+    assert isinstance(base_message, dict)
+
+    rich_message_event: JsonObject = cast(
+        JsonObject,
+        {
+            **base_message,
+            "type": "message",
+            "channel": "C1",
+            "thread_ts": "1700000000.000100",
+            "reply_count": 2,
+            "latest_reply": "1700000200.000300",
+            "edited": {"user": "U0001", "ts": "1700000300.000400"},
+            "files": [
+                {
+                    "id": "F0001",
+                    "name": "notes.md",
+                    "title": "notes",
+                    "filetype": "md",
+                    "mimetype": "text/markdown",
+                    "size": 123,
+                    "url_private": "https://slack.example/private/F0001",
+                    "url_private_download": "https://slack.example/download/F0001",
+                },
+            ],
+            "subtype": "file_share",
+        },
+    )
+    raw_envelope = json.dumps(
+        {
+            "type": "events_api",
+            "envelope_id": "env-1",
+            "payload": {"event": rich_message_event},
+        },
+    )
+    parsed = _parse_envelope(raw_envelope)
+    assert parsed is not None
+    assert parsed.payload is not None
+
+    write = translate_message_event(parsed.payload.event)
+    assert write is not None
+
+    expected_payload = Message.model_validate(rich_message_event).model_dump(mode="json")
+    assert write.payload == expected_payload
+    assert json.dumps(write.payload, sort_keys=True) == json.dumps(expected_payload, sort_keys=True)
 
 
 # === DB-backed integration ===
