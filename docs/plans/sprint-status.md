@@ -72,6 +72,19 @@ Currently at `<after-this-commit>` with Sprint 0 + POC B merged.
 | Post-Sprint-1 critical review | cursor (gpt-5.5-extra-high) | (killed) | n/a | **REQUEST CHANGES**. 5 findings (2 blockers + 3 high). Triage: findings 3+5 owner-fixed inline (autocommit guard + schema users dedup); findings 1+2 handed to 1F (wire binary + Upgrade dispatch); finding 4 handed to 1G (Socket Mode payload conformance). Report at `~/.agent-handoff/2026-06-08/review-sprint1/report.md`. |
 | 1F wire binary + same-port dispatch | claude (opus) | (killed) | `synap5e/feat/sprint1f-wire-binary` | **MERGED**. Discovered + fixed pre-existing severe bug: 1B's `wire/tail.py` used `psycopg.AsyncConnection` (asyncio) — every WS connect crashed under trio with real DB; reviewer missed because their env had no DATABASE_URL. Trio-native rewrite (sync psycopg + to_thread + notifies-poller thread + memory channel bridge) landed in scope-extended 1F. Also: new `dispatch.py` for same-port Upgrade routing, full binary wiring, slack_degraded debouncing, backfill_progress emission. 393 tests with DATABASE_URL set. |
 | **Sprint 1 smoke test** | n/a (owner) | `slack-fuse-smoke` | n/a | **PASS**. Integrated binary runs end-to-end against real Slack + local Postgres: `/health` 200, `/metrics` returns coherent JSON, `/ws` subscribe to `slurper-health` delivers event + caught_up. 490 user_added events on populate. **7-day soak is now live** in tmux session `slack-fuse-smoke`. Sprint 1 acceptance criterion in progress. |
+
+## Sprint 2 — fan-out (batch 1)
+
+| Track | Model | tmux | Branch | Status |
+|---|---|---|---|---|
+| 2A LegacyCacheBackfiller | cursor (gpt-5.3-codex-xhigh) | `sprint2a-legacy` | `synap5e/feat/2a-legacy-backfill` | in flight |
+| 2B Renderer library | claude (opus) | `sprint2b-renderer` | `synap5e/feat/2b-renderer-library` | in flight (port POC B impl; replace Sprint 0 NotImplementedError stubs) |
+| 2F Test infra polish | cursor (gpt-5.3-codex-xhigh) | `sprint2f-test-infra` | `synap5e/feat/2f-test-infra` | in flight (postgres auto-provision so reviewers don't miss DB-only bugs; synthetic generators; FUSE harness extensions) |
+
+Batch 2 (will spawn when batch 1 lands or a slot opens):
+- 2C HTTP /resolve + /permalink (Codex)
+- 2D Snapshot generator (Opus)
+- 2E Client projector (Opus, biggest — depends on 2B's renderer impl)
 | 1G Socket Mode payload conformance | cursor (gpt-5.3-codex-xhigh) | (killed) | `synap5e/feat/sprint1g-message-payload-conformance` | **MERGED** at `06bdad6`. Live `message` events now Message.model_validate(...).model_dump('json'), byte-equivalent to backfill. Conformance test asserts the equivalence against a conversations.history-derived envelope with reactions+files+edited+reply metadata. |
 | 1B WS server | cursor (gpt-5.5-extra-high) | (killed) | `synap5e/feat/sprint1b-ws-server` | **MERGED** at `<after-this>`. Added SNAPSHOT_REQUIRED to ErrorCode enum (sanctioned per prompt). LISTEN protocol: `NOTIFY new_event, '<stream-id>'` (or empty payload for wake-all fallback) — 1A coordinates by emitting these in the offset-assignment TX. |
 | 1C HTTP /health + /metrics | cursor (gpt-5.3-codex-xhigh) | (killed) | `synap5e/feat/sprint1c-http-health-metrics` | **MERGED**. Custom trio+h11 server, no new dep. `serve_http_on_listeners` exposed for 1B WS to compose (Upgrade-header path landed in 1B's PR). |
