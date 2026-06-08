@@ -26,6 +26,7 @@ import os
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
 import psycopg
 import trio
@@ -35,6 +36,8 @@ import slack_fuse_server.migrations as server_migrations
 from slack_fuse.migrations.runner import apply_migrations
 from slack_fuse_render import ChannelId
 from slack_fuse_server.backfill.api import BackfillContext, SlackApiBackfiller, SleepBounds, backfill_channel
+from slack_fuse_server.backfill.legacy import LegacyCacheBackfiller
+from slack_fuse_server.backfill.types import Backfiller
 from slack_fuse_server.config import ServerConfig, load_server_config
 from slack_fuse_server.dispatch import serve_dispatch
 from slack_fuse_server.http.metrics import MetricsAggregator, SubscriberSnapshot
@@ -52,6 +55,8 @@ _AUTO_BACKFILL_ENV = "SLACK_FUSE_SERVER_BACKFILL"
 # Sleep between channels in the automatic backfill pass (RFC: yields between
 # channels so live ingestion stays responsive).
 _AUTO_BACKFILL_CHANNEL_GAP_S = 60.0
+_BACKFILL_SOURCES = ("slack-api", "legacy-cache")
+type BackfillSource = Literal["slack-api", "legacy-cache"]
 
 
 def _connect_and_migrate(database_url: str) -> psycopg.Connection[TupleRow]:
@@ -67,7 +72,11 @@ def _connect_and_migrate(database_url: str) -> psycopg.Connection[TupleRow]:
     return conn
 
 
-def _make_backfiller(client: SlackClient, limiter: trio.CapacityLimiter, config: ServerConfig) -> SlackApiBackfiller:
+def _make_api_backfiller(
+    client: SlackClient,
+    limiter: trio.CapacityLimiter,
+    config: ServerConfig,
+) -> SlackApiBackfiller:
     sleeps = SleepBounds(
         page_min_s=config.backfill_page_sleep_min_s,
         page_max_s=config.backfill_page_sleep_max_s,
@@ -75,6 +84,24 @@ def _make_backfiller(client: SlackClient, limiter: trio.CapacityLimiter, config:
         thread_max_s=config.backfill_thread_sleep_max_s,
     )
     return SlackApiBackfiller(client, limiter, sleeps)
+
+
+def _make_backfiller(
+    source: BackfillSource,
+    *,
+    client: SlackClient | None,
+    limiter: trio.CapacityLimiter,
+    config: ServerConfig,
+) -> Backfiller:
+    if source == "legacy-cache":
+        return LegacyCacheBackfiller(limiter=limiter)
+    if source == "slack-api":
+        if client is None:  # pragma: no cover - guarded by _run_backfill source wiring
+            msg = "slack-api backfill source requires a SlackClient"
+            raise ValueError(msg)
+        return _make_api_backfiller(client, limiter, config)
+    msg = f"unsupported backfill source {source!r}"
+    raise ValueError(msg)
 
 
 # === Backfill-override persistence (RFC §Backfill → Per-channel size threshold) ===
@@ -201,7 +228,7 @@ async def _auto_backfill(
 ) -> None:
     """Automatic first-bootup pass: backfill every member channel, throttled."""
     await trio.sleep(30)  # let startup settle before hitting the API hard
-    backfiller = _make_backfiller(client, limiter, config)
+    backfiller = _make_backfiller("slack-api", client=client, limiter=limiter, config=config)
     first = True
     async for channel_id in backfiller.channels_to_backfill():
         if not first:
@@ -218,20 +245,30 @@ async def _auto_backfill(
 # === Backfill (admin) mode ===
 
 
-async def _run_backfill(config: ServerConfig, channel_id: str, *, allow_large: bool, max_messages: int | None) -> None:
+async def _run_backfill(
+    config: ServerConfig,
+    channel_id: str,
+    *,
+    allow_large: bool,
+    max_messages: int | None,
+    source: BackfillSource,
+) -> None:
     conn = _connect_and_migrate(config.database_url)
-    client = SlackClient(config.slack_user_token)
     limiter = trio.CapacityLimiter(1)
     writer = OffsetWriter(conn, limiter)
     health = HealthEmitter(writer)
-    backfiller = _make_backfiller(client, limiter, config)
+    client: SlackClient | None = None
+    if source == "slack-api":
+        client = SlackClient(config.slack_user_token)
+    backfiller = _make_backfiller(source, client=client, limiter=limiter, config=config)
 
     abort_at = _resolve_abort_at(conn, channel_id, config, allow_large=allow_large, max_messages=max_messages)
     ctx = BackfillContext(writer=writer, health=health, warn_at=config.backfill_warn_at, abort_at=abort_at)
     try:
         result = await backfill_channel(backfiller, ChannelId(channel_id), ctx)
     finally:
-        client.close()
+        if client is not None:
+            client.close()
         conn.close()
 
     status = "ABORTED" if result.aborted else "completed"
@@ -256,6 +293,12 @@ def _build_parser() -> argparse.ArgumentParser:
     bf.add_argument("channel_id", help="Slack channel id, e.g. C0AKQ5DS0FQ")
     bf.add_argument("--allow-large", action="store_true", help="lift the per-channel size limit entirely")
     bf.add_argument("--max-messages", type=int, default=None, help="override the per-channel abort threshold")
+    bf.add_argument(
+        "--source",
+        choices=_BACKFILL_SOURCES,
+        default="slack-api",
+        help="backfill source implementation to use",
+    )
     return parser
 
 
@@ -268,9 +311,16 @@ def main() -> None:
         channel_id: str = args.channel_id
         allow_large: bool = args.allow_large
         max_messages: int | None = args.max_messages
+        source: BackfillSource = args.source
 
         async def _thunk() -> None:
-            await _run_backfill(config, channel_id, allow_large=allow_large, max_messages=max_messages)
+            await _run_backfill(
+                config,
+                channel_id,
+                allow_large=allow_large,
+                max_messages=max_messages,
+                source=source,
+            )
 
         trio.run(_thunk)
         return
