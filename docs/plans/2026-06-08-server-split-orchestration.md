@@ -108,8 +108,12 @@ tests pass. This is the contract.**
 
 ### Worker assignment
 
-Spec-handoff to a single Claude agent (Sonnet 1m). One worktree, one
-PR. Owner does final review against the RFC before merge.
+Specced-handoff to a single agent. **Worker model**: Claude Opus
+(interfaces require care; small enough to fit comfortably in
+standard context). **Reviewer model**: GPT-5.5 xhigh, with the
+explicit charter of "do the stubs match the RFC exactly?" — see
+post-Sprint-0 gate. One worktree, one PR. Owner does final review
+against the RFC before merge.
 
 ### Acceptance
 
@@ -148,8 +152,11 @@ assumptions before downstream commits.
 ### Worker assignment
 
 Two separate agent-handoff workers, run in parallel during Sprint 0.
+**POC A model**: Codex (mechanical lift of Socket Mode + write loop).
+**POC B model**: Claude Opus (renderer-split correctness reasoning).
 Both write reports to `docs/plans/poc-reports/`. Owner reads
-reports, decides any RFC adjustments before Sprint 1.
+reports, decides any RFC adjustments before Sprint 1. No formal
+reviewer — owner reads the reports directly.
 
 ## Sprint 1: Server vertical slice
 
@@ -158,12 +165,17 @@ against the real workspace. No client work yet.
 
 ### Tracks
 
-| Track | Files | Spec sketch |
-|---|---|---|
-| 1A | `slack_fuse_server/slurper/{api,socket,offsets,health}.py` | Lift SlackClient, rewrite Socket Mode handler to write events via the Sprint-0 offset-assignment pattern, emit slurper-health events |
-| 1B | `slack_fuse_server/wire/server.py` | WS server, accepts subscribe, emits event/caught_up/error/ping/pong. No snapshot_at yet (no snapshots exist) |
-| 1C | `slack_fuse_server/http/server.py` | `/health` + `/metrics` only |
-| 1D | `tools/debug_subscribe.py` | CLI: open WS, subscribe to <stream>, print events |
+| Track | Files | Writer model | Spec sketch |
+|---|---|---|---|
+| 1A | `slack_fuse_server/slurper/{api,socket,offsets,health}.py` | Claude Opus (Socket Mode handler rewrite is subtle) | Lift SlackClient, rewrite Socket Mode handler to write events via the Sprint-0 offset-assignment pattern, emit slurper-health events |
+| 1B | `slack_fuse_server/wire/server.py` | GPT-5.5 xhigh (concurrent WS connection handling + framing) | WS server, accepts subscribe, emits event/caught_up/error/ping/pong. No snapshot_at yet (no snapshots exist) |
+| 1C | `slack_fuse_server/http/server.py` | Codex (mechanical HTTP handlers) | `/health` + `/metrics` only |
+| 1D | `tools/debug_subscribe.py` | Codex (small CLI) | CLI: open WS, subscribe to <stream>, print events |
+
+Sprint-1 reviewer: opposite-family of the dominant writer. Since 1A
+is Opus and is the biggest of these, default reviewer is GPT-5.5
+xhigh. If 1A/1B reveal anything subtle during their build, run an
+additional Gemini 3.1 Pro wildcard review.
 
 Tracks can run in parallel as soon as Sprint 0 is merged. 1A/1B/1C
 all live in `slack_fuse_server/` so worktree boundaries matter — see
@@ -186,7 +198,8 @@ Sprint 0's contracts; they CAN run concurrently as separate worktrees.
 
 ### Track 2A — LegacyCacheBackfiller
 
-- **Owner**: one agent (haiku ok — mechanical)
+- **Worker model**: Codex (coding-optimized; mechanical lift from existing JSON-cache shape)
+- **Reviewer model**: Claude Opus (opposite family)
 - **Branch**: `synap5e/feat/2a-legacy-backfill`
 - **Files owned exclusively**:
   - `slack_fuse_server/backfill/legacy.py` (new)
@@ -205,7 +218,8 @@ Sprint 0's contracts; they CAN run concurrently as separate worktrees.
 
 ### Track 2B — Renderer library
 
-- **Owner**: one agent (sonnet — has to reason about format)
+- **Worker model**: Claude Opus (format reasoning; the two-pass split is subtle)
+- **Reviewer model**: GPT-5.5 xhigh (opposite family)
 - **Branch**: `synap5e/feat/2b-renderer-library`
 - **Files owned exclusively**:
   - `slack_fuse_render/render.py` (new)
@@ -223,7 +237,8 @@ Sprint 0's contracts; they CAN run concurrently as separate worktrees.
 
 ### Track 2C — HTTP /resolve + /permalink
 
-- **Owner**: one agent (sonnet — has to handle Slack-specific URL parsing already in the codebase)
+- **Worker model**: Codex (lift the existing URL parsing from `slack_fuse/resolve.py`; coding-shape work)
+- **Reviewer model**: Claude Opus (opposite family)
 - **Branch**: `synap5e/feat/2c-http-resolve-permalink`
 - **Files owned exclusively**:
   - `slack_fuse_server/http/resolve.py` (new)
@@ -240,7 +255,8 @@ Sprint 0's contracts; they CAN run concurrently as separate worktrees.
 
 ### Track 2D — Snapshot generator
 
-- **Owner**: one agent (sonnet — needs careful transactional thinking)
+- **Worker model**: Claude Opus (transactional correctness + cost-metrics columns)
+- **Reviewer model**: GPT-5.5 xhigh (opposite family)
 - **Branch**: `synap5e/feat/2d-snapshots`
 - **Files owned exclusively**:
   - `slack_fuse_server/snapshot/{generator,scheduler}.py` (new)
@@ -257,7 +273,8 @@ Sprint 0's contracts; they CAN run concurrently as separate worktrees.
 
 ### Track 2E — Client projector
 
-- **Owner**: one agent (sonnet — biggest single track)
+- **Worker model**: Claude Opus (biggest single track; per-stream queue concurrency + chunk write logic + cursor management; use the 1M-context variant if the codebase grows past 200k tokens)
+- **Reviewer model**: GPT-5.5 xhigh PLUS Gemini 3.1 Pro wildcard (two independent reviews; this track's scope and correctness surface justifies it)
 - **Branch**: `synap5e/feat/2e-client-projector`
 - **Files owned exclusively**:
   - `slack_fuse/projector/{__init__,ws_client,per_stream,apply}.py`
@@ -279,7 +296,8 @@ Sprint 0's contracts; they CAN run concurrently as separate worktrees.
 
 ### Track 2F — Test infra polish
 
-- **Owner**: one agent (haiku — supportive)
+- **Worker model**: Codex (mechanical fixtures + harnesses)
+- **Reviewer model**: skip formal review; owner reads the PR — these are test fixtures, no product semantics
 - **Branch**: `synap5e/feat/2f-test-infra`
 - **Files owned exclusively**:
   - `tests/_fake_slack/` (new) — full httpx mock transport for every Slack endpoint we call
@@ -329,6 +347,8 @@ Things that need Sprint 2 substantially done.
 
 - **Depends on**: 2D snapshot generator
 - **Files**: `slack_fuse_server/http/snapshot.py`, `tests/http/test_snapshot.py`
+- **Writer model**: Codex (mechanical streaming endpoint)
+- **Reviewer model**: Claude Opus (opposite family)
 - **Acceptance**: Streams JSONL response, gzip-encoded, against a
   populated snapshots table
 
@@ -337,20 +357,27 @@ Things that need Sprint 2 substantially done.
 - **Depends on**: 2E projector (chunks populate), 2B renderer
 - **Files**: `slack_fuse/fuse_ops_v2.py` (parallel to existing
   `fuse_ops.py`; legacy stays for cutover safety)
+- **Writer model**: Claude Opus (kernel-cache invariants + tier-aware
+  dispatch are the riskiest correctness surface in the rebuild;
+  pyfuse3 attribute-stub awkwardness needs careful navigation)
+- **Reviewer model**: GPT-5.5 xhigh + Gemini 3.1 Pro wildcard (the
+  Pre-3B-merge gate; two independent reviews because the failure
+  mode is "stale bytes served forever from kernel cache" which is
+  hard to notice)
 - **Acceptance**:
   - Tier-aware readdir / lookup
   - inodes table populates
   - Day-range bound computation correct across timezones
   - notify_store + invalidate coordination respects the trailer rule
-- **Critical**: a critical-review agent runs against this before
-  merge — kernel-cache invariants are the riskiest part of the
-  rebuild
 
 ### Track 3C — Trailer logic
 
 - **Depends on**: 2E projector + 3B FUSE adapter
 - **Files**: `slack_fuse/projector/trailer.py`,
   `slack_fuse/fuse_ops_v2.py` (small additions)
+- **Writer model**: Claude Opus (cross-cuts FUSE read + projector
+  health-event handling)
+- **Reviewer model**: GPT-5.5 xhigh
 - **Acceptance**: Three trailer conditions per RFC fire correctly;
   JSONL log writes; transition invalidation pings all primed inodes
 
@@ -359,6 +386,8 @@ Things that need Sprint 2 substantially done.
 - **Depends on**: client schema only (Sprint 0)
 - **Files**: `slack_fuse/cli/tier.py`
 - **Can start anytime**: but only useful once 3B FUSE adapter is in
+- **Writer model**: Codex (small CLI)
+- **Reviewer model**: Claude Opus (opposite family)
 - **Acceptance**: `slack-fuse tier <slug> <hot|hidden|blocked>` writes
   channels.tier correctly; subsequent readdir reflects it
 
@@ -367,6 +396,9 @@ Things that need Sprint 2 substantially done.
 - **Depends on**: 2E projector + 3B FUSE adapter
 - **Files**: `slack_fuse/projector/apply.py` (additions),
   `slack_fuse/fuse_ops_v2.py` (additions)
+- **Writer model**: Claude Opus (the race itself is what made the
+  reviewer flag it; the fix needs care)
+- **Reviewer model**: GPT-5.5 xhigh
 - **Acceptance**: synthetic test reproduces the race (message before
   user_added); verifies that user_added invalidates the matching
   cached inodes
@@ -496,13 +528,19 @@ Critical-review agents run at specific points. The review's job is
 adversarial: find what's wrong with the implementation, not validate
 that it's done.
 
-| Gate | When | Reviewer model | What it checks |
+**Reviewer selection rule**: use a model from a different family than
+the one that wrote the majority of the work being reviewed. The point
+is variance — same-family reviewers share the same training-induced
+blind spots as the author. Gemini 3.1 Pro is a wildcard for any gate
+when we want a third vendor entirely.
+
+| Gate | When | Reviewer | What it checks |
 |---|---|---|---|
-| Post-Sprint-0 | After interface freeze PR | gemini-3.5-flash or similar non-OpenAI | Interfaces match RFC exactly; no surprise additions; types check |
-| Post-Sprint-1 | After server vertical slice merges to server-split | gemini-3.5-flash | Slurper writes events conformant to wire frames; offsets advance correctly; slurper-health emits per spec |
-| Pre-3B-merge | Before FUSE adapter merges | sonnet-thinking | Kernel-cache invariants hold; notify_store and invalidate_inode coordination per RFC; trailer rule honoured |
-| Post-Sprint-3 | After convergence | gemini-3.5-flash + sonnet-thinking (two independent reviews) | End-to-end behaviour matches RFC; resolved-questions table entries still hold |
-| Pre-cutover | Before `SLACK_FUSE_MODE=split` becomes default | sonnet-thinking | Bake-in evidence; performance acceptable; rollback path tested |
+| Post-Sprint-0 | After interface freeze PR | Opposite-family of writer (if Opus wrote → codex-xhigh; if codex wrote → opus) | Interfaces match RFC exactly; no surprise additions; types check |
+| Post-Sprint-1 | After server vertical slice merges to server-split | Opposite-family of dominant Sprint-1 writer | Slurper writes events conformant to wire frames; offsets advance correctly; slurper-health emits per spec |
+| Pre-3B-merge | Before FUSE adapter merges | Opposite-family of 3B writer, PLUS gemini-3.1-pro as a second independent review | Kernel-cache invariants hold; notify_store and invalidate_inode coordination per RFC; trailer rule honoured. Two reviews because this is the riskiest correctness boundary in the rebuild |
+| Post-Sprint-3 | After convergence | Two independent reviews: opposite-family of dominant Sprint-3 writer + gemini-3.1-pro | End-to-end behaviour matches RFC; resolved-questions table entries still hold |
+| Pre-cutover | Before `SLACK_FUSE_MODE=split` becomes default | Opposite-family of dominant rebuild writer + gemini-3.1-pro | Bake-in evidence; performance acceptable; rollback path tested |
 
 Gate failures cause the owner to spawn fix-tracks rather than merge.
 
@@ -563,16 +601,52 @@ hold.
 At end of each sprint, owner folds clarifications back into the RFC
 in a single revision commit so the RFC stays canonical.
 
-## Worker model selection cheatsheet
+## Worker model selection
 
-| Task shape | Model |
+### Available models for this project
+
+- **Claude Opus** — `agent-handoff --agent claude --model opus` (alias for `claude-opus-4-7`)
+- **Codex** (coding-optimized) — `agent-handoff --agent cursor --model gpt-5.3-codex-xhigh` for the high-effort variant, or `gpt-5.3-codex` mid-tier
+- **GPT-5.5 xhigh** (frontier) — `agent-handoff --agent cursor --model gpt-5.5-extra-high`
+- **Gemini 3.1 Pro** (wildcard third vendor) — `agent-handoff --agent cursor --model gemini-3.1-pro`
+
+`sonnet-thinking` and the smaller Claude sibling models are off-menu
+for this project — the rebuild benefits from frontier-tier reasoning
+even on tracks that look mechanical, because the seams between tracks
+are subtle.
+
+### Picking a writer
+
+| Task shape | Default |
 |---|---|
-| Mechanical lift from current codebase | haiku |
-| Mechanical refactor with tests | haiku |
-| Spec-driven implementation, well-bounded | sonnet |
-| Implementation with subtle correctness concerns (cache invariants, concurrency) | sonnet-thinking |
-| Adversarial review | gemini-3.5-flash (different vendor; cheaper than gemini-pro for first-pass) |
-| Deep architectural review or final pre-cutover sweep | sonnet-thinking + gemini-3.1-pro (two independent reviews) |
+| Mechanical lift from current codebase | Codex (mid-tier, coding-optimized) |
+| Mechanical refactor with tests | Codex |
+| Spec-driven implementation, well-bounded | Opus or GPT-5.5 xhigh (pick by vendor diversity across concurrent tracks) |
+| Implementation with subtle correctness concerns (cache invariants, concurrency, ordering) | Opus or GPT-5.5 xhigh, never Codex |
+| Long contiguous track touching many files (e.g. 2E client projector) | Opus (1m context variant if needed) |
+
+When spawning multiple concurrent tracks in Sprint 2, deliberately
+spread vendors: 50/50 Opus and codex/GPT roughly, so each track has
+a natural opposite-family reviewer available.
+
+### Picking a reviewer (the variance rule)
+
+Use a model from a different family than the writer of the work
+being reviewed.
+
+| Writer family | Default reviewer |
+|---|---|
+| Claude Opus | Codex or GPT-5.5 xhigh |
+| Codex or GPT-5.5 xhigh | Claude Opus |
+| Mixed-family tracks (large convergence sprint) | Two independent reviews: one opposite-family-of-dominant-writer, one Gemini 3.1 Pro wildcard |
+
+Gemini 3.1 Pro is the wildcard third vendor — pull it in when:
+- The review is high-stakes (FUSE adapter, pre-cutover sweep) and we
+  want a third independent perspective beyond the writer/reviewer pair
+- The owner suspects the writer + opposite-family-reviewer pair
+  share a blind spot (e.g. both have leaned heavily on the same
+  pattern across multiple tracks)
+- A reviewer's findings need adjudication and we want a tiebreaker
 
 Default to the cheapest model that can plausibly do the task. The
 owner re-reviews everything before merge anyway.
