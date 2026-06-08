@@ -23,6 +23,8 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 
 import psycopg
@@ -34,10 +36,14 @@ from slack_fuse.migrations.runner import apply_migrations
 from slack_fuse_render import ChannelId
 from slack_fuse_server.backfill.api import BackfillContext, SlackApiBackfiller, SleepBounds, backfill_channel
 from slack_fuse_server.config import ServerConfig, load_server_config
+from slack_fuse_server.dispatch import serve_dispatch
+from slack_fuse_server.http.metrics import MetricsAggregator, SubscriberSnapshot
 from slack_fuse_server.slurper.api import SlackClient
 from slack_fuse_server.slurper.health import HealthEmitter
 from slack_fuse_server.slurper.offsets import OffsetWriter
+from slack_fuse_server.slurper.socket import SocketModeOptions, SocketModeStatus
 from slack_fuse_server.slurper.users import populate_users_once, run_socket_mode_with_users
+from slack_fuse_server.wire.server import WireServer
 
 log = logging.getLogger(__name__)
 
@@ -117,6 +123,32 @@ def _resolve_abort_at(
 # === Server (serve) mode ===
 
 
+def _build_metrics_aggregator(
+    config: ServerConfig,
+    status: SocketModeStatus,
+    wire_server: WireServer,
+    started_at: datetime,
+) -> MetricsAggregator:
+    """Wire `/metrics` to live runtime state: socket-mode status + WS subscribers."""
+
+    def _subscribers() -> Sequence[SubscriberSnapshot]:
+        return [
+            SubscriberSnapshot(
+                client_id=info.client_id,
+                connected_since=info.connected_since,
+                subscriptions=info.subscriptions,
+            )
+            for info in wire_server.connection_infos()
+        ]
+
+    return MetricsAggregator(
+        database_url=config.database_url,
+        server_started_at=started_at,
+        socket_mode_state=lambda: status.state,
+        subscribers=_subscribers,
+    )
+
+
 async def _serve(config: ServerConfig) -> None:
     conn = _connect_and_migrate(config.database_url)
     client = SlackClient(config.slack_user_token)
@@ -124,16 +156,40 @@ async def _serve(config: ServerConfig) -> None:
     writer = OffsetWriter(conn, limiter)
     health = HealthEmitter(writer)
 
+    status = SocketModeStatus()
+    wire_server = WireServer(config.database_url, shared_secret=config.shared_secret or None)
+    metrics = _build_metrics_aggregator(config, status, wire_server, datetime.now(UTC))
+
     auto_backfill = os.environ.get(_AUTO_BACKFILL_ENV, "").lower() in ("1", "true", "yes")
     try:
         async with trio.open_nursery() as nursery:
-            nursery.start_soon(run_socket_mode_with_users, writer, health, client, config.slack_app_token)
+            nursery.start_soon(_run_socket_mode_with_users_task, writer, health, client, config, status)
             nursery.start_soon(populate_users_once, writer, client)
+            nursery.start_soon(_serve_dispatch_task, config.listen_addr, wire_server, metrics)
             if auto_backfill:
                 nursery.start_soon(_auto_backfill, config, writer, health, client, limiter)
+            log.info("slack-fuse-server listening on %s (HTTP /health, /metrics + WS /ws)", config.listen_addr)
     finally:
         client.close()
         conn.close()
+
+
+async def _run_socket_mode_with_users_task(
+    writer: OffsetWriter,
+    health: HealthEmitter,
+    client: SlackClient,
+    config: ServerConfig,
+    status: SocketModeStatus,
+) -> None:
+    options = SocketModeOptions(
+        degraded_min_duration_s=config.slack_degraded_min_duration_s,
+        status=status,
+    )
+    await run_socket_mode_with_users(writer, health, client, config.slack_app_token, options=options)
+
+
+async def _serve_dispatch_task(listen_addr: str, wire_server: WireServer, metrics: MetricsAggregator) -> None:
+    await serve_dispatch(listen_addr=listen_addr, wire_server=wire_server, metrics_source=metrics)
 
 
 async def _auto_backfill(

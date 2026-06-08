@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import NoReturn, Protocol
 
 import trio
@@ -46,6 +47,15 @@ class WireServerOptions:
     client_timeout_s: float = _DEFAULT_CLIENT_TIMEOUT_S
 
 
+@dataclass(frozen=True, slots=True)
+class ConnectionInfo:
+    """A live WS connection's `/metrics` snapshot (see `MetricsAggregator`)."""
+
+    client_id: str
+    connected_since: datetime
+    subscriptions: int
+
+
 class WireServer:
     """Accepts client subscriptions and streams event-log frames over `/ws`."""
 
@@ -65,6 +75,9 @@ class WireServer:
         self._tailer = EventTailer(database_url, max_replay_events=options.max_replay_events)
         self._heartbeat_interval_s = options.heartbeat_interval_s
         self._client_timeout_s = options.client_timeout_s
+        # Live connections, keyed by a per-server monotonic id, for `/metrics`.
+        self._connections: dict[int, _ConnectionHandler] = {}
+        self._next_conn_id = 0
 
     async def serve(
         self,
@@ -72,14 +85,30 @@ class WireServer:
         task_status: trio.TaskStatus[WebSocketServer] = trio.TASK_STATUS_IGNORED,
     ) -> NoReturn:
         await serve_websocket(
-            self._handle_request,
+            self.handle_request,
             self._host,
             self._port,
             None,
             task_status=task_status,
         )
 
-    async def _handle_request(self, request: WebSocketRequest) -> None:
+    def connection_infos(self) -> list[ConnectionInfo]:
+        """Snapshot of live WS connections. Read from the trio loop (no locking)."""
+        return [
+            ConnectionInfo(
+                client_id=handler.client_id,
+                connected_since=handler.connected_since,
+                subscriptions=handler.subscription_count,
+            )
+            for handler in self._connections.values()
+        ]
+
+    async def handle_request(self, request: WebSocketRequest) -> None:
+        """Accept (or reject) one WS handshake and run the connection to close.
+
+        Public so the same-port dispatch (`slack_fuse_server.dispatch`) can drive
+        a handshake it peeked itself, not only the standalone `serve()` loop.
+        """
         if request.path != "/ws":
             await request.reject(404, body=b"not found")
             return
@@ -90,13 +119,20 @@ class WireServer:
             await ws.aclose(1008, "auth failed")
             return
 
+        conn_id = self._next_conn_id
+        self._next_conn_id += 1
         handler = _ConnectionHandler(
             ws,
             self._tailer,
+            client_id=str(conn_id),
             heartbeat_interval_s=self._heartbeat_interval_s,
             client_timeout_s=self._client_timeout_s,
         )
-        await handler.run()
+        self._connections[conn_id] = handler
+        try:
+            await handler.run()
+        finally:
+            self._connections.pop(conn_id, None)
 
 
 class _ConnectionHandler:
@@ -105,6 +141,7 @@ class _ConnectionHandler:
         ws: WebSocketConnection,
         tailer: EventTailer,
         *,
+        client_id: str,
         heartbeat_interval_s: float,
         client_timeout_s: float,
     ) -> None:
@@ -115,6 +152,12 @@ class _ConnectionHandler:
         self._subscriptions = ConnectionSubscriptions()
         self._send_lock = trio.Lock()
         self._tail_lock = trio.Lock()
+        self.client_id = client_id
+        self.connected_since = datetime.now(UTC)
+
+    @property
+    def subscription_count(self) -> int:
+        return self._subscriptions.count()
 
     async def run(self) -> None:
         try:

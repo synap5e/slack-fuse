@@ -95,7 +95,17 @@ async def serve_http_from_listen_addr(*, listen_addr: str, metrics_source: Metri
     await serve_http(host=host, port=port, metrics_source=metrics_source)
 
 
-async def _serve_connection(stream: trio.SocketStream, *, metrics_source: MetricsSource) -> None:
+async def serve_http_connection(stream: trio.abc.Stream, *, metrics_source: MetricsSource) -> None:
+    """Serve a single already-accepted connection as HTTP.
+
+    Public entry for the same-port dispatch (`slack_fuse_server.dispatch`), which
+    classifies the request then replays it into this handler over a stream that
+    prepends the bytes it already peeked.
+    """
+    await _serve_connection(stream, metrics_source=metrics_source)
+
+
+async def _serve_connection(stream: trio.abc.Stream, *, metrics_source: MetricsSource) -> None:
     conn = h11.Connection(h11.SERVER)
     try:
         request = await _read_request(conn, stream)
@@ -110,17 +120,14 @@ async def _serve_connection(stream: trio.SocketStream, *, metrics_source: Metric
         await stream.aclose()
 
 
-async def _read_request(conn: h11.Connection, stream: trio.SocketStream) -> HttpRequest | None:
+async def _read_request(conn: h11.Connection, stream: trio.abc.Stream) -> HttpRequest | None:
     method: str | None = None
     target: str | None = None
     while True:
         event = conn.next_event()
         if event is h11.NEED_DATA:
             chunk = await stream.receive_some(_READ_CHUNK_SIZE)
-            if chunk:
-                conn.receive_data(chunk)
-            else:
-                conn.receive_data(b"")
+            conn.receive_data(bytes(chunk) if chunk else b"")
             continue
         if isinstance(event, h11.Request):
             method = event.method.decode("ascii").upper()
@@ -137,19 +144,17 @@ async def _read_request(conn: h11.Connection, stream: trio.SocketStream) -> Http
             return None
 
 
-async def _send_response(conn: h11.Connection, stream: trio.SocketStream, response: HttpResponse) -> None:
+async def _send_response(conn: h11.Connection, stream: trio.abc.Stream, response: HttpResponse) -> None:
     header_tuples: list[tuple[bytes, bytes]] = [
         (b"content-type", response.content_type.encode("ascii")),
         (b"content-length", str(len(response.body)).encode("ascii")),
         (b"connection", b"close"),
     ]
-    encoded = b"".join(
-        (
-            conn.send(h11.Response(status_code=response.status_code, headers=header_tuples)),
-            conn.send(h11.Data(data=response.body)),
-            conn.send(h11.EndOfMessage()),
-        )
-    )
+    encoded = b"".join((
+        conn.send(h11.Response(status_code=response.status_code, headers=header_tuples)),
+        conn.send(h11.Data(data=response.body)),
+        conn.send(h11.EndOfMessage()),
+    ))
     await stream.send_all(encoded)
 
 

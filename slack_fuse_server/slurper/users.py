@@ -33,7 +33,7 @@ from slack_fuse_server._json import JsonObject
 from slack_fuse_server.slurper.api import SlackAPIError, SlackClient
 from slack_fuse_server.slurper.health import HealthEmitter
 from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter, assign_offset, insert_event
-from slack_fuse_server.slurper.socket import SocketModeRunner
+from slack_fuse_server.slurper.socket import SocketModeOptions, SocketModeRunner
 
 log = logging.getLogger(__name__)
 
@@ -312,8 +312,10 @@ class UsersSocketModeRunner(SocketModeRunner):
         health: HealthEmitter,
         client: SlackClient,
         app_token: str,
+        *,
+        options: SocketModeOptions | None = None,
     ) -> None:
-        super().__init__(writer, health, client, app_token)
+        super().__init__(writer, health, client, app_token, options=options)
         self._users_writer = writer
         self._users_client = client
 
@@ -351,6 +353,8 @@ async def run_socket_mode_with_users(
     health: HealthEmitter,
     client: SlackClient,
     app_token: str,
+    *,
+    options: SocketModeOptions | None = None,
 ) -> None:
     """Entry point: Socket Mode with message/channel + user-change writes."""
-    await UsersSocketModeRunner(writer, health, client, app_token).run()
+    await UsersSocketModeRunner(writer, health, client, app_token, options=options).run()

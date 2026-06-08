@@ -17,6 +17,7 @@ Both land atomically — a client that sees the event and an operator reading
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from enum import StrEnum
 
 import trio
@@ -39,6 +40,7 @@ class HealthKind(StrEnum):
     SOCKET_MODE_RECONNECTED = "socket_mode_reconnected"
     AUTH_TOKEN_INVALID = "auth_token_invalid"
     BACKFILL_STARTED = "backfill_started"
+    BACKFILL_PROGRESS = "backfill_progress"
     BACKFILL_COMPLETED = "backfill_completed"
     BACKFILL_ABORTED = "backfill_aborted"
 
@@ -74,3 +76,45 @@ class HealthEmitter:
         )
         log.info("slurper-health: %s %s (offset=%d)", kind, body, offset)
         return offset
+
+
+class SlackDegradedTracker:
+    """Debounces `slack_degraded` so a transient blip doesn't spam the stream.
+
+    A degraded *episode* begins on the first failure and ends when the next
+    success is recorded. Within an episode, `slack_degraded` is emitted at most
+    once, and only after the episode has persisted for `min_duration_s` — so a
+    one-off failure that recovers on the next attempt produces no event, while a
+    genuine outage surfaces once it crosses the threshold (RFC §Slurper health
+    stream; `slack_degraded_min_duration_s` in `ServerConfig`).
+
+    `clock` is injectable so tests can advance time deterministically; it
+    defaults to the trio clock the rest of the slurper measures against.
+    """
+
+    def __init__(
+        self,
+        health: HealthEmitter,
+        min_duration_s: float,
+        *,
+        clock: Callable[[], float] = trio.current_time,
+    ) -> None:
+        self._health = health
+        self._min_duration_s = min_duration_s
+        self._clock = clock
+        self._degraded_since: float | None = None
+        self._emitted = False
+
+    async def record_failure(self, reason: str) -> None:
+        """Note a connection-attempt failure; emit once the episode crosses the threshold."""
+        now = self._clock()
+        if self._degraded_since is None:
+            self._degraded_since = now
+        if not self._emitted and (now - self._degraded_since) >= self._min_duration_s:
+            await self._health.emit(HealthKind.SLACK_DEGRADED, {"reason": reason})
+            self._emitted = True
+
+    def record_healthy(self) -> None:
+        """End any degraded episode. The caller emits its own recovery transition."""
+        self._degraded_since = None
+        self._emitted = False

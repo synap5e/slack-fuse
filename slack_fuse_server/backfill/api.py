@@ -58,17 +58,26 @@ class SleepBounds:
     thread_max_s: float = _DEFAULT_THREAD_SLEEP_MAX
 
 
+# How often `backfill_channel` emits a `backfill_progress` health event, in
+# messages. Small enough that `/metrics` `in_progress.messages_so_far` advances
+# visibly during a run, large enough that the per-emit DB write stays negligible
+# against the API-page throttle.
+_DEFAULT_PROGRESS_EVERY = 500
+
+
 @dataclass(frozen=True, slots=True)
 class BackfillContext:
     """Write sink + thresholds for the `backfill_channel` driver.
 
     `abort_at=None` lifts the per-channel size limit (operator override).
+    `progress_every` controls the `backfill_progress` emission cadence.
     """
 
     writer: OffsetWriter
     health: HealthEmitter
     warn_at: int
     abort_at: int | None
+    progress_every: int = _DEFAULT_PROGRESS_EVERY
 
 
 def _ts_float(ts: str) -> float | None:
@@ -215,7 +224,10 @@ async def backfill_channel(
     """Drive one channel's backfill: write `message` events, honour thresholds.
 
     Emits the `backfill_started` / `slack_degraded(backfill_large)` /
-    `backfill_completed` / `backfill_aborted` health events around the run.
+    `backfill_progress{channel_id, messages_so_far}` (every `ctx.progress_every`
+    messages) / `backfill_completed` / `backfill_aborted` health events around
+    the run. `/metrics` reads the latest `backfill_progress` payload to populate
+    `in_progress.messages_so_far`.
     """
     cid = channel_id.value
     stream = f"channel:{cid}"
@@ -236,6 +248,8 @@ async def backfill_channel(
             if not warned and messages >= ctx.warn_at:
                 warned = True
                 await ctx.health.emit(HealthKind.SLACK_DEGRADED, {"reason": "backfill_large", "channel_id": cid})
+            if ctx.progress_every > 0 and messages % ctx.progress_every == 0:
+                await ctx.health.emit(HealthKind.BACKFILL_PROGRESS, {"channel_id": cid, "messages_so_far": messages})
             record = EventRecord(
                 stream=stream, kind="message", ts=msg.ts, payload=msg.model_dump(mode="json"), dedup=True
             )

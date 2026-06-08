@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from typing import cast
 
 import httpx
@@ -54,7 +55,7 @@ from slack_fuse.models import (
 )
 from slack_fuse_server._json import JsonObject
 from slack_fuse_server.slurper.api import SlackAPIError, SlackClient
-from slack_fuse_server.slurper.health import HealthEmitter, HealthKind
+from slack_fuse_server.slurper.health import HealthEmitter, HealthKind, SlackDegradedTracker
 from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter
 
 log = logging.getLogger(__name__)
@@ -62,13 +63,17 @@ log = logging.getLogger(__name__)
 _OPEN_URL = "https://slack.com/api/apps.connections.open"
 _RECONNECT_MIN = 2.0
 _RECONNECT_MAX = 300.0
+DEFAULT_DEGRADED_MIN_DURATION_S = 30.0
 
 # apps.connections.open `error` values that mean the app token is bad — emit
 # auth_token_invalid rather than silently retrying forever.
 _AUTH_ERRORS = frozenset({"invalid_auth", "token_revoked", "not_authed", "account_inactive"})
 
-# Slack structure-event types that imply the user lost access to the channel
-# (no conversations.info enrichment possible — the channel may be gone).
+# Slack structure-event types that imply the user lost access to the channel.
+# v1 mapping (RFC has no dedicated `channel_deleted` wire kind): a deleted or
+# departed channel is surfaced as `channel_member_changed{is_member: False}`,
+# i.e. "you can no longer see this channel" — the same signal as being removed.
+# `conversations.info` enrichment is skipped because the channel may be gone.
 _MEMBERSHIP_LOST_EVENTS = frozenset({"channel_deleted", "channel_left", "group_deleted"})
 _ARCHIVE_EVENTS = frozenset({"channel_archive", "group_archive"})
 _UNARCHIVE_EVENTS = frozenset({"channel_unarchive", "group_unarchive"})
@@ -79,6 +84,46 @@ _MEMBER_EVENTS = frozenset({"member_joined_channel", "member_left_channel"})
 
 class _AuthFailed(Exception):
     """apps.connections.open reported a bad app token."""
+
+
+@dataclass(slots=True)
+class SocketModeStatus:
+    """Live socket-mode connection state, surfaced in `/metrics`.
+
+    Mutated only from the trio event loop by `SocketModeRunner`; read from the
+    same loop by the metrics provider, so no locking is needed.
+    """
+
+    state: str = "connecting"
+
+
+@dataclass(frozen=True, slots=True)
+class SocketModeOptions:
+    """Tunables threaded into the socket-mode runner from server config.
+
+    Bundled so the runner constructor and entry points stay within the
+    argument-count budget. `status` is shared with the metrics layer when the
+    integrated server wires `/metrics`; left `None` (a fresh holder) in tests.
+    """
+
+    degraded_min_duration_s: float = DEFAULT_DEGRADED_MIN_DURATION_S
+    status: SocketModeStatus | None = None
+
+
+def _classify_open_failure(exc: BaseException) -> str:
+    """Map an `apps.connections.open` failure to a `slack_degraded` reason."""
+    if isinstance(exc, httpx.TimeoutException):
+        return "timeout"
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        if status == 429:
+            return "rate_limited"
+        if 500 <= status < 600:
+            return "api_5xx"
+        return "api_error"
+    if isinstance(exc, httpx.HTTPError):
+        return "network"
+    return "api_error"
 
 
 def translate_message_event(event: SocketEventPayload) -> EventRecord | None:
@@ -135,7 +180,10 @@ class SocketModeRunner:
         health: HealthEmitter,
         client: SlackClient,
         app_token: str,
+        *,
+        options: SocketModeOptions | None = None,
     ) -> None:
+        options = options or SocketModeOptions()
         self._writer = writer
         self._health = health
         self._client = client
@@ -144,25 +192,33 @@ class SocketModeRunner:
         # trio clock time of the most recent disconnect; None while connected
         # for the first time (initial connect emits slack_healthy, not reconnected).
         self._disconnected_at: float | None = None
+        self._degraded = SlackDegradedTracker(health, options.degraded_min_duration_s)
+        self._status = options.status if options.status is not None else SocketModeStatus()
 
     async def run(self) -> None:
         """Keep a Socket Mode connection open for the lifetime of the nursery."""
         backoff = _RECONNECT_MIN
         while True:
+            self._status.state = "connecting"
             try:
                 ws_url = await trio.to_thread.run_sync(self._open_socket, limiter=self._limiter)
             except _AuthFailed:
+                self._status.state = "auth_failed"
                 await self._health.emit(HealthKind.AUTH_TOKEN_INVALID)
                 await trio.sleep(backoff)
                 backoff = min(backoff * 2.0, _RECONNECT_MAX)
                 continue
             except (httpx.HTTPError, ValueError) as exc:
-                log.warning("socket-mode: apps.connections.open failed: %s", exc)
+                self._status.state = "disconnected"
+                reason = _classify_open_failure(exc)
+                log.warning("socket-mode: apps.connections.open failed (%s): %s", reason, exc)
+                await self._degraded.record_failure(reason)
                 await trio.sleep(backoff)
                 backoff = min(backoff * 2.0, _RECONNECT_MAX)
                 continue
 
             graceful = await self._connect_and_run(ws_url)
+            self._status.state = "disconnected"
             await self._health.emit(HealthKind.SOCKET_MODE_DISCONNECTED)
             self._disconnected_at = trio.current_time()
             if graceful:
@@ -200,6 +256,8 @@ class SocketModeRunner:
             return False
 
     async def _on_hello(self) -> None:
+        self._status.state = "connected"
+        self._degraded.record_healthy()
         if self._disconnected_at is None:
             await self._health.emit(HealthKind.SLACK_HEALTHY)
         else:
@@ -346,6 +404,8 @@ async def run_socket_mode(
     health: HealthEmitter,
     client: SlackClient,
     app_token: str,
+    *,
+    options: SocketModeOptions | None = None,
 ) -> None:
     """Entry point: build a `SocketModeRunner` and run it forever."""
-    await SocketModeRunner(writer, health, client, app_token).run()
+    await SocketModeRunner(writer, health, client, app_token, options=options).run()
