@@ -16,6 +16,7 @@ The public surface is re-exported here; implementations live in `render.py`
 
 from __future__ import annotations
 
+from slack_fuse_render.mrkdwn import convert_structural
 from slack_fuse_render.render import (
     channel_md_frontmatter,
     extract_mention_channel_ids,
@@ -41,6 +42,7 @@ __all__ = [
     "UserResolver",
     "UserView",
     "channel_md_frontmatter",
+    "convert_structural",
     "extract_mention_channel_ids",
     "extract_mention_user_ids",
     "render_message_structural",
