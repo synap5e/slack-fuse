@@ -82,7 +82,21 @@ Currently at `<after-this-commit>` with Sprint 0 + POC B merged.
 | 2F Test infra polish | cursor (gpt-5.3-codex-xhigh) | (killed) | `synap5e/feat/2f-test-infra` | **MERGED** at `5efe1db`. 405 → 439 tests; **0 skipped** (was 36). Manual initdb/pg_ctl postgres auto-provision (no pytest-postgresql dep). Synthetic generators cover all 9 event kinds. FUSE harness extended with lookup/getattr/read + tier_aware_channels_factory. The DB-bug-masking gap that the post-Sprint-1 review missed is fully closed. |
 | 2C HTTP /resolve + /permalink | cursor (gpt-5.3-codex-xhigh) | `sprint2c-resolve` | `synap5e/feat/2c-http-resolve-permalink` | in flight (lift logic from legacy resolve/permalink modules) |
 | 2D Snapshot generator | claude (opus) | (killed) | `synap5e/feat/2d-snapshots` | **MERGED** at `631bb05`. Periodic scheduler wired into slurper nursery on dedicated DB conn. Cost columns (`payload_bytes`, `events_covered`, `generation_duration_ms`, `generation_trigger`) populate; deterministic (canonical_json + sorted projection); REPEATABLE READ isolation for atomic-vs-events-log. Note: `SnapshotLine` DTO is message-shaped only — 3A will need a looser line shape for users/channel-list snapshots. |
-| 2E Client projector | claude (opus[1m]) | `sprint2e-projector` | `synap5e/feat/2e-client-projector` | in flight (biggest single Sprint 2 track) |
+| 2E Client projector | claude (opus[1m]) | (killed) | `synap5e/feat/2e-client-projector` | **MERGED** at `ce126fd`. 34 projector tests, all hard invariants verified. Owner-fixed conftest to use auto-postgres `database_url` fixture (worker's conftest still gated on direct env-var read, would have skipped 34 tests in default CI). **515 tests / 0 skipped — Sprint 2 complete.** Live-soak smoke deferred (workspace quiet). |
+
+## Sprint 3 — convergence (starting now)
+
+Sprint 2 didn't have its own review gate per the plan — straight to Sprint 3.
+
+Dependencies:
+- 3A snapshot HTTP endpoint: depends on 2D ✅
+- 3B FUSE adapter: depends on 2E + 2B ✅ (Pre-3B critical review gate; double-review)
+- 3C trailer logic: depends on 2E + 3B
+- 3D tier CLI: independent (client schema only) ✅
+- 3E cross-stream invalidation: depends on 2E + 3B
+
+Spawning batch: 3A (Codex), 3B (Opus, riskiest), 3D (Codex, independent quick win).
+3C + 3E wait for 3B to land + review.
 | 2C HTTP /resolve + /permalink | cursor (gpt-5.3-codex-xhigh) | (killed) | `synap5e/feat/2c-http-resolve-permalink` | **MERGED** at `e2d8a59`. Lifting strategy: option 2 (copy bodies into server modules), keeps legacy independent. CLI gained `--server-url` proxy mode. |
 | (owner inline) flake fix | n/a | n/a | n/a | Bumped WS test timeouts (1.0→5.0s default, 0.5→3.0s explicit) — was flaking under full-suite + cold-Pg load after 2F auto-provision landed. |
 | 1G Socket Mode payload conformance | cursor (gpt-5.3-codex-xhigh) | (killed) | `synap5e/feat/sprint1g-message-payload-conformance` | **MERGED** at `06bdad6`. Live `message` events now Message.model_validate(...).model_dump('json'), byte-equivalent to backfill. Conformance test asserts the equivalence against a conversations.history-derived envelope with reactions+files+edited+reply metadata. |
