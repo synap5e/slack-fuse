@@ -21,6 +21,7 @@ dependencies = [
 
 [project.scripts]
 slack-fuse = "slack_fuse.__main__:main"
+slack-fuse-server = "slack_fuse_server.slurper.__main__:main"
 
 [tool.hatch.build.targets.wheel]
 # Three top-level packages ship from this repo: the client (`slack_fuse`),
