@@ -1,3 +1,4 @@
+# pyright: reportPrivateUsage=false
 """Smoke tests for the cross-cutting test infrastructure (Sprint 2F seeds).
 
 Proves the fake Slack transport, the synthetic-event generator, and the FUSE
@@ -11,12 +12,19 @@ from typing import cast
 
 import httpx
 import pyfuse3
+import pytest
 
 from slack_fuse.models import (
+    AppsConnectionsOpenResponse,
+    ChatGetPermalinkResponse,
     ConversationsHistoryResponse,
+    ConversationsInfoResponse,
     ConversationsListResponse,
+    ConversationsRepliesResponse,
     FilesInfoResponse,
+    UsersInfoResponse,
     UsersListResponse,
+    _SlackResponse,
 )
 from slack_fuse_server.wire.frames import EventFrame, FrameAdapter
 from tests._fuse_harness import capture_readdir, fake_request_context
@@ -29,10 +37,30 @@ def test_fake_slack_conversations_list(fake_slack_http: httpx.Client) -> None:
     assert any(c.name == "general" for c in data.channels)
 
 
-def test_fake_slack_fixtures_validate_against_models(fake_slack_http: httpx.Client) -> None:
-    assert UsersListResponse.model_validate(fake_slack_http.get("/users.list").json()).ok
-    assert ConversationsHistoryResponse.model_validate(fake_slack_http.get("/conversations.history").json()).ok
-    assert FilesInfoResponse.model_validate(fake_slack_http.get("/files.info").json()).ok
+# Every shipped fake-Slack fixture must validate against its real response
+# model. This is the interface-drift guard: if a downstream track edits a
+# fixture and breaks the model contract, this test catches it immediately.
+_FIXTURE_MODELS: list[tuple[str, type[_SlackResponse]]] = [
+    ("/apps.connections.open", AppsConnectionsOpenResponse),
+    ("/chat.getPermalink", ChatGetPermalinkResponse),
+    ("/conversations.history", ConversationsHistoryResponse),
+    ("/conversations.info", ConversationsInfoResponse),
+    ("/conversations.list", ConversationsListResponse),
+    ("/conversations.replies", ConversationsRepliesResponse),
+    ("/files.info", FilesInfoResponse),
+    ("/users.info", UsersInfoResponse),
+    ("/users.list", UsersListResponse),
+]
+
+
+@pytest.mark.parametrize(("path", "model"), _FIXTURE_MODELS, ids=lambda v: v if isinstance(v, str) else v.__name__)
+def test_fake_slack_fixture_validates_against_model(
+    fake_slack_http: httpx.Client,
+    path: str,
+    model: type[_SlackResponse],
+) -> None:
+    validated = model.model_validate(fake_slack_http.get(path).json())
+    assert validated.ok, f"{path} fixture must have ok=true for the smoke corpus"
 
 
 def test_fake_slack_unknown_method_is_not_ok(fake_slack_http: httpx.Client) -> None:

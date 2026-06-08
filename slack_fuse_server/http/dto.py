@@ -21,6 +21,8 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from slack_fuse_server._json import JsonObject
+
 # `/snapshot` response framing (see RFC §Snapshot delivery via HTTP).
 SNAPSHOT_CONTENT_TYPE = "application/jsonl"
 SNAPSHOT_CONTENT_ENCODING = "gzip"
@@ -30,6 +32,36 @@ class _DTO(BaseModel):
     """Base for HTTP DTOs: immutable, reject unknown fields."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
+
+
+# === /snapshot JSONL line payload ===
+#
+# Per RFC §Snapshot delivery via HTTP, the GET /streams/<id>/snapshot endpoint
+# streams one JSONL record per current-state item. "Format matches what the
+# projector would have received as a sequence of `message` events — same
+# shape." Lines have ts + payload only; stream is implicit in the URL and
+# offsets aren't meaningful for snapshot lines (a snapshot is a current-state
+# dump, not historical events). The projector's apply path treats each line as
+# if it were the payload of a `kind="message"` EventFrame.
+
+
+class SnapshotLine(_DTO):
+    """One JSONL record from the /snapshot endpoint.
+
+    Wire shape: `{"ts": "<slack-ts>", "payload": {<message-fields>}}`.
+    `payload` matches the EventFrame `payload` for `kind="message"` events;
+    consumers apply each line via the same projection code path used for live
+    `message` event frames.
+    """
+
+    ts: str = Field(
+        ...,
+        description="Slack ts of the message (UTC epoch with microsecond fraction).",
+    )
+    payload: JsonObject = Field(
+        ...,
+        description="Message-shaped payload, same as EventFrame.payload for kind='message'.",
+    )
 
 
 # === /resolve ===

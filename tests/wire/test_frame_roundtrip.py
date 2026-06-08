@@ -1,7 +1,12 @@
-"""Every WS frame model round-trips, and the discriminated union dispatches.
+"""Every WS frame model round-trips through JSON, and the discriminated
+union dispatches.
 
-Sprint 0 contract: each frame survives `model_validate(model_dump())`
-byte-exactly, and `FrameAdapter` resolves an arbitrary dumped frame back to the
+Sprint 0 contract: each frame survives a byte-equivalent JSON round-trip
+(serialize → bytes → parse → equal model AND stable second serialization).
+This is the contract that matters on the wire — JSON dict round-trip via
+`model_dump()` would mask serialization-level divergences (datetime
+formatting, enum representation, etc.) that bite when frames cross the
+network. `FrameAdapter` resolves an arbitrary parsed frame back to the
 right concrete model via the `type` discriminator.
 """
 
@@ -45,19 +50,34 @@ _FRAMES: list[Frame] = [
 
 
 @pytest.mark.parametrize("frame", _FRAMES, ids=lambda f: f.type)
-def test_concrete_model_roundtrip(frame: Frame) -> None:
-    dumped = frame.model_dump()
-    restored = type(frame).model_validate(dumped)
+def test_concrete_model_json_byte_roundtrip(frame: Frame) -> None:
+    """Each frame serialises to JSON bytes and parses back equal; a second
+    serialise produces byte-identical output."""
+    raw = frame.model_dump_json()
+    restored = type(frame).model_validate_json(raw)
     assert restored == frame
-    # And the dump is stable across a second cycle.
-    assert restored.model_dump() == dumped
+    assert restored.model_dump_json() == raw
 
 
 @pytest.mark.parametrize("frame", _FRAMES, ids=lambda f: f.type)
-def test_discriminated_union_dispatch(frame: Frame) -> None:
-    restored = FrameAdapter.validate_python(frame.model_dump())
+def test_discriminated_union_dispatch_via_json(frame: Frame) -> None:
+    """Validate via the union's JSON path (matches how the WS server
+    parses incoming bytes off the wire)."""
+    raw = frame.model_dump_json()
+    restored = FrameAdapter.validate_json(raw)
     assert type(restored) is type(frame)
     assert restored == frame
+
+
+@pytest.mark.parametrize("frame", _FRAMES, ids=lambda f: f.type)
+def test_concrete_model_dict_roundtrip(frame: Frame) -> None:
+    """Dict round-trip retained as a structural sanity check alongside
+    the byte-level one. Catches Python-level type drift even when JSON
+    happens to be idempotent."""
+    dumped = frame.model_dump()
+    restored = type(frame).model_validate(dumped)
+    assert restored == frame
+    assert restored.model_dump() == dumped
 
 
 def test_discriminator_is_the_type_field() -> None:

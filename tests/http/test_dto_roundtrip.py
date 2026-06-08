@@ -1,4 +1,12 @@
-"""Every HTTP DTO round-trips through `model_validate(model_dump())`."""
+"""Every HTTP DTO round-trips through JSON byte-equivalent serialisation.
+
+The byte-level (`model_dump_json` / `model_validate_json`) round-trip is
+the contract that matters on the wire — dict round-trip via `model_dump`
+would hide serialisation-level divergences (datetime ISO formatting,
+None vs missing keys, JSONL line shape) that bite when DTOs cross the
+HTTP boundary. Dict round-trip kept as a structural sanity check
+alongside the byte-level one.
+"""
 
 from __future__ import annotations
 
@@ -21,6 +29,7 @@ from slack_fuse_server.http.dto import (
     ResolveRequest,
     ResolveResponse,
     SlackMetrics,
+    SnapshotLine,
     SnapshotQuery,
     StreamMetrics,
     SubscribersMetrics,
@@ -36,6 +45,16 @@ _DTOS: list[BaseModel] = [
     PermalinkResponse(url="https://example.slack.com/archives/C1/p1700000000000100"),
     HealthResponse(ok=True),
     SnapshotQuery(at=184500),
+    SnapshotLine(
+        ts="1779000000.000100",
+        payload={
+            "type": "message",
+            "user": "U1",
+            "text": "hello",
+            "edited": None,
+            "reactions": [{"name": "wave", "count": 2}],
+        },
+    ),
     MetricsResponse(
         server_started_at=_T,
         slack=SlackMetrics(
@@ -62,7 +81,18 @@ _DTOS: list[BaseModel] = [
 
 
 @pytest.mark.parametrize("dto", _DTOS, ids=lambda d: type(d).__name__)
-def test_dto_roundtrip(dto: BaseModel) -> None:
+def test_dto_json_byte_roundtrip(dto: BaseModel) -> None:
+    """Byte-equivalent round-trip: serialise → bytes → parse → equal model
+    AND a second serialise produces byte-identical output."""
+    raw = dto.model_dump_json()
+    restored = type(dto).model_validate_json(raw)
+    assert restored == dto
+    assert restored.model_dump_json() == raw
+
+
+@pytest.mark.parametrize("dto", _DTOS, ids=lambda d: type(d).__name__)
+def test_dto_dict_roundtrip(dto: BaseModel) -> None:
+    """Structural round-trip retained alongside the byte-level one."""
     dumped = dto.model_dump()
     restored = type(dto).model_validate(dumped)
     assert restored == dto
