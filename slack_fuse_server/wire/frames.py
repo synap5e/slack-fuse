@@ -24,6 +24,7 @@ class ErrorCode(StrEnum):
 
     STREAM_NOT_FOUND = "stream_not_found"
     SINCE_TOO_HIGH = "since_too_high"
+    SNAPSHOT_REQUIRED = "snapshot_required"
     AUTH_FAILED = "auth_failed"
 
 
