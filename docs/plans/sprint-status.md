@@ -114,10 +114,19 @@ invalidation. 3C (trailer JSONL log + module extraction) deferred to
 Sprint 4 hygiene — pure observability, 3B already implements the trailer
 correctness.
 
+### Pre-cutover review
+
+| Track | Model | tmux | Branch | Status |
+|---|---|---|---|---|
+| Post-Sprint-3 review | cursor (gpt-5.5-extra-high) | (killed) | n/a | **REQUEST CHANGES**. Verdict: legacy-default merge is safe, but split-mode opt-in bake-in needs fixes. Verifications all clean (ruff/pyright 0/0/0; pytest 621 passed, 0 skipped WITHOUT DATABASE_URL set — 2F fixture survived; smoke /health 200 + /metrics coherent). **6 substantive findings** (P0×2 + P1×4): (1) projector opens one psycopg conn per subscribed stream → 323+ conns for a 320-channel workspace, exceeds default `max_connections`; (2) snapshot apply is upsert-only, NOT full-state replacement → deleted rows survive cursor advance; (3) applier `except Exception: log; return` lets a later successful event advance cursor past a failed offset; (4) WS `_receive_loop` blocks on a full per-stream queue (HoL — module doc claims otherwise); (5) `V2InvalidationSink.channel_list_changed()` invalidates only `channel.md` + conv-root dirs, not thread.md or subtree dirs; (6) `slack-fuse tier <slug>` lookup doesn't match FUSE V2's slug logic — tests use synthetic `channels.slug` column that production schema doesn't have. Plus minor wiring gaps (split mount ignores `ClientConfig.mountpoint`; `stale_after_disconnect_s` parsed but unused). Report at `~/.agent-handoff/2026-06-09/post-sprint3-review/report.md`. |
+
 ### Next owner action
 
-Post-Sprint-3 critical review gate (pre-cutover) — user-in-loop touchpoint
-per the orchestration plan. Pause for owner input before firing.
+**User-in-loop checkpoint reached.** Sprint 3 functionally complete +
+pre-cutover review delivered. Pause for owner decision on fix-track scope
+and whether to merge `server-split-rebuild` → `main` immediately (legacy-
+default, zero behavior change for current users) or hold until split
+mode is bake-in-ready.
 | 2C HTTP /resolve + /permalink | cursor (gpt-5.3-codex-xhigh) | (killed) | `synap5e/feat/2c-http-resolve-permalink` | **MERGED** at `e2d8a59`. Lifting strategy: option 2 (copy bodies into server modules), keeps legacy independent. CLI gained `--server-url` proxy mode. |
 | (owner inline) flake fix | n/a | n/a | n/a | Bumped WS test timeouts (1.0→5.0s default, 0.5→3.0s explicit) — was flaking under full-suite + cold-Pg load after 2F auto-provision landed. |
 | 1G Socket Mode payload conformance | cursor (gpt-5.3-codex-xhigh) | (killed) | `synap5e/feat/sprint1g-message-payload-conformance` | **MERGED** at `06bdad6`. Live `message` events now Message.model_validate(...).model_dump('json'), byte-equivalent to backfill. Conformance test asserts the equivalence against a conversations.history-derived envelope with reactions+files+edited+reply metadata. |
