@@ -95,10 +95,13 @@ Dependencies:
 - 3D tier CLI: independent (client schema only) ✅
 - 3E cross-stream invalidation: depends on 2E + 3B
 
-Spawning batch: 3A (Codex), 3B (Opus, riskiest), 3D (Codex, independent quick win).
-3C + 3E wait for 3B to land + review.
+| Track | Model | tmux | Branch | Status |
+|---|---|---|---|---|
+| 3A snapshot HTTP endpoint | cursor (gpt-5.3-codex-xhigh) | (killed) | `synap5e/feat/3a-snapshot-http` | **MERGED** at `d4f83a6`. End-to-end test: generator → HTTP → 2E projector fetch — pass. WS now emits `snapshot_at` redirect (replaces `snapshot_required` error from 1B). Minor extension: URL includes optional `since=<offset>` for accurate `events_skipped` recording. |
+| 3B FUSE adapter | claude (opus[1m]) | `sprint3b-fuse` | `synap5e/feat/3b-fuse-adapter` | in flight (riskiest correctness surface; Pre-3B-merge double-review fires after) |
+| 3D tier CLI | cursor (gpt-5.3-codex-xhigh) | `sprint3d-tier` | `synap5e/feat/3d-tier-cli` | in flight (handoff probe-flaked first attempt; succeeded second try) |
 
-In flight (3A + 3B). 3D handoff probe transient-flaked (cursor-agent slow); will retry on next wake-up or owner-inline (small scope).
+3C + 3E wait for 3B to land + review.
 | 2C HTTP /resolve + /permalink | cursor (gpt-5.3-codex-xhigh) | (killed) | `synap5e/feat/2c-http-resolve-permalink` | **MERGED** at `e2d8a59`. Lifting strategy: option 2 (copy bodies into server modules), keeps legacy independent. CLI gained `--server-url` proxy mode. |
 | (owner inline) flake fix | n/a | n/a | n/a | Bumped WS test timeouts (1.0→5.0s default, 0.5→3.0s explicit) — was flaking under full-suite + cold-Pg load after 2F auto-provision landed. |
 | 1G Socket Mode payload conformance | cursor (gpt-5.3-codex-xhigh) | (killed) | `synap5e/feat/sprint1g-message-payload-conformance` | **MERGED** at `06bdad6`. Live `message` events now Message.model_validate(...).model_dump('json'), byte-equivalent to backfill. Conformance test asserts the equivalence against a conversations.history-derived envelope with reactions+files+edited+reply metadata. |
