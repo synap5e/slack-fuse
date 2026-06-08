@@ -67,7 +67,8 @@ Currently at `<after-this-commit>` with Sprint 0 + POC B merged.
 
 | Track | Model | tmux | Branch | Status |
 |---|---|---|---|---|
-| 1A slurper | claude (opus) | `sprint1a-slurper` | `synap5e/feat/sprint1a-slurper` | in flight |
+| 1A slurper | claude (opus) | (killed) | `synap5e/feat/sprint1a-slurper` | **MERGED** at `aa7855c`. 363 → 364 tests. Live-smoked against real Slack workspace + scratch postgres. NOTIFY new_event landed in offsets.insert_event. Bug found & fixed: shared psycopg connection must be `autocommit=True` or backfill silently rolls back into savepoints. Verified 1B/1C unaffected (read-only). Deferred users-stream emission → handed off as 1E. |
+| 1E users-stream emitter | cursor (gpt-5.3-codex-xhigh) | `sprint1e-users` | `synap5e/feat/sprint1e-users-stream` | in flight (closes 1A deferral; needed for projector mention-resolution testing) |
 | 1B WS server | cursor (gpt-5.5-extra-high) | (killed) | `synap5e/feat/sprint1b-ws-server` | **MERGED** at `<after-this>`. Added SNAPSHOT_REQUIRED to ErrorCode enum (sanctioned per prompt). LISTEN protocol: `NOTIFY new_event, '<stream-id>'` (or empty payload for wake-all fallback) — 1A coordinates by emitting these in the offset-assignment TX. |
 | 1C HTTP /health + /metrics | cursor (gpt-5.3-codex-xhigh) | (killed) | `synap5e/feat/sprint1c-http-health-metrics` | **MERGED**. Custom trio+h11 server, no new dep. `serve_http_on_listeners` exposed for 1B WS to compose (Upgrade-header path landed in 1B's PR). |
 | 1D debug subscribe CLI | cursor (gpt-5.3-codex-xhigh) | (killed) | `synap5e/feat/sprint1d-debug-subscribe-cli` | **MERGED**. `tools/debug_subscribe.py` + 7 unit tests. Auto-responds to ping with pong. Manual smoke deferred until 1A's slurper is running. |
