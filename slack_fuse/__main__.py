@@ -307,6 +307,8 @@ def cmd_permalink(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    from .cli import register_tier_subcommand
+
     parser = argparse.ArgumentParser(
         prog="slack-fuse",
         description="FUSE filesystem for Slack",
@@ -362,6 +364,7 @@ def main() -> None:
         help="Proxy to server endpoint (ws://..., wss://..., http://..., or https://...)",
     )
     permalink_parser.set_defaults(func=cmd_permalink)
+    register_tier_subcommand(sub)
 
     args = parser.parse_args()
     args.func(args)
