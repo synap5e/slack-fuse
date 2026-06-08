@@ -82,6 +82,21 @@ def test_due_streams_empty_below_thresholds(server_conn: psycopg.Connection[Tupl
     assert due_streams(server_conn, every_n_events=1000, max_age_seconds=99999.0) == []
 
 
+def test_due_streams_excludes_singleton_streams(server_conn: psycopg.Connection[TupleRow]) -> None:
+    """Review P0-C: the scheduler does not auto-snapshot singleton streams.
+
+    The WS server never redirects ``users`` / ``channel-list`` to a snapshot
+    (the split client can't full-state-apply them), so generating their
+    snapshots would be wasted work. Only the channel stream is due here.
+    """
+    for i in range(5):
+        _write_message(server_conn, "users", f"60{i}.000000")
+        _write_message(server_conn, "channel-list", f"61{i}.000000")
+        _write_message(server_conn, "channel:C1", f"62{i}.000000")
+    due = due_streams(server_conn, every_n_events=5, max_age_seconds=99999.0)
+    assert due == [("channel:C1", "event_count")]
+
+
 # === tick (async) ===
 
 

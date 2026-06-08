@@ -159,7 +159,7 @@ def cmd_mount(args: argparse.Namespace) -> None:
     from .store import SlackStore
     from .user_cache import UserCache
 
-    mountpoint = Path(args.mountpoint)
+    mountpoint = Path(args.mountpoint or _default_mountpoint())
     mountpoint.mkdir(parents=True, exist_ok=True)
 
     # Clean stale mount if present (e.g. after a crash)
@@ -323,7 +323,11 @@ def cmd_mount_split(args: argparse.Namespace) -> None:
     # The projector's post-commit sink: maps ChunkRef / ThreadChunkRef /
     # channel-list intents onto V2 inodes and drops their kernel page cache.
     sink = V2InvalidationSink(sink_conn, tz)
-    ws_options = WSClientOptions(server_url=config.server_url, shared_secret=config.shared_secret)
+    ws_options = WSClientOptions(
+        server_url=config.server_url,
+        shared_secret=config.shared_secret,
+        pool_size=config.projector_pool_size,
+    )
 
     fuse_options: set[str] = {"fsname=slack-fuse", "ro"}
     if args.debug:
@@ -479,7 +483,9 @@ def cmd_permalink(args: argparse.Namespace) -> None:
         client.close()
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser. Exposed so tests can assert argument wiring (e.g.
+    the split-mount mountpoint default) without invoking the command handlers."""
     from .cli import register_tier_subcommand
 
     parser = argparse.ArgumentParser(
@@ -492,8 +498,12 @@ def main() -> None:
     mount_parser.add_argument(
         "mountpoint",
         nargs="?",
-        default=_default_mountpoint(),
-        help=f"Mount point (default: {_default_mountpoint()})",
+        default=None,
+        # Default resolved lazily in the command handler so that, in split mode,
+        # an unspecified mountpoint falls back to ClientConfig.mountpoint rather
+        # than always being overridden by the legacy default (review residual:
+        # config.mountpoint was dead because the argparse default always won).
+        help=f"Mount point (default: ClientConfig.mountpoint in split mode, else {_default_mountpoint()})",
     )
     mount_parser.add_argument(
         "--debug",
@@ -545,7 +555,11 @@ def main() -> None:
     )
     permalink_parser.set_defaults(func=cmd_permalink)
     register_tier_subcommand(sub)
+    return parser
 
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
     args.func(args)
 

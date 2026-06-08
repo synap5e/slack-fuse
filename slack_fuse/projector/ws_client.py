@@ -14,11 +14,13 @@ This module is the boundary between the wire protocol and the local DB. It:
 - bumps `connection_state.last_frame_at` on every received frame so the FUSE
   read-side trailer logic sees the connection is live
 
-The receiver-per-frame routing model (RFC §Flow control) is realised here by
-having `enqueue` use `send` (not `send_nowait`) and routing each frame from a
-small dispatch helper. Because the per-stream send channel is bounded, send
-blocks the *calling task*, never the WebSocket receive loop itself — events
-for stream B continue to land while stream A backpressures.
+The receive loop never blocks on per-stream backpressure (review P1-E). Each
+`StreamApplier`'s queue is unbounded and `enqueue` is non-blocking, so routing a
+frame for a saturated stream A can never stop the loop from reading stream B's
+frames off the socket. The appliers share a bounded `ConnectionPool` rather than
+opening one DB connection per stream (review P0-A), so subscribing to a
+320-channel workspace no longer exhausts a stock local Postgres
+`max_connections`.
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ from pydantic import ValidationError
 from slack_fuse.projector.apply import InvalidationSink, NullInvalidationSink
 from slack_fuse.projector.cursor import read_cursor
 from slack_fuse.projector.per_stream import ConnectionFactory, StreamApplier
+from slack_fuse.projector.pool import DEFAULT_POOL_SIZE, ConnectionPool
 from slack_fuse.projector.snapshot_fetch import SnapshotFetchError, SnapshotRedirect, fetch_and_apply_snapshot
 from slack_fuse_server.wire.frames import (
     CaughtUpFrame,
@@ -69,6 +72,7 @@ class WSClientOptions:
     server_url: str
     shared_secret: str | None = None
     base_http_url: str | None = None  # for snapshot URL resolution; None ⇒ derive from server_url
+    pool_size: int = DEFAULT_POOL_SIZE  # bounded applier connection pool (review P0-A)
 
 
 class WSClient:
@@ -84,7 +88,9 @@ class WSClient:
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self._options = options
-        self._factory = connection_factory
+        # Bounded pool the appliers borrow from (review P0-A): ~pool_size
+        # connections regardless of how many channel streams are subscribed.
+        self._pool = ConnectionPool(connection_factory, max_size=options.pool_size)
         # The `state_conn` is used for `connection_state` bookkeeping and
         # one-off cursor reads at startup — never for chunk writes.
         self._state_conn = state_conn
@@ -128,6 +134,8 @@ class WSClient:
             self._ws = None
             for applier in self._appliers.values():
                 await applier.close()
+            self._appliers.clear()
+            await self._pool.aclose()
             if owned_http is not None:
                 await owned_http.aclose()
                 self._http = None
@@ -144,6 +152,11 @@ class WSClient:
 
     # === appliers ===
 
+    def _make_applier(self, stream: str) -> StreamApplier:
+        """Construct a `StreamApplier` for `stream`. Test seam: subclasses
+        override this to inject a `before_apply` hook (e.g. the HoL test)."""
+        return StreamApplier(stream, self._pool, self._sink)
+
     async def _ensure_applier(self, stream: str) -> StreamApplier:
         existing = self._appliers.get(stream)
         if existing is not None:
@@ -152,7 +165,7 @@ class WSClient:
         if nursery is None:  # pragma: no cover - only invoked inside run()
             msg = "WSClient._ensure_applier called outside run() nursery"
             raise RuntimeError(msg)
-        applier = StreamApplier(stream, self._factory, self._sink)
+        applier = self._make_applier(stream)
         self._appliers[stream] = applier
         await nursery.start(applier.serve)
         return applier
@@ -219,10 +232,12 @@ class WSClient:
         http = self._http
         if http is None:  # pragma: no cover
             return
-        # Use a dedicated connection — snapshot apply flips off autocommit for
-        # the duration of one big TX; we don't want to touch the appliers'
-        # per-stream connections.
-        snapshot_conn = self._factory()
+        # Borrow a pooled connection for the snapshot apply (review P0-A). The
+        # apply runs one big TX on an autocommit connection (it does not flip
+        # autocommit), so a pooled connection is safe; bounding it through the
+        # pool keeps the total connection budget intact even mid-snapshot.
+        snapshot_conn = await self._pool.acquire()
+        discard = False
         try:
             redirect = SnapshotRedirect(stream=frame.stream, at_offset=frame.at, url=frame.url)
             try:
@@ -233,11 +248,16 @@ class WSClient:
                     base_url=self._options.base_http_url,
                     sink=self._sink,
                 )
-            except (httpx.HTTPError, SnapshotFetchError) as exc:
+            except (httpx.HTTPError, SnapshotFetchError, ValueError) as exc:
+                # ValueError: a stale server offering a snapshot for a stream the
+                # client cannot replace-apply (e.g. a singleton stream — review
+                # P0-C). Log + leave the stream subscribed via the replay path
+                # rather than tearing the client down.
                 log.warning("ws: snapshot fetch for %s failed: %s", frame.stream, exc)
+                discard = True
                 return
         finally:
-            snapshot_conn.close()
+            await self._pool.release(snapshot_conn, discard=discard)
         # Resume the WS subscription from the snapshot offset.
         await self._send_frame(SubscribeFrame(stream=frame.stream, since=frame.at))
 

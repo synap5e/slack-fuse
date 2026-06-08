@@ -32,6 +32,17 @@ _SECRET_HEADER = b"x-slack-fuse-secret"
 _AUTHORIZATION_HEADER = b"authorization"
 
 
+def _snapshot_redirect_allowed(stream: str) -> bool:
+    """Whether the server may answer a too-old subscribe with `snapshot_at`.
+
+    Only `channel:<id>` streams: the split client can only full-state-apply
+    channel snapshots, not the `users` / `channel-list` singleton streams
+    (review P0-C). Singleton streams are small and always replay from `since`
+    instead — the server never advertises a snapshot the client cannot consume.
+    """
+    return stream.startswith("channel:")
+
+
 class _OutgoingFrame(Protocol):
     def model_dump_json(self) -> str: ...
 
@@ -222,7 +233,7 @@ class _ConnectionHandler:
             )
             return
 
-        if self._tailer.replay_is_too_old(frame.since, head_offset):
+        if _snapshot_redirect_allowed(frame.stream) and self._tailer.replay_is_too_old(frame.since, head_offset):
             snapshot_offset = await self._tailer.find_snapshot_at_or_after(frame.stream, frame.since, head_offset)
             self._subscriptions.remove(frame.stream)
             if snapshot_offset is not None:

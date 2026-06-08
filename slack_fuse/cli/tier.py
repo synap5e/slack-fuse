@@ -9,8 +9,6 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 
 import psycopg
-from psycopg import Cursor
-from psycopg.errors import UndefinedColumn
 from psycopg.rows import TupleRow
 from pydantic_settings import (
     BaseSettings,
@@ -19,7 +17,7 @@ from pydantic_settings import (
     TomlConfigSettingsSource,
 )
 
-from slack_fuse.slug import slugify
+from slack_fuse.fuse_v2_helpers import CONV_ROOTS, fetch_channel_by_slug
 
 TierName = Literal["hot", "hidden", "blocked"]
 _VALID_TIERS: tuple[TierName, TierName, TierName] = ("hot", "hidden", "blocked")
@@ -76,7 +74,10 @@ def register_tier_subcommand(subparsers: _SubparserRegistry) -> None:
         help="Set a channel tier override",
         description="Manually set channel visibility tier and mark source as manual",
     )
-    parser.add_argument("slug_or_channel_id", help="Channel slug or channel ID")
+    parser.add_argument(
+        "slug_or_channel_id",
+        help="Channel slug (e.g. 'general' or 'channels/general'), or channel ID (e.g. 'C123')",
+    )
     parser.add_argument("tier", choices=_VALID_TIERS, help="One of: hot, hidden, blocked")
     parser.set_defaults(func=cmd_tier)
 
@@ -119,12 +120,12 @@ def set_channel_tier(*, database_url: str, slug_or_channel_id: str, desired_tier
     conn: psycopg.Connection[TupleRow] = psycopg.connect(database_url)
     conn.autocommit = True
     try:
-        with conn.cursor() as cur:
-            channel_id = _resolve_channel_id(cur, slug_or_channel_id)
-            if channel_id is None:
-                msg = f"unknown channel slug or id: {slug_or_channel_id}"
-                raise TierCommandError(msg, exit_code=2)
+        channel_id = _resolve_channel_id(conn, slug_or_channel_id)
+        if channel_id is None:
+            msg = f"unknown channel slug or id: {slug_or_channel_id}"
+            raise TierCommandError(msg, exit_code=2)
 
+        with conn.cursor() as cur:
             cur.execute(
                 "SELECT tier, tier_source, subscribed FROM channels WHERE channel_id = %s",
                 (channel_id,),
@@ -160,46 +161,73 @@ def set_channel_tier(*, database_url: str, slug_or_channel_id: str, desired_tier
         conn.close()
 
 
-def _resolve_channel_id(cur: Cursor[TupleRow], slug_or_channel_id: str) -> str | None:
-    slug_match = _lookup_channel_id_by_slug(cur, slug_or_channel_id)
-    if slug_match is not None:
-        return slug_match
+def _resolve_channel_id(conn: psycopg.Connection[TupleRow], slug_or_channel_id: str) -> str | None:
+    """Resolve a CLI target to a channel id using the SAME slug logic as FUSE V2.
 
-    cur.execute("SELECT channel_id FROM channels WHERE channel_id = %s", (slug_or_channel_id,))
-    row = cur.fetchone()
-    if row is None:
+    Accepts (in priority order):
+
+    1. ``<conv-root>/<slug>`` — fully qualified, resolved against that conv root.
+    2. ``<slug>`` — resolved across all conv roots via ``fetch_channel_by_slug``
+       (the exact hot-first, per-conv-root assignment FUSE V2 uses, incl. DM
+       display-name slugs). A slug matching in more than one conv root is
+       ambiguous and raises (the operator must qualify it).
+    3. ``<channel_id>`` — a literal id, the unambiguous escape hatch.
+
+    Reuses ``fetch_channel_by_slug`` / ``assign_conv_root_slugs`` so a slug that
+    works in the mounted filesystem resolves to the same channel here, against
+    the real production schema (review P1-G — the old path queried a
+    non-existent ``channels.slug`` column, then fell back to a slug replay that
+    didn't partition by conv root, mishandled DMs, and didn't exclude blocked).
+    """
+    qualified = _resolve_qualified_slug(conn, slug_or_channel_id)
+    if qualified is not None:
+        return qualified
+
+    if "/" not in slug_or_channel_id:
+        slug_match = _resolve_bare_slug(conn, slug_or_channel_id)
+        if slug_match is not None:
+            return slug_match
+
+    return _resolve_literal_channel_id(conn, slug_or_channel_id)
+
+
+def _resolve_qualified_slug(conn: psycopg.Connection[TupleRow], target: str) -> str | None:
+    """Resolve a ``<conv-root>/<slug>`` target, or return ``None`` if not one."""
+    if "/" not in target:
         return None
-    return str(row[0])
-
-
-def _lookup_channel_id_by_slug(cur: Cursor[TupleRow], slug: str) -> str | None:
-    try:
-        cur.execute("SELECT channel_id FROM channels WHERE slug = %s", (slug,))
-    except UndefinedColumn:
-        # Older schemas did not persist slug; replay from channel names.
-        return _lookup_channel_id_by_replayed_slug(cur, slug)
-
-    row = cur.fetchone()
-    if row is None:
+    conv_root, _, slug = target.partition("/")
+    if conv_root not in CONV_ROOTS or not slug:
         return None
-    return str(row[0])
+    row = fetch_channel_by_slug(conn, conv_root, slug, allow_hidden=True)
+    return None if row is None else row.channel_id
 
 
-def _lookup_channel_id_by_replayed_slug(cur: Cursor[TupleRow], slug: str) -> str | None:
-    cur.execute("SELECT channel_id, name FROM channels ORDER BY channel_id")
-    rows = cur.fetchall()
-    slug_counts: dict[str, int] = {}
-    for row in rows:
-        channel_id = str(row[0])
-        raw_name = row[1]
-        name = str(raw_name) if isinstance(raw_name, str) else channel_id
-        base_slug = slugify(name) or channel_id[:12].lower()
-        count = slug_counts.get(base_slug, 0)
-        slug_counts[base_slug] = count + 1
-        candidate = base_slug if count == 0 else f"{base_slug}-{count + 1}"
-        if candidate == slug:
-            return channel_id
-    return None
+def _resolve_bare_slug(conn: psycopg.Connection[TupleRow], slug: str) -> str | None:
+    """Resolve a bare ``<slug>`` across every conv root.
+
+    Raises ``TierCommandError`` if the slug collides across conv roots so the
+    operator re-runs with a ``<conv-root>/<slug>`` qualifier rather than silently
+    re-tiering the wrong channel.
+    """
+    matches: list[tuple[str, str]] = []
+    for conv_root in CONV_ROOTS:
+        row = fetch_channel_by_slug(conn, conv_root, slug, allow_hidden=True)
+        if row is not None:
+            matches.append((conv_root, row.channel_id))
+    if not matches:
+        return None
+    if len(matches) > 1:
+        roots = ", ".join(f"{conv_root}/{slug}" for conv_root, _ in matches)
+        msg = f"slug {slug!r} is ambiguous across conv roots; qualify it as one of: {roots}"
+        raise TierCommandError(msg, exit_code=2)
+    return matches[0][1]
+
+
+def _resolve_literal_channel_id(conn: psycopg.Connection[TupleRow], channel_id: str) -> str | None:
+    with conn.cursor() as cur:
+        cur.execute("SELECT channel_id FROM channels WHERE channel_id = %s", (channel_id,))
+        row = cur.fetchone()
+    return None if row is None else str(row[0])
 
 
 def _as_tier_name(value: str) -> TierName:

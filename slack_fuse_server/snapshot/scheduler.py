@@ -76,9 +76,23 @@ class _StreamCadence:
     age_seconds: float | None
 
 
+_CHANNEL_STREAM_PREFIX = "channel:"
+
+
+def _snapshot_candidate(stream: str) -> bool:
+    """Whether the scheduler should auto-generate a snapshot for `stream`.
+
+    Only `channel:<id>` streams. The `users` / `channel-list` singleton streams
+    are small and the WS server always replays them rather than redirecting to a
+    snapshot the split client cannot full-state-apply (review P0-C), so
+    generating singleton snapshots would just be wasted work.
+    """
+    return is_projectable_stream(stream) and stream.startswith(_CHANNEL_STREAM_PREFIX)
+
+
 def _candidate_streams(cur: psycopg.Cursor[TupleRow]) -> list[str]:
     cur.execute("SELECT DISTINCT stream FROM events")
-    return sorted(s for (s,) in cur.fetchall() if isinstance(s, str) and is_projectable_stream(s))
+    return sorted(s for (s,) in cur.fetchall() if isinstance(s, str) and _snapshot_candidate(s))
 
 
 def _stream_cadence(cur: psycopg.Cursor[TupleRow], stream: str) -> _StreamCadence | None:

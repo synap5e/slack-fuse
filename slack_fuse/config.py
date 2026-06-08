@@ -42,6 +42,11 @@ class ClientConfig(BaseSettings):
     # Mountpoint (overridden by the SLACK_FUSE_MOUNTPOINT env var).
     mountpoint: str = "/views/slack"
 
+    # Bounded connection pool the projector's per-stream appliers share
+    # (review P0-A). Sized below a stock local Postgres max_connections=100
+    # after the split mount's other fixed connections are accounted for.
+    projector_pool_size: int = 8
+
     # Staleness-trailer behaviour.
     stale_trailer_enabled: bool = True
     stale_after_disconnect_s: float = 60.0

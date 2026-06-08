@@ -163,31 +163,67 @@ def test_thread_chunk_changed_unknown_thread_is_noop(
 
 
 # ============================================================================
-# channel_list_changed → all materialized channel.md + conv-root dirs
+# channel_list_changed → ALL materialized inodes (review P1-F)
 # ============================================================================
 
 
-def test_channel_list_changed_invalidates_all_channel_md_and_conv_roots(
+def test_channel_list_changed_invalidates_all_materialized_inodes(
     client_conn: Connection[TupleRow],
     ops: SlackFuseOpsV2,
     fake_pyfuse3: FakePyfuse3,
 ) -> None:
+    """Review P1-F: a channel-list change must drop EVERY materialized inode —
+    channel.md AND thread.md AND directory inodes — not just channel.md. A
+    rename rewrites thread.md frontmatter; an archive/block makes the whole
+    subtree ENOENT; a membership change reslugs descendants. The old behaviour
+    left thread.md serving stale kernel-cached bytes."""
     seed_channel(client_conn, "C1", "general", tier="hot")
     seed_channel(client_conn, "C2", "random", tier="hot")
-    # Materialize a spread of channel.md inodes (meta + day-level) and a
-    # conv-root dir, plus a non-channel.md path that must NOT be invalidated.
     meta_inode = ops.inodes.get_or_create("/channels/general/channel.md")
     day1_inode = ops.inodes.get_or_create("/channels/general/2026-06/08/channel.md")
     day2_inode = ops.inodes.get_or_create("/channels/random/2026-06/08/channel.md")
     conv_root_inode = ops.inodes.get_or_create("/channels")
+    day_dir_inode = ops.inodes.get_or_create("/channels/general/2026-06/08")
     thread_inode = ops.inodes.get_or_create("/channels/general/2026-06/08/some-thread/thread.md")
 
     sink = _make_sink(client_conn, fake_pyfuse3)
     sink.channel_list_changed()
 
     invalidated = set(fake_pyfuse3.invalidate_calls)
-    assert {meta_inode, day1_inode, day2_inode, conv_root_inode} <= invalidated
-    assert thread_inode not in invalidated
+    # Every materialized inode is dropped, including thread.md and directories.
+    assert {meta_inode, day1_inode, day2_inode, conv_root_inode, day_dir_inode, thread_inode} <= invalidated
+
+
+def test_channel_archived_invalidates_thread_md_inode_end_to_end(
+    client_conn: Connection[TupleRow],
+    ops: SlackFuseOpsV2,
+    fake_pyfuse3: FakePyfuse3,
+) -> None:
+    """Review P1-F regression: prime a hot thread.md, then apply
+    ``channel_archived`` for its channel and drive the sink as the applier
+    would. ``invalidate_inode`` must fire for the thread.md inode — not just
+    channel.md — so the kernel stops serving the (now-blocked) thread bytes."""
+    seed_channel(client_conn, "C1", "general", tier="hot")
+    thread_inode = ops.inodes.get_or_create("/channels/general/2026-06/08/some-thread/thread.md")
+
+    result = apply_event(
+        client_conn,
+        EventFrame(
+            stream="channel-list",
+            offset=1,
+            kind="channel_archived",
+            ts=None,
+            payload=_payload(channel_id="C1"),
+        ),
+    )
+    assert result.channel_list_changed is True
+
+    sink = _make_sink(client_conn, fake_pyfuse3)
+    # Mirror StreamApplier._fire_invalidations for a channel_list_changed result.
+    if result.channel_list_changed:
+        sink.channel_list_changed()
+
+    assert thread_inode in fake_pyfuse3.invalidate_calls
 
 
 # ============================================================================

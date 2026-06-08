@@ -795,16 +795,27 @@ class V2InvalidationSink:
             self._invalidate_path(path)
 
     def channel_list_changed(self) -> None:
-        # Channel-list churn (add/rename/archive/tier/membership) changes both
-        # the conv-root listings and the ``channel: <name>`` frontmatter of
-        # every channel.md, so drop every materialized channel.md inode plus
-        # every conv-root directory inode.
-        for inode in self._materialized_channel_md_inodes():
+        # Channel-list churn (add/rename/archive/tier/membership) changes far
+        # more than the conv-root listings and channel.md frontmatter:
+        #
+        #   * ``channel_renamed`` rewrites the ``channel:`` line in every
+        #     ``thread.md`` frontmatter, not just ``channel.md``.
+        #   * ``channel_archived`` / a tier flip to ``blocked`` makes the whole
+        #     subtree ENOENT — every cached ``thread.md`` and month/day/thread
+        #     directory under it must drop.
+        #   * ``channel_member_changed`` moves the channel between ``channels/``
+        #     and ``other-channels/``, changing every descendant path.
+        #   * A DM user display change reslugs the DM directory.
+        #
+        # The mutated channel's slug/conv-root may already be unknown after the
+        # mutation, so resolving "just the affected subtree" is unreliable. With
+        # ``fi.keep_cache=True`` any *materialized* inode (looked up or read at
+        # least once) can be serving stale kernel-cached bytes, so on any
+        # channel-list change we invalidate every materialized inode — channel.md
+        # AND thread.md AND every directory (review P1-F). Channel-list churn is
+        # rare, so the broad sweep is acceptable for v1.
+        for inode in self._all_materialized_inodes():
             self._invalidate_inode(inode)
-        for root in CONV_ROOTS:
-            inode = self._inodes.get_inode(f"/{root}")
-            if inode is not None:
-                self._invalidate_inode(inode)
 
     # -- resolution helpers ---------------------------------------------
 
@@ -849,10 +860,18 @@ class V2InvalidationSink:
                 return slug
         return None
 
-    def _materialized_channel_md_inodes(self) -> list[int]:
-        """Every allocated inode whose path is a ``channel.md`` (day or meta)."""
+    def _all_materialized_inodes(self) -> list[int]:
+        """Every allocated inode (review P1-F).
+
+        A channel-list change can invalidate any file or directory under a
+        renamed/archived/re-tiered channel, and the affected slug/conv-root may
+        be unknown post-mutation, so we sweep the whole ``inodes`` table rather
+        than trying to scope to one subtree. Conv-root directory inodes are in
+        the table too (materialized when root is first listed), so they are
+        covered without a separate pass.
+        """
         with self._conn.cursor() as cur:
-            _ = cur.execute("SELECT inode FROM inodes WHERE path LIKE %s", (f"%/{CHANNEL_MD}",))
+            _ = cur.execute("SELECT inode FROM inodes")
             return [int(r[0]) for r in cur.fetchall()]
 
     def _invalidate_path(self, path: str) -> None:

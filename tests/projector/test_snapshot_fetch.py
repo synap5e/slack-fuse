@@ -174,4 +174,132 @@ def test_snapshot_fetch_advances_cursor_on_empty_body(client_conn_factory: Clien
     assert _cursor(verify_conn, stream) == 33
 
 
+def _seed_top_level_chunk(conn: psycopg.Connection[TupleRow], channel_id: str, ts: str, *, mention: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO chunks (channel_id, message_ts, content_md, reply_count) VALUES (%s, %s, %s, 0)",
+            (channel_id, Decimal(ts), f"stale chunk mentioning <@{mention}>"),
+        )
+        cur.execute(
+            "INSERT INTO chunk_mentions (channel_id, message_ts, mention_kind, mentioned_id) "
+            "VALUES (%s, %s, 'user', %s)",
+            (channel_id, Decimal(ts), mention),
+        )
+
+
+def _seed_thread_reply(conn: psycopg.Connection[TupleRow], channel_id: str, thread_ts: str, reply_ts: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO thread_chunks (channel_id, thread_ts, reply_ts, role, content_md) "
+            "VALUES (%s, %s, %s, 'reply', %s)",
+            (channel_id, Decimal(thread_ts), Decimal(reply_ts), "stale reply"),
+        )
+
+
+def _chunk_exists(conn: psycopg.Connection[TupleRow], channel_id: str, ts: str) -> bool:
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM chunks WHERE channel_id = %s AND message_ts = %s", (channel_id, Decimal(ts)))
+        return cur.fetchone() is not None
+
+
+def _mention_count(conn: psycopg.Connection[TupleRow], channel_id: str, ts: str) -> int:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) FROM chunk_mentions WHERE channel_id = %s AND message_ts = %s",
+            (channel_id, Decimal(ts)),
+        )
+        row = cur.fetchone()
+    return 0 if row is None else int(row[0])
+
+
+def _thread_reply_exists(conn: psycopg.Connection[TupleRow], channel_id: str, thread_ts: str, reply_ts: str) -> bool:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM thread_chunks WHERE channel_id = %s AND thread_ts = %s AND reply_ts = %s",
+            (channel_id, Decimal(thread_ts), Decimal(reply_ts)),
+        )
+        return cur.fetchone() is not None
+
+
+def test_snapshot_apply_removes_stale_rows_before_advancing_cursor(client_conn_factory: ClientConnFactory) -> None:
+    """Review P0-B regression: a snapshot is full-state, not additive.
+
+    Seed a local chunk (and its mention) that the server has since deleted; the
+    snapshot at a later offset omits it. Applying the snapshot must delete the
+    stale chunk + its `chunk_mentions` rows AND advance the cursor — atomically,
+    in one TX. On the pre-fix upsert-only path the stale chunk survived forever
+    once the cursor advanced past the delete event the client never saw.
+    """
+    stream = "channel:CDEL"
+    stale_ts = "100.000001"
+
+    seed_conn = client_conn_factory()
+    _seed_top_level_chunk(seed_conn, "CDEL", stale_ts, mention="UGHOST")
+    assert _chunk_exists(seed_conn, "CDEL", stale_ts)
+    assert _mention_count(seed_conn, "CDEL", stale_ts) == 1
+
+    # The snapshot at offset 500 contains only a *different* message — the
+    # server's current state after the stale message was deleted.
+    kept_ts = synthetic_ts(0)
+    body = json.dumps({"type": "message", "ts": kept_ts, "user": "U0001", "text": "kept", "thread_ts": None}).encode()
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body)
+
+    conn = client_conn_factory()
+
+    async def run() -> None:
+        async with httpx.AsyncClient(base_url="http://snapshot.test", transport=httpx.MockTransport(handler)) as http:
+            result = await fetch_and_apply_snapshot(
+                http, conn, SnapshotRedirect(stream=stream, at_offset=500, url="/streams/X/snapshot?at=500")
+            )
+            assert result.records_applied == 1
+
+    trio.run(run)
+
+    verify_conn = client_conn_factory()
+    # Stale chunk + its mentions are gone (full-state replacement).
+    assert not _chunk_exists(verify_conn, "CDEL", stale_ts)
+    assert _mention_count(verify_conn, "CDEL", stale_ts) == 0
+    # The snapshot's message is present, and the cursor advanced — atomically.
+    assert _chunk_exists(verify_conn, "CDEL", kept_ts)
+    assert _cursor(verify_conn, stream) == 500
+
+
+def test_snapshot_apply_removes_stale_thread_replies(client_conn_factory: ClientConnFactory) -> None:
+    """Review P0-B: thread replies absent from the snapshot are removed too."""
+    stream = "channel:CTHR"
+    parent_ts = synthetic_ts(0)
+    kept_reply_ts = synthetic_ts(1)
+    stale_reply_ts = "100.000002"
+
+    seed_conn = client_conn_factory()
+    # A stale reply the snapshot will omit, plus the parent so the kept reply
+    # has somewhere to attach.
+    _seed_thread_reply(seed_conn, "CTHR", parent_ts, stale_reply_ts)
+    assert _thread_reply_exists(seed_conn, "CTHR", parent_ts, stale_reply_ts)
+
+    parent = {"type": "message", "ts": parent_ts, "user": "U0", "text": "parent", "thread_ts": parent_ts}
+    kept_reply = {"type": "message", "ts": kept_reply_ts, "user": "U1", "text": "kept reply", "thread_ts": parent_ts}
+    body = (json.dumps(parent) + "\n" + json.dumps(kept_reply)).encode()
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body)
+
+    conn = client_conn_factory()
+
+    async def run() -> None:
+        async with httpx.AsyncClient(base_url="http://snapshot.test", transport=httpx.MockTransport(handler)) as http:
+            await fetch_and_apply_snapshot(
+                http, conn, SnapshotRedirect(stream=stream, at_offset=700, url="/streams/X/snapshot?at=700")
+            )
+
+    trio.run(run)
+
+    verify_conn = client_conn_factory()
+    assert not _thread_reply_exists(verify_conn, "CTHR", parent_ts, stale_reply_ts)
+    assert _thread_reply_exists(verify_conn, "CTHR", parent_ts, kept_reply_ts)
+    assert _cursor(verify_conn, stream) == 700
+
+
 _ = ChunkRef  # keep the import alive for the test header

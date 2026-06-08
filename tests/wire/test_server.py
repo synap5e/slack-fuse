@@ -299,6 +299,41 @@ async def test_subscribe_too_old_returns_snapshot_required_when_no_snapshot_exis
     assert frame.head_offset == 2
 
 
+async def test_subscribe_singleton_too_old_replays_instead_of_snapshot(
+    pg_conn: psycopg.Connection[TupleRow],
+) -> None:
+    """Review P0-C: the server must NOT redirect a singleton stream to a
+    snapshot — the split client cannot full-state-apply ``users`` /
+    ``channel-list`` snapshots. Even when a covering snapshot exists and the
+    replay gap exceeds ``max_replay_events``, a singleton subscribe replays its
+    events and ends in ``caught_up`` rather than ``snapshot_at``.
+    """
+    database_url = _prepare_database(pg_conn)
+    stream = "users"
+    _seed_stream(pg_conn, stream, [_message("1.000001", "u1"), _message("2.000001", "u2")])
+    # A snapshot exists; on a channel stream this would trigger a redirect.
+    _seed_snapshot(
+        pg_conn,
+        stream,
+        at_offset=2,
+        payloads=[{"ts": "1.000001"}, {"ts": "2.000001"}],
+    )
+
+    async with _running_server(database_url, max_replay_events=1) as port, _connect(port) as ws:
+        await ws.send_message(SubscribeFrame(stream=stream, since=0).model_dump_json())
+        first = await _recv_frame(ws)
+        second = await _recv_frame(ws)
+        caught_up = await _recv_frame(ws)
+
+    assert isinstance(first, EventFrame)
+    assert first.stream == stream
+    assert first.offset == 1
+    assert isinstance(second, EventFrame)
+    assert second.offset == 2
+    assert isinstance(caught_up, CaughtUpFrame)
+    assert caught_up.head_offset == 2
+
+
 async def test_client_ping_gets_pong(pg_conn: psycopg.Connection[TupleRow]) -> None:
     database_url = _prepare_database(pg_conn)
 

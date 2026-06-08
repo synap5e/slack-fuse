@@ -4,32 +4,44 @@ Per RFC §Wire protocol → Snapshot delivery via HTTP. The WS server emits
 `snapshot_at { stream, at, url }` when `since` is too far behind for cheap
 event replay; this module fetches the snapshot over HTTP (`GET
 /streams/<stream-id>/snapshot?at=<offset>`), streams the JSONL response, and
-applies every line as a synthetic `message` event in a **single postgres
+applies it as a **full-state replacement** in a **single postgres
 transaction**.
+
+Full-state replacement (review P0-B). A snapshot is the *current materialised
+state* of a stream at offset `at` — it is authoritative, not additive. Applying
+it as upserts alone is wrong: a row present locally but absent from the snapshot
+(e.g. a message deleted by an event the client never saw before disconnecting)
+would survive forever once the cursor advanced past the delete. So before
+upserting the snapshot rows we DELETE the channel's `chunks` / `thread_chunks`
+whose keys are absent from the snapshot (their `chunk_mentions` cascade away via
+FK). The delete + upserts + cursor advance are one TX, so a crash mid-apply
+leaves the prior consistent state, not a half-replaced one.
 
 Atomicity matters: the cursor advance to `at` is part of the same TX as the
 chunk writes. If the fetch or apply fails partway, the TX rolls back and the
 next subscribe re-tries the snapshot from the same cursor — no partial chunks,
 no orphaned advance.
 
-Concurrency: this runs out-of-band from the per-stream event applier (the
-applier is suspended for the duration via the WS client's stream-state
-bookkeeping). To keep the apply genuinely transactional we toggle the
-connection to non-autocommit for the duration; restore autocommit on exit.
+Singleton streams (review P0-C). Only `channel:<id>` snapshots are consumable
+by this client. The server is responsible for never issuing `snapshot_at` for
+the `users` / `channel-list` singleton streams (it replays them instead). If a
+stale server does, `apply_snapshot_row` raises `ValueError`, which the WS client
+catches and logs rather than tearing the connection down.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import cast
 from urllib.parse import urljoin
 
 import httpx
 import trio
-from psycopg import Connection
+from psycopg import Connection, Cursor
 from psycopg.rows import TupleRow
 
 from slack_fuse.models import JsonObject
@@ -43,6 +55,8 @@ from slack_fuse.projector.apply import (
 from slack_fuse.projector.cursor import advance_cursor
 
 log = logging.getLogger(__name__)
+
+_CHANNEL_STREAM_PREFIX = "channel:"
 
 
 class SnapshotFetchError(Exception):
@@ -115,26 +129,83 @@ def _apply_snapshot_sync(
     at_offset: int,
     lines: tuple[str, ...],
 ) -> list[ApplyResult]:
-    """Apply every JSONL row in one TX. Returns post-commit invalidations.
+    """Apply the snapshot as a full-state replacement in one TX.
 
     The shape of each row matches a Slack `Message` payload (per RFC: snapshot
     apply re-uses the live-event `message` projection code via
-    `apply_snapshot_row`).
+    `apply_snapshot_row`). Before upserting, stale local rows absent from the
+    snapshot are deleted (review P0-B) so the projection matches the
+    authoritative server state at `at_offset` rather than the union of old + new.
     """
     results: list[ApplyResult] = []
     with conn.transaction(), conn.cursor() as cur:
-        for raw in lines:
-            try:
-                row = json.loads(raw)
-            except json.JSONDecodeError as exc:
-                msg = f"snapshot for {stream}: malformed JSONL"
-                raise SnapshotFetchError(msg) from exc
-            if not isinstance(row, dict):
-                msg = f"snapshot for {stream}: row is not an object"
-                raise SnapshotFetchError(msg)
-            results.append(apply_snapshot_row(cur, stream, cast(JsonObject, row)))
+        rows = [_decode_row(stream, raw) for raw in lines]
+        if stream.startswith(_CHANNEL_STREAM_PREFIX):
+            channel_id = stream.removeprefix(_CHANNEL_STREAM_PREFIX)
+            _delete_chunks_absent_from_snapshot(cur, channel_id, rows)
+        for row in rows:
+            results.append(apply_snapshot_row(cur, stream, row))
         advance_cursor(cur, stream, at_offset)
     return results
+
+
+def _decode_row(stream: str, raw: str) -> JsonObject:
+    try:
+        row = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        msg = f"snapshot for {stream}: malformed JSONL"
+        raise SnapshotFetchError(msg) from exc
+    if not isinstance(row, dict):
+        msg = f"snapshot for {stream}: row is not an object"
+        raise SnapshotFetchError(msg)
+    return cast(JsonObject, row)
+
+
+def _snapshot_ts(value: object) -> Decimal | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return Decimal(value)
+    except (ValueError, ArithmeticError):
+        return None
+
+
+def _delete_chunks_absent_from_snapshot(
+    cur: Cursor[TupleRow],
+    channel_id: str,
+    rows: Sequence[JsonObject],
+) -> None:
+    """Delete the channel's chunks/thread_chunks whose keys are not in the snapshot.
+
+    A top-level message (or thread parent: `thread_ts` unset or == `ts`) keeps a
+    `chunks` row keyed by `message_ts`; a thread reply (`thread_ts` set and !=
+    `ts`) keeps a `thread_chunks` row keyed by `(thread_ts, reply_ts)`. Empty
+    keep-sets delete everything for the channel — exactly what a snapshot with
+    no top-level messages / no replies should produce. `chunk_mentions` /
+    `thread_chunk_mentions` cascade away via their FKs.
+    """
+    keep_top: list[Decimal] = []
+    keep_thread_parent: list[Decimal] = []
+    keep_thread_reply: list[Decimal] = []
+    for row in rows:
+        ts = _snapshot_ts(row.get("ts"))
+        if ts is None:
+            continue
+        thread_ts = _snapshot_ts(row.get("thread_ts"))
+        if thread_ts is not None and thread_ts != ts:
+            keep_thread_parent.append(thread_ts)
+            keep_thread_reply.append(ts)
+        else:
+            keep_top.append(ts)
+    cur.execute(
+        "DELETE FROM chunks WHERE channel_id = %s AND message_ts <> ALL(%s::numeric[])",
+        (channel_id, keep_top),
+    )
+    cur.execute(
+        "DELETE FROM thread_chunks WHERE channel_id = %s "
+        "AND (thread_ts, reply_ts) NOT IN (SELECT * FROM unnest(%s::numeric[], %s::numeric[]))",
+        (channel_id, keep_thread_parent, keep_thread_reply),
+    )
 
 
 def _fire_invalidations(sink: InvalidationSink, results: Iterable[ApplyResult]) -> None:
