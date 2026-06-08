@@ -11,6 +11,7 @@ import trio
 from pydantic import ValidationError
 from trio_websocket import ConnectionClosed, WebSocketConnection, WebSocketRequest, WebSocketServer, serve_websocket
 
+from slack_fuse_server.http.snapshot import build_snapshot_url
 from slack_fuse_server.wire.frames import (
     CaughtUpFrame,
     ErrorCode,
@@ -19,6 +20,7 @@ from slack_fuse_server.wire.frames import (
     FrameAdapter,
     PingFrame,
     PongFrame,
+    SnapshotAtFrame,
     SubscribeFrame,
 )
 from slack_fuse_server.wire.subscriptions import ConnectionSubscriptions
@@ -221,7 +223,21 @@ class _ConnectionHandler:
             return
 
         if self._tailer.replay_is_too_old(frame.since, head_offset):
+            snapshot_offset = await self._tailer.find_snapshot_at_or_after(frame.stream, frame.since, head_offset)
             self._subscriptions.remove(frame.stream)
+            if snapshot_offset is not None:
+                await self._send_frame(
+                    SnapshotAtFrame(
+                        stream=frame.stream,
+                        at=snapshot_offset,
+                        url=build_snapshot_url(
+                            frame.stream,
+                            at_offset=snapshot_offset,
+                            client_since_offset=frame.since,
+                        ),
+                    )
+                )
+                return
             await self._send_frame(
                 ErrorFrame(code=ErrorCode.SNAPSHOT_REQUIRED, stream=frame.stream, head_offset=head_offset)
             )

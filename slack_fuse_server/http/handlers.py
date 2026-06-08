@@ -16,6 +16,7 @@ from slack_fuse_server.http.dto import (
 from slack_fuse_server.http.metrics import MetricsSource
 from slack_fuse_server.http.permalink import resolve_path_to_permalink_url
 from slack_fuse_server.http.resolve import resolve_permalink_url
+from slack_fuse_server.http.snapshot import SnapshotPayload, fetch_snapshot_payload
 from slack_fuse_server.slurper.api import SlackClient
 
 
@@ -34,6 +35,13 @@ class ResolvePermalinkDeps:
     client: SlackClient
     users: DisplayNameResolver
     workspace_url: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotDeps:
+    """Dependencies required by `GET /streams/<id>/snapshot`."""
+
+    database_url: str
 
 
 def handle_health() -> HealthResponse:
@@ -61,4 +69,20 @@ def handle_permalink(request: PermalinkRequest, deps: ResolvePermalinkDeps) -> P
             deps.workspace_url,
             ts=request.ts,
         )
+    )
+
+
+def handle_snapshot(
+    stream: str,
+    *,
+    at: int,
+    since: int | None,
+    deps: SnapshotDeps,
+) -> SnapshotPayload:
+    """`GET /streams/<id>/snapshot?at=<offset>[&since=<offset>]`."""
+    return fetch_snapshot_payload(
+        deps.database_url,
+        stream=stream,
+        requested_at=at,
+        client_since_offset=since,
     )

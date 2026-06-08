@@ -41,7 +41,7 @@ from slack_fuse_server.backfill.legacy import LegacyCacheBackfiller
 from slack_fuse_server.backfill.types import Backfiller
 from slack_fuse_server.config import ServerConfig, load_server_config
 from slack_fuse_server.dispatch import serve_dispatch
-from slack_fuse_server.http.handlers import ResolvePermalinkDeps
+from slack_fuse_server.http.handlers import ResolvePermalinkDeps, SnapshotDeps
 from slack_fuse_server.http.metrics import MetricsAggregator, SubscriberSnapshot
 from slack_fuse_server.slurper.api import SlackClient
 from slack_fuse_server.slurper.health import HealthEmitter
@@ -201,6 +201,7 @@ async def _serve(config: ServerConfig) -> None:
         users=users,
         workspace_url=os.environ.get("SLACK_WORKSPACE_URL"),
     )
+    snapshot_deps = SnapshotDeps(database_url=config.database_url)
     limiter = trio.CapacityLimiter(1)
     writer = OffsetWriter(conn, limiter)
     health = HealthEmitter(writer)
@@ -225,7 +226,14 @@ async def _serve(config: ServerConfig) -> None:
         async with trio.open_nursery() as nursery:
             nursery.start_soon(_run_socket_mode_with_users_task, writer, health, client, config, status)
             nursery.start_soon(populate_users_once, writer, client)
-            nursery.start_soon(_serve_dispatch_task, config.listen_addr, wire_server, metrics, resolve_permalink_deps)
+            nursery.start_soon(
+                _serve_dispatch_task,
+                config.listen_addr,
+                wire_server,
+                metrics,
+                resolve_permalink_deps,
+                snapshot_deps,
+            )
             nursery.start_soon(snapshot_scheduler.run)
             if auto_backfill:
                 nursery.start_soon(_auto_backfill, config, writer, health, client, limiter)
@@ -255,12 +263,14 @@ async def _serve_dispatch_task(
     wire_server: WireServer,
     metrics: MetricsAggregator,
     resolve_permalink_deps: ResolvePermalinkDeps,
+    snapshot_deps: SnapshotDeps,
 ) -> None:
     await serve_dispatch(
         listen_addr=listen_addr,
         wire_server=wire_server,
         metrics_source=metrics,
         resolve_permalink_deps=resolve_permalink_deps,
+        snapshot_deps=snapshot_deps,
     )
 
 

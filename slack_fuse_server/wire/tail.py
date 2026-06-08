@@ -79,6 +79,9 @@ class EventTailer:
     async def get_head_offset(self, stream: str) -> int | None:
         return await trio.to_thread.run_sync(self._get_head_offset_sync, stream)
 
+    async def find_snapshot_at_or_after(self, stream: str, since: int, head_offset: int) -> int | None:
+        return await trio.to_thread.run_sync(self._find_snapshot_at_or_after_sync, stream, since, head_offset)
+
     def replay_is_too_old(self, since: int, head_offset: int) -> bool:
         return head_offset - since > self.max_replay_events
 
@@ -163,6 +166,19 @@ class EventTailer:
                 )
             rows = cur.fetchall()
         return [_record_to_frame(row) for row in rows]
+
+    def _find_snapshot_at_or_after_sync(self, stream: str, since: int, head_offset: int) -> int | None:
+        if since > head_offset:
+            return None
+        with psycopg.connect(self._database_url) as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT at_offset FROM snapshots "
+                "WHERE stream = %s AND at_offset >= %s AND at_offset <= %s "
+                "ORDER BY at_offset DESC LIMIT 1",
+                (stream, since, head_offset),
+            )
+            row = cur.fetchone()
+        return None if row is None else int(row[0])
 
     def _open_listen_conn(self) -> psycopg.Connection[TupleRow]:
         conn: psycopg.Connection[TupleRow] = psycopg.connect(self._database_url, autocommit=True)

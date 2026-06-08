@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import psycopg
 import pytest
@@ -26,6 +27,7 @@ from slack_fuse_server.wire.frames import (
     FrameAdapter,
     PingFrame,
     PongFrame,
+    SnapshotAtFrame,
     SubscribeFrame,
 )
 from slack_fuse_server.wire.server import WireServer, WireServerOptions
@@ -113,6 +115,22 @@ def _seed_stream(pg_conn: psycopg.Connection[TupleRow], stream: str, payloads: l
                 """,
                 (stream, offset, "message", payload.get("ts"), Jsonb(payload)),
             )
+    pg_conn.commit()
+
+
+def _seed_snapshot(
+    pg_conn: psycopg.Connection[TupleRow],
+    stream: str,
+    at_offset: int,
+    payloads: list[JsonObject],
+) -> None:
+    with pg_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO snapshots "
+            "(stream, at_offset, payload, payload_bytes, events_covered, generation_duration_ms, generation_trigger) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            (stream, at_offset, Jsonb(payloads), 1, at_offset, 1, "manual"),
+        )
     pg_conn.commit()
 
 
@@ -234,7 +252,39 @@ async def test_subscribe_since_too_high_returns_head_offset(pg_conn: psycopg.Con
     assert frame.head_offset == 1
 
 
-async def test_subscribe_too_old_returns_snapshot_required(pg_conn: psycopg.Connection[TupleRow]) -> None:
+async def test_subscribe_too_old_returns_snapshot_at_when_snapshot_exists(
+    pg_conn: psycopg.Connection[TupleRow],
+) -> None:
+    database_url = _prepare_database(pg_conn)
+    stream = "channel:C1"
+    _seed_stream(pg_conn, stream, [_message("1.000001", "one"), _message("2.000001", "two")])
+    _seed_snapshot(
+        pg_conn,
+        stream,
+        at_offset=2,
+        payloads=[
+            {"ts": "1.000001", "payload": _message("1.000001", "one")},
+            {"ts": "2.000001", "payload": _message("2.000001", "two")},
+        ],
+    )
+
+    async with _running_server(database_url, max_replay_events=1) as port, _connect(port) as ws:
+        await ws.send_message(SubscribeFrame(stream=stream, since=0).model_dump_json())
+        frame = await _recv_frame(ws)
+
+    assert isinstance(frame, SnapshotAtFrame)
+    assert frame.stream == stream
+    assert frame.at == 2
+    parsed = urlsplit(frame.url)
+    assert parsed.path == "/streams/channel%3AC1/snapshot"
+    query = parse_qs(parsed.query)
+    assert query["at"] == ["2"]
+    assert query["since"] == ["0"]
+
+
+async def test_subscribe_too_old_returns_snapshot_required_when_no_snapshot_exists(
+    pg_conn: psycopg.Connection[TupleRow],
+) -> None:
     database_url = _prepare_database(pg_conn)
     stream = "channel:C1"
     _seed_stream(pg_conn, stream, [_message("1.000001", "one"), _message("2.000001", "two")])

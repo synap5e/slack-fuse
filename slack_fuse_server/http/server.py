@@ -1,24 +1,34 @@
-"""Minimal trio HTTP server for `/health`, `/metrics`, `/resolve`, `/permalink`."""
+"""Minimal trio HTTP server for `/health`, `/metrics`, `/resolve`, `/permalink`, `/streams/*/snapshot`."""
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
 from functools import partial
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import h11
+import psycopg
 import trio
 from pydantic import BaseModel, ValidationError
 
-from slack_fuse_server.http.dto import PermalinkRequest, ResolveRequest
+from slack_fuse_server.http.dto import (
+    SNAPSHOT_CONTENT_ENCODING,
+    SNAPSHOT_CONTENT_TYPE,
+    PermalinkRequest,
+    ResolveRequest,
+)
 from slack_fuse_server.http.handlers import (
     ResolvePermalinkDeps,
+    SnapshotDeps,
     handle_health,
     handle_metrics,
     handle_permalink,
     handle_resolve,
+    handle_snapshot,
 )
 from slack_fuse_server.http.metrics import MetricsSource
+from slack_fuse_server.http.snapshot import SnapshotNotFoundError
 from slack_fuse_server.slurper.api import SlackAPIError
 
 _JSON_CONTENT_TYPE = "application/json"
@@ -30,6 +40,7 @@ class HttpResponse:
     status_code: int
     body: bytes
     content_type: str = _JSON_CONTENT_TYPE
+    headers: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +79,7 @@ def route_request(  # noqa: C901 - endpoint routing dispatch hub.
     *,
     metrics_source: MetricsSource,
     resolve_permalink_deps: ResolvePermalinkDeps | None = None,
+    snapshot_deps: SnapshotDeps | None = None,
 ) -> HttpResponse:
     """Pure routing table for supported HTTP endpoints."""
     if request.path == "/health":
@@ -94,6 +106,18 @@ def route_request(  # noqa: C901 - endpoint routing dispatch hub.
             return _error_response(status_code=503, code="service_unavailable")
         return _handle_permalink(request, resolve_permalink_deps)
 
+    snapshot_stream = _snapshot_stream_from_path(request.path)
+    if snapshot_stream is not None:
+        if request.method != "GET":
+            return _error_response(status_code=405, code="method_not_allowed")
+        if snapshot_deps is None:
+            return _error_response(status_code=503, code="service_unavailable")
+        try:
+            at, since = _parse_snapshot_query(request.target)
+        except ValueError:
+            return _error_response(status_code=400, code="bad_request")
+        return _handle_snapshot(snapshot_stream, at=at, since=since, deps=snapshot_deps)
+
     return _error_response(status_code=404, code="not_found")
 
 
@@ -103,12 +127,14 @@ async def serve_http(
     port: int,
     metrics_source: MetricsSource,
     resolve_permalink_deps: ResolvePermalinkDeps | None = None,
+    snapshot_deps: SnapshotDeps | None = None,
 ) -> None:
     """Serve HTTP endpoints on the given host/port."""
     handler = partial(
         _serve_connection,
         metrics_source=metrics_source,
         resolve_permalink_deps=resolve_permalink_deps,
+        snapshot_deps=snapshot_deps,
     )
     await trio.serve_tcp(handler, port=port, host=host)
 
@@ -117,12 +143,14 @@ async def serve_http_on_listeners(
     listeners: list[trio.SocketListener],
     metrics_source: MetricsSource,
     resolve_permalink_deps: ResolvePermalinkDeps | None = None,
+    snapshot_deps: SnapshotDeps | None = None,
 ) -> None:
     """Serve on already-open listeners (useful for tests and shared-port setups)."""
     handler = partial(
         _serve_connection,
         metrics_source=metrics_source,
         resolve_permalink_deps=resolve_permalink_deps,
+        snapshot_deps=snapshot_deps,
     )
     await trio.serve_listeners(handler, listeners)
 
@@ -132,6 +160,7 @@ async def serve_http_from_listen_addr(
     listen_addr: str,
     metrics_source: MetricsSource,
     resolve_permalink_deps: ResolvePermalinkDeps | None = None,
+    snapshot_deps: SnapshotDeps | None = None,
 ) -> None:
     """Serve HTTP endpoints using an RFC-style `listen_addr` string."""
     host, port = parse_listen_addr(listen_addr)
@@ -140,6 +169,7 @@ async def serve_http_from_listen_addr(
         port=port,
         metrics_source=metrics_source,
         resolve_permalink_deps=resolve_permalink_deps,
+        snapshot_deps=snapshot_deps,
     )
 
 
@@ -148,6 +178,7 @@ async def serve_http_connection(
     *,
     metrics_source: MetricsSource,
     resolve_permalink_deps: ResolvePermalinkDeps | None = None,
+    snapshot_deps: SnapshotDeps | None = None,
 ) -> None:
     """Serve a single already-accepted connection as HTTP.
 
@@ -159,6 +190,7 @@ async def serve_http_connection(
         stream,
         metrics_source=metrics_source,
         resolve_permalink_deps=resolve_permalink_deps,
+        snapshot_deps=snapshot_deps,
     )
 
 
@@ -167,6 +199,7 @@ async def _serve_connection(
     *,
     metrics_source: MetricsSource,
     resolve_permalink_deps: ResolvePermalinkDeps | None = None,
+    snapshot_deps: SnapshotDeps | None = None,
 ) -> None:
     conn = h11.Connection(h11.SERVER)
     try:
@@ -177,6 +210,7 @@ async def _serve_connection(
             request,
             metrics_source=metrics_source,
             resolve_permalink_deps=resolve_permalink_deps,
+            snapshot_deps=snapshot_deps,
         )
         await _send_response(conn, stream, response)
     except h11.RemoteProtocolError:
@@ -217,6 +251,7 @@ async def _send_response(conn: h11.Connection, stream: trio.abc.Stream, response
         (b"content-length", str(len(response.body)).encode("ascii")),
         (b"connection", b"close"),
     ]
+    header_tuples.extend((name.encode("ascii"), value.encode("ascii")) for name, value in response.headers)
     encoded = b"".join((
         conn.send(h11.Response(status_code=response.status_code, headers=header_tuples)),
         conn.send(h11.Data(data=response.body)),
@@ -266,3 +301,60 @@ def _handle_permalink(request: HttpRequest, deps: ResolvePermalinkDeps) -> HttpR
     except SlackAPIError:
         return _error_response(status_code=502, code="slack_api_error")
     return _dto_response(status_code=200, payload=response)
+
+
+def _handle_snapshot(stream: str, *, at: int, since: int | None, deps: SnapshotDeps) -> HttpResponse:
+    try:
+        payload = handle_snapshot(stream, at=at, since=since, deps=deps)
+    except SnapshotNotFoundError:
+        return _error_response(status_code=404, code="not_found")
+    except ValueError:
+        return _error_response(status_code=400, code="bad_request")
+    except psycopg.Error:
+        return _error_response(status_code=503, code="service_unavailable")
+    return HttpResponse(
+        status_code=200,
+        body=payload.body,
+        content_type=SNAPSHOT_CONTENT_TYPE,
+        headers=(("content-encoding", SNAPSHOT_CONTENT_ENCODING),),
+    )
+
+
+def _snapshot_stream_from_path(path: str) -> str | None:
+    parts = path.split("/")
+    if len(parts) != 4 or parts[1] != "streams" or parts[3] != "snapshot":
+        return None
+    encoded_stream = parts[2]
+    if not encoded_stream:
+        return None
+    stream = unquote(encoded_stream)
+    return stream or None
+
+
+def _parse_snapshot_query(target: str) -> tuple[int, int | None]:
+    query = parse_qs(urlsplit(target).query, keep_blank_values=False)
+    at_raw = _single_query_value(query, "at")
+    if at_raw is None:  # pragma: no cover - required=True guarantees this.
+        raise ValueError("missing 'at' query parameter")
+    at = _parse_non_negative_int(at_raw)
+    since_raw = _single_query_value(query, "since", required=False)
+    since = None if since_raw is None else _parse_non_negative_int(since_raw)
+    return at, since
+
+
+def _single_query_value(query: dict[str, list[str]], key: str, *, required: bool = True) -> str | None:
+    values = query.get(key)
+    if values is None:
+        if required:
+            raise ValueError(f"missing {key!r} query parameter")
+        return None
+    if len(values) != 1:
+        raise ValueError(f"duplicate {key!r} query parameter")
+    return values[0]
+
+
+def _parse_non_negative_int(text: str) -> int:
+    value = int(text)
+    if value < 0:
+        raise ValueError("snapshot query offsets must be >= 0")
+    return value
