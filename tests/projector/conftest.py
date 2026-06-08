@@ -14,7 +14,6 @@ flip `autocommit = True` (matching the projector's contract).
 
 from __future__ import annotations
 
-import os
 import uuid
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -28,7 +27,6 @@ import slack_fuse.migrations as client_migrations
 from slack_fuse.migrations.runner import apply_migrations
 from slack_fuse.projector.apply import ChunkRef, ThreadChunkRef
 
-_DATABASE_URL = os.environ.get("DATABASE_URL")
 _CLIENT_MIGRATIONS_DIR = Path(client_migrations.__file__).parent
 
 
@@ -36,11 +34,15 @@ ClientConnFactory = Callable[[], psycopg.Connection[TupleRow]]
 
 
 @pytest.fixture
-def client_conn_factory() -> Iterator[ClientConnFactory]:
-    """Yield a factory that opens autocommit connections in a migrated client schema."""
-    if not _DATABASE_URL:
-        pytest.skip("DATABASE_URL not set; skipping Postgres-backed test")
-    dsn = _DATABASE_URL
+def client_conn_factory(database_url: str) -> Iterator[ClientConnFactory]:
+    """Yield a factory that opens autocommit connections in a migrated client schema.
+
+    Uses the session-scoped `database_url` fixture from the top-level conftest:
+    either a user-set `DATABASE_URL` or an auto-provisioned temporary cluster
+    (Sprint 2F). Lets the projector tests actually exercise their DB-backed
+    invariants in default CI runs instead of all silently skipping.
+    """
+    dsn = database_url
 
     schema = f"sf_client_{uuid.uuid4().hex}"
     opened: list[psycopg.Connection[TupleRow]] = []
