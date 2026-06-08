@@ -140,16 +140,25 @@ origin/main; not pushed per standing directive).
 merged to main at `da72097`. `SLACK_FUSE_MODE=split` is ready for opt-in
 bake-in.
 
+### Pre-bake-in cleanup
+
+Owner decision: land both deferred items as part of testing setup.
+
+| Track | Model | tmux | Branch | Status |
+|---|---|---|---|---|
+| 3C trailer JSONL + config wiring | claude (opus) | (killed) | `synap5e/feat/3c-plus-config` | **MERGED** at `31616b8`. 672 tests / 0 skipped. Trailer logic extracted to `slack_fuse/projector/trailer.py` (StalenessState / staleness_reason / format_trailer / TrailerDecision / classify_trailer / render_trailer); `fuse_v2_helpers` re-exports for back-compat. JSONL writer at `slack_fuse/projector/trailer_log.py` — append-only O_APPEND/O_CLOEXEC, one `os.write` per line, no rotation. `ClientConfig.trailer_log_path` (default None = disabled) wired through `cmd_mount_split`; `SlackFuseOpsV2.read` emits one decision per FUSE read incl. clean reads. Three config knobs wired: `stale_after_disconnect_s`, `stale_trailer_enabled`, `catchup_window_s`. **Worker caveat (worth resolving during bake-in)**: B3 `catchup_window_s` semantics — `caught_up` is once-per-(re)connection per stream, not periodic, so a literal `now - last_caught_up_at > window` check trails in steady state past `window` seconds. Backward-compat preserved (None `last_caught_up_at` → boolean fallback, existing tests stay clean), but production reads with real caught_up rows WILL trail at default 10s window. Worker added `catchup_stale` to HealthSignature so primed-clean inodes get invalidated on window crossing. The kill switch is `stale_trailer_enabled=False`; bake-in JSONL log measures false-positive rate. Pre-bake-in TODO: either widen the window, add server-side periodic caught_up re-emission, or rework as "since last frame". |
+
+### Pre-bake-in state
+
+`main` at `31616b8`, 67 commits ahead of origin (not pushed per standing
+directive). 672 tests, 0 skipped. Legacy mount path untouched. Pre-cutover
+gate cleared. Sprint 1 7-day soak still running healthy (`slack-fuse-smoke`
+tmux).
+
 ### Next owner action
 
-**User-in-loop touchpoint.** Pre-cutover review approved. Decide:
-- Start the 4-week `SLACK_FUSE_MODE=split` opt-in bake-in clock now.
-- Land deferred 3C trailer-decision JSONL log + module extraction before
-  the bake-in for forensic observability.
-- Land deferred config wiring (`stale_after_disconnect_s` /
-  `stale_trailer_enabled` / `catchup_window_s`) — reviewer flagged
-  non-blocking.
-- Push `main` to `origin/main` (held off per standing "no push" directive).
+User-in-loop touchpoint. Decide on bake-in start + the `catchup_window_s`
+semantics resolution noted above.
 | 2C HTTP /resolve + /permalink | cursor (gpt-5.3-codex-xhigh) | (killed) | `synap5e/feat/2c-http-resolve-permalink` | **MERGED** at `e2d8a59`. Lifting strategy: option 2 (copy bodies into server modules), keeps legacy independent. CLI gained `--server-url` proxy mode. |
 | (owner inline) flake fix | n/a | n/a | n/a | Bumped WS test timeouts (1.0→5.0s default, 0.5→3.0s explicit) — was flaking under full-suite + cold-Pg load after 2F auto-provision landed. |
 | 1G Socket Mode payload conformance | cursor (gpt-5.3-codex-xhigh) | (killed) | `synap5e/feat/sprint1g-message-payload-conformance` | **MERGED** at `06bdad6`. Live `message` events now Message.model_validate(...).model_dump('json'), byte-equivalent to backfill. Conformance test asserts the equivalence against a conversations.history-derived envelope with reactions+files+edited+reply metadata. |
