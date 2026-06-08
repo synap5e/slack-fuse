@@ -1,4 +1,4 @@
-"""Minimal trio HTTP server for `/health` and `/metrics`."""
+"""Minimal trio HTTP server for `/health`, `/metrics`, `/resolve`, `/permalink`."""
 
 from __future__ import annotations
 
@@ -8,10 +8,18 @@ from functools import partial
 
 import h11
 import trio
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
-from slack_fuse_server.http.handlers import handle_health, handle_metrics
+from slack_fuse_server.http.dto import PermalinkRequest, ResolveRequest
+from slack_fuse_server.http.handlers import (
+    ResolvePermalinkDeps,
+    handle_health,
+    handle_metrics,
+    handle_permalink,
+    handle_resolve,
+)
 from slack_fuse_server.http.metrics import MetricsSource
+from slack_fuse_server.slurper.api import SlackAPIError
 
 _JSON_CONTENT_TYPE = "application/json"
 _READ_CHUNK_SIZE = 16_384
@@ -28,6 +36,7 @@ class HttpResponse:
 class HttpRequest:
     method: str
     target: str
+    body: bytes = b""
 
     @property
     def path(self) -> str:
@@ -54,7 +63,12 @@ def parse_listen_addr(listen_addr: str) -> tuple[str, int]:
     return host, int(port_text)
 
 
-def route_request(request: HttpRequest, *, metrics_source: MetricsSource) -> HttpResponse:
+def route_request(  # noqa: C901 - endpoint routing dispatch hub.
+    request: HttpRequest,
+    *,
+    metrics_source: MetricsSource,
+    resolve_permalink_deps: ResolvePermalinkDeps | None = None,
+) -> HttpResponse:
     """Pure routing table for supported HTTP endpoints."""
     if request.path == "/health":
         if request.method != "GET":
@@ -66,6 +80,20 @@ def route_request(request: HttpRequest, *, metrics_source: MetricsSource) -> Htt
             return _error_response(status_code=405, code="method_not_allowed")
         return _dto_response(status_code=200, payload=handle_metrics(metrics_source))
 
+    if request.path == "/resolve":
+        if request.method != "POST":
+            return _error_response(status_code=405, code="method_not_allowed")
+        if resolve_permalink_deps is None:
+            return _error_response(status_code=503, code="service_unavailable")
+        return _handle_resolve(request, resolve_permalink_deps)
+
+    if request.path == "/permalink":
+        if request.method != "POST":
+            return _error_response(status_code=405, code="method_not_allowed")
+        if resolve_permalink_deps is None:
+            return _error_response(status_code=503, code="service_unavailable")
+        return _handle_permalink(request, resolve_permalink_deps)
+
     return _error_response(status_code=404, code="not_found")
 
 
@@ -74,44 +102,82 @@ async def serve_http(
     host: str,
     port: int,
     metrics_source: MetricsSource,
+    resolve_permalink_deps: ResolvePermalinkDeps | None = None,
 ) -> None:
     """Serve HTTP endpoints on the given host/port."""
-    handler = partial(_serve_connection, metrics_source=metrics_source)
+    handler = partial(
+        _serve_connection,
+        metrics_source=metrics_source,
+        resolve_permalink_deps=resolve_permalink_deps,
+    )
     await trio.serve_tcp(handler, port=port, host=host)
 
 
 async def serve_http_on_listeners(
     listeners: list[trio.SocketListener],
     metrics_source: MetricsSource,
+    resolve_permalink_deps: ResolvePermalinkDeps | None = None,
 ) -> None:
     """Serve on already-open listeners (useful for tests and shared-port setups)."""
-    handler = partial(_serve_connection, metrics_source=metrics_source)
+    handler = partial(
+        _serve_connection,
+        metrics_source=metrics_source,
+        resolve_permalink_deps=resolve_permalink_deps,
+    )
     await trio.serve_listeners(handler, listeners)
 
 
-async def serve_http_from_listen_addr(*, listen_addr: str, metrics_source: MetricsSource) -> None:
+async def serve_http_from_listen_addr(
+    *,
+    listen_addr: str,
+    metrics_source: MetricsSource,
+    resolve_permalink_deps: ResolvePermalinkDeps | None = None,
+) -> None:
     """Serve HTTP endpoints using an RFC-style `listen_addr` string."""
     host, port = parse_listen_addr(listen_addr)
-    await serve_http(host=host, port=port, metrics_source=metrics_source)
+    await serve_http(
+        host=host,
+        port=port,
+        metrics_source=metrics_source,
+        resolve_permalink_deps=resolve_permalink_deps,
+    )
 
 
-async def serve_http_connection(stream: trio.abc.Stream, *, metrics_source: MetricsSource) -> None:
+async def serve_http_connection(
+    stream: trio.abc.Stream,
+    *,
+    metrics_source: MetricsSource,
+    resolve_permalink_deps: ResolvePermalinkDeps | None = None,
+) -> None:
     """Serve a single already-accepted connection as HTTP.
 
     Public entry for the same-port dispatch (`slack_fuse_server.dispatch`), which
     classifies the request then replays it into this handler over a stream that
     prepends the bytes it already peeked.
     """
-    await _serve_connection(stream, metrics_source=metrics_source)
+    await _serve_connection(
+        stream,
+        metrics_source=metrics_source,
+        resolve_permalink_deps=resolve_permalink_deps,
+    )
 
 
-async def _serve_connection(stream: trio.abc.Stream, *, metrics_source: MetricsSource) -> None:
+async def _serve_connection(
+    stream: trio.abc.Stream,
+    *,
+    metrics_source: MetricsSource,
+    resolve_permalink_deps: ResolvePermalinkDeps | None = None,
+) -> None:
     conn = h11.Connection(h11.SERVER)
     try:
         request = await _read_request(conn, stream)
         if request is None:
             return
-        response = route_request(request, metrics_source=metrics_source)
+        response = route_request(
+            request,
+            metrics_source=metrics_source,
+            resolve_permalink_deps=resolve_permalink_deps,
+        )
         await _send_response(conn, stream, response)
     except h11.RemoteProtocolError:
         if conn.our_state is not h11.ERROR:
@@ -123,6 +189,7 @@ async def _serve_connection(stream: trio.abc.Stream, *, metrics_source: MetricsS
 async def _read_request(conn: h11.Connection, stream: trio.abc.Stream) -> HttpRequest | None:
     method: str | None = None
     target: str | None = None
+    body = bytearray()
     while True:
         event = conn.next_event()
         if event is h11.NEED_DATA:
@@ -134,12 +201,12 @@ async def _read_request(conn: h11.Connection, stream: trio.abc.Stream) -> HttpRe
             target = event.target.decode("ascii")
             continue
         if isinstance(event, h11.Data):
-            # Endpoint surface is GET-only; consume any body and ignore it.
+            body.extend(bytes(event.data))
             continue
         if isinstance(event, h11.EndOfMessage):
             if method is None or target is None:
                 return None
-            return HttpRequest(method=method, target=target)
+            return HttpRequest(method=method, target=target, body=bytes(body))
         if isinstance(event, h11.ConnectionClosed):
             return None
 
@@ -165,3 +232,37 @@ def _dto_response(*, status_code: int, payload: BaseModel) -> HttpResponse:
 def _error_response(*, status_code: int, code: str) -> HttpResponse:
     body = json.dumps({"error": code}, separators=(",", ":")).encode("utf-8")
     return HttpResponse(status_code=status_code, body=body)
+
+
+def _handle_resolve(request: HttpRequest, deps: ResolvePermalinkDeps) -> HttpResponse:
+    try:
+        payload = ResolveRequest.model_validate_json(request.body)
+    except ValidationError:
+        return _error_response(status_code=400, code="bad_request")
+
+    try:
+        response = handle_resolve(payload, deps)
+    except LookupError:
+        return _error_response(status_code=404, code="not_found")
+    except ValueError:
+        return _error_response(status_code=400, code="bad_request")
+    except SlackAPIError:
+        return _error_response(status_code=502, code="slack_api_error")
+    return _dto_response(status_code=200, payload=response)
+
+
+def _handle_permalink(request: HttpRequest, deps: ResolvePermalinkDeps) -> HttpResponse:
+    try:
+        payload = PermalinkRequest.model_validate_json(request.body)
+    except ValidationError:
+        return _error_response(status_code=400, code="bad_request")
+
+    try:
+        response = handle_permalink(payload, deps)
+    except LookupError:
+        return _error_response(status_code=404, code="not_found")
+    except ValueError:
+        return _error_response(status_code=400, code="bad_request")
+    except SlackAPIError:
+        return _error_response(status_code=502, code="slack_api_error")
+    return _dto_response(status_code=200, payload=response)

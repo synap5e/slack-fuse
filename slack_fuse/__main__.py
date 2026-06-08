@@ -9,6 +9,10 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
+from typing import cast
+from urllib.parse import urlsplit, urlunsplit
+
+import httpx
 
 
 def _default_mountpoint() -> str:
@@ -32,6 +36,72 @@ def _env_bool(name: str, default: bool) -> bool:
         return False
     msg = f"{name} must be a boolean (got {raw!r})"
     raise ValueError(msg)
+
+
+def _http_base_from_server_url(server_url: str) -> str:
+    """Convert ws:// or http:// server URL into an HTTP base URL."""
+    parsed = urlsplit(server_url)
+    if parsed.scheme not in ("ws", "wss", "http", "https"):
+        msg = f"server URL must use ws/wss/http/https (got {parsed.scheme!r})"
+        raise ValueError(msg)
+    if not parsed.netloc:
+        msg = f"server URL is missing host:port: {server_url!r}"
+        raise ValueError(msg)
+
+    scheme = "https" if parsed.scheme in ("wss", "https") else "http"
+    path = parsed.path.rstrip("/")
+    if path.endswith("/ws"):
+        path = path[:-3]
+    return urlunsplit((scheme, parsed.netloc, path, "", ""))
+
+
+def _post_server_json(server_url: str, endpoint: str, payload: dict[str, str]) -> dict[str, object]:
+    """POST JSON to an endpoint and return a parsed JSON object body."""
+    url = f"{_http_base_from_server_url(server_url)}{endpoint}"
+    response = httpx.post(url, json=payload, timeout=30.0)
+    try:
+        body_raw: object = response.json()
+    except ValueError:
+        body_raw = {}
+
+    if response.status_code >= 400:
+        error = "unknown_error"
+        if isinstance(body_raw, dict):
+            body_dict = cast("dict[str, object]", body_raw)
+            error_raw = body_dict.get("error")
+            if isinstance(error_raw, str):
+                error = error_raw
+        raise RuntimeError(error)
+
+    if not isinstance(body_raw, dict):
+        msg = f"server returned non-object JSON from {endpoint}"
+        raise ValueError(msg)
+    return cast("dict[str, object]", body_raw)
+
+
+def _required_string(payload: dict[str, object], key: str) -> str:
+    value = payload.get(key)
+    if not isinstance(value, str):
+        msg = f"server response missing string field {key!r}"
+        raise ValueError(msg)
+    return value
+
+
+def _absolute_path_from_mount_relative(mountpoint: str, relative_path: str) -> str:
+    clean = relative_path.lstrip("/")
+    return os.path.join(mountpoint, clean)
+
+
+def _path_for_server(path: str, mountpoint: str) -> str:
+    """Prefer a mount-relative path when possible; else keep caller input."""
+    expanded_mount = os.path.abspath(os.path.expanduser(mountpoint))
+    if not os.path.isabs(path):
+        return path
+    expanded_path = os.path.abspath(os.path.expanduser(path))
+    relative = os.path.relpath(expanded_path, expanded_mount)
+    if relative == ".." or relative.startswith(f"..{os.sep}"):
+        return expanded_path
+    return relative
 
 
 def cmd_mount(args: argparse.Namespace) -> None:
@@ -150,12 +220,25 @@ def cmd_unmount(args: argparse.Namespace) -> None:
 
 def cmd_resolve(args: argparse.Namespace) -> None:
     """Resolve a Slack permalink to a FUSE path."""
+    mountpoint = os.path.expanduser(args.mountpoint)
+    if args.server_url:
+        try:
+            payload = _post_server_json(args.server_url, "/resolve", {"url": args.url})
+            relative_path = _required_string(payload, "path")
+            print(_absolute_path_from_mount_relative(mountpoint, relative_path))
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(2 if str(e) == "not_found" else 1)
+        except (ValueError, httpx.HTTPError) as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+
     from .api import SlackAPIError, SlackClient
     from .auth import load_tokens
     from .resolve import PermalinkResolutionError, resolve_permalink
     from .user_cache import UserCache
 
-    mountpoint = os.path.expanduser(args.mountpoint)
     tokens = load_tokens()
     client = SlackClient(tokens.user_token)
     users = UserCache(client.http)
@@ -178,12 +261,27 @@ def cmd_resolve(args: argparse.Namespace) -> None:
 
 def cmd_permalink(args: argparse.Namespace) -> None:
     """Resolve a FUSE path to a Slack permalink."""
+    mountpoint = os.path.expanduser(args.mountpoint)
+    if args.server_url:
+        request_payload: dict[str, str] = {"path": _path_for_server(args.path, mountpoint)}
+        if args.ts:
+            request_payload["ts"] = args.ts
+        try:
+            payload = _post_server_json(args.server_url, "/permalink", request_payload)
+            print(_required_string(payload, "url"))
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        except (ValueError, httpx.HTTPError) as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+
     from .api import SlackAPIError, SlackClient
     from .auth import load_tokens
     from .permalink import resolve_path_to_permalink
     from .user_cache import UserCache
 
-    mountpoint = os.path.expanduser(args.mountpoint)
     tokens = load_tokens()
     client = SlackClient(tokens.user_token)
     users = UserCache(client.http)
@@ -245,6 +343,10 @@ def main() -> None:
         default=_default_mountpoint(),
         help=f"Mount point (default: {_default_mountpoint()})",
     )
+    resolve_parser.add_argument(
+        "--server-url",
+        help="Proxy to server endpoint (ws://..., wss://..., http://..., or https://...)",
+    )
     resolve_parser.set_defaults(func=cmd_resolve)
 
     permalink_parser = sub.add_parser("permalink", help="Resolve a FUSE path to a Slack permalink")
@@ -254,6 +356,10 @@ def main() -> None:
         "--mountpoint",
         default=_default_mountpoint(),
         help=f"Mount point (default: {_default_mountpoint()})",
+    )
+    permalink_parser.add_argument(
+        "--server-url",
+        help="Proxy to server endpoint (ws://..., wss://..., http://..., or https://...)",
     )
     permalink_parser.set_defaults(func=cmd_permalink)
 
