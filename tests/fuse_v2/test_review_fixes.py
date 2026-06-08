@@ -10,6 +10,8 @@ filesystem-integrity and staleness gaps (P0-4, P1-5, P1-6, P1-7).
 
 from __future__ import annotations
 
+import errno
+import stat
 import time
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -26,7 +28,7 @@ from slack_fuse.fuse_ops_v2 import (
     SlackFuseOpsV2,
     _file_attr_timeout,  # pyright: ignore[reportPrivateUsage]
 )
-from slack_fuse.fuse_v2_helpers import fetch_channel_by_slug
+from slack_fuse.fuse_v2_helpers import assign_conv_root_slugs, fetch_channel_by_slug
 from slack_fuse.projector.health_subscriber import read_signature, watch_health, watch_health_once
 from tests.fuse_v2.conftest import (
     NOOP_INVALIDATE_INODE,
@@ -473,3 +475,112 @@ def test_p2_9_readdir_snapshot_is_stable_against_concurrent_inserts(
     seed_channel(client_conn, "C-000", "aaa-first", tier="hot")
     names_after = [name for name, _attr, _tok in snapshot]
     assert names_after == names_before
+
+
+# ============================================================================
+# P0-2 (re-review): hidden channels must be reachable through the REAL
+# ``ops.lookup()`` callback, not just the helper. readdir filters hidden out;
+# lookup resolves the child path directly so a known slug still resolves.
+# GPT-5.5 xhigh caught that the prior P0-4 fix only proved helper behavior,
+# while lookup() scanned readdir output (hot-only) and so ENOENT'd hidden.
+# ============================================================================
+
+
+async def _lookup(ops: SlackFuseOpsV2, parent_inode: int, name: bytes) -> pyfuse3.EntryAttributes:
+    return await ops.lookup(parent_inode, name, _ctx())
+
+
+def _make_noop_ops(conn: Connection[TupleRow]) -> SlackFuseOpsV2:
+    return SlackFuseOpsV2(
+        conn=conn,
+        local_tz=ZoneInfo("UTC"),
+        limiter=trio.CapacityLimiter(1),
+        notify_store=NOOP_NOTIFY_STORE,
+        invalidate_inode=NOOP_INVALIDATE_INODE,
+    )
+
+
+@pytest.mark.trio
+async def test_hidden_channel_reachable_via_real_lookup(
+    client_conn: Connection[TupleRow],
+) -> None:
+    seed_channel(client_conn, "C-BRAVO", "bravo", tier="hidden")
+    ops = _make_noop_ops(client_conn)
+    channels_inode = ops.inodes.get_or_create("/channels")
+
+    # readdir does NOT list the hidden channel...
+    assert {name for name, _ in ops.list_dir_for_test("/channels")} == set()
+
+    # ...but the real lookup() resolves it by its known slug.
+    entry = await _lookup(ops, channels_inode, b"bravo")
+    assert stat.S_ISDIR(entry.st_mode)
+    assert entry.st_ino == ops.inodes.get_inode("/channels/bravo")
+
+
+@pytest.mark.trio
+async def test_blocked_channel_enoent_via_real_lookup(
+    client_conn: Connection[TupleRow],
+) -> None:
+    seed_channel(client_conn, "C-CHARLIE", "charlie", tier="blocked")
+    ops = _make_noop_ops(client_conn)
+    channels_inode = ops.inodes.get_or_create("/channels")
+
+    with pytest.raises(pyfuse3.FUSEError) as exc:
+        _ = await _lookup(ops, channels_inode, b"charlie")
+    assert exc.value.errno == errno.ENOENT
+
+
+@pytest.mark.trio
+async def test_hidden_and_hot_same_name_distinguishable_via_real_lookup(
+    client_conn: Connection[TupleRow],
+) -> None:
+    # Hidden sorts FIRST by channel_id but hot wins the unsuffixed slug; the
+    # hidden one lands on ``general-2``. Both must resolve through real lookup.
+    seed_channel(client_conn, "C-AAA", "general", tier="hidden")
+    seed_channel(client_conn, "C-ZZZ", "general", tier="hot")
+    ops = _make_noop_ops(client_conn)
+    channels_inode = ops.inodes.get_or_create("/channels")
+
+    # readdir shows only the hot channel under the base slug.
+    assert {name for name, _ in ops.list_dir_for_test("/channels")} == {"general"}
+
+    hot_entry = await _lookup(ops, channels_inode, b"general")
+    hidden_entry = await _lookup(ops, channels_inode, b"general-2")
+    assert stat.S_ISDIR(hot_entry.st_mode)
+    assert stat.S_ISDIR(hidden_entry.st_mode)
+    assert hot_entry.st_ino != hidden_entry.st_ino
+
+    # The base slug maps to the HOT channel, the suffixed one to the hidden.
+    hot = fetch_channel_by_slug(client_conn, "channels", "general", allow_hidden=True)
+    hidden = fetch_channel_by_slug(client_conn, "channels", "general-2", allow_hidden=True)
+    assert hot is not None and hot.channel_id == "C-ZZZ"
+    assert hidden is not None and hidden.channel_id == "C-AAA"
+    assert hot_entry.st_ino == ops.inodes.get_inode("/channels/general")
+    assert hidden_entry.st_ino == ops.inodes.get_inode("/channels/general-2")
+
+
+@pytest.mark.trio
+async def test_hidden_reachable_via_real_lookup_in_every_conv_root(
+    client_conn: Connection[TupleRow],
+) -> None:
+    """The lookup fix is generic across conv roots: a hidden DM, group-DM, and
+    not-joined public channel each resolve by their known slug."""
+    seed_user(client_conn, "U-DM", "dave")
+    seed_channel(client_conn, "D-1", "", tier="hidden", is_im=True, im_user_id="U-DM", is_member=True)
+    seed_channel(client_conn, "G-1", "huddle-crew", tier="hidden", is_mpim=True, is_member=True)
+    seed_channel(client_conn, "C-OTH", "announcements", tier="hidden", is_member=False)
+    ops = _make_noop_ops(client_conn)
+
+    cases = {
+        "dms": ops.inodes.get_or_create("/dms"),
+        "group-dms": ops.inodes.get_or_create("/group-dms"),
+        "other-channels": ops.inodes.get_or_create("/other-channels"),
+    }
+    for conv_root, parent_inode in cases.items():
+        # readdir lists nothing (all hidden) in this conv root...
+        assert ops.list_dir_for_test(f"/{conv_root}") == []
+        # ...but each hidden channel resolves by its lookup-listing slug.
+        slug = next(slug for _r, slug in assign_conv_root_slugs(client_conn, conv_root))
+        entry = await _lookup(ops, parent_inode, slug.encode())
+        assert stat.S_ISDIR(entry.st_mode)
+        assert entry.st_ino == ops.inodes.get_inode(f"/{conv_root}/{slug}")

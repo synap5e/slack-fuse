@@ -340,7 +340,7 @@ class SlackFuseOpsV2(pyfuse3.Operations):
     # Path classification and dispatch
     # ------------------------------------------------------------------
 
-    def _list_dir(self, path: str) -> list[tuple[str, bool]]:  # noqa: C901  (path-depth dispatch hub)
+    def _list_dir(self, path: str, *, for_lookup: bool = False) -> list[tuple[str, bool]]:  # noqa: C901  (path-depth dispatch hub)
         parts = parse_path(path)
         depth = len(parts)
         if depth == 0:
@@ -353,8 +353,21 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         if depth == 1:
             # Slugs are assigned over the full hot+hidden set (so they agree
             # with the lookup path — review P0-4) then filtered to hot for the
-            # readdir listing.
-            return [(slug, True) for r, slug in assign_conv_root_slugs(self._conn, conv_root) if r.tier == "hot"]
+            # readdir listing. ``lookup`` passes ``for_lookup=True`` so hidden
+            # channels remain reachable by their (suffixed) slug even though
+            # readdir does not list them: per the RFC three-tier model, hidden
+            # is "not listed but reachable by known path" (review P0-2 /
+            # GPT-5.5). Without this, ``cat /channels/<hidden-slug>/...`` would
+            # ENOENT because the kernel's lookup of the slug found nothing in
+            # the hot-only listing. The conv-root child level is the ONLY depth
+            # where readdir and lookup diverge — every deeper level already
+            # resolves with ``allow_hidden=True`` and encodes existence (months/
+            # days/threads that actually have chunks), so scanning the listing
+            # stays correct there.
+            slugs = assign_conv_root_slugs(self._conn, conv_root)
+            if for_lookup:
+                return [(slug, True) for _r, slug in slugs]
+            return [(slug, True) for r, slug in slugs if r.tier == "hot"]
 
         row = fetch_channel_by_slug(self._conn, conv_root, parts[1], allow_hidden=True)
         if row is None:
@@ -502,7 +515,10 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         child_path = f"/{child_name}" if parent_path == "/" else f"{parent_path}/{child_name}"
 
         def _sync() -> pyfuse3.EntryAttributes | None:
-            entries = self._list_dir(parent_path)
+            # ``for_lookup=True`` so hidden conv-root channels resolve by their
+            # known slug (RFC: hidden is reachable, just not listed). readdir
+            # filters them out; lookup must not (review P0-2 / GPT-5.5).
+            entries = self._list_dir(parent_path, for_lookup=True)
             for entry_name, entry_is_dir in entries:
                 if entry_name == child_name:
                     inode = self._inodes.get_or_create(child_path)
