@@ -132,12 +132,24 @@ origin/main; not pushed per standing directive).
 | Track | Model | tmux | Branch | Status |
 |---|---|---|---|---|
 | Post-Sprint-3 fixes | claude (opus[1m]) | (killed) | `synap5e/feat/post-sprint3-fixes` | Worker SHIPPED at `e53c6a5`. 636 tests / 0 skipped without DATABASE_URL; ruff/pyright 0/0/0. New: ConnectionPool (bounded, default 8, configurable; appliers borrow-per-event); snapshot DELETE-then-upsert all-one-TX for full-state semantics; singleton snapshot redirects gated to channel streams only; applier exceptions raise → WSClient teardown → reconnect from durable cursor; unbounded per-stream queues + send_nowait removes WS HoL; channel_list_changed invalidates ALL materialized inodes; tier CLI uses real V2 slug logic against production schema (synthetic `channels.slug` column REMOVED from tests). Worker verified each new regression fails on pre-fix behavior via temporary revert. Wired residuals: `ClientConfig.mountpoint` honored by split mount; `projector_pool_size` config. Deferred: `stale_after_disconnect_s` / `stale_trailer_enabled` / `catchup_window_s` config wiring; 3C trailer-decision JSONL. |
-| Re-review post-Sprint-3 fixes | cursor (gpt-5.5-extra-high) | `review-post-sprint3-fixes` | n/a | in flight (single reviewer; same vendor as original review since they raised the findings) |
+| Re-review post-Sprint-3 fixes | cursor (gpt-5.5-extra-high) | (killed) | n/a | **REQUEST CHANGES**. 6/7 closed; P0-B partially closed with 2 scoped holes: empty channel snapshot bypasses full-state replacement; snapshot-delete invalidations don't reach sink. Report at `~/.agent-handoff/2026-06-09/review-post-sprint3-fixes/report.md`. |
+| Post-Sprint-3 fixes-2 (P0-B holes) | claude (opus[1m]) | (killed) | `synap5e/feat/post-sprint3-fixes` (chained) | **MERGED** at `da72097`. Empty channel bodies now route through full-state replacement (singleton streams keep cursor-only shortcut since server-side gate prevents singleton snapshot redirects). `_delete_chunks_absent_from_snapshot` returns deleted refs via `DELETE ... RETURNING`; refs reach the sink post-commit alongside upsert refs. 639 tests. New regressions verified failing on pre-fix tree. Design deviation: no direct end-to-end thread.md test (any surviving reply re-upserts and fires invalidation for the same inode; deleted-last-reply drops slug resolvability) — composition of projector test (deleted ThreadChunkRef reaches sink) + existing FUSE test (ref → inode) accepted by reviewer. |
+| Re-re-review post-Sprint-3 fixes-2 | cursor (gpt-5.5-extra-high) | (killed) | n/a | **APPROVE**. Both P0-B holes closed; composition argument accepted. Verifications green (ruff/pyright/pytest 639/0-skipped). Report at `~/.agent-handoff/2026-06-09/review-post-sprint3-fixes-2/report.md`. |
+
+**Pre-cutover gate cleared.** All post-Sprint-3 findings closed. Branch
+merged to main at `da72097`. `SLACK_FUSE_MODE=split` is ready for opt-in
+bake-in.
 
 ### Next owner action
 
-Wait on re-review report; on APPROVE merge to main and start the 4-week
-opt-in bake-in clock for `SLACK_FUSE_MODE=split`.
+**User-in-loop touchpoint.** Pre-cutover review approved. Decide:
+- Start the 4-week `SLACK_FUSE_MODE=split` opt-in bake-in clock now.
+- Land deferred 3C trailer-decision JSONL log + module extraction before
+  the bake-in for forensic observability.
+- Land deferred config wiring (`stale_after_disconnect_s` /
+  `stale_trailer_enabled` / `catchup_window_s`) — reviewer flagged
+  non-blocking.
+- Push `main` to `origin/main` (held off per standing "no push" directive).
 | 2C HTTP /resolve + /permalink | cursor (gpt-5.3-codex-xhigh) | (killed) | `synap5e/feat/2c-http-resolve-permalink` | **MERGED** at `e2d8a59`. Lifting strategy: option 2 (copy bodies into server modules), keeps legacy independent. CLI gained `--server-url` proxy mode. |
 | (owner inline) flake fix | n/a | n/a | n/a | Bumped WS test timeouts (1.0→5.0s default, 0.5→3.0s explicit) — was flaking under full-suite + cold-Pg load after 2F auto-provision landed. |
 | 1G Socket Mode payload conformance | cursor (gpt-5.3-codex-xhigh) | (killed) | `synap5e/feat/sprint1g-message-payload-conformance` | **MERGED** at `06bdad6`. Live `message` events now Message.model_validate(...).model_dump('json'), byte-equivalent to backfill. Conformance test asserts the equivalence against a conversations.history-derived envelope with reactions+files+edited+reply metadata. |
