@@ -18,6 +18,64 @@ several in flight at a time. Critical-review agents fire at gates.
 Conflicts get rebased by the loser of the race, not resolved by the
 owner.
 
+## Decisions (recorded 2026-06-08)
+
+These answers came from the user at orchestration kickoff. Recorded
+here so future owner sessions don't re-ask.
+
+| Question | Answer |
+|---|---|
+| Deployment target | k8s eventually, **but local Python service for now** (the rebuild ships against `uv run slack-fuse-server` first; manifests + systemd come after Sprint 3) |
+| Client postgres | One per machine, local during dev |
+| Sprint 2 concurrency cap | 2–3 concurrent worker tracks |
+| POC A Slack target | Reuse the real Slack workspace (user token, read-only via Socket Mode + history) |
+| Push to `origin` during build | **No.** Everything stays local until cutover. No remote backup, but no risk of exposing in-flight architecture |
+| Integration target | **Fresh-slate worktree at `.wt/server-split-rebuild/`** branched from `main`. All worker branches branch from `server-split-rebuild` and merge back there. `main` stays untouched until cutover replaces v1 wholesale |
+| Owner-loop cadence | `/wait-for 15min` pattern: spawn workers → wait up to 15m → check stalls → bump or resolve → repeat |
+| Cost ceiling | None. Use the best model per the cheatsheet |
+
+## Workflow setup
+
+Before any Sprint 0 work starts, the owner executes once:
+
+```bash
+cd /home/simon/agentic/slack-fuse
+git wt server-split-rebuild      # creates .wt/server-split-rebuild/, branch off main
+```
+
+Owner work happens in that worktree from then on. Worker handoffs
+launch with `--cwd <their own worktree path>` and branch from
+`server-split-rebuild`. Owner merges worker branches into
+`server-split-rebuild`. `main` is never touched during the rebuild.
+
+When Sprint 4 cutover completes:
+
+```bash
+# In the main checkout, NOT the rebuild worktree
+git checkout main
+git merge --squash server-split-rebuild
+git commit -m "feat: server-split rebuild (replaces v1)"
+git tag main-pre-split <old-main-sha>   # preserve v1 history
+```
+
+## Owner loop pattern
+
+Realised via `ScheduleWakeup` at 15-minute intervals when workers
+are in flight. Each wake-up:
+
+1. Read incoming agent-messages (push-delivered to next-turn context).
+2. For workers reporting done: review their PR (`git pr` workflow),
+   run any required gate-review agent, merge to `server-split-rebuild`
+   if green or message the worker if fix needed.
+3. For workers reporting stuck: triage per *Edge case handling*.
+   Mechanical clarifications resolved inline; ambiguous/cross-cutting
+   escalated to the user.
+4. For workers that haven't reported in this cycle: `agent-message
+   <session> "status?"` to bump.
+5. If anything is still in flight or just bumped, schedule the next
+   wake-up. If everything done and no fresh work to spawn, surface
+   the sprint-boundary check-in to the user.
+
 ## Repo and branch strategy
 
 **Single repo, long-lived integration branch, worktrees per task.**
@@ -122,6 +180,35 @@ against the RFC before merge.
 - Owner runs an RFC-divergence review agent (see *Review gates*)
   before merging — the gate is "interfaces match the RFC exactly"
 
+### Risks the Sprint 0 worker should also surface
+
+Two risks that emerged during orchestration planning. These don't
+have to be RESOLVED in Sprint 0, but the worker should think about
+them and flag in their report if either looks like an RFC gap:
+
+1. **Backfiller idempotency under edits.** Legacy cache may have
+   message version A (pre-edit); SlackApiBackfiller, run second, may
+   see version B (post-edit). The RFC's `(stream, slack_ts)` dedup
+   constraint keeps the first-written version and drops B —
+   meaning legacy keeps an outdated version. Three possible
+   resolutions: (a) API backfill runs FIRST for editable history,
+   legacy fills only what API didn't reach; (b) constraint becomes
+   `ON CONFLICT DO UPDATE` keyed by payload version; (c) we accept
+   this as a known limitation and address with a periodic
+   "refresh-from-API" sweep. Worker should pick a default and flag.
+
+2. **Cross-stream race + per-stream queues.** Per-stream queues
+   apply events on independent applier tasks. A `message` event on
+   `channel:CX` mentioning U999 might apply concurrently with a
+   `user_added` event for U999 on the `users` stream. The
+   `chunk_mentions` invalidation logic could miss the just-written
+   row if the user-added applier reads `chunk_mentions` before the
+   message applier has committed. Worker should either (a) require
+   both applies to coordinate via a shared lock / advisory lock,
+   (b) prove the race is benign (e.g. invalidation always sees a
+   stable snapshot due to MVCC), or (c) flag as needing RFC
+   spec-work in Sprint 2E.
+
 ## Sprint 0': POCs (parallel with Sprint 0)
 
 These don't need Sprint 0's interfaces. They de-risk the riskiest
@@ -180,6 +267,11 @@ additional Gemini 3.1 Pro wildcard review.
 Tracks can run in parallel as soon as Sprint 0 is merged. 1A/1B/1C
 all live in `slack_fuse_server/` so worktree boundaries matter — see
 *File ownership* below.
+
+**Deployment shape**: local Python process run as `uv run
+slack-fuse-server`. No systemd unit, no Docker image, no k8s
+manifest in v1. Those land in a separate post-Sprint-3 phase once
+the architecture is proven against the user's real workspace.
 
 ### Acceptance
 
