@@ -1333,6 +1333,16 @@ It also means Slack's `<@U123|cached-name>` form is normalised to
 `<@U123>` at chunk-write time — the cached display name is discarded;
 our `users` table is always the source of truth at read time.
 
+**Tradeoff** (raised by POC B, 2026-06-08): if a mentioned user is
+absent from the local `users` table at read time, the resolver falls
+back to the raw UID literal (e.g. `@U123`) where the legacy
+single-pass renderer would have shown the cached label (`@alice`).
+Mitigated in practice by eager population of the `users` table on
+client startup, plus `user_added` invalidating affected inodes
+(RFC §Projection logic). If belt-and-suspenders is ever needed, the
+chunk can retain the cached label as a side-table and the resolver
+prefer table → label → id; not needed for v1.
+
 ### Frozen-dataclass types
 
 ```python
