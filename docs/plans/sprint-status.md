@@ -106,10 +106,18 @@ Dependencies:
 | Pre-3B-fix re-review (gemini 3.1 pro) | cursor | (killed) | n/a | **APPROVE**. All 5 original findings verified CLOSED; two non-blocking observations. Report at `~/.agent-handoff/2026-06-09/review-3bfix-gemini/report.md`. |
 | 3B-fix-2 (hidden lookup regression) | claude (opus[1m]) | (killed) | `synap5e/feat/3b-fuse-fixes` (chained) | **MERGED** at `d5aafe6`. `ops.lookup()` no longer scans readdir output; conv-root children resolved via `fetch_channel_by_slug(allow_hidden=True)`. 4 new real-ops tests; 606 pre-rebase / 612 post-rebase tests. |
 | 3D tier CLI | cursor (gpt-5.3-codex-xhigh) | (killed) | `synap5e/feat/3d-tier-cli` | **MERGED** at `c9b5835`. |
-| 3E cross-stream invalidation + V2 sink | claude (opus[1m]) | `sprint3e` | `synap5e/feat/3e-cross-stream-invalidation` | in flight. Wires V2 projector InvalidationSink in `cmd_mount_split()` (closing GPT-5.5's flagged gap) + enforces 2E's two TX invariants + adds two race regression tests (original + reviewer's adversarial user_added-lookup-before-message-commit). |
+| 3E cross-stream invalidation + V2 sink | claude (opus[1m]) | (killed) | `synap5e/feat/3e-cross-stream-invalidation` | **MERGED** at `67fe7d6`. V2InvalidationSink maps ChunkRef/ThreadChunkRef/channel-list intents to V2 inodes; `cmd_mount_split` now runs the projector (WSClient) in-process with the sink + a reconnect supervisor + the health subscriber on separate psycopg connections. Added missing same-TX `chunk_mentions` lookup for `channel_added` (the `<#C…>-before-channel_added` gap; user_added/user_renamed/channel_renamed already had it from 2E). 621 tests (10 new: 8 sink units + 1 original race + 1 adversarial race). Worker deviations all justified in code: sink invalidates materialized inodes (not just notify_store-primed) because `keep_cache=True` caches even when notify_store was skipped; projector lives in-process (separate process can't invalidate this process's kernel cache); adversarial test guards the unresolved-fallback backstop (orthogonal to the cross-stream lookup by design). |
 
-3C (trailer JSONL log + module extraction) deferred until after 3E — pure
-hygiene/observability work; 3B already implements the trailer correctness.
+**Sprint 3 functionally complete.** All hard-gate tracks merged: 3A snapshot
+HTTP, 3B FUSE adapter (+ fix + fix-2), 3D tier CLI, 3E cross-stream
+invalidation. 3C (trailer JSONL log + module extraction) deferred to
+Sprint 4 hygiene — pure observability, 3B already implements the trailer
+correctness.
+
+### Next owner action
+
+Post-Sprint-3 critical review gate (pre-cutover) — user-in-loop touchpoint
+per the orchestration plan. Pause for owner input before firing.
 | 2C HTTP /resolve + /permalink | cursor (gpt-5.3-codex-xhigh) | (killed) | `synap5e/feat/2c-http-resolve-permalink` | **MERGED** at `e2d8a59`. Lifting strategy: option 2 (copy bodies into server modules), keeps legacy independent. CLI gained `--server-url` proxy mode. |
 | (owner inline) flake fix | n/a | n/a | n/a | Bumped WS test timeouts (1.0→5.0s default, 0.5→3.0s explicit) — was flaking under full-suite + cold-Pg load after 2F auto-provision landed. |
 | 1G Socket Mode payload conformance | cursor (gpt-5.3-codex-xhigh) | (killed) | `synap5e/feat/sprint1g-message-payload-conformance` | **MERGED** at `06bdad6`. Live `message` events now Message.model_validate(...).model_dump('json'), byte-equivalent to backfill. Conformance test asserts the equivalence against a conversations.history-derived envelope with reactions+files+edited+reply metadata. |
