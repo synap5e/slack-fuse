@@ -46,6 +46,7 @@ from slack_fuse_server.slurper.health import HealthEmitter
 from slack_fuse_server.slurper.offsets import OffsetWriter
 from slack_fuse_server.slurper.socket import SocketModeOptions, SocketModeStatus
 from slack_fuse_server.slurper.users import populate_users_once, run_socket_mode_with_users
+from slack_fuse_server.snapshot import SnapshotScheduler
 from slack_fuse_server.wire.server import WireServer
 
 log = logging.getLogger(__name__)
@@ -69,6 +70,18 @@ def _connect_and_migrate(database_url: str) -> psycopg.Connection[TupleRow]:
     applied = apply_migrations(conn, _MIGRATIONS_DIR)
     if applied:
         log.info("applied server migrations: %s", ", ".join(applied))
+    return conn
+
+
+def _connect_snapshot(database_url: str) -> psycopg.Connection[TupleRow]:
+    """A second connection for the snapshot scheduler (migrations already applied).
+
+    Autocommit so `generate_snapshot`'s `conn.transaction()` opens a real
+    transaction at the REPEATABLE READ level it sets — mirroring the
+    `OffsetWriter` connection contract.
+    """
+    conn: psycopg.Connection[TupleRow] = psycopg.connect(database_url)
+    conn.autocommit = True
     return conn
 
 
@@ -183,6 +196,17 @@ async def _serve(config: ServerConfig) -> None:
     writer = OffsetWriter(conn, limiter)
     health = HealthEmitter(writer)
 
+    # The snapshot scheduler runs on its own connection + limiter so generating
+    # a large snapshot never blocks live event writes (its REPEATABLE READ reads
+    # don't contend with the writer's autocommit inserts on a separate backend).
+    snapshot_conn = _connect_snapshot(config.database_url)
+    snapshot_scheduler = SnapshotScheduler(
+        snapshot_conn,
+        every_n_events=config.snapshot_every_n_events,
+        max_age_seconds=config.snapshot_max_age_hours * 3600,
+        limiter=trio.CapacityLimiter(1),
+    )
+
     status = SocketModeStatus()
     wire_server = WireServer(config.database_url, shared_secret=config.shared_secret or None)
     metrics = _build_metrics_aggregator(config, status, wire_server, datetime.now(UTC))
@@ -193,12 +217,14 @@ async def _serve(config: ServerConfig) -> None:
             nursery.start_soon(_run_socket_mode_with_users_task, writer, health, client, config, status)
             nursery.start_soon(populate_users_once, writer, client)
             nursery.start_soon(_serve_dispatch_task, config.listen_addr, wire_server, metrics)
+            nursery.start_soon(snapshot_scheduler.run)
             if auto_backfill:
                 nursery.start_soon(_auto_backfill, config, writer, health, client, limiter)
             log.info("slack-fuse-server listening on %s (HTTP /health, /metrics + WS /ws)", config.listen_addr)
     finally:
         client.close()
         conn.close()
+        snapshot_conn.close()
 
 
 async def _run_socket_mode_with_users_task(
