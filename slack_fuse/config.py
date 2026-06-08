@@ -48,9 +48,21 @@ class ClientConfig(BaseSettings):
     projector_pool_size: int = 8
 
     # Staleness-trailer behaviour.
+    #
+    # ``stale_trailer_enabled`` is a bake-in comparison knob, NOT a long-term
+    # setting: with it off, staleness no longer appends a trailer nor gates
+    # kernel-cache priming, so an operator can A/B "trailer-warned" vs "no
+    # trailer" reads. The unresolved-mention fallback gate stays on regardless.
     stale_trailer_enabled: bool = True
+    # WS-disconnect staleness threshold (s). No frame for this long → trailer.
     stale_after_disconnect_s: float = 60.0
+    # Catch-up freshness window (s). A ``stream_caught_up`` row older than this
+    # is treated as no recent at-head confirmation (still catching up).
     catchup_window_s: float = 10.0
+    # Optional append-only JSONL log of per-read trailer decisions for bake-in
+    # false-positive measurement. ``None`` disables logging. Rotation is the
+    # operator's responsibility (logrotate / cron) — the writer only appends.
+    trailer_log_path: Path | None = None
 
     @classmethod
     def settings_customise_sources(

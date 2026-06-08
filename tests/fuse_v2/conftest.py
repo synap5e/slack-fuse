@@ -223,11 +223,24 @@ def set_connection_state(
             )
 
 
-def mark_stream_caught_up(conn: Connection[TupleRow], stream: str, at_offset: int = 1) -> None:
+def mark_stream_caught_up(
+    conn: Connection[TupleRow],
+    stream: str,
+    at_offset: int = 1,
+    *,
+    seconds_ago: float = 0.0,
+) -> None:
+    """Stamp ``stream_caught_up`` for ``stream``.
+
+    ``seconds_ago`` backdates ``caught_up_at`` (default 0 → ``now()``) so the
+    catch-up freshness window (``catchup_window_s``) can be crossed without
+    touching the wall clock.
+    """
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO stream_caught_up (stream, caught_up_at, at_offset) VALUES (%s, now(), %s) "
+            "INSERT INTO stream_caught_up (stream, caught_up_at, at_offset) "
+            "VALUES (%s, now() - make_interval(secs => %s), %s) "
             "ON CONFLICT (stream) DO UPDATE SET caught_up_at = EXCLUDED.caught_up_at, "
             "at_offset = GREATEST(stream_caught_up.at_offset, EXCLUDED.at_offset)",
-            (stream, at_offset),
+            (stream, seconds_ago, at_offset),
         )

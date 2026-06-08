@@ -30,7 +30,8 @@ import stat
 import threading
 import time
 from collections.abc import Callable, Sequence
-from datetime import date, datetime
+from dataclasses import dataclass, replace
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Final
 from zoneinfo import ZoneInfo
@@ -57,16 +58,21 @@ from slack_fuse.fuse_v2_helpers import (
     fetch_known_months,
     fetch_staleness_state,
     fetch_thread_chunks,
-    format_trailer,
     is_valid_day,
     is_valid_month,
     parse_day_date,
     parse_path,
     resolve_with_miss_tracking,
     sql_resolvers_for,
-    staleness_reason,
     thread_frontmatter,
     ts_to_local_date,
+)
+from slack_fuse.projector.trailer import (
+    DEFAULT_CATCHUP_WINDOW_S,
+    STALE_AFTER_DISCONNECT_S,
+    TrailerDecision,
+    classify_trailer,
+    render_trailer,
 )
 
 if TYPE_CHECKING:
@@ -74,6 +80,14 @@ if TYPE_CHECKING:
     from psycopg.rows import TupleRow
 
     from slack_fuse.projector.apply import ChunkRef, ThreadChunkRef
+    from slack_fuse.projector.trailer_log import TrailerLog
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
+
+
+NowFn = Callable[[], datetime]
 
 log = logging.getLogger(__name__)
 
@@ -178,37 +192,85 @@ def _file_attr_timeout(path: str, tz: ZoneInfo) -> float:
 # ============================================================================
 
 
+@dataclass(frozen=True, slots=True)
+class TrailerConfig:
+    """The read-path knobs that drive the trailer decision (Sprint 3C wiring).
+
+    Threaded from ``ClientConfig`` through ``SlackFuseOpsV2`` into the assembly
+    helpers so the per-read classification matches the health subscriber.
+    ``trailer_enabled=False`` is the bake-in comparison knob (RFC §Configuration
+    → ``stale_trailer_enabled``): when off, staleness no longer appends a
+    trailer nor gates ``notify_store`` — the decision is still classified and
+    logged, so the false-positive rate stays measurable, but the bytes are
+    served raw. The unresolved-mention fallback invariant is independent and
+    stays on regardless.
+    """
+
+    now: datetime
+    stale_after_s: float = STALE_AFTER_DISCONNECT_S
+    catchup_window_s: float = DEFAULT_CATCHUP_WINDOW_S
+    trailer_enabled: bool = True
+
+
+def _decide_and_apply(
+    conn: Connection[TupleRow],
+    base: str,
+    stream: str,
+    fallback_reasons: Sequence[str],
+    cfg: TrailerConfig,
+) -> tuple[bytes, bool, bool, TrailerDecision]:
+    """Classify staleness + fallback for ``base`` and apply the trailer.
+
+    Returns ``(bytes, had_trailer, had_unresolved_fallback, decision)``.
+    ``had_trailer`` is the *effective* flag (a trailer was appended), which is
+    always ``False`` when ``trailer_enabled`` is off even if the decision
+    classifies as ``stale``. ``had_unresolved_fallback`` is independent of the
+    trailer flag and of ``trailer_enabled``. ``decision`` carries the true
+    classification for the JSONL log regardless of either flag.
+    """
+    stale = fetch_staleness_state(conn, stream)
+    decision = classify_trailer(
+        stale,
+        stream=stream,
+        now=cfg.now,
+        stale_after_s=cfg.stale_after_s,
+        catchup_window_s=cfg.catchup_window_s,
+        fallback_reasons=fallback_reasons,
+    )
+    had_fallback = bool(fallback_reasons)
+    trailer_text = render_trailer(decision) if cfg.trailer_enabled else None
+    if trailer_text is not None:
+        return (base + trailer_text).encode(), True, had_fallback, decision
+    return base.encode(), False, had_fallback, decision
+
+
 def _assemble_channel_day(
     conn: Connection[TupleRow],
     row: ChannelRow,
     day: date,
     tz: ZoneInfo,
-) -> tuple[bytes, bool, bool] | None:
+    cfg: TrailerConfig,
+) -> tuple[bytes, bool, bool, TrailerDecision] | None:
     """Assemble bytes for ``/<conv-root>/<slug>/<YYYY-MM>/<DD>/channel.md``.
 
-    Returns ``(bytes, had_trailer, had_unresolved_fallback)``. ``None`` if the
-    day has no chunks.
+    Returns ``(bytes, had_trailer, had_unresolved_fallback, decision)``.
+    ``None`` if the day has no chunks.
     """
     contents = fetch_day_chunks(conn, row.channel_id, day, tz)
     if not contents:
         return None
     body = "\n".join(contents)
     users, channels = sql_resolvers_for(conn)
-    resolved, had_miss = resolve_with_miss_tracking(body, users, channels)
-    frontmatter = day_channel_frontmatter(row, day)
-    base = frontmatter + resolved
-    stale = fetch_staleness_state(conn, f"channel:{row.channel_id}")
-    reason = staleness_reason(stale)
-    if reason is not None:
-        base += format_trailer(reason, stale.last_frame_at)
-        return base.encode(), True, had_miss
-    return base.encode(), False, had_miss
+    resolved, fallback_reasons = resolve_with_miss_tracking(body, users, channels)
+    base = day_channel_frontmatter(row, day) + resolved
+    return _decide_and_apply(conn, base, f"channel:{row.channel_id}", fallback_reasons, cfg)
 
 
 def _assemble_channel_meta(
     conn: Connection[TupleRow],
     row: ChannelRow,
-) -> tuple[bytes, bool, bool]:
+    cfg: TrailerConfig,
+) -> tuple[bytes, bool, bool, TrailerDecision]:
     """Assemble bytes for ``/<conv-root>/<slug>/channel.md`` — channel metadata.
 
     Channel metadata is local projected data too: it goes stale after a
@@ -219,12 +281,7 @@ def _assemble_channel_meta(
     staleness stream is ``channel-list``.
     """
     base = channel_meta_frontmatter(row).decode()
-    stale = fetch_staleness_state(conn, CHANNEL_LIST_STREAM)
-    reason = staleness_reason(stale)
-    if reason is not None:
-        base += format_trailer(reason, stale.last_frame_at)
-        return base.encode(), True, False
-    return base.encode(), False, False
+    return _decide_and_apply(conn, base, CHANNEL_LIST_STREAM, (), cfg)
 
 
 def _assemble_thread(
@@ -232,25 +289,21 @@ def _assemble_thread(
     row: ChannelRow,
     thread_ts: Decimal,
     tz: ZoneInfo,
-) -> tuple[bytes, bool, bool] | None:
+    cfg: TrailerConfig,
+) -> tuple[bytes, bool, bool, TrailerDecision] | None:
     """Assemble bytes for ``/.../<thread-slug>/thread.md``.
 
-    Returns ``(bytes, had_trailer, had_unresolved_fallback)`` or ``None``.
+    Returns ``(bytes, had_trailer, had_unresolved_fallback, decision)`` or
+    ``None``.
     """
     contents, reply_count = fetch_thread_chunks(conn, row.channel_id, thread_ts)
     if not contents:
         return None
     body = "\n".join(contents)
     users, channels = sql_resolvers_for(conn)
-    resolved, had_miss = resolve_with_miss_tracking(body, users, channels)
-    frontmatter = thread_frontmatter(row, thread_ts, reply_count, tz)
-    base = frontmatter + resolved
-    stale = fetch_staleness_state(conn, f"channel:{row.channel_id}")
-    reason = staleness_reason(stale)
-    if reason is not None:
-        base += format_trailer(reason, stale.last_frame_at)
-        return base.encode(), True, had_miss
-    return base.encode(), False, had_miss
+    resolved, fallback_reasons = resolve_with_miss_tracking(body, users, channels)
+    base = thread_frontmatter(row, thread_ts, reply_count, tz) + resolved
+    return _decide_and_apply(conn, base, f"channel:{row.channel_id}", fallback_reasons, cfg)
 
 
 # ============================================================================
@@ -269,7 +322,7 @@ class SlackFuseOpsV2(pyfuse3.Operations):
     legacy adapter's threading discipline.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913  (keyword-only config + test-injection knobs)
         self,
         conn: Connection[TupleRow],
         local_tz: ZoneInfo,
@@ -277,6 +330,11 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         *,
         notify_store: NotifyStoreFn | None = None,
         invalidate_inode: InvalidateInodeFn | None = None,
+        stale_after_s: float = STALE_AFTER_DISCONNECT_S,
+        catchup_window_s: float = DEFAULT_CATCHUP_WINDOW_S,
+        trailer_enabled: bool = True,
+        trailer_log: TrailerLog | None = None,
+        now_fn: NowFn = _utcnow,
     ) -> None:
         super().__init__()
         self._conn = conn
@@ -286,6 +344,16 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         self._invalidate_inode: InvalidateInodeFn = (
             invalidate_inode if invalidate_inode is not None else _default_invalidate_inode
         )
+        # Trailer-decision wiring (Sprint 3C). ``stale_after_s`` /
+        # ``catchup_window_s`` / ``trailer_enabled`` come from ``ClientConfig``;
+        # ``trailer_log`` (when set) records one decision per read for bake-in
+        # false-positive analysis; ``now_fn`` is injectable so tests can cross
+        # the staleness / catch-up windows without sleeping.
+        self._stale_after_s = stale_after_s
+        self._catchup_window_s = catchup_window_s
+        self._trailer_enabled = trailer_enabled
+        self._trailer_log = trailer_log
+        self._now_fn = now_fn
         self._inodes = PersistentInodeMap(conn)
         self._primed_inodes: set[int] = set()
         self._primed_lock = threading.Lock()
@@ -436,7 +504,27 @@ class SlackFuseOpsV2(pyfuse3.Operations):
 
         The two booleans together drive the ``notify_store`` gating in
         ``read()``. Per RFC: trailer-bearing OR fallback-bearing bytes must
-        NEVER enter the kernel page cache via ``notify_store``.
+        NEVER enter the kernel page cache via ``notify_store``. This is the
+        size/attr-path accessor (``getattr`` / ``lookup`` / ``opendir``); the
+        read path uses :meth:`_resolve_decision` to also obtain the loggable
+        decision record.
+        """
+        resolved = self._resolve_decision(path)
+        if resolved is None:
+            return None
+        content, had_trailer, had_fallback, _decision = resolved
+        return content, had_trailer, had_fallback
+
+    def _resolve_decision(
+        self,
+        path: str,
+        now: datetime | None = None,
+    ) -> tuple[bytes, bool, bool, TrailerDecision] | None:
+        """Assemble bytes + the trailer decision for ``path``, or ``None``.
+
+        ``now`` defaults to ``self._now_fn()`` so attr-path callers don't have
+        to thread a clock; the read path passes its own ``now`` so the logged
+        decision timestamp matches the served bytes.
         """
         parts = parse_path(path)
         depth = len(parts)
@@ -447,18 +535,25 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         if row is None:
             return None
 
+        cfg = TrailerConfig(
+            now=now if now is not None else self._now_fn(),
+            stale_after_s=self._stale_after_s,
+            catchup_window_s=self._catchup_window_s,
+            trailer_enabled=self._trailer_enabled,
+        )
+
         # /<conv-root>/<slug>/channel.md — channel metadata. Subject to the
         # same staleness trailer + notify_store gate as day/thread files
         # (review P1-5).
         if depth == 3 and parts[2] == CHANNEL_MD:
-            return _assemble_channel_meta(self._conn, row)
+            return _assemble_channel_meta(self._conn, row, cfg)
 
         # /<conv-root>/<slug>/<YYYY-MM>/<DD>/channel.md
         if depth == 5 and parts[4] == CHANNEL_MD:
             day = parse_day_date(parts[2], parts[3])
             if day is None:
                 return None
-            return _assemble_channel_day(self._conn, row, day, self._tz)
+            return _assemble_channel_day(self._conn, row, day, self._tz, cfg)
 
         # /<conv-root>/<slug>/<YYYY-MM>/<DD>/<thread-slug>/thread.md
         if depth == 6 and parts[5] == THREAD_MD:
@@ -468,7 +563,7 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             thread_ts = self._resolve_thread_ts(row.channel_id, day, parts[4])
             if thread_ts is None:
                 return None
-            return _assemble_thread(self._conn, row, thread_ts, self._tz)
+            return _assemble_thread(self._conn, row, thread_ts, self._tz, cfg)
 
         return None
 
@@ -624,26 +719,35 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         if path is None:
             raise pyfuse3.FUSEError(errno.EIO)
 
-        def _sync() -> tuple[bytes, bool, bool, str] | None:
-            resolved = self._resolve_content(path)
+        def _sync() -> tuple[bytes, bool, bool, TrailerDecision, str] | None:
+            resolved = self._resolve_decision(path)
             if resolved is None:
                 return None
-            content, trailer, fallback = resolved
-            return content, trailer, fallback, path
+            content, trailer, fallback, decision = resolved
+            return content, trailer, fallback, decision, path
 
         result = await trio.to_thread.run_sync(_sync, limiter=self._limiter)
         if result is None:
             raise pyfuse3.FUSEError(errno.EIO)
-        content, had_trailer, had_fallback, real_path = result
+        content, had_trailer, had_fallback, decision, real_path = result
+
+        # One JSONL decision record per read (clean reads included) for bake-in
+        # false-positive measurement. ``inode`` is stamped here, where it's
+        # known; the writer is append-only and out of the page-cache path, so
+        # this never blocks the read result.
+        self._record_trailer_decision(decision, fh)
 
         # ----------------- HARD INVARIANT GATE -----------------
         # notify_store is the bytes-into-kernel-page-cache action. Two
         # invariants forbid it:
         #   1. Trailer present → kernel must NOT cache the warning bytes
-        #      (RFC §FUSE read path → Trailer / kernel-cache invariant)
+        #      (RFC §FUSE read path → Trailer / kernel-cache invariant).
+        #      ``had_trailer`` is the *effective* flag: with
+        #      ``stale_trailer_enabled=False`` no trailer is appended, so
+        #      staleness no longer gates priming (the bake-in comparison knob).
         #   2. Unresolved-fallback present → kernel must NOT cache
         #      UID/CID literals (RFC §FUSE read path → Unresolved-fallback
-        #      / kernel-cache invariant)
+        #      / kernel-cache invariant). Independent of the trailer flag.
         # Tier is the third gate: only ``hot`` files get primed at all
         # (RFC §Three-tier visibility model → "Kernel priming … fires only
         # on tier = 'hot' reads.").
@@ -653,6 +757,20 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             self._track_primed(fh)
 
         return content[off : off + size]
+
+    def _record_trailer_decision(self, decision: TrailerDecision, inode: int) -> None:
+        """Append one trailer decision to the JSONL log, if logging is enabled.
+
+        Best-effort: a log-write failure must never fail a read, so any OSError
+        is swallowed with a warning (the decision log is observability, not a
+        correctness surface).
+        """
+        if self._trailer_log is None:
+            return
+        try:
+            self._trailer_log.write(replace(decision, inode=inode))
+        except OSError as exc:  # pragma: no cover - log fd failures are rare
+            log.warning("trailer_log write failed (inode=%d): %s", inode, exc)
 
     async def statfs(
         self,

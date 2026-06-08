@@ -17,9 +17,37 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Final
 from zoneinfo import ZoneInfo
 
+from slack_fuse.projector.trailer import (
+    DEFAULT_CATCHUP_WINDOW_S,
+    FALLBACK_CHANNEL_REASON,
+    FALLBACK_USER_REASON,
+    STALE_AFTER_DISCONNECT_S,
+    StalenessState,
+    TrailerDecision,
+    classify_trailer,
+    format_trailer,
+    render_trailer,
+    staleness_reason,
+)
 from slack_fuse.slug import slugify
 from slack_fuse_render import ChannelId, ChannelView, UserId, UserResolver, UserView, resolve_mentions
 from slack_fuse_render.resolvers import ChannelResolver
+
+# Re-exported from ``slack_fuse.projector.trailer`` (Sprint 3C extraction) so the
+# existing ``fuse_ops_v2`` / health-subscriber / test imports keep resolving
+# against ``fuse_v2_helpers`` while the pure trailer logic lives in one module.
+__all__ = [
+    "DEFAULT_CATCHUP_WINDOW_S",
+    "FALLBACK_CHANNEL_REASON",
+    "FALLBACK_USER_REASON",
+    "STALE_AFTER_DISCONNECT_S",
+    "StalenessState",
+    "TrailerDecision",
+    "classify_trailer",
+    "format_trailer",
+    "render_trailer",
+    "staleness_reason",
+]
 
 if TYPE_CHECKING:
     from psycopg import Connection, Cursor
@@ -35,14 +63,6 @@ THREAD_MD: Final = "thread.md"
 # The `channel-list` stream is the staleness stream for channel-metadata
 # (``channel.md``) reads — channel inventory/rename/archive flow over it.
 CHANNEL_LIST_STREAM: Final = "channel-list"
-
-# WS-disconnect staleness threshold. Mirrors RFC §Configuration →
-# ``stale_after_disconnect_s`` (config.py default) and §Offline behaviour →
-# Staleness conditions #1 ("reconnecting unsuccessfully for at least 60 s").
-# Both the read-path classifier (``staleness_reason``) and the health
-# subscriber's time-aware signature key off this single constant so the
-# "trailer never lies" invariant can't drift between them.
-STALE_AFTER_DISCONNECT_S: Final = 60.0
 
 
 # ============================================================================
@@ -722,18 +742,26 @@ def resolve_with_miss_tracking(
     body: str,
     users: UserResolver,
     channels: ChannelResolver,
-) -> tuple[str, bool]:
-    """Substitute mentions in ``body`` and report whether any fell back.
+) -> tuple[str, list[str]]:
+    """Substitute mentions in ``body`` and report which kinds fell back.
 
-    The bool component is ``True`` iff at least one ``<@U…>`` or ``<#C…>``
-    placeholder fell back to a UID/CID literal (per RFC §FUSE read path →
+    The second component is the (possibly empty) list of fallback reasons — one
+    of :data:`FALLBACK_USER_REASON` / :data:`FALLBACK_CHANNEL_REASON` per kind
+    that fell back to a UID/CID literal (per RFC §FUSE read path →
     Unresolved-fallback / kernel-cache invariant: such bytes must NOT be
-    ``notify_store``-d into the kernel page cache).
+    ``notify_store``-d into the kernel page cache). A non-empty list means the
+    read must skip ``notify_store``; the specific reasons feed the trailer
+    decision log so a non-primed read is attributable.
     """
     user_track = _MissTrackingUserResolver(base=users)
     channel_track = _MissTrackingChannelResolver(base=channels)
     resolved = resolve_mentions(body, user_track, channel_track)
-    return resolved, user_track.had_miss or channel_track.had_miss
+    reasons: list[str] = []
+    if user_track.had_miss:
+        reasons.append(FALLBACK_USER_REASON)
+    if channel_track.had_miss:
+        reasons.append(FALLBACK_CHANNEL_REASON)
+    return resolved, reasons
 
 
 def sql_resolvers_for(conn: Connection[TupleRow]) -> tuple[UserResolver, ChannelResolver]:
@@ -747,25 +775,23 @@ def sql_resolvers_for(conn: Connection[TupleRow]) -> tuple[UserResolver, Channel
 
 
 # ============================================================================
-# Staleness trailer
+# Staleness trailer — I/O. The pure classifier (``StalenessState``,
+# ``staleness_reason``, ``format_trailer``, ``TrailerDecision``) lives in
+# ``slack_fuse.projector.trailer``; this wrapper only loads the state values.
 # ============================================================================
-
-
-@dataclass(frozen=True, slots=True)
-class StalenessState:
-    """Per-RFC §Offline behaviour → Source of truth for staleness."""
-
-    last_frame_at: datetime | None
-    last_slurper_health: str
-    last_health_update_at: datetime | None
-    initial_catch_up_done_for_stream: bool
 
 
 def fetch_staleness_state(
     conn: Connection[TupleRow],
     stream: str,
 ) -> StalenessState:
-    """SELECT ``connection_state`` + ``stream_caught_up`` for ``stream``."""
+    """SELECT ``connection_state`` + ``stream_caught_up`` for ``stream``.
+
+    The ``stream_caught_up`` row carries both ``caught_up_at`` (drives the
+    catch-up freshness window — RFC §Configuration → ``catchup_window_s``) and
+    ``at_offset`` (recorded on the decision so the bake-in log can correlate a
+    trailer to the stream head it was caught up to).
+    """
     with conn.cursor() as cur:
         _ = cur.execute(
             "SELECT last_frame_at, last_slurper_health, last_health_update_at FROM connection_state WHERE id = 1"
@@ -778,56 +804,18 @@ def fetch_staleness_state(
             last_frame_at = row[0] if isinstance(row[0], datetime) else None
             last_slurper_health = "unknown" if row[1] is None else str(row[1])
             last_health_update_at = row[2] if isinstance(row[2], datetime) else None
-        _ = cur.execute("SELECT 1 FROM stream_caught_up WHERE stream = %s", (stream,))
-        caught_up = cur.fetchone() is not None
+        _ = cur.execute("SELECT caught_up_at, at_offset FROM stream_caught_up WHERE stream = %s", (stream,))
+        caught_up_row = cur.fetchone()
+    last_caught_up_at: datetime | None = None
+    caught_up_offset: int | None = None
+    if caught_up_row is not None:
+        last_caught_up_at = caught_up_row[0] if isinstance(caught_up_row[0], datetime) else None
+        caught_up_offset = None if caught_up_row[1] is None else int(caught_up_row[1])
     return StalenessState(
         last_frame_at=last_frame_at,
         last_slurper_health=last_slurper_health,
         last_health_update_at=last_health_update_at,
-        initial_catch_up_done_for_stream=caught_up,
+        initial_catch_up_done_for_stream=caught_up_row is not None,
+        last_caught_up_at=last_caught_up_at,
+        caught_up_offset=caught_up_offset,
     )
-
-
-_DISCONNECTED_STATES: Final[frozenset[str]] = frozenset({"disconnected"})
-_DEGRADED_STATES: Final[frozenset[str]] = frozenset({"degraded", "auth_failed"})
-
-
-def staleness_reason(state: StalenessState, *, now: datetime | None = None) -> str | None:
-    """Return the trailer reason string, or ``None`` if content is current.
-
-    Per RFC §Offline behaviour → Staleness conditions, exactly three
-    fundamental degradation states append a trailer. The reason strings come
-    from §Trailer format.
-    """
-    health = state.last_slurper_health
-    if health == "auth_failed":
-        return "auth token invalid"
-    if health in _DISCONNECTED_STATES:
-        return "socket-mode disconnected"
-    if health in _DEGRADED_STATES:
-        return "slack ingestion unhealthy"
-
-    # WS disconnect detection — last_frame_at older than the threshold
-    # indicates we are reconnecting unsuccessfully.
-    now_real = now if now is not None else datetime.now(UTC)
-    if state.last_frame_at is None or (now_real - state.last_frame_at) > timedelta(seconds=STALE_AFTER_DISCONNECT_S):
-        # No frame in the last 60s: be conservative and trail. The
-        # belt-and-suspenders invalidation invariant means this stops the
-        # moment a frame arrives.
-        if not state.initial_catch_up_done_for_stream:
-            return "catching up after reconnect"
-        return "server unreachable"
-
-    if not state.initial_catch_up_done_for_stream:
-        return "catching up after reconnect"
-
-    return None
-
-
-def format_trailer(reason: str, last_frame_at: datetime | None) -> str:
-    """Compose the staleness trailer (see RFC §Trailer format)."""
-    if last_frame_at is None:
-        ts = "never"
-    else:
-        ts = last_frame_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
-    return f"\n---\n\n> ⚠ Content may be stale. Last successful sync: {ts}. Reason: {reason}.\n"

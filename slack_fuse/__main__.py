@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import logging
 import os
 import signal
@@ -247,7 +248,7 @@ def cmd_mount(args: argparse.Namespace) -> None:
         pyfuse3.close()
 
 
-def cmd_mount_split(args: argparse.Namespace) -> None:
+def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-wiring entrypoint: conns, ops, projector, subscriber)
     """Mount the Sprint-3B split adapter (``SlackFuseOpsV2``) over the local
     projections store, with the projector + health subscriber wired to the
     FUSE-side kernel-cache invalidators.
@@ -278,6 +279,7 @@ def cmd_mount_split(args: argparse.Namespace) -> None:
     from slack_fuse.fuse_ops_v2 import SlackFuseOpsV2, V2InvalidationSink
     from slack_fuse.migrations.runner import apply_migrations
     from slack_fuse.projector.health_subscriber import watch_health
+    from slack_fuse.projector.trailer_log import TrailerLog
     from slack_fuse.projector.ws_client import SINGLETON_STREAMS, WSClient, WSClientOptions
 
     config = load_client_config()
@@ -318,7 +320,21 @@ def cmd_mount_split(args: argparse.Namespace) -> None:
 
     tz = _resolve_local_zoneinfo()
     store_limiter = trio.CapacityLimiter(1)
-    ops = SlackFuseOpsV2(fuse_conn, tz, store_limiter)
+
+    # Optional per-read trailer-decision JSONL log (bake-in observability).
+    trailer_log = TrailerLog.open(config.trailer_log_path) if config.trailer_log_path is not None else None
+    if trailer_log is not None:
+        log.info("trailer decision log: %s", config.trailer_log_path)
+
+    ops = SlackFuseOpsV2(
+        fuse_conn,
+        tz,
+        store_limiter,
+        stale_after_s=config.stale_after_disconnect_s,
+        catchup_window_s=config.catchup_window_s,
+        trailer_enabled=config.stale_trailer_enabled,
+        trailer_log=trailer_log,
+    )
 
     # The projector's post-commit sink: maps ChunkRef / ThreadChunkRef /
     # channel-list intents onto V2 inodes and drops their kernel page cache.
@@ -365,7 +381,15 @@ def cmd_mount_split(args: argparse.Namespace) -> None:
 
     async def _run() -> None:
         async with trio.open_nursery() as nursery:
-            nursery.start_soon(watch_health, health_conn, ops.invalidate_all_primed)
+            nursery.start_soon(
+                functools.partial(
+                    watch_health,
+                    health_conn,
+                    ops.invalidate_all_primed,
+                    stale_after_s=config.stale_after_disconnect_s,
+                    catchup_window_s=config.catchup_window_s,
+                )
+            )
             nursery.start_soon(_run_projector)
             await pyfuse3.main()
             nursery.cancel_scope.cancel()
@@ -380,6 +404,8 @@ def cmd_mount_split(args: argparse.Namespace) -> None:
         health_conn.close()
         state_conn.close()
         sink_conn.close()
+        if trailer_log is not None:
+            trailer_log.close()
 
 
 def cmd_unmount(args: argparse.Namespace) -> None:
