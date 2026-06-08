@@ -23,7 +23,7 @@ def test_discover_client_migrations() -> None:
 
 def test_discover_server_migrations() -> None:
     found = discover_migrations(_SERVER_DIR)
-    assert [name for _, name, _ in found] == ["0001_init.sql"]
+    assert [name for _, name, _ in found] == ["0001_init.sql", "0002_users_dedup.sql"]
 
 
 def _table_exists(conn: psycopg.Connection[TupleRow], name: str) -> bool:

@@ -25,6 +25,14 @@ CREATE UNIQUE INDEX events_message_dedup
     ON events (stream, kind, (payload->>'ts'))
     WHERE kind = 'message';
 
+-- Users-stream dedup: one `user_added` per workspace user. Sprint 1E
+-- emits these at slurper startup; the partial unique index makes the
+-- "first writer wins" invariant a hard constraint instead of a runtime
+-- SELECT-then-INSERT check that any future writer could bypass.
+CREATE UNIQUE INDEX events_users_added_dedup
+    ON events (stream, kind, (payload ->> 'id'))
+    WHERE stream = 'users' AND kind = 'user_added';
+
 -- Periodic snapshots so cold consumers don't replay from offset 0.
 -- The cost columns are first-party instrumentation for the
 -- still-open snapshot-cadence question — they let us measure whether

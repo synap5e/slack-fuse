@@ -139,6 +139,20 @@ class OffsetWriter:
     """
 
     def __init__(self, conn: Connection[TupleRow], limiter: trio.CapacityLimiter) -> None:
+        # Fail fast rather than rely on callers remembering the docstring
+        # contract. The bug this guards against is silent: writes appear to
+        # succeed, then disappear when the connection closes because they
+        # were nested savepoints inside an implicit outer transaction
+        # opened by an earlier bare SELECT.
+        if not conn.autocommit:
+            msg = (
+                "OffsetWriter requires conn.autocommit=True. "
+                "Without it, write_event()'s `with conn.transaction()` becomes "
+                "a savepoint inside an implicit outer transaction and rolls "
+                "back when the connection closes. Set conn.autocommit=True "
+                "BEFORE constructing the writer."
+            )
+            raise ValueError(msg)
         self._conn = conn
         self._limiter = limiter
 
