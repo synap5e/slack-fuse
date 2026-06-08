@@ -15,10 +15,19 @@ dependencies = [
     "trio>=0.27.0",
     "trio-websocket>=0.11.0",
     "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "psycopg[binary]>=3.1",
 ]
 
 [project.scripts]
 slack-fuse = "slack_fuse.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+# Three top-level packages ship from this repo: the client (`slack_fuse`),
+# the event-sourced backend (`slack_fuse_server`), and the shared pure
+# renderer library (`slack_fuse_render`). SQL migration files inside these
+# packages are included automatically.
+packages = ["slack_fuse", "slack_fuse_server", "slack_fuse_render"]
 
 [dependency-groups]
 dev = [
@@ -35,7 +44,7 @@ reportUnusedCallResult = false
 reportImplicitStringConcatenation = false
 reportUnannotatedClassAttribute = false
 reportUnknownLambdaType = false
-include = ["slack_fuse", "slack_fuse_poc_b", "tests"]
+include = ["slack_fuse", "slack_fuse_server", "slack_fuse_render", "slack_fuse_poc_b", "tests"]
 exclude = ["**/__pycache__", "**/.venv", "**/.ruff_cache"]
 
 [tool.ruff]

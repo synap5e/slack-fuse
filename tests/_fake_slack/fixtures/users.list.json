@@ -1,0 +1,16 @@
+{
+  "ok": true,
+  "members": [
+    {
+      "id": "U0001",
+      "name": "alice",
+      "profile": { "display_name": "Alice", "real_name": "Alice Anderson" }
+    },
+    {
+      "id": "U0002",
+      "name": "bob",
+      "profile": { "display_name": "", "real_name": "Bob Brown" }
+    }
+  ],
+  "response_metadata": { "next_cursor": "" }
+}

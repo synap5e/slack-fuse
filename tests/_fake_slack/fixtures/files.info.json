@@ -1,0 +1,17 @@
+{
+  "ok": true,
+  "file": {
+    "id": "F0001",
+    "name": "huddle-canvas",
+    "title": "Huddle notes",
+    "url_private": "https://files.example.slack.com/files-pri/T-F0001/huddle-canvas",
+    "is_huddle_canvas": true,
+    "huddle_transcript_file_id": "F0002",
+    "huddle_date_start": 1700000000,
+    "huddle_date_end": 1700003600,
+    "shares": {
+      "private": { "C0001": [{ "ts": "1700000000.000100", "thread_ts": null }] },
+      "public": {}
+    }
+  }
+}

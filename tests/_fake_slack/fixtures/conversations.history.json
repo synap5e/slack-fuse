@@ -1,0 +1,23 @@
+{
+  "ok": true,
+  "messages": [
+    {
+      "type": "message",
+      "ts": "1700000000.000100",
+      "user": "U0001",
+      "text": "Hello <@U0002>, welcome to <#C0001>!",
+      "reactions": [{ "name": "wave", "count": 2, "users": ["U0002", "U0003"] }]
+    },
+    {
+      "type": "message",
+      "ts": "1700000100.000200",
+      "user": "U0002",
+      "text": "Thanks! Glad to be here.",
+      "thread_ts": "1700000100.000200",
+      "reply_count": 1,
+      "latest_reply": "1700000200.000300"
+    }
+  ],
+  "has_more": false,
+  "response_metadata": { "next_cursor": "" }
+}

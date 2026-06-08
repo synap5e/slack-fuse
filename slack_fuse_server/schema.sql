@@ -1,0 +1,128 @@
+-- slack-fuse-server schema (event store).
+--
+-- Authoritative reference copy of RFC §Schemas → Server: events store.
+-- The migration runner applies migrations/0001_init.sql (identical content);
+-- this file exists so the schema is reviewable as a single document.
+
+-- The append-only event log.
+CREATE TABLE events (
+    id BIGSERIAL PRIMARY KEY,
+    stream TEXT NOT NULL,
+    offset_in_stream BIGINT NOT NULL,
+    kind TEXT NOT NULL,
+    ts TEXT,                          -- Slack message ts when applicable
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (stream, offset_in_stream)
+);
+CREATE INDEX events_stream_offset_idx ON events (stream, offset_in_stream);
+
+-- Backfill dedup: same Slack ts = same message. Keyed by (stream, ts) and
+-- scoped to message events only, so re-running either backfiller is a no-op
+-- while non-message event kinds may legitimately repeat. (RFC §Backfill →
+-- Both writes are idempotent.)
+CREATE UNIQUE INDEX events_message_dedup
+    ON events (stream, kind, (payload->>'ts'))
+    WHERE kind = 'message';
+
+-- Periodic snapshots so cold consumers don't replay from offset 0.
+-- The cost columns are first-party instrumentation for the
+-- still-open snapshot-cadence question — they let us measure whether
+-- snapshots are paying for themselves before tuning cadence.
+CREATE TABLE snapshots (
+    stream TEXT NOT NULL,
+    at_offset BIGINT NOT NULL,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    payload_bytes BIGINT NOT NULL,
+    events_covered BIGINT NOT NULL,
+    generation_duration_ms INT NOT NULL,
+    generation_trigger TEXT NOT NULL
+        CHECK (generation_trigger IN ('event_count', 'time', 'manual')),
+    PRIMARY KEY (stream, at_offset)
+);
+
+-- One row per time a snapshot was used to catch a client up. Lets us
+-- measure cache-hit-rate per snapshot: if `events_skipped` is small,
+-- the snapshot wasn't worth generating.
+CREATE TABLE snapshot_uses (
+    snapshot_stream TEXT NOT NULL,
+    snapshot_at_offset BIGINT NOT NULL,
+    used_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    client_since_offset BIGINT NOT NULL,
+    events_skipped BIGINT NOT NULL,
+    FOREIGN KEY (snapshot_stream, snapshot_at_offset)
+        REFERENCES snapshots (stream, at_offset)
+);
+CREATE INDEX snapshot_uses_lookup_idx
+    ON snapshot_uses (snapshot_stream, snapshot_at_offset);
+
+-- Workspace inventory. Mirrored from Slack via events into a queryable
+-- materialization for fast channel-list answers (so subscribe to
+-- channel-list isn't required for cold metadata reads).
+CREATE TABLE channels (
+    channel_id TEXT PRIMARY KEY,
+    name TEXT,
+    is_im BOOLEAN,
+    is_mpim BOOLEAN,
+    is_member BOOLEAN,
+    is_archived BOOLEAN,
+    im_user_id TEXT,
+    topic TEXT,
+    purpose TEXT,
+    num_members INT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE users (
+    user_id TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Live cursor across all streams (the current write head). Used by the
+-- server to assign monotonically increasing offsets within a stream
+-- under concurrent writes.
+CREATE TABLE stream_heads (
+    stream TEXT PRIMARY KEY,
+    next_offset BIGINT NOT NULL DEFAULT 1
+);
+
+-- Append-only log of slurper health transitions. Mirrors what the
+-- server publishes on the slurper-health stream; here so an operator
+-- can SELECT directly without parsing the event log.
+CREATE TABLE health_log (
+    id BIGSERIAL PRIMARY KEY,
+    kind TEXT NOT NULL,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Per-channel backfill size overrides. Persists so re-runs honour the
+-- operator's --allow-large / --max-messages decision. (RFC §Backfill →
+-- Per-channel size threshold.)
+CREATE TABLE backfill_overrides (
+    channel_id TEXT PRIMARY KEY,
+    max_messages BIGINT,  -- NULL = no limit
+    set_by TEXT NOT NULL DEFAULT 'admin',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Offset-assignment pattern (RFC §Schemas → Offset assignment pattern).
+-- Concurrent writers to the same stream serialize via the stream_heads row
+-- lock; writers to different streams are independent. Canonical write TX:
+--
+--   BEGIN;
+--   INSERT INTO stream_heads (stream) VALUES ($1)
+--     ON CONFLICT (stream) DO NOTHING;
+--   UPDATE stream_heads
+--      SET next_offset = next_offset + 1
+--    WHERE stream = $1
+--   RETURNING next_offset - 1 AS my_offset;
+--   INSERT INTO events (stream, offset_in_stream, kind, ts, payload)
+--   VALUES ($1, $my_offset, $2, $3, $4);
+--   COMMIT;
+--
+-- The UPDATE ... RETURNING row-locks the stream's stream_heads row for the
+-- duration of the transaction. The pattern survives parallelisation (one
+-- task per channel during backfill) without code changes.

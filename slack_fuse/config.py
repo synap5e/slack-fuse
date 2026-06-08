@@ -1,0 +1,78 @@
+"""Client config loader.
+
+Per RFC §Configuration → Client. Precedence: env vars (prefix `SLACK_FUSE_`)
+first, then the TOML file, then built-in defaults. The client needs no Slack
+tokens (they stay server-side); only the shared secret to talk to its own
+server is required.
+
+`SLACK_FUSE_MOUNTPOINT` overrides `mountpoint` (matches the existing
+single-process behaviour). Use `load_client_config(toml_path=...)` for a
+non-default TOML file (tests); `ClientConfig()` reads the conventional path.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from pydantic_settings import (
+    BaseSettings,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+    TomlConfigSettingsSource,
+)
+
+_ENV_PREFIX = "SLACK_FUSE_"
+_DEFAULT_TOML = Path.home() / ".config" / "slack-fuse" / "config.toml"
+
+
+class ClientConfig(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix=_ENV_PREFIX,
+        toml_file=_DEFAULT_TOML,
+        extra="ignore",
+    )
+
+    # Server endpoint.
+    server_url: str = "ws://localhost:8765"
+    shared_secret: str  # required; must match the server's
+
+    # Postgres.
+    database_url: str = "postgresql:///slack_fuse"
+
+    # Mountpoint (overridden by the SLACK_FUSE_MOUNTPOINT env var).
+    mountpoint: str = "/views/slack"
+
+    # Staleness-trailer behaviour.
+    stale_trailer_enabled: bool = True
+    stale_after_disconnect_s: float = 60.0
+    catchup_window_s: float = 10.0
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        # Order = priority (earlier wins): explicit init kwargs, then env,
+        # then the TOML file. Defaults fill anything none of them set.
+        return (init_settings, env_settings, TomlConfigSettingsSource(settings_cls))
+
+
+def load_client_config(toml_path: Path | None = None) -> ClientConfig:
+    """Load `ClientConfig`, optionally from a non-default TOML file."""
+    # BaseSettings populates required fields from env/TOML at runtime, so the
+    # no-arg construction is correct despite pyright not seeing the sources.
+    if toml_path is None:
+        return ClientConfig()  # pyright: ignore[reportCallIssue]
+
+    class _Configured(ClientConfig):
+        model_config = SettingsConfigDict(
+            env_prefix=_ENV_PREFIX,
+            toml_file=toml_path,
+            extra="ignore",
+        )
+
+    return _Configured()  # pyright: ignore[reportCallIssue]

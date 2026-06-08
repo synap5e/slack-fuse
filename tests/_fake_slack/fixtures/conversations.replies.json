@@ -1,0 +1,23 @@
+{
+  "ok": true,
+  "messages": [
+    {
+      "type": "message",
+      "ts": "1700000100.000200",
+      "user": "U0002",
+      "text": "Thanks! Glad to be here.",
+      "thread_ts": "1700000100.000200",
+      "reply_count": 1,
+      "latest_reply": "1700000200.000300"
+    },
+    {
+      "type": "message",
+      "ts": "1700000200.000300",
+      "user": "U0001",
+      "text": "You're most welcome.",
+      "thread_ts": "1700000100.000200"
+    }
+  ],
+  "has_more": false,
+  "response_metadata": { "next_cursor": "" }
+}

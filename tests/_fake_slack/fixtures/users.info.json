@@ -1,0 +1,8 @@
+{
+  "ok": true,
+  "user": {
+    "id": "U0001",
+    "name": "alice",
+    "profile": { "display_name": "Alice", "real_name": "Alice Anderson" }
+  }
+}

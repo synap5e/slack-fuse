@@ -1,0 +1,24 @@
+{
+  "ok": true,
+  "channels": [
+    {
+      "id": "C0001",
+      "name": "general",
+      "is_member": true,
+      "is_private": false,
+      "is_im": false,
+      "is_mpim": false,
+      "is_archived": false,
+      "num_members": 42,
+      "topic": { "value": "Company-wide announcements", "creator": "U0001", "last_set": 0 },
+      "purpose": { "value": "General chatter", "creator": "U0001", "last_set": 0 }
+    },
+    {
+      "id": "D0001",
+      "is_im": true,
+      "is_member": true,
+      "user": "U0002"
+    }
+  ],
+  "response_metadata": { "next_cursor": "" }
+}
