@@ -3,24 +3,71 @@
 Lives on `server-split-rebuild`. Updated as the owner loop ticks.
 Most-recent first.
 
-## 2026-06-08 — Sprint 0 + POCs kickoff
+## 2026-06-08 — Sprint 0 + POC B merged
 
-### Workers
+### Sprint 0 — MERGED
 
-| Worker | Model | tmux | Branch | Status |
-|---|---|---|---|---|
-| Sprint 0 interface freeze | claude (opus) | `sprint0-interface-freeze` | `synap5e/feat/sprint0-interface-freeze` | in flight |
-| POC A events→postgres | cursor (gpt-5.3-codex-xhigh) | `poc-a-events` | `synap5e/poc/a-events-to-postgres` | in flight |
-| POC B renderer-split | claude (opus) | `poc-b-renderer` | `synap5e/poc/b-renderer-split` | **MERGED** at `7e5752a`. 45/45 tests, 0 structural bugs found. Design verified SAFE for Sprint 2B. RFC updated with absent-user-fallback tradeoff note. Real discovery: current `slack_fuse/mrkdwn.py` docstring/CLAUDE.md claim code+blockquote handling but the code doesn't — no code-span protection in v1. Doc'd in POC report. |
+- **Branch**: `synap5e/feat/sprint0-interface-freeze` (2 commits:
+  worker's interface freeze `8e4f197` + owner fixup `8046a54`)
+- **Worker**: claude (opus) — completed cleanly
+- **Reviewer**: cursor (gpt-5.3-codex-xhigh) — REQUEST CHANGES with
+  3 polish findings + 2 design findings
+- **Resolution**:
+  - Owner fixed the 3 polish findings inline (snapshot JSONL line
+    DTO added; round-trip tests upgraded to byte-level; fake-Slack
+    fixture coverage extended to all 9 fixtures)
+  - Owner folded the 2 design findings into the RFC as
+    clarifications:
+    - Backfill idempotency under edits → accepted v1 limitation,
+      remediation path via future admin `--refresh` command
+    - Cross-stream race → unresolved-fallback / kernel-cache
+      invariant added to RFC §FUSE read path; concurrency test
+      required as Sprint 2E acceptance criterion
+- **Verification**: ruff + basedpyright + pytest (344 passed, 2
+  skipped) all green
+- **Risk analyses from worker (both validated)**:
+  - Backfill idempotency: `message_changed`-event refresh path
+    works for live events; bootstrap edits are the accepted v1
+    limitation
+  - Cross-stream race: `READ COMMITTED` analysis correct for the
+    initial scenario, but reviewer found a second race
+    (user_added's lookup-before-message-commit) — covered by the
+    new RFC invariant
+
+### POC B — MERGED (earlier)
+
+See previous status. RFC absent-user-fallback note added.
+
+### POC A — RUNNING
+
+- Worker reported partial/blocked: zero `events_api` envelopes in
+  30-minute sample window. Confirmed against production
+  slack-fuse (also zero) — workspace genuinely quiet (Sunday night
+  US time). Worker released; slurper continues in tmux session
+  `poc-a-slurper` for 48-hour observation.
+- Report at `docs/plans/poc-reports/poc-a.md`
+- Action for owner: collect overnight data tomorrow
 
 ### Integration target
 
 Worktree `.wt/server-split-rebuild/`, branch `server-split-rebuild`.
-Created from `main` at `fee797f`. Currently has POC B merged.
+Currently at `<after-this-commit>` with Sprint 0 + POC B merged.
 
 ### Sprint-boundary check-in points (user-in-loop)
 
-- After Sprint 0 lands + POC reports in **← next user touchpoint**
-- After Sprint 1 server soak (~1 week observation)
+- ~~After Sprint 0 lands + POC reports in~~ **Sprint 0 done; POC A
+  data collection deferred to tomorrow (overnight observation)**
+- After Sprint 1 server soak (~1 week observation) **← next user touchpoint**
 - After Sprint 2 fan-out (6-ish tracks merged)
 - After Sprint 3 convergence (pre-cutover gate)
+
+### Next owner action
+
+Spawn Sprint 1 tracks:
+- 1A (slurper, Claude Opus)
+- 1B (WS server, GPT-5.5 xhigh)
+- 1C (HTTP /health + /metrics, Codex)
+- 1D (debug subscribe CLI, Codex)
+
+All four can run in parallel; per the cap-of-3 decision, owner
+will keep ≤3 concurrent at any time.

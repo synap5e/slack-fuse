@@ -385,6 +385,21 @@ Sprint 0's contracts; they CAN run concurrently as separate worktrees.
     produces identical DB state
   - Cursor advances correctly; `caught_up` frame triggers
     `stream_caught_up` insert
+  - **Concurrency invariants enforced** (per the post-Sprint-0 review
+    of the cross-stream race; see RFC §FUSE read path → Unresolved-fallback
+    / kernel-cache invariant):
+    - (i) chunk + chunk_mentions row written in a SINGLE postgres TX
+    - (ii) user_added / channel_added / user_renamed / channel_renamed
+      events: UPSERT + chunk_mentions-SELECT + invalidate_inode calls
+      all in a SINGLE postgres TX
+    - **Required concurrency test** (Sprint 2E gate): synthetic
+      reproduction of the cross-stream race: user_added's lookup
+      runs before the matching message's TX commits → user_added
+      commits → message commits → FUSE read renders with fallback
+      literal → assert that notify_store is SKIPPED (per the
+      unresolved-fallback rule) and the subsequent read re-renders
+      correctly. If notify_store is called on a fallback-bearing
+      read, the test fails.
 
 ### Track 2F — Test infra polish
 
@@ -491,9 +506,21 @@ Things that need Sprint 2 substantially done.
 - **Writer model**: Claude Opus (the race itself is what made the
   reviewer flag it; the fix needs care)
 - **Reviewer model**: GPT-5.5 xhigh
-- **Acceptance**: synthetic test reproduces the race (message before
-  user_added); verifies that user_added invalidates the matching
-  cached inodes
+- **Acceptance**:
+  - The two TX invariants from 2E are present and enforced (NOT
+    spread across separate transactions)
+  - Two synthetic race tests pass:
+    1. Original race: message before user_added → expects
+       chunk_mentions invalidation lookup to find the matching row
+       and call invalidate_inode
+    2. Reviewer's adversarial race (from post-Sprint-0 review): user_added's lookup runs BEFORE
+       message TX commits → falls back at FUSE-read time → assert
+       notify_store SKIPPED → next read re-renders correctly. This
+       enforces the unresolved-fallback / kernel-cache invariant
+       from RFC §FUSE read path
+  - Per-event-kind documentation of which TX-level invariants apply
+    (mainly: user_added, channel_added, user_renamed, channel_renamed
+    all need the UPSERT+lookup+invalidate-in-one-TX pattern from 2E)
 
 ## Sprint 4: Cutover
 

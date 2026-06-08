@@ -1045,6 +1045,50 @@ field) and on every `stream_caught_up` insert, the projector calls
 in-memory hash table on the FUSE/projector process; it's bounded by
 the hot-tier file count.
 
+### Unresolved-fallback / kernel-cache invariant
+
+A second variant of the same hazard, raised by the post-Sprint-0
+adversarial review (2026-06-08): if `resolve_mentions` falls back to
+a UID literal (`@U123`) or channel-id literal (`#C123`) for ANY
+mention in the rendered output — because the corresponding user or
+channel isn't yet in the local `users`/`channels` table — the read
+path must also NOT call `notify_store`.
+
+Without this rule, the following race produces stale literals
+indefinitely under PostgreSQL READ COMMITTED:
+
+```
+T1: user_added(U999) TX starts
+T2: user_added's chunk_mentions lookup runs (sees no rows — message
+    not yet inserted)
+T3: message-mentioning-U999 TX starts
+T4: message TX commits (chunk + chunk_mentions visible)
+T5: FUSE read: chunk visible (T4), user NOT visible (user_added not
+    committed). Falls back to "@U999" literal. notify_store would
+    bake this into kernel cache.
+T6: user_added TX commits
+T7: No subsequent invalidate triggers for U999 (lookup at T2 already
+    ran and missed)
+T8: Subsequent FUSE reads serve the stale "@U999" from kernel cache
+    forever (until some unrelated mutation invalidates the inode)
+```
+
+Mirrors the trailer-skip rule. Reasoning: bytes containing
+unresolved-fallback literals are "provisionally complete" the same
+way trailer-bearing bytes are. The next read re-renders against the
+now-populated `users`/`channels` tables and notify_stores the
+correct bytes.
+
+Performance impact is bounded: on a fresh client start the `users`
+and `channels` streams are subscribed-and-caught-up early (small
+streams, fast), so the window where mentions fall back to literals
+is short. After steady state, fallback is rare.
+
+The connection_state belt-and-suspenders invalidation (above) does
+NOT cover this case because the user_added/channel_added events
+don't trigger a connection_state transition — they're routine event
+applications, not health events.
+
 ### Renderer placement
 
 The structural renderer (`render_message_structural`) runs at
@@ -1298,6 +1342,44 @@ trips the abort threshold (`SlackApiBackfiller` path; the legacy
 importer doesn't enforce the threshold because the data's already
 local) is exactly the kind of channel a user would want hidden or
 blocked anyway.
+
+### Idempotency under edits: accepted v1 limitation
+
+When `LegacyCacheBackfiller` runs first and writes message A for
+`(channel, ts=t)`, then `SlackApiBackfiller` runs second and sees
+message B for the same `(channel, ts=t)` because the user edited
+the message between when legacy was cached and now, the `events_message_dedup`
+partial unique index drops B (first-writer-wins, append-only-log
+invariant preserved).
+
+This means the events log will contain the stale pre-edit body
+indefinitely, unless a future live `message_changed` event for the
+same ts arrives (which overwrites the projection via the
+non-dedup'd `message_changed` event path). For pre-ingestion
+historical edits, no such event will ever arrive.
+
+**Accepted as a v1 limitation.** Rationale: rare in practice
+(requires legacy-cached message + edit between cache and
+ingestion-start + we care); easy remediation path (manual `slack-fuse-server
+backfill <channel-id> --refresh` admin command, deferred to v2,
+that re-fetches via API and emits `message_changed` events for any
+divergence).
+
+**Alternative considered**: run `SlackApiBackfiller` first then
+legacy fills only what API didn't reach. Rejected because it
+defeats the rate-limit-skipping benefit that motivates the legacy
+importer.
+
+**Alternative considered**: `SlackApiBackfiller` compares its
+INSERT result with the existing row on `ON CONFLICT DO NOTHING`
+and emits a `message_changed` event when payloads differ.
+Workable; deferred to v2 if the limitation bites in practice.
+
+This limitation has no impact on the append-only log invariant
+itself, on live ingestion, on `message_changed`/`message_deleted`
+handling (those event kinds are NOT covered by the dedup constraint
+and accumulate freely), or on Sprint 2A's interface (`Backfiller`
+Protocol is unchanged).
 
 ## Renderer-as-library
 
