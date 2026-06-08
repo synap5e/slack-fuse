@@ -34,13 +34,17 @@ def _table_exists(conn: psycopg.Connection[TupleRow], name: str) -> bool:
 
 
 def test_apply_server_migrations_idempotent(pg_conn: psycopg.Connection[TupleRow]) -> None:
-    assert apply_migrations(pg_conn, _SERVER_DIR) == ["0001_init.sql"]
+    assert apply_migrations(pg_conn, _SERVER_DIR) == ["0001_init.sql", "0002_users_dedup.sql"]
     assert _table_exists(pg_conn, "events")
     assert _table_exists(pg_conn, "snapshots")
     assert _table_exists(pg_conn, "backfill_overrides")
-    # The partial dedup index exists.
+    # The partial dedup indexes exist (both message and users-added).
     with pg_conn.cursor() as cur:
         cur.execute("SELECT to_regclass('events_message_dedup')")
+        row = cur.fetchone()
+    assert row is not None and row[0] is not None
+    with pg_conn.cursor() as cur:
+        cur.execute("SELECT to_regclass('events_users_added_dedup')")
         row = cur.fetchone()
     assert row is not None and row[0] is not None
     # Second run applies nothing.
