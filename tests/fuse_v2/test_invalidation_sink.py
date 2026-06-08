@@ -14,12 +14,14 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, cast
 from zoneinfo import ZoneInfo
 
+import httpx
 import pytest
 
 from slack_fuse.fuse_ops_v2 import SlackFuseOpsV2, V2InvalidationSink
 from slack_fuse.fuse_v2_helpers import dedup_thread_slug_map, fetch_day_thread_parents
 from slack_fuse.models import JsonObject
 from slack_fuse.projector.apply import ChunkRef, ThreadChunkRef, apply_event
+from slack_fuse.projector.snapshot_fetch import SnapshotRedirect, fetch_and_apply_snapshot
 from slack_fuse_server.wire.frames import EventFrame
 from tests.fuse_v2.conftest import (
     FakePyfuse3,
@@ -224,6 +226,64 @@ def test_channel_archived_invalidates_thread_md_inode_end_to_end(
         sink.channel_list_changed()
 
     assert thread_inode in fake_pyfuse3.invalidate_calls
+
+
+# ============================================================================
+# Snapshot-delete invalidations end-to-end (review hole 2): a snapshot that
+# removes a chunk for a *materialized* file must drop that file's kernel cache.
+# ============================================================================
+
+
+@pytest.mark.trio
+async def test_snapshot_delete_invalidates_materialized_day_file_inode(
+    client_conn: Connection[TupleRow],
+    ops: SlackFuseOpsV2,
+    fake_pyfuse3: FakePyfuse3,
+) -> None:
+    """Review hole 2 (top-level): an empty channel snapshot removes the day's
+    only chunk; the materialized day-file inode must be invalidated so the
+    kernel stops serving the stale pre-delete bytes (V2 ``fi.keep_cache=True``).
+
+    On the pre-fix tree the empty body short-circuited to a cursor-only advance
+    (no delete, no invalidation) AND the delete path returned no refs — so the
+    day file's inode was never dropped.
+    """
+    seed_channel(client_conn, "C1", "general", tier="hot")
+    ts = _ts(datetime(2026, 6, 8, 14, 30, tzinfo=UTC))
+    seed_chunk(client_conn, "C1", ts, "## 14:30 <@U1>\n\nstale content\n")
+    day_path = "/channels/general/2026-06/08/channel.md"
+    inode = ops.inodes.get_or_create(day_path)
+
+    sink = _make_sink(client_conn, fake_pyfuse3)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"")
+
+    async with httpx.AsyncClient(base_url="http://snapshot.test", transport=httpx.MockTransport(handler)) as http:
+        await fetch_and_apply_snapshot(
+            http,
+            client_conn,
+            SnapshotRedirect(stream="channel:C1", at_offset=50, url="/streams/X/snapshot?at=50"),
+            sink=sink,
+        )
+
+    assert inode in fake_pyfuse3.invalidate_calls
+    with client_conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM chunks WHERE channel_id = 'C1'")
+        row = cur.fetchone()
+    assert row is not None and int(row[0]) == 0
+
+
+# NOTE: the thread-side of hole 2 is covered at the projector level by
+# tests/projector/test_snapshot_fetch.py::test_snapshot_delete_fires_invalidation_for_removed_rows
+# (asserts a deleted ThreadChunkRef reaches the sink — fails pre-fix) composed
+# with test_thread_chunk_changed_invalidates_thread_file_inode above (asserts a
+# ThreadChunkRef resolves to the thread.md inode). An end-to-end thread test
+# can't *isolate* the deleted-ref path: a surviving reply in the same snapshot
+# re-upserts and fires thread_chunk_changed for the same inode, while removing
+# the last reply drops reply_count to 0 and the thread dir (and its slug
+# resolvability) with it. So no thread-only end-to-end case both fails pre-fix
+# and resolves an inode — the two-part coverage above is the faithful guard.
 
 
 # ============================================================================

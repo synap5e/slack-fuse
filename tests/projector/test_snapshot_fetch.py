@@ -16,7 +16,7 @@ import psycopg
 import trio
 from psycopg.rows import TupleRow
 
-from slack_fuse.projector.apply import ChunkRef
+from slack_fuse.projector.apply import ChunkRef, ThreadChunkRef
 from slack_fuse.projector.snapshot_fetch import (
     SnapshotFetchError,
     SnapshotRedirect,
@@ -187,13 +187,38 @@ def _seed_top_level_chunk(conn: psycopg.Connection[TupleRow], channel_id: str, t
         )
 
 
-def _seed_thread_reply(conn: psycopg.Connection[TupleRow], channel_id: str, thread_ts: str, reply_ts: str) -> None:
+def _seed_thread_reply(
+    conn: psycopg.Connection[TupleRow],
+    channel_id: str,
+    thread_ts: str,
+    reply_ts: str,
+    *,
+    mention: str | None = None,
+) -> None:
     with conn.cursor() as cur:
         cur.execute(
             "INSERT INTO thread_chunks (channel_id, thread_ts, reply_ts, role, content_md) "
             "VALUES (%s, %s, %s, 'reply', %s)",
             (channel_id, Decimal(thread_ts), Decimal(reply_ts), "stale reply"),
         )
+        if mention is not None:
+            cur.execute(
+                "INSERT INTO thread_chunk_mentions (channel_id, thread_ts, reply_ts, mention_kind, mentioned_id) "
+                "VALUES (%s, %s, %s, 'user', %s)",
+                (channel_id, Decimal(thread_ts), Decimal(reply_ts), mention),
+            )
+
+
+def _thread_mention_count(
+    conn: psycopg.Connection[TupleRow], channel_id: str, thread_ts: str, reply_ts: str
+) -> int:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) FROM thread_chunk_mentions WHERE channel_id = %s AND thread_ts = %s AND reply_ts = %s",
+            (channel_id, Decimal(thread_ts), Decimal(reply_ts)),
+        )
+        row = cur.fetchone()
+    return 0 if row is None else int(row[0])
 
 
 def _chunk_exists(conn: psycopg.Connection[TupleRow], channel_id: str, ts: str) -> bool:
@@ -300,6 +325,103 @@ def test_snapshot_apply_removes_stale_thread_replies(client_conn_factory: Client
     assert not _thread_reply_exists(verify_conn, "CTHR", parent_ts, stale_reply_ts)
     assert _thread_reply_exists(verify_conn, "CTHR", parent_ts, kept_reply_ts)
     assert _cursor(verify_conn, stream) == 700
+
+
+def test_empty_channel_snapshot_is_full_replacement(client_conn_factory: ClientConnFactory) -> None:
+    """Review hole 1: an empty channel snapshot deletes ALL local rows.
+
+    On the pre-fix path an empty body short-circuited to a cursor-only advance,
+    so stale top-level chunks, thread replies, and their mention rows survived
+    forever once the cursor passed the deletes the client never saw. The empty
+    body is the authoritative "channel now has zero messages" state, so it must
+    run the full-replacement path: every `chunks` / `thread_chunks` (and their
+    cascading `chunk_mentions` / `thread_chunk_mentions`) for the channel is
+    removed, and the deleted keys fire through the sink (hole 2).
+    """
+    stream = "channel:CEMP2"
+    stale_top_ts = "100.000001"
+    parent_ts = "200.000000"
+    stale_reply_ts = "200.000005"
+
+    seed_conn = client_conn_factory()
+    _seed_top_level_chunk(seed_conn, "CEMP2", stale_top_ts, mention="UGHOST")
+    _seed_thread_reply(seed_conn, "CEMP2", parent_ts, stale_reply_ts, mention="UGHOST2")
+    assert _chunk_exists(seed_conn, "CEMP2", stale_top_ts)
+    assert _mention_count(seed_conn, "CEMP2", stale_top_ts) == 1
+    assert _thread_reply_exists(seed_conn, "CEMP2", parent_ts, stale_reply_ts)
+    assert _thread_mention_count(seed_conn, "CEMP2", parent_ts, stale_reply_ts) == 1
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"")
+
+    sink = RecordingSink()
+    conn = client_conn_factory()
+
+    async def run() -> None:
+        async with httpx.AsyncClient(base_url="http://snapshot.test", transport=httpx.MockTransport(handler)) as http:
+            result = await fetch_and_apply_snapshot(
+                http, conn, SnapshotRedirect(stream=stream, at_offset=900, url="/streams/X/snapshot?at=900"), sink=sink
+            )
+            assert result.records_applied == 0
+
+    trio.run(run)
+
+    verify_conn = client_conn_factory()
+    # All four tables are empty for the channel.
+    assert not _chunk_exists(verify_conn, "CEMP2", stale_top_ts)
+    assert _mention_count(verify_conn, "CEMP2", stale_top_ts) == 0
+    assert not _thread_reply_exists(verify_conn, "CEMP2", parent_ts, stale_reply_ts)
+    assert _thread_mention_count(verify_conn, "CEMP2", parent_ts, stale_reply_ts) == 0
+    # Cursor advanced atomically.
+    assert _cursor(verify_conn, stream) == 900
+    # The deleted day-file / thread-file keys fired for invalidation (hole 2).
+    assert ChunkRef("CEMP2", Decimal(stale_top_ts)) in sink.chunks
+    assert ThreadChunkRef("CEMP2", Decimal(parent_ts), Decimal(stale_reply_ts)) in sink.thread_chunks
+
+
+def test_snapshot_delete_fires_invalidation_for_removed_rows(client_conn_factory: ClientConnFactory) -> None:
+    """Review hole 2: a (non-empty) snapshot that removes rows fires invalidations.
+
+    On the pre-fix path `_delete_chunks_absent_from_snapshot` deleted rows but
+    returned nothing, so the deleted keys never reached the sink. A snapshot that
+    clears the last chunk for a materialised file then left the kernel page cache
+    serving stale bytes (V2 `fi.keep_cache=True`). Here the snapshot keeps an
+    unrelated kept message but omits a stale top-level chunk and a stale thread
+    reply; the sink must receive both deleted refs.
+    """
+    stream = "channel:CDEL2"
+    stale_top_ts = "100.000001"
+    parent_ts = "200.000000"
+    stale_reply_ts = "200.000005"
+
+    seed_conn = client_conn_factory()
+    _seed_top_level_chunk(seed_conn, "CDEL2", stale_top_ts, mention="UGHOST")
+    _seed_thread_reply(seed_conn, "CDEL2", parent_ts, stale_reply_ts, mention="UGHOST2")
+
+    kept_ts = synthetic_ts(0)
+    body = json.dumps({"type": "message", "ts": kept_ts, "user": "U0001", "text": "kept", "thread_ts": None}).encode()
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body)
+
+    sink = RecordingSink()
+    conn = client_conn_factory()
+
+    async def run() -> None:
+        async with httpx.AsyncClient(base_url="http://snapshot.test", transport=httpx.MockTransport(handler)) as http:
+            await fetch_and_apply_snapshot(
+                http,
+                conn,
+                SnapshotRedirect(stream=stream, at_offset=1000, url="/streams/X/snapshot?at=1000"),
+                sink=sink,
+            )
+
+    trio.run(run)
+
+    # Both deleted refs reached the sink, alongside the kept upsert's ref.
+    assert ChunkRef("CDEL2", Decimal(stale_top_ts)) in sink.chunks
+    assert ChunkRef("CDEL2", Decimal(kept_ts)) in sink.chunks
+    assert ThreadChunkRef("CDEL2", Decimal(parent_ts), Decimal(stale_reply_ts)) in sink.thread_chunks
 
 
 _ = ChunkRef  # keep the import alive for the test header

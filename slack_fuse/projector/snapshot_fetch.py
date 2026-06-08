@@ -17,6 +17,18 @@ whose keys are absent from the snapshot (their `chunk_mentions` cascade away via
 FK). The delete + upserts + cursor advance are one TX, so a crash mid-apply
 leaves the prior consistent state, not a half-replaced one.
 
+This holds even for an *empty* channel snapshot (review hole 1): a zero-row body
+is the authoritative "this channel now has no messages" state, so a channel
+stream always runs the full-replacement path (deleting every local chunk) rather
+than the cursor-only short-circuit — only singleton streams (`users` /
+`channel-list`) take the empty short-circuit, since the server gate replays them
+instead of redirecting to an empty snapshot.
+
+The delete itself surfaces the removed keys (review hole 2): a snapshot that
+clears the last chunk for a materialised file leaves no surviving upsert to
+carry the invalidation, so deleted `ChunkRef` / `ThreadChunkRef`s are collected
+via `RETURNING` and fired through the sink post-commit alongside the upsert refs.
+
 Atomicity matters: the cursor advance to `at` is part of the same TX as the
 chunk writes. If the fetch or apply fails partway, the TX rolls back and the
 next subscribe re-tries the snapshot from the same cursor — no partial chunks,
@@ -47,8 +59,10 @@ from psycopg.rows import TupleRow
 from slack_fuse.models import JsonObject
 from slack_fuse.projector.apply import (
     ApplyResult,
+    ChunkRef,
     InvalidationSink,
     NullInvalidationSink,
+    ThreadChunkRef,
     apply_snapshot_row,
     require_autocommit,
 )
@@ -105,12 +119,18 @@ async def fetch_and_apply_snapshot(
         body_bytes = await response.aread()
 
     lines = [line for line in body_bytes.decode("utf-8").splitlines() if line.strip()]
-    if not lines:
-        # Empty snapshot still advances the cursor so we don't re-fetch on
-        # reconnect; one tiny TX covers it.
+    if not lines and not redirect.stream.startswith(_CHANNEL_STREAM_PREFIX):
+        # Singleton streams (`users` / `channel-list`): the server gate never
+        # redirects these to a snapshot for the empty case (it replays them
+        # instead), so an empty body just advances the cursor. One tiny TX.
         await trio.to_thread.run_sync(_apply_empty_snapshot, conn, redirect.stream, redirect.at_offset)
         return SnapshotResult(stream=redirect.stream, at_offset=redirect.at_offset, records_applied=0)
 
+    # Channel streams ALWAYS go through the full-replacement path, even when the
+    # body is empty (review P0-B): an empty channel snapshot is the authoritative
+    # "this channel now has zero messages" state, so it must DELETE every local
+    # chunk/thread_chunk for the channel — not merely advance the cursor, which
+    # would orphan stale rows the client never saw deleted.
     invalidations = await trio.to_thread.run_sync(
         _apply_snapshot_sync, conn, redirect.stream, redirect.at_offset, tuple(lines)
     )
@@ -142,7 +162,7 @@ def _apply_snapshot_sync(
         rows = [_decode_row(stream, raw) for raw in lines]
         if stream.startswith(_CHANNEL_STREAM_PREFIX):
             channel_id = stream.removeprefix(_CHANNEL_STREAM_PREFIX)
-            _delete_chunks_absent_from_snapshot(cur, channel_id, rows)
+            results.append(_delete_chunks_absent_from_snapshot(cur, channel_id, rows))
         for row in rows:
             results.append(apply_snapshot_row(cur, stream, row))
         advance_cursor(cur, stream, at_offset)
@@ -174,7 +194,7 @@ def _delete_chunks_absent_from_snapshot(
     cur: Cursor[TupleRow],
     channel_id: str,
     rows: Sequence[JsonObject],
-) -> None:
+) -> ApplyResult:
     """Delete the channel's chunks/thread_chunks whose keys are not in the snapshot.
 
     A top-level message (or thread parent: `thread_ts` unset or == `ts`) keeps a
@@ -183,6 +203,13 @@ def _delete_chunks_absent_from_snapshot(
     keep-sets delete everything for the channel — exactly what a snapshot with
     no top-level messages / no replies should produce. `chunk_mentions` /
     `thread_chunk_mentions` cascade away via their FKs.
+
+    Returns the deleted rows as an `ApplyResult` (review hole 2): a snapshot that
+    removes the last chunk(s) for a materialised day/thread file has no surviving
+    upsert to carry the invalidation, so the deleted keys are surfaced via
+    `RETURNING` and fired through the sink post-commit. Without this the DB is
+    correct but the kernel page cache (V2 `fi.keep_cache=True`) serves the stale
+    pre-delete bytes until something else touches the path.
     """
     keep_top: list[Decimal] = []
     keep_thread_parent: list[Decimal] = []
@@ -198,14 +225,20 @@ def _delete_chunks_absent_from_snapshot(
         else:
             keep_top.append(ts)
     cur.execute(
-        "DELETE FROM chunks WHERE channel_id = %s AND message_ts <> ALL(%s::numeric[])",
+        "DELETE FROM chunks WHERE channel_id = %s AND message_ts <> ALL(%s::numeric[]) RETURNING message_ts",
         (channel_id, keep_top),
     )
+    deleted_top = tuple(ChunkRef(channel_id, cast(Decimal, row[0])) for row in cur.fetchall())
     cur.execute(
         "DELETE FROM thread_chunks WHERE channel_id = %s "
-        "AND (thread_ts, reply_ts) NOT IN (SELECT * FROM unnest(%s::numeric[], %s::numeric[]))",
+        "AND (thread_ts, reply_ts) NOT IN (SELECT * FROM unnest(%s::numeric[], %s::numeric[])) "
+        "RETURNING thread_ts, reply_ts",
         (channel_id, keep_thread_parent, keep_thread_reply),
     )
+    deleted_thread = tuple(
+        ThreadChunkRef(channel_id, cast(Decimal, row[0]), cast(Decimal, row[1])) for row in cur.fetchall()
+    )
+    return ApplyResult(chunks=deleted_top, thread_chunks=deleted_thread)
 
 
 def _fire_invalidations(sink: InvalidationSink, results: Iterable[ApplyResult]) -> None:
