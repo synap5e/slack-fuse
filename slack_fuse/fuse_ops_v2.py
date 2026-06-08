@@ -47,6 +47,7 @@ from slack_fuse.fuse_v2_helpers import (
     PersistentInodeMap,
     assign_conv_root_slugs,
     channel_meta_frontmatter,
+    conv_root_for,
     day_channel_frontmatter,
     dedup_thread_slug_map,
     fetch_channel_by_slug,
@@ -65,11 +66,14 @@ from slack_fuse.fuse_v2_helpers import (
     sql_resolvers_for,
     staleness_reason,
     thread_frontmatter,
+    ts_to_local_date,
 )
 
 if TYPE_CHECKING:
     from psycopg import Connection
     from psycopg.rows import TupleRow
+
+    from slack_fuse.projector.apply import ChunkRef, ThreadChunkRef
 
 log = logging.getLogger(__name__)
 
@@ -682,6 +686,184 @@ class SlackFuseOpsV2(pyfuse3.Operations):
 
 
 # ============================================================================
+# Cross-stream invalidation sink (Sprint 3E)
+# ============================================================================
+
+
+def _fetch_channel_row_by_id(conn: Connection[TupleRow], channel_id: str) -> ChannelRow | None:
+    """SELECT a single channels row by id (the columns ``ChannelRow`` needs)."""
+    with conn.cursor() as cur:
+        _ = cur.execute(
+            "SELECT channel_id, name, is_im, is_mpim, is_member, is_archived, im_user_id, tier "
+            "FROM channels WHERE channel_id = %s",
+            (channel_id,),
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    return ChannelRow(
+        channel_id=str(row[0]),
+        name="" if row[1] is None else str(row[1]),
+        is_im=bool(row[2]),
+        is_mpim=bool(row[3]),
+        is_member=bool(row[4]),
+        is_archived=bool(row[5]),
+        im_user_id=None if row[6] is None else str(row[6]),
+        tier=str(row[7]),
+    )
+
+
+class V2InvalidationSink:
+    """Projector ``InvalidationSink`` that drops V2 FUSE inodes' kernel cache.
+
+    Structurally implements ``slack_fuse.projector.apply.InvalidationSink``
+    (``chunk_changed`` / ``thread_chunk_changed`` / ``channel_list_changed``).
+    It is the production wiring the RFC §FUSE read path → Unresolved-fallback /
+    kernel-cache invariant relies on: the V2 projector's per-event mutations
+    must reach the FUSE process's kernel page cache, or live chunk changes stay
+    invisible behind ``fi.keep_cache=True`` until the polling-TTL floor.
+
+    --------------------------------------------------------------------------
+    Per-event-kind invalidation pattern (reader's guide — not runtime config)
+    --------------------------------------------------------------------------
+    The projector's ``apply_event`` performs a cross-stream ``chunk_mentions``
+    lookup *inside the same TX* as the upsert for these kinds, then emits
+    ``ChunkRef`` / ``ThreadChunkRef`` intents this sink turns into inode drops:
+
+      * ``user_added`` / ``user_renamed`` — upsert ``users`` + lookup
+        ``chunk_mentions WHERE mention_kind='user' AND mentioned_id=$uid``.
+      * ``channel_added`` / ``channel_renamed`` — upsert ``channels`` + lookup
+        ``chunk_mentions WHERE mention_kind='channel' AND mentioned_id=$cid``.
+
+    The *same TX* is load-bearing: under ``READ COMMITTED`` a separate-TX lookup
+    can miss a ``message`` whose write TX has not committed yet (the reviewer's
+    adversarial race). The read-side unresolved-fallback invariant
+    (``notify_store`` skipped while any mention is unresolved) is the backstop
+    if the lookup still misses — see ``tests/projector/test_cross_stream_race.py``.
+
+    These kinds need only the chunk-changed invalidation (the mutated chunk's
+    own inode) — no cross-stream lookup:
+
+      * ``message`` / ``message_changed`` / ``message_deleted``
+      * ``channel_archived`` / ``channel_unarchived``
+
+    --------------------------------------------------------------------------
+    Threading
+    --------------------------------------------------------------------------
+    Called synchronously from ``StreamApplier._fire_invalidations`` on the trio
+    event-loop thread *after* the applier's TX commits. Owns a dedicated psycopg
+    connection so its reads never race the FUSE callbacks' connection (which run
+    on worker threads). ``invalidate_inode`` defaults to the same pyfuse3
+    wrapper ``SlackFuseOpsV2`` uses for the health-subscriber path.
+
+    --------------------------------------------------------------------------
+    Why materialized, not only notify_store-primed
+    --------------------------------------------------------------------------
+    We invalidate every *materialized* inode (one present in the ``inodes``
+    table — looked-up or read at least once), not just the notify_store-primed
+    set. With ``fi.keep_cache=True`` the kernel caches the bytes returned by a
+    plain ``read()`` even when ``notify_store`` was skipped (e.g. an
+    unresolved-``<@U…>`` fallback read). So a later ``user_added`` must drop that
+    inode's cache regardless of whether ``notify_store`` ever fired — otherwise
+    the UID-literal fallback would be served from the kernel cache forever.
+    """
+
+    def __init__(
+        self,
+        conn: Connection[TupleRow],
+        local_tz: ZoneInfo,
+        *,
+        invalidate_inode: InvalidateInodeFn | None = None,
+    ) -> None:
+        self._conn = conn
+        self._tz = local_tz
+        self._inodes = PersistentInodeMap(conn)
+        self._invalidate_inode: InvalidateInodeFn = (
+            invalidate_inode if invalidate_inode is not None else _default_invalidate_inode
+        )
+
+    # -- InvalidationSink protocol --------------------------------------
+
+    def chunk_changed(self, ref: ChunkRef) -> None:
+        path = self._day_file_path(ref.channel_id, ref.message_ts)
+        if path is not None:
+            self._invalidate_path(path)
+
+    def thread_chunk_changed(self, ref: ThreadChunkRef) -> None:
+        path = self._thread_file_path(ref.channel_id, ref.thread_ts)
+        if path is not None:
+            self._invalidate_path(path)
+
+    def channel_list_changed(self) -> None:
+        # Channel-list churn (add/rename/archive/tier/membership) changes both
+        # the conv-root listings and the ``channel: <name>`` frontmatter of
+        # every channel.md, so drop every materialized channel.md inode plus
+        # every conv-root directory inode.
+        for inode in self._materialized_channel_md_inodes():
+            self._invalidate_inode(inode)
+        for root in CONV_ROOTS:
+            inode = self._inodes.get_inode(f"/{root}")
+            if inode is not None:
+                self._invalidate_inode(inode)
+
+    # -- resolution helpers ---------------------------------------------
+
+    def _channel_location(self, channel_id: str) -> tuple[str, str] | None:
+        """Return ``(conv_root, slug)`` for ``channel_id``, or ``None``.
+
+        ``None`` when the channel is unknown or ``blocked`` (blocked channels
+        are excluded from slug assignment and have no reachable subtree).
+        """
+        row = _fetch_channel_row_by_id(self._conn, channel_id)
+        if row is None or row.tier == "blocked":
+            return None
+        conv_root = conv_root_for(row)
+        for candidate, slug in assign_conv_root_slugs(self._conn, conv_root):
+            if candidate.channel_id == channel_id:
+                return conv_root, slug
+        return None
+
+    def _day_file_path(self, channel_id: str, message_ts: Decimal) -> str | None:
+        location = self._channel_location(channel_id)
+        if location is None:
+            return None
+        conv_root, slug = location
+        day = ts_to_local_date(message_ts, self._tz)
+        return f"/{conv_root}/{slug}/{day:%Y-%m}/{day:%d}/{CHANNEL_MD}"
+
+    def _thread_file_path(self, channel_id: str, thread_ts: Decimal) -> str | None:
+        location = self._channel_location(channel_id)
+        if location is None:
+            return None
+        conv_root, slug = location
+        day = ts_to_local_date(thread_ts, self._tz)
+        thread_slug = self._thread_slug(channel_id, day, thread_ts)
+        if thread_slug is None:
+            return None
+        return f"/{conv_root}/{slug}/{day:%Y-%m}/{day:%d}/{thread_slug}/{THREAD_MD}"
+
+    def _thread_slug(self, channel_id: str, day: date, thread_ts: Decimal) -> str | None:
+        parents = fetch_day_thread_parents(self._conn, channel_id, day, self._tz)
+        for slug, ts in dedup_thread_slug_map(parents).items():
+            if ts == thread_ts:
+                return slug
+        return None
+
+    def _materialized_channel_md_inodes(self) -> list[int]:
+        """Every allocated inode whose path is a ``channel.md`` (day or meta)."""
+        with self._conn.cursor() as cur:
+            _ = cur.execute("SELECT inode FROM inodes WHERE path LIKE %s", (f"%/{CHANNEL_MD}",))
+            return [int(r[0]) for r in cur.fetchall()]
+
+    def _invalidate_path(self, path: str) -> None:
+        inode = self._inodes.get_inode(path)
+        if inode is None:
+            # Never materialized → the kernel holds nothing for this path.
+            return
+        self._invalidate_inode(inode)
+
+
+# ============================================================================
 # Synchronous APIs for non-pyfuse3 unit tests
 # ============================================================================
 
@@ -702,5 +884,6 @@ __all__ = [
     "InvalidateInodeFn",
     "NotifyStoreFn",
     "SlackFuseOpsV2",
+    "V2InvalidationSink",
     "synchronous_read_for_test",
 ]

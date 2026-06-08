@@ -16,16 +16,30 @@ assert only the projector-side state and the InvalidationSink callback fan-out.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from decimal import Decimal
-from typing import cast
+from typing import TYPE_CHECKING, cast
+from zoneinfo import ZoneInfo
 
 import psycopg
+import pytest
+import trio
 from psycopg.rows import TupleRow
 
+from slack_fuse.fuse_ops_v2 import SlackFuseOpsV2
 from slack_fuse.models import JsonObject
 from slack_fuse.projector.apply import ChunkRef, ThreadChunkRef, apply_event
 from slack_fuse_server.wire.frames import EventFrame
 from tests._synthetic_events import synthetic_ts
+from tests.fuse_v2.conftest import (
+    FakePyfuse3,
+    mark_stream_caught_up,
+    seed_channel,
+    set_connection_state,
+)
+
+if TYPE_CHECKING:
+    from tests.projector.conftest import ClientConnFactory
 
 
 def _payload(**fields: object) -> JsonObject:
@@ -186,3 +200,104 @@ def test_late_user_added_invalidates_thread_chunks_too(
         ),
     )
     assert ThreadChunkRef("CR3", Decimal(parent_ts), Decimal(reply_ts)) in result.thread_chunks
+
+
+# ---------------------------------------------------------------------------
+# Sprint 3E: the reviewer's adversarial race — user_added's cross-stream lookup
+# runs BEFORE the message TX commits, so the lookup misses. The read-side
+# unresolved-fallback invariant is the backstop that prevents kernel poisoning.
+# ---------------------------------------------------------------------------
+
+
+def _ts_decimal(dt: datetime) -> Decimal:
+    return Decimal(str(dt.timestamp()))
+
+
+@pytest.mark.trio
+async def test_adversarial_user_added_lookup_before_message_commit(
+    client_conn_factory: ClientConnFactory,
+) -> None:
+    """``user_added``'s ``chunk_mentions`` lookup runs before the message TX
+    commits, so it MISSES — no inode invalidation fires for the message chunk.
+
+    The backstop is the read-side unresolved-fallback invariant: while ``UADV``
+    is unresolved, a read of the (now-committed) message renders the UID-literal
+    fallback and ``notify_store`` is SKIPPED, so the kernel page cache is never
+    poisoned even though the cross-stream invalidation missed. Once ``UADV``
+    becomes resolvable, the next read primes the correct bytes.
+
+    NB: ``SlackUser.display()`` falls back to the user id, so the literal
+    "user is in the table but still a fallback" state isn't reachable via the
+    real apply path. We realise the race faithfully by keeping ``user_added``'s
+    TX *uncommitted* at the fallback read — the reader genuinely cannot see the
+    user yet, which is exactly the window the backstop must cover.
+    """
+    setup = client_conn_factory()
+    seed_channel(setup, "CADV", "adversarial", tier="hot")
+    set_connection_state(setup, last_slurper_health="healthy", last_frame_at_offset_s=1.0)
+    mark_stream_caught_up(setup, "channel:CADV")
+
+    ts = _ts_decimal(datetime(2026, 6, 8, 14, 30, tzinfo=UTC))
+
+    # TX-B: the projector's user_added transaction, driven statement-by-statement
+    # so we can interleave the message commit + a read between its cross-stream
+    # lookup and its commit (apply_event would commit atomically). Mirrors
+    # `_apply_user_added`: upsert users THEN scan chunk_mentions.
+    user_conn = client_conn_factory()
+    user_conn.autocommit = False
+    with user_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO users (user_id, display_name) VALUES ('UADV', 'Adv User') "
+            "ON CONFLICT (user_id) DO UPDATE SET display_name = EXCLUDED.display_name"
+        )
+        cur.execute(
+            "SELECT channel_id, message_ts FROM chunk_mentions WHERE mention_kind = 'user' AND mentioned_id = 'UADV'"
+        )
+        missed = cur.fetchall()
+    # The lookup found nothing: TX-A (below) has not committed yet under READ
+    # COMMITTED, so the cross-stream invalidation has nothing to fire for.
+    assert missed == []
+
+    # TX-A: the message write, committing AFTER user_added's lookup already ran.
+    msg_conn = client_conn_factory()
+    msg_conn.autocommit = False
+    with msg_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO chunks (channel_id, message_ts, content_md, reply_count) VALUES (%s, %s, %s, 0)",
+            ("CADV", ts, "## 14:30 <@UADV>\n\nhi\n"),
+        )
+        cur.execute(
+            "INSERT INTO chunk_mentions (channel_id, message_ts, mention_kind, mentioned_id) "
+            "VALUES (%s, %s, 'user', 'UADV')",
+            ("CADV", ts),
+        )
+    msg_conn.commit()
+
+    # Backstop read: the chunk is now visible, but UADV is still unresolved
+    # (TX-B uncommitted). notify_store MUST be skipped → kernel not poisoned.
+    read_conn = client_conn_factory()
+    fake = FakePyfuse3()
+    ops = SlackFuseOpsV2(
+        read_conn,
+        ZoneInfo("UTC"),
+        trio.CapacityLimiter(1),
+        notify_store=fake.notify_store,
+        invalidate_inode=fake.invalidate_inode,
+    )
+    day_path = "/channels/adversarial/2026-06/08/channel.md"
+    inode = ops.inodes.get_or_create(day_path)
+    content_fallback = await ops.read(inode, 0, 131072)
+    assert b"@UADV" in content_fallback
+    assert b"\xe2\x9a\xa0 Content may be stale" not in content_fallback
+    assert fake.notify_calls == []
+    assert ops.primed_inodes_snapshot == frozenset()
+
+    # TX-B commits: UADV becomes resolvable workspace-wide.
+    user_conn.commit()
+
+    # The next read picks up the user and primes clean bytes.
+    content_resolved = await ops.read(inode, 0, 131072)
+    assert b"@Adv User" in content_resolved
+    assert b"@UADV" not in content_resolved
+    assert len(fake.notify_calls) == 1
+    assert fake.notify_calls[0].inode == inode

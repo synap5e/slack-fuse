@@ -1,0 +1,267 @@
+"""Sprint 3E: the V2 ``InvalidationSink`` (``fuse_ops_v2.V2InvalidationSink``).
+
+The sink maps the projector's post-commit ``ChunkRef`` / ``ThreadChunkRef`` /
+channel-list intents onto V2 FUSE inodes and drops their kernel page cache.
+These tests assert the path-resolution + inode-drop behaviour against a real
+migrated client schema, plus the end-to-end original cross-stream race
+(message-before-user_added) flowing through apply → read → sink → read.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from decimal import Decimal
+from typing import TYPE_CHECKING, cast
+from zoneinfo import ZoneInfo
+
+import pytest
+
+from slack_fuse.fuse_ops_v2 import SlackFuseOpsV2, V2InvalidationSink
+from slack_fuse.fuse_v2_helpers import dedup_thread_slug_map, fetch_day_thread_parents
+from slack_fuse.models import JsonObject
+from slack_fuse.projector.apply import ChunkRef, ThreadChunkRef, apply_event
+from slack_fuse_server.wire.frames import EventFrame
+from tests.fuse_v2.conftest import (
+    FakePyfuse3,
+    mark_stream_caught_up,
+    seed_channel,
+    seed_chunk,
+    set_connection_state,
+)
+
+if TYPE_CHECKING:
+    from psycopg import Connection
+    from psycopg.rows import TupleRow
+
+
+def _ts(dt: datetime) -> Decimal:
+    return Decimal(str(dt.timestamp()))
+
+
+def _payload(**fields: object) -> JsonObject:
+    return cast("JsonObject", dict(fields))
+
+
+def _make_sink(conn: Connection[TupleRow], fake: FakePyfuse3) -> V2InvalidationSink:
+    return V2InvalidationSink(conn, ZoneInfo("UTC"), invalidate_inode=fake.invalidate_inode)
+
+
+# ============================================================================
+# chunk_changed → day-file inode
+# ============================================================================
+
+
+def test_chunk_changed_invalidates_materialized_day_file_inode(
+    client_conn: Connection[TupleRow],
+    ops: SlackFuseOpsV2,
+    fake_pyfuse3: FakePyfuse3,
+) -> None:
+    seed_channel(client_conn, "C1", "general", tier="hot")
+    ts = _ts(datetime(2026, 6, 8, 14, 30, tzinfo=UTC))
+    day_path = "/channels/general/2026-06/08/channel.md"
+    inode = ops.inodes.get_or_create(day_path)
+
+    sink = _make_sink(client_conn, fake_pyfuse3)
+    sink.chunk_changed(ChunkRef("C1", ts))
+
+    assert fake_pyfuse3.invalidate_calls == [inode]
+
+
+def test_chunk_changed_skips_unmaterialized_inode(
+    client_conn: Connection[TupleRow],
+    fake_pyfuse3: FakePyfuse3,
+) -> None:
+    """A ChunkRef whose day-file inode was never allocated → no invalidate.
+
+    The kernel can't be holding bytes for a path it never looked up.
+    """
+    seed_channel(client_conn, "C1", "general", tier="hot")
+    ts = _ts(datetime(2026, 6, 8, 14, 30, tzinfo=UTC))
+
+    sink = _make_sink(client_conn, fake_pyfuse3)
+    sink.chunk_changed(ChunkRef("C1", ts))
+
+    assert fake_pyfuse3.invalidate_calls == []
+
+
+def test_chunk_changed_unknown_channel_is_noop(
+    client_conn: Connection[TupleRow],
+    fake_pyfuse3: FakePyfuse3,
+) -> None:
+    sink = _make_sink(client_conn, fake_pyfuse3)
+    sink.chunk_changed(ChunkRef("CNOPE", _ts(datetime(2026, 6, 8, 14, 30, tzinfo=UTC))))
+    assert fake_pyfuse3.invalidate_calls == []
+
+
+def test_chunk_changed_blocked_channel_is_noop(
+    client_conn: Connection[TupleRow],
+    ops: SlackFuseOpsV2,
+    fake_pyfuse3: FakePyfuse3,
+) -> None:
+    """Blocked channels have no reachable subtree, so nothing to invalidate even
+    if a day-file inode was somehow allocated while it was still hot."""
+    seed_channel(client_conn, "C1", "blocked-chan", tier="blocked", is_archived=True)
+    ts = _ts(datetime(2026, 6, 8, 14, 30, tzinfo=UTC))
+    _ = ops.inodes.get_or_create("/channels/blocked-chan/2026-06/08/channel.md")
+
+    sink = _make_sink(client_conn, fake_pyfuse3)
+    sink.chunk_changed(ChunkRef("C1", ts))
+
+    assert fake_pyfuse3.invalidate_calls == []
+
+
+# ============================================================================
+# thread_chunk_changed → thread.md inode
+# ============================================================================
+
+
+def test_thread_chunk_changed_invalidates_thread_file_inode(
+    client_conn: Connection[TupleRow],
+    ops: SlackFuseOpsV2,
+    fake_pyfuse3: FakePyfuse3,
+) -> None:
+    seed_channel(client_conn, "C1", "general", tier="hot")
+    parent_ts = _ts(datetime(2026, 6, 8, 9, 0, tzinfo=UTC))
+    reply_ts = _ts(datetime(2026, 6, 8, 9, 5, tzinfo=UTC))
+    # A thread parent (reply_count > 0) so the day folder lists a thread dir.
+    seed_chunk(
+        client_conn,
+        "C1",
+        parent_ts,
+        "## 09:00 <@U1>\n\nLets discuss the plan\n\n> Thread: 1 replies\n",
+        reply_count=1,
+    )
+    # Derive the slug exactly as the read path / sink does.
+    parents = fetch_day_thread_parents(client_conn, "C1", datetime(2026, 6, 8).date(), ZoneInfo("UTC"))
+    slug_map = dedup_thread_slug_map(parents)
+    [(thread_slug, mapped_ts)] = list(slug_map.items())
+    assert mapped_ts == parent_ts
+    thread_path = f"/channels/general/2026-06/08/{thread_slug}/thread.md"
+    inode = ops.inodes.get_or_create(thread_path)
+
+    sink = _make_sink(client_conn, fake_pyfuse3)
+    sink.thread_chunk_changed(ThreadChunkRef("C1", parent_ts, reply_ts))
+
+    assert fake_pyfuse3.invalidate_calls == [inode]
+
+
+def test_thread_chunk_changed_unknown_thread_is_noop(
+    client_conn: Connection[TupleRow],
+    fake_pyfuse3: FakePyfuse3,
+) -> None:
+    seed_channel(client_conn, "C1", "general", tier="hot")
+    # No thread parent seeded → slug resolution misses → no invalidate.
+    sink = _make_sink(client_conn, fake_pyfuse3)
+    sink.thread_chunk_changed(
+        ThreadChunkRef(
+            "C1",
+            _ts(datetime(2026, 6, 8, 9, 0, tzinfo=UTC)),
+            _ts(datetime(2026, 6, 8, 9, 5, tzinfo=UTC)),
+        )
+    )
+    assert fake_pyfuse3.invalidate_calls == []
+
+
+# ============================================================================
+# channel_list_changed → all materialized channel.md + conv-root dirs
+# ============================================================================
+
+
+def test_channel_list_changed_invalidates_all_channel_md_and_conv_roots(
+    client_conn: Connection[TupleRow],
+    ops: SlackFuseOpsV2,
+    fake_pyfuse3: FakePyfuse3,
+) -> None:
+    seed_channel(client_conn, "C1", "general", tier="hot")
+    seed_channel(client_conn, "C2", "random", tier="hot")
+    # Materialize a spread of channel.md inodes (meta + day-level) and a
+    # conv-root dir, plus a non-channel.md path that must NOT be invalidated.
+    meta_inode = ops.inodes.get_or_create("/channels/general/channel.md")
+    day1_inode = ops.inodes.get_or_create("/channels/general/2026-06/08/channel.md")
+    day2_inode = ops.inodes.get_or_create("/channels/random/2026-06/08/channel.md")
+    conv_root_inode = ops.inodes.get_or_create("/channels")
+    thread_inode = ops.inodes.get_or_create("/channels/general/2026-06/08/some-thread/thread.md")
+
+    sink = _make_sink(client_conn, fake_pyfuse3)
+    sink.channel_list_changed()
+
+    invalidated = set(fake_pyfuse3.invalidate_calls)
+    assert {meta_inode, day1_inode, day2_inode, conv_root_inode} <= invalidated
+    assert thread_inode not in invalidated
+
+
+# ============================================================================
+# End-to-end original race (AC3 #1 / AC6): message-before-user_added.
+# ============================================================================
+
+
+@pytest.mark.trio
+async def test_end_to_end_message_before_user_added(
+    client_conn: Connection[TupleRow],
+    ops: SlackFuseOpsV2,
+    fake_pyfuse3: FakePyfuse3,
+) -> None:
+    """Prime a hot day file holding a ``<@UNEW>`` fallback, then apply
+    ``user_added`` and drive the sink: ``invalidate_inode`` fires, and the next
+    read renders the resolved name and primes.
+
+    Spec acceptance criterion 6: the originally-broken sequence end-to-end.
+    """
+    seed_channel(client_conn, "C1", "general", tier="hot")
+    set_connection_state(client_conn, last_slurper_health="healthy", last_frame_at_offset_s=1.0)
+    mark_stream_caught_up(client_conn, "channel:C1")
+
+    ts = str(_ts(datetime(2026, 6, 8, 14, 30, tzinfo=UTC)))
+    # The message arrives BEFORE user_added; its author UNEW is unknown.
+    _ = apply_event(
+        client_conn,
+        EventFrame(
+            stream="channel:C1",
+            offset=1,
+            kind="message",
+            ts=ts,
+            payload=_payload(type="message", ts=ts, user="UNEW", text="hello there", thread_ts=None),
+        ),
+    )
+
+    day_path = "/channels/general/2026-06/08/channel.md"
+    inode = ops.inodes.get_or_create(day_path)
+
+    # First read: UNEW is unresolved → UID-literal fallback, notify_store SKIPPED
+    # (unresolved-fallback invariant), so the inode is NOT primed.
+    content_pre = await ops.read(inode, 0, 131072)
+    assert b"@UNEW" in content_pre
+    assert b"\xe2\x9a\xa0 Content may be stale" not in content_pre  # no trailer
+    assert fake_pyfuse3.notify_calls == []
+    assert ops.primed_inodes_snapshot == frozenset()
+
+    # user_added(UNEW) arrives. Its same-TX chunk_mentions lookup finds the
+    # already-written chunk and surfaces it for invalidation.
+    result = apply_event(
+        client_conn,
+        EventFrame(
+            stream="users",
+            offset=1,
+            kind="user_added",
+            ts=None,
+            payload=_payload(id="UNEW", name="newbie", profile=_payload(display_name="Alice", real_name="Alice R")),
+        ),
+    )
+    assert ChunkRef("C1", Decimal(ts)) in result.chunks
+
+    # Drive the sink exactly as StreamApplier._fire_invalidations would.
+    sink = _make_sink(client_conn, fake_pyfuse3)
+    for ref in result.chunks:
+        sink.chunk_changed(ref)
+    for thread_ref in result.thread_chunks:
+        sink.thread_chunk_changed(thread_ref)
+
+    # The day-file inode the kernel cached the fallback into is dropped.
+    assert inode in fake_pyfuse3.invalidate_calls
+
+    # Next read renders the resolved display name AND primes (clean bytes).
+    content_post = await ops.read(inode, 0, 131072)
+    assert b"@Alice" in content_post
+    assert b"@UNEW" not in content_post
+    assert len(fake_pyfuse3.notify_calls) == 1
+    assert fake_pyfuse3.notify_calls[0].inode == inode

@@ -543,7 +543,17 @@ def _apply_channel_added(cur: Cursor[TupleRow], payload: JsonObject) -> ApplyRes
         "  updated_at = now()",
         (channel_id, name, is_im, is_mpim, is_member, is_archived, im_user_id, topic, purpose, tier, tier != "blocked"),
     )
-    return ApplyResult(channel_list_changed=True)
+    # Cross-stream race (same shape as user_added): a `message` referencing
+    # `<#C…>` can arrive before this `channel_added`, leaving chunks rendered
+    # with the CID-literal fallback. The lookup runs in this SAME TX as the
+    # upsert above so a concurrently-committing message TX can't slip between a
+    # separate lookup and the insert under READ COMMITTED (see
+    # tests/projector/test_cross_stream_race.py). channel_list_changed alone
+    # would also drop these inodes, but the explicit refs keep the invalidation
+    # precise instead of relying on the broad channel.md sweep.
+    refs = _collect_channel_mention_refs(cur, channel_id)
+    thread_refs = _collect_thread_channel_mention_refs(cur, channel_id)
+    return ApplyResult(chunks=refs, thread_chunks=thread_refs, channel_list_changed=True)
 
 
 def _apply_channel_renamed(cur: Cursor[TupleRow], payload: JsonObject) -> ApplyResult:
@@ -688,6 +698,11 @@ def _apply_user_added(cur: Cursor[TupleRow], payload: JsonObject) -> ApplyResult
         "ON CONFLICT (user_id) DO UPDATE SET display_name = EXCLUDED.display_name, updated_at = now()",
         (user.id, display),
     )
+    # Same-TX cross-stream lookup: `cur` is the cursor inside apply_event's
+    # `with conn.transaction()`, so the upsert above and this `chunk_mentions`
+    # scan share one transaction. That ordering is what closes the reviewer's
+    # adversarial race — a separate-TX lookup under READ COMMITTED could run
+    # between a message's INSERT and COMMIT and miss the just-written chunk.
     refs = _collect_user_mention_refs(cur, user.id)
     thread_refs = _collect_thread_user_mention_refs(cur, user.id)
     return ApplyResult(chunks=refs, thread_chunks=thread_refs)

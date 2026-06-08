@@ -249,16 +249,24 @@ def cmd_mount(args: argparse.Namespace) -> None:
 
 def cmd_mount_split(args: argparse.Namespace) -> None:
     """Mount the Sprint-3B split adapter (``SlackFuseOpsV2``) over the local
-    projections store, with the health subscriber wired to the FUSE-side
-    kernel-cache invalidator.
+    projections store, with the projector + health subscriber wired to the
+    FUSE-side kernel-cache invalidators.
 
-    This is the integrated process the RFC describes (FUSE mount + health
-    subscriber share inode state in one process). The projector runs as its own
-    service writing ``connection_state`` / ``stream_caught_up``; the health
-    subscriber polls those tables and drops every primed inode on a staleness
-    transition (review P0-2: ``watch_health`` was previously test-only). Gated
-    behind ``SLACK_FUSE_MODE=split`` / ``--mode split`` so the legacy adapter
-    stays the default per the Phase-4 cutover safety plan.
+    This is the integrated process the RFC describes (FUSE mount + projector +
+    health subscriber share inode state in one process). Two complementary
+    invalidation paths run alongside ``pyfuse3.main()``:
+
+    * The **projector** (``WSClient``) subscribes to the server, applies events
+      into the local projections store, and fires a :class:`V2InvalidationSink`
+      after each TX commits so live chunk mutations drop the matching primed
+      inode (Sprint 3E). Without this the projector ran out-of-process and could
+      not reach this process's kernel page cache, so live messages stayed
+      invisible behind ``fi.keep_cache=True`` until the polling-TTL floor.
+    * The **health subscriber** polls ``connection_state`` / ``stream_caught_up``
+      and drops every primed inode on a staleness transition (review P0-2).
+
+    Gated behind ``SLACK_FUSE_MODE=split`` / ``--mode split`` so the legacy
+    adapter stays the default per the Phase-4 cutover safety plan.
     """
     import psycopg
     import pyfuse3
@@ -267,9 +275,10 @@ def cmd_mount_split(args: argparse.Namespace) -> None:
 
     import slack_fuse.migrations as client_migrations
     from slack_fuse.config import load_client_config
-    from slack_fuse.fuse_ops_v2 import SlackFuseOpsV2
+    from slack_fuse.fuse_ops_v2 import SlackFuseOpsV2, V2InvalidationSink
     from slack_fuse.migrations.runner import apply_migrations
     from slack_fuse.projector.health_subscriber import watch_health
+    from slack_fuse.projector.ws_client import SINGLETON_STREAMS, WSClient, WSClientOptions
 
     config = load_client_config()
     mountpoint = Path(args.mountpoint or config.mountpoint)
@@ -299,23 +308,61 @@ def cmd_mount_split(args: argparse.Namespace) -> None:
     if applied:
         log.info("applied client migrations: %s", ", ".join(applied))
 
-    # Separate connections: FUSE callbacks (worker thread) vs the health
-    # subscriber poll loop. Sharing one psycopg connection across both is unsafe.
+    # One connection per concurrent consumer; sharing a psycopg connection
+    # across the FUSE callbacks (worker threads), the health poll loop, the
+    # projector bookkeeping, and the invalidation sink would race.
     fuse_conn = _open_conn()
     health_conn = _open_conn()
+    state_conn = _open_conn()
+    sink_conn = _open_conn()
 
     tz = _resolve_local_zoneinfo()
     store_limiter = trio.CapacityLimiter(1)
     ops = SlackFuseOpsV2(fuse_conn, tz, store_limiter)
+
+    # The projector's post-commit sink: maps ChunkRef / ThreadChunkRef /
+    # channel-list intents onto V2 inodes and drops their kernel page cache.
+    sink = V2InvalidationSink(sink_conn, tz)
+    ws_options = WSClientOptions(server_url=config.server_url, shared_secret=config.shared_secret)
 
     fuse_options: set[str] = {"fsname=slack-fuse", "ro"}
     if args.debug:
         fuse_options.add("debug")
     pyfuse3.init(ops, str(mountpoint), fuse_options)
 
+    async def _run_projector() -> None:
+        """Supervise the WSClient: reconnect with backoff if it exits.
+
+        Unlike the standalone ``slack-fuse-projector`` (which systemd restarts),
+        the in-mount projector must survive transient server outages without
+        taking the mount down, so we restart a fresh ``WSClient`` on each exit.
+        A fresh client per attempt matters: ``WSClient`` closes its appliers on
+        exit and cannot be re-run. While disconnected the read path degrades to
+        the staleness trailer via the health subscriber.
+        """
+        backoff = 2.0
+        max_backoff = 300.0
+        while True:
+            client = WSClient(ws_options, _open_conn, state_conn, sink=sink)
+            try:
+                with state_conn.cursor() as cur:
+                    cur.execute("SELECT channel_id FROM channels WHERE subscribed = TRUE")
+                    per_channel = [f"channel:{row[0]}" for row in cur.fetchall()]
+                initial_streams = list(SINGLETON_STREAMS) + per_channel
+                await client.run(initial_streams=initial_streams)
+            except Exception as exc:  # noqa: BLE001 - supervisor must outlive any WS error
+                log.warning("projector exited (%s); reconnecting in %.0fs", exc, backoff)
+                await trio.sleep(backoff)
+                backoff = min(backoff * 2, max_backoff)
+            else:
+                # Clean exit (connection closed): retry promptly, reset backoff.
+                backoff = 2.0
+                await trio.sleep(1.0)
+
     async def _run() -> None:
         async with trio.open_nursery() as nursery:
             nursery.start_soon(watch_health, health_conn, ops.invalidate_all_primed)
+            nursery.start_soon(_run_projector)
             await pyfuse3.main()
             nursery.cancel_scope.cancel()
 
@@ -327,6 +374,8 @@ def cmd_mount_split(args: argparse.Namespace) -> None:
         pyfuse3.close()
         fuse_conn.close()
         health_conn.close()
+        state_conn.close()
+        sink_conn.close()
 
 
 def cmd_unmount(args: argparse.Namespace) -> None:
