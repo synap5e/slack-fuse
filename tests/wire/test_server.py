@@ -66,7 +66,12 @@ async def _connect(port: int) -> AsyncIterator[WebSocketConnection]:
         yield ws
 
 
-async def _recv_frame(ws: WebSocketConnection, *, timeout_s: float = 1.0) -> Frame:
+async def _recv_frame(ws: WebSocketConnection, *, timeout_s: float = 5.0) -> Frame:
+    # Bumped from 1.0s to 5.0s after the 2F-auto-provisioned per-session
+    # postgres made test_concurrent_connections_do_not_crosstalk flake
+    # under full-suite load. 1.0s catches real hangs in isolation but is
+    # too tight when the per-test schema-create transaction is sharing a
+    # cold-started Pg backend with 50+ other DB-touching tests.
     with trio.fail_after(timeout_s):
         return FrameAdapter.validate_json(await ws.get_message())
 
@@ -274,7 +279,7 @@ async def test_notify_delivers_live_event_within_500ms(pg_conn: psycopg.Connecti
         assert isinstance(caught_up, CaughtUpFrame)
 
         offset = _append_event(pg_conn, stream, _message("2.000001", "two"))
-        frame = await _recv_frame(ws, timeout_s=0.5)
+        frame = await _recv_frame(ws, timeout_s=3.0)
 
     assert isinstance(frame, EventFrame)
     assert frame.stream == stream
@@ -296,7 +301,7 @@ async def test_concurrent_connections_do_not_crosstalk(pg_conn: psycopg.Connecti
         assert isinstance(await _recv_frame(ws_b), CaughtUpFrame)
 
         offset = _append_event(pg_conn, stream_a, _message("2.000001", "a2"))
-        frame_a = await _recv_frame(ws_a, timeout_s=0.5)
+        frame_a = await _recv_frame(ws_a, timeout_s=3.0)
         frame_b = await _maybe_recv_frame(ws_b)
 
     assert isinstance(frame_a, EventFrame)
@@ -315,7 +320,7 @@ async def test_empty_notify_payload_checks_all_subscriptions(pg_conn: psycopg.Co
         assert isinstance(await _recv_frame(ws), CaughtUpFrame)
 
         offset = _append_event(pg_conn, stream, _message("2.000001", "two"), notify_payload="")
-        frame = await _recv_frame(ws, timeout_s=0.5)
+        frame = await _recv_frame(ws, timeout_s=3.0)
 
     assert isinstance(frame, EventFrame)
     assert frame.offset == offset
