@@ -77,14 +77,13 @@ Currently at `<after-this-commit>` with Sprint 0 + POC B merged.
 
 | Track | Model | tmux | Branch | Status |
 |---|---|---|---|---|
-| 2A LegacyCacheBackfiller | cursor (gpt-5.3-codex-xhigh) | `sprint2a-legacy` | `synap5e/feat/2a-legacy-backfill` | in flight |
-| 2B Renderer library | claude (opus) | `sprint2b-renderer` | `synap5e/feat/2b-renderer-library` | in flight (port POC B impl; replace Sprint 0 NotImplementedError stubs) |
-| 2F Test infra polish | cursor (gpt-5.3-codex-xhigh) | `sprint2f-test-infra` | `synap5e/feat/2f-test-infra` | in flight (postgres auto-provision so reviewers don't miss DB-only bugs; synthetic generators; FUSE harness extensions) |
+| 2A LegacyCacheBackfiller | cursor (gpt-5.3-codex-xhigh) | (killed) | `synap5e/feat/2a-legacy-backfill` | **MERGED** at `e722e79`. Reads `~/.cache/slack-fuse/messages/` cache; idempotent via events_message_dedup. Admin CLI gained `--source {slack-api,legacy-cache}` flag. Live smoke against real cache pulled valid payloads from C046S4RH6GG. |
+| 2B Renderer library | claude (opus) | (killed) | `synap5e/feat/2b-renderer-library` | **MERGED** at `549ae15`. Ported POC B impl. 30 new render tests + 45 POC equivalence tests all pass. Author-header rendered as `<@U…>` placeholder so renames invalidate the chunk (late-resolution-aligned). Legacy renderer shim bonus deferred (file in not-allowed list). |
+| 2F Test infra polish | cursor (gpt-5.3-codex-xhigh) | `sprint2f-test-infra` | `synap5e/feat/2f-test-infra` | in flight (postgres auto-provision, synthetic generators, FUSE harness extensions) |
+| 2D Snapshot generator | claude (opus) | `sprint2d-snapshots` | `synap5e/feat/2d-snapshots` | in flight (depends only on events table — populated by running soak) |
+| 2E Client projector | claude (opus[1m]) | `sprint2e-projector` | `synap5e/feat/2e-client-projector` | in flight (biggest single Sprint 2 track; uses 2B renderer impl + cross-stream race invariants; Opus 1M for context headroom) |
 
-Batch 2 (will spawn when batch 1 lands or a slot opens):
-- 2C HTTP /resolve + /permalink (Codex)
-- 2D Snapshot generator (Opus)
-- 2E Client projector (Opus, biggest — depends on 2B's renderer impl)
+Remaining: 2C (HTTP /resolve + /permalink) — spawn after one of the above completes.
 | 1G Socket Mode payload conformance | cursor (gpt-5.3-codex-xhigh) | (killed) | `synap5e/feat/sprint1g-message-payload-conformance` | **MERGED** at `06bdad6`. Live `message` events now Message.model_validate(...).model_dump('json'), byte-equivalent to backfill. Conformance test asserts the equivalence against a conversations.history-derived envelope with reactions+files+edited+reply metadata. |
 | 1B WS server | cursor (gpt-5.5-extra-high) | (killed) | `synap5e/feat/sprint1b-ws-server` | **MERGED** at `<after-this>`. Added SNAPSHOT_REQUIRED to ErrorCode enum (sanctioned per prompt). LISTEN protocol: `NOTIFY new_event, '<stream-id>'` (or empty payload for wake-all fallback) — 1A coordinates by emitting these in the offset-assignment TX. |
 | 1C HTTP /health + /metrics | cursor (gpt-5.3-codex-xhigh) | (killed) | `synap5e/feat/sprint1c-http-health-metrics` | **MERGED**. Custom trio+h11 server, no new dep. `serve_http_on_listeners` exposed for 1B WS to compose (Upgrade-header path landed in 1B's PR). |
