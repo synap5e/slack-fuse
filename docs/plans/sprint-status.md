@@ -97,6 +97,8 @@ Dependencies:
 
 Spawning batch: 3A (Codex), 3B (Opus, riskiest), 3D (Codex, independent quick win).
 3C + 3E wait for 3B to land + review.
+
+In flight (3A + 3B). 3D handoff probe transient-flaked (cursor-agent slow); will retry on next wake-up or owner-inline (small scope).
 | 2C HTTP /resolve + /permalink | cursor (gpt-5.3-codex-xhigh) | (killed) | `synap5e/feat/2c-http-resolve-permalink` | **MERGED** at `e2d8a59`. Lifting strategy: option 2 (copy bodies into server modules), keeps legacy independent. CLI gained `--server-url` proxy mode. |
 | (owner inline) flake fix | n/a | n/a | n/a | Bumped WS test timeouts (1.0→5.0s default, 0.5→3.0s explicit) — was flaking under full-suite + cold-Pg load after 2F auto-provision landed. |
 | 1G Socket Mode payload conformance | cursor (gpt-5.3-codex-xhigh) | (killed) | `synap5e/feat/sprint1g-message-payload-conformance` | **MERGED** at `06bdad6`. Live `message` events now Message.model_validate(...).model_dump('json'), byte-equivalent to backfill. Conformance test asserts the equivalence against a conversations.history-derived envelope with reactions+files+edited+reply metadata. |
