@@ -98,10 +98,13 @@ Dependencies:
 | Track | Model | tmux | Branch | Status |
 |---|---|---|---|---|
 | 3A snapshot HTTP endpoint | cursor (gpt-5.3-codex-xhigh) | (killed) | `synap5e/feat/3a-snapshot-http` | **MERGED** at `d4f83a6`. End-to-end test: generator → HTTP → 2E projector fetch — pass. WS now emits `snapshot_at` redirect (replaces `snapshot_required` error from 1B). Minor extension: URL includes optional `since=<offset>` for accurate `events_skipped` recording. |
-| 3B FUSE adapter | claude (opus[1m]) | `sprint3b-fuse` | `synap5e/feat/3b-fuse-adapter` | in flight (riskiest correctness surface; Pre-3B-merge double-review fires after) |
-| 3D tier CLI | cursor (gpt-5.3-codex-xhigh) | `sprint3d-tier` | `synap5e/feat/3d-tier-cli` | in flight (handoff probe-flaked first attempt; succeeded second try) |
+| 3B FUSE adapter | claude (opus[1m]) | (killed) | `synap5e/feat/3b-fuse-adapter` | Worker reported SHIPPED at `4504296` (rebased); 583+68 tests. **Pre-3B dual review REJECTED**. |
+| Pre-3B review (gpt-5.5 xhigh) | cursor | (killed) | n/a | **REQUEST CHANGES**. P0×2 + P1×3 + P2×1. Report at `~/.agent-handoff/2026-06-08/review-3b-gpt/report.md`. |
+| Pre-3B review (gemini 3.1 pro) | cursor | (killed) | n/a | **REJECT**. 5 critical findings (3 overlap with gpt's P0/P1, 2 unique: slug collision + last_frame_at thrashing). Report at `~/.agent-handoff/2026-06-08/review-3b-gemini/report.md`. |
+| 3B-fix (4 P0 + 3 P1 + 3 P2) | claude (opus[1m]) | `sprint3b-fix` | `synap5e/feat/3b-fuse-fixes` | in flight (off `3b-fuse-adapter`). P0s: (1) time-driven staleness vs DB-polling disconnect — both reviewers caught; (2) watch_health not wired into production; (3) last_frame_at thrashes HealthSignature; (4) slug collision between readdir(hot) and lookup(hot+hidden). |
+| 3D tier CLI | cursor (gpt-5.3-codex-xhigh) | (killed) | `synap5e/feat/3d-tier-cli` | **MERGED** at `<commit>`. ruff/pyright/pytest green. |
 
-3C + 3E wait for 3B to land + review.
+3C + 3E wait for 3B-fix to land + re-review.
 | 2C HTTP /resolve + /permalink | cursor (gpt-5.3-codex-xhigh) | (killed) | `synap5e/feat/2c-http-resolve-permalink` | **MERGED** at `e2d8a59`. Lifting strategy: option 2 (copy bodies into server modules), keeps legacy independent. CLI gained `--server-url` proxy mode. |
 | (owner inline) flake fix | n/a | n/a | n/a | Bumped WS test timeouts (1.0→5.0s default, 0.5→3.0s explicit) — was flaking under full-suite + cold-Pg load after 2F auto-provision landed. |
 | 1G Socket Mode payload conformance | cursor (gpt-5.3-codex-xhigh) | (killed) | `synap5e/feat/sprint1g-message-payload-conformance` | **MERGED** at `06bdad6`. Live `message` events now Message.model_validate(...).model_dump('json'), byte-equivalent to backfill. Conformance test asserts the equivalence against a conversations.history-derived envelope with reactions+files+edited+reply metadata. |
