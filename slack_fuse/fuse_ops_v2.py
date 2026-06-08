@@ -29,8 +29,8 @@ import os
 import stat
 import threading
 import time
-from collections.abc import Callable
-from datetime import UTC, date, datetime
+from collections.abc import Callable, Sequence
+from datetime import date, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Final
 from zoneinfo import ZoneInfo
@@ -39,25 +39,23 @@ import pyfuse3
 import trio
 
 from slack_fuse.fuse_v2_helpers import (
+    CHANNEL_LIST_STREAM,
     CHANNEL_MD,
     CONV_ROOTS,
     THREAD_MD,
     ChannelRow,
     PersistentInodeMap,
-    build_channel_slug,
+    assign_conv_root_slugs,
     channel_meta_frontmatter,
     day_channel_frontmatter,
     dedup_thread_slug_map,
-    derive_thread_slug,
     fetch_channel_by_slug,
-    fetch_conv_root_rows,
     fetch_day_chunks,
     fetch_day_thread_parents,
     fetch_known_days,
     fetch_known_months,
     fetch_staleness_state,
     fetch_thread_chunks,
-    fetch_users_for_dm_slugs,
     format_trailer,
     is_valid_day,
     is_valid_month,
@@ -82,12 +80,26 @@ InvalidateInodeFn = Callable[[int], None]
 ROOT_INODE: Final = 1
 
 
+# errnos that are benign during a teardown/unmount race: the inode the kernel
+# is asking about (or that we're trying to drop) is simply gone. Anything else
+# from notify_store / invalidate_inode is a real surprise and logged loudly
+# (review P2-10 / GPT: debug-level logging is effectively silent in prod).
+_BENIGN_KERNEL_CACHE_ERRNOS: Final = frozenset({errno.ENOENT, errno.EBADF})
+
+
+def _log_kernel_cache_oserror(op: str, inode: int, exc: OSError) -> None:
+    if exc.errno in _BENIGN_KERNEL_CACHE_ERRNOS:
+        log.debug("%s(%d) failed (benign shutdown/unmount race, errno=%s): %s", op, inode, exc.errno, exc)
+    else:
+        log.warning("%s(%d) failed (errno=%s): %s", op, inode, exc.errno, exc)
+
+
 def _default_notify_store(inode: int, offset: int, data: bytes) -> None:
     """Wrap pyfuse3.notify_store; exists so tests can inject a fake."""
     try:
         pyfuse3.notify_store(inode, offset, data)  # pyright: ignore[reportArgumentType]
     except OSError as exc:
-        log.debug("notify_store(%d, %d, %d bytes) failed: %s", inode, offset, len(data), exc)
+        _log_kernel_cache_oserror("notify_store", inode, exc)
 
 
 def _default_invalidate_inode(inode: int) -> None:
@@ -95,7 +107,22 @@ def _default_invalidate_inode(inode: int) -> None:
     try:
         pyfuse3.invalidate_inode(inode)  # pyright: ignore[reportArgumentType]
     except OSError as exc:
-        log.debug("invalidate_inode(%d) failed: %s", inode, exc)
+        _log_kernel_cache_oserror("invalidate_inode", inode, exc)
+
+
+# Attribute/entry caching timeouts (review P2-8 / Gemini Class 8). Without
+# these the kernel re-issues getattr on every access, and getattr renders the
+# whole file to compute its size — so `ls -l` on a day directory re-renders
+# every file. Only locked-in (strictly-past-day) ``channel.md`` files, whose
+# bytes can no longer grow, are cached; everything whose size can still change
+# (today's day file, thread files, channel metadata) keeps a 0 timeout so the
+# kernel always re-checks the live size. Directories also stay at 0: caching a
+# directory's entry would let a freshly-``blocked`` channel stay traversable
+# until the entry expired, undermining the tier-flip ENOENT path (P1-6); dir
+# getattr renders nothing, so there's no perf benefit to caching it anyway.
+_DIR_ATTR_TIMEOUT_S: Final = 0.0
+_IMMUTABLE_FILE_TIMEOUT_S: Final = 3600.0
+_MUTABLE_FILE_TIMEOUT_S: Final = 0.0
 
 
 def _make_dir_attr(inode: int) -> pyfuse3.EntryAttributes:
@@ -104,28 +131,42 @@ def _make_dir_attr(inode: int) -> pyfuse3.EntryAttributes:
     entry.st_mode = stat.S_IFDIR | 0o555
     entry.st_nlink = 2
     entry.st_size = 0
-    now_ns = int(time.time() * 1e9)
-    entry.st_atime_ns = now_ns
-    entry.st_mtime_ns = now_ns
-    entry.st_ctime_ns = now_ns
+    entry.st_atime_ns = entry.st_mtime_ns = entry.st_ctime_ns = int(time.time() * 1e9)
     entry.st_uid = os.getuid()
     entry.st_gid = os.getgid()
+    entry.entry_timeout = _DIR_ATTR_TIMEOUT_S
+    entry.attr_timeout = _DIR_ATTR_TIMEOUT_S
     return entry
 
 
-def _make_file_attr(inode: int, size: int) -> pyfuse3.EntryAttributes:
+def _make_file_attr(inode: int, size: int, *, timeout_s: float = _MUTABLE_FILE_TIMEOUT_S) -> pyfuse3.EntryAttributes:
     entry = pyfuse3.EntryAttributes()
     entry.st_ino = inode  # pyright: ignore[reportAttributeAccessIssue]
     entry.st_mode = stat.S_IFREG | 0o444
     entry.st_nlink = 1
     entry.st_size = size
-    now_ns = int(time.time() * 1e9)
-    entry.st_atime_ns = now_ns
-    entry.st_mtime_ns = now_ns
-    entry.st_ctime_ns = now_ns
+    entry.st_atime_ns = entry.st_mtime_ns = entry.st_ctime_ns = int(time.time() * 1e9)
     entry.st_uid = os.getuid()
     entry.st_gid = os.getgid()
+    entry.entry_timeout = timeout_s
+    entry.attr_timeout = timeout_s
     return entry
+
+
+def _file_attr_timeout(path: str, tz: ZoneInfo) -> float:
+    """Pick an attr/entry timeout for a regular file at ``path``.
+
+    Only a day-level ``channel.md`` for a date strictly before today (local tz)
+    is treated as immutable — its content can no longer grow. Today's day file
+    (new messages), thread files (replies can land on any day), and channel
+    metadata can all still change size, so they stay uncached.
+    """
+    parts = parse_path(path)
+    if len(parts) == 5 and parts[4] == CHANNEL_MD:
+        day = parse_day_date(parts[2], parts[3])
+        if day is not None and day < datetime.now(tz).date():
+            return _IMMUTABLE_FILE_TIMEOUT_S
+    return _MUTABLE_FILE_TIMEOUT_S
 
 
 # ============================================================================
@@ -158,6 +199,28 @@ def _assemble_channel_day(
         base += format_trailer(reason, stale.last_frame_at)
         return base.encode(), True, had_miss
     return base.encode(), False, had_miss
+
+
+def _assemble_channel_meta(
+    conn: Connection[TupleRow],
+    row: ChannelRow,
+) -> tuple[bytes, bool, bool]:
+    """Assemble bytes for ``/<conv-root>/<slug>/channel.md`` — channel metadata.
+
+    Channel metadata is local projected data too: it goes stale after a
+    rename/archive/tier change or a channel-list catch-up gap. So it is subject
+    to the same trailer + ``notify_store`` gate as day/thread files (review
+    P1-5: both reviewers flagged that this file was kernel-primed unconditionally
+    and would serve stale metadata forever while disconnected). The natural
+    staleness stream is ``channel-list``.
+    """
+    base = channel_meta_frontmatter(row).decode()
+    stale = fetch_staleness_state(conn, CHANNEL_LIST_STREAM)
+    reason = staleness_reason(stale)
+    if reason is not None:
+        base += format_trailer(reason, stale.last_frame_at)
+        return base.encode(), True, False
+    return base.encode(), False, False
 
 
 def _assemble_thread(
@@ -222,6 +285,13 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         self._inodes = PersistentInodeMap(conn)
         self._primed_inodes: set[int] = set()
         self._primed_lock = threading.Lock()
+        # Per-opendir snapshots so readdir pagination tokens stay stable even
+        # if the underlying channel/day set shifts between paginated calls
+        # (review P2-9 / Gemini Class 5: array-index tokens skip/duplicate
+        # entries when the row-set changes mid-iteration).
+        self._dir_handles: dict[int, list[tuple[str, pyfuse3.EntryAttributes, int]]] = {}
+        self._dir_handle_seq = 0
+        self._dir_handle_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Public surface used by the health subscriber + tests
@@ -281,10 +351,10 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         conv_root = parts[0]
 
         if depth == 1:
-            rows = fetch_conv_root_rows(self._conn, conv_root, allow_hidden=False)
-            users = fetch_users_for_dm_slugs(self._conn, rows)
-            counts: dict[str, int] = {}
-            return [(build_channel_slug(r, users, counts), True) for r in rows]
+            # Slugs are assigned over the full hot+hidden set (so they agree
+            # with the lookup path — review P0-4) then filtered to hot for the
+            # readdir listing.
+            return [(slug, True) for r, slug in assign_conv_root_slugs(self._conn, conv_root) if r.tier == "hot"]
 
         row = fetch_channel_by_slug(self._conn, conv_root, parts[1], allow_hidden=True)
         if row is None:
@@ -320,19 +390,24 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         depth = len(parts)
         if depth == 0:
             return True
-        if depth == 1:
-            return parts[0] in CONV_ROOTS
         if parts[0] not in CONV_ROOTS:
             return False
+        if depth == 1:
+            return True
+        # depth >= 2: the channel must still resolve (hot or hidden). A
+        # blocked/deleted channel is ENOENT for its ENTIRE subtree, not just
+        # its root — `_is_dir` is reached via `getattr` on persistent inodes
+        # that may have been allocated while the channel was still hot, so a
+        # purely syntactic depth-3+ check would keep the blocked subtree
+        # traversable (review P1-6 / GPT).
+        if fetch_channel_by_slug(self._conn, parts[0], parts[1], allow_hidden=True) is None:
+            return False
         if depth == 2:
-            row = fetch_channel_by_slug(self._conn, parts[0], parts[1], allow_hidden=True)
-            return row is not None
+            return True
         if depth == 3:
-            if parts[2] == CHANNEL_MD:
-                return False
-            return is_valid_month(parts[2])
+            return parts[2] != CHANNEL_MD and is_valid_month(parts[2])
         if depth == 4:
-            return is_valid_day(parts[3])
+            return is_valid_month(parts[2]) and is_valid_day(parts[3])
         if depth == 5:
             return parts[4] != CHANNEL_MD
         if depth == 6:
@@ -355,9 +430,11 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         if row is None:
             return None
 
-        # /<conv-root>/<slug>/channel.md — channel metadata
+        # /<conv-root>/<slug>/channel.md — channel metadata. Subject to the
+        # same staleness trailer + notify_store gate as day/thread files
+        # (review P1-5).
         if depth == 3 and parts[2] == CHANNEL_MD:
-            return channel_meta_frontmatter(row), False, False
+            return _assemble_channel_meta(self._conn, row)
 
         # /<conv-root>/<slug>/<YYYY-MM>/<DD>/channel.md
         if depth == 5 and parts[4] == CHANNEL_MD:
@@ -381,13 +458,9 @@ class SlackFuseOpsV2(pyfuse3.Operations):
     def _resolve_thread_ts(self, channel_id: str, day: date, thread_slug: str) -> Decimal | None:
         parents = fetch_day_thread_parents(self._conn, channel_id, day, self._tz)
         slug_map = dedup_thread_slug_map(parents)
-        ts = slug_map.get(thread_slug)
-        if ts is not None:
-            return ts
-        # Fall back: if the slug map missed (no thread by that name yet under
-        # this day), no thread file exists.
-        _ = derive_thread_slug  # kept imported for symmetry; not used here
-        return None
+        # If the slug map missed (no thread by that name yet under this day),
+        # no thread file exists.
+        return slug_map.get(thread_slug)
 
     # ------------------------------------------------------------------
     # FUSE callbacks
@@ -409,7 +482,7 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             if resolved is None:
                 return None
             content, _trailer, _fallback = resolved
-            return _make_file_attr(inode, len(content))
+            return _make_file_attr(inode, len(content), timeout_s=_file_attr_timeout(path, self._tz))
 
         result = await trio.to_thread.run_sync(_sync, limiter=self._limiter)
         if result is None:
@@ -439,7 +512,7 @@ class SlackFuseOpsV2(pyfuse3.Operations):
                     if resolved is None:
                         return None
                     content, _trailer, _fallback = resolved
-                    return _make_file_attr(inode, len(content))
+                    return _make_file_attr(inode, len(content), timeout_s=_file_attr_timeout(child_path, self._tz))
             return None
 
         result = await trio.to_thread.run_sync(_sync, limiter=self._limiter)
@@ -447,14 +520,44 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.ENOENT)
         return result
 
+    def _snapshot_dir(self, path: str) -> list[tuple[str, pyfuse3.EntryAttributes, int]]:
+        """Materialize a directory listing with stable pagination tokens.
+
+        Called once per ``opendir`` so the (name, attr, next_token) triples are
+        frozen for the lifetime of the dir handle; ``readdir`` then serves
+        slices by token without re-querying, so a concurrent insert can't shift
+        the array out from under an in-progress iteration.
+        """
+        result: list[tuple[str, pyfuse3.EntryAttributes, int]] = []
+        for idx, (name, is_dir) in enumerate(self._list_dir(path)):
+            child_path = f"/{name}" if path == "/" else f"{path}/{name}"
+            child_inode = self._inodes.get_or_create(child_path)
+            if is_dir:
+                attr = _make_dir_attr(child_inode)
+            else:
+                resolved = self._resolve_content(child_path)
+                size = len(resolved[0]) if resolved is not None else 0
+                attr = _make_file_attr(child_inode, size, timeout_s=_file_attr_timeout(child_path, self._tz))
+            result.append((name, attr, idx + 1))
+        return result
+
+    def _register_dir_handle(self, snapshot: list[tuple[str, pyfuse3.EntryAttributes, int]]) -> int:
+        with self._dir_handle_lock:
+            self._dir_handle_seq += 1
+            fh = self._dir_handle_seq
+            self._dir_handles[fh] = snapshot
+        return fh
+
     async def opendir(  # pyright: ignore[reportIncompatibleMethodOverride]
         self,
         inode: int,
         ctx: pyfuse3.RequestContext,
     ) -> int:
-        if self._inodes.get_path(inode) is None:
+        path = self._inodes.get_path(inode)
+        if path is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
-        return inode
+        snapshot = await trio.to_thread.run_sync(lambda: self._snapshot_dir(path), limiter=self._limiter)
+        return self._register_dir_handle(snapshot)
 
     async def readdir(
         self,
@@ -462,31 +565,23 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         start_id: int,
         token: pyfuse3.ReaddirToken,
     ) -> None:
-        path = self._inodes.get_path(fh)
-        if path is None:
+        with self._dir_handle_lock:
+            snapshot = self._dir_handles.get(fh)
+        if snapshot is None:
             return
-
-        def _sync() -> list[tuple[str, pyfuse3.EntryAttributes, int]]:
-            entries = self._list_dir(path)
-            result: list[tuple[str, pyfuse3.EntryAttributes, int]] = []
-            for idx, (name, is_dir) in enumerate(entries):
-                if idx < start_id:
-                    continue
-                child_path = f"/{name}" if path == "/" else f"{path}/{name}"
-                child_inode = self._inodes.get_or_create(child_path)
-                if is_dir:
-                    attr = _make_dir_attr(child_inode)
-                else:
-                    resolved = self._resolve_content(child_path)
-                    size = len(resolved[0]) if resolved is not None else 0
-                    attr = _make_file_attr(child_inode, size)
-                result.append((name, attr, idx + 1))
-            return result
-
-        computed = await trio.to_thread.run_sync(_sync, limiter=self._limiter)
-        for name, attr, next_id in computed:
+        for name, attr, next_id in snapshot:
+            if next_id <= start_id:
+                continue
             if not pyfuse3.readdir_reply(token, name.encode("utf-8"), attr, next_id):
                 break
+
+    async def releasedir(self, fh: int) -> None:
+        with self._dir_handle_lock:
+            _ = self._dir_handles.pop(fh, None)
+
+    async def forget(self, inode_list: Sequence[tuple[int, int]]) -> None:
+        for inode, _nlookup in inode_list:
+            self._inodes.forget(inode)
 
     async def open(
         self,
@@ -593,5 +688,3 @@ __all__ = [
     "SlackFuseOpsV2",
     "synchronous_read_for_test",
 ]
-# Imports retained for re-export under tests / health subscriber.
-_ = (UTC, datetime)  # noqa: PLW0127, RUF100

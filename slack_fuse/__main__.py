@@ -9,10 +9,13 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
+
+if TYPE_CHECKING:
+    from zoneinfo import ZoneInfo
 
 
 def _default_mountpoint() -> str:
@@ -104,8 +107,47 @@ def _path_for_server(path: str, mountpoint: str) -> str:
     return relative
 
 
+def _resolve_local_zoneinfo() -> ZoneInfo:
+    """Resolve the process's local IANA timezone as a ``ZoneInfo``.
+
+    ``SlackFuseOpsV2`` needs a keyed ``ZoneInfo`` (it passes ``tz.key`` to
+    Postgres ``AT TIME ZONE``), so a bare ``datetime.astimezone().tzinfo``
+    (which has no ``.key``) won't do. Prefer ``$TZ``, then the
+    ``/etc/localtime`` symlink target, then UTC.
+    """
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    tz_env = os.environ.get("TZ")
+    if tz_env:
+        try:
+            return ZoneInfo(tz_env)
+        except (ZoneInfoNotFoundError, ValueError):
+            pass
+    localtime = Path("/etc/localtime")
+    if localtime.is_symlink():
+        target = str(localtime.resolve())
+        marker = "/zoneinfo/"
+        if marker in target:
+            try:
+                return ZoneInfo(target.split(marker, 1)[1])
+            except (ZoneInfoNotFoundError, ValueError):
+                pass
+    return ZoneInfo("UTC")
+
+
+def _mount_mode(args: argparse.Namespace) -> str:
+    """Mount mode: CLI ``--mode`` wins, else ``SLACK_FUSE_MODE`` env, else legacy."""
+    cli = getattr(args, "mode", None)
+    if cli:
+        return str(cli)
+    return os.environ.get("SLACK_FUSE_MODE", "legacy")
+
+
 def cmd_mount(args: argparse.Namespace) -> None:
-    """Mount the FUSE filesystem."""
+    """Mount the FUSE filesystem (legacy store-backed or split projections)."""
+    if _mount_mode(args) == "split":
+        cmd_mount_split(args)
+        return
     import pyfuse3
     import trio
 
@@ -203,6 +245,88 @@ def cmd_mount(args: argparse.Namespace) -> None:
         pass
     finally:
         pyfuse3.close()
+
+
+def cmd_mount_split(args: argparse.Namespace) -> None:
+    """Mount the Sprint-3B split adapter (``SlackFuseOpsV2``) over the local
+    projections store, with the health subscriber wired to the FUSE-side
+    kernel-cache invalidator.
+
+    This is the integrated process the RFC describes (FUSE mount + health
+    subscriber share inode state in one process). The projector runs as its own
+    service writing ``connection_state`` / ``stream_caught_up``; the health
+    subscriber polls those tables and drops every primed inode on a staleness
+    transition (review P0-2: ``watch_health`` was previously test-only). Gated
+    behind ``SLACK_FUSE_MODE=split`` / ``--mode split`` so the legacy adapter
+    stays the default per the Phase-4 cutover safety plan.
+    """
+    import psycopg
+    import pyfuse3
+    import trio
+    from psycopg.rows import TupleRow
+
+    import slack_fuse.migrations as client_migrations
+    from slack_fuse.config import load_client_config
+    from slack_fuse.fuse_ops_v2 import SlackFuseOpsV2
+    from slack_fuse.migrations.runner import apply_migrations
+    from slack_fuse.projector.health_subscriber import watch_health
+
+    config = load_client_config()
+    mountpoint = Path(args.mountpoint or config.mountpoint)
+    mountpoint.mkdir(parents=True, exist_ok=True)
+
+    import subprocess as _sp
+
+    _sp.run(["fusermount3", "-uz", str(mountpoint)], capture_output=True)
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.debug else logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    log = logging.getLogger(__name__)
+
+    def _open_conn() -> psycopg.Connection[TupleRow]:
+        conn: psycopg.Connection[TupleRow] = psycopg.connect(config.database_url)
+        conn.autocommit = True
+        return conn
+
+    # One-time migrations so the projections schema exists.
+    migrate_conn = _open_conn()
+    try:
+        applied = apply_migrations(migrate_conn, Path(client_migrations.__file__).parent)
+    finally:
+        migrate_conn.close()
+    if applied:
+        log.info("applied client migrations: %s", ", ".join(applied))
+
+    # Separate connections: FUSE callbacks (worker thread) vs the health
+    # subscriber poll loop. Sharing one psycopg connection across both is unsafe.
+    fuse_conn = _open_conn()
+    health_conn = _open_conn()
+
+    tz = _resolve_local_zoneinfo()
+    store_limiter = trio.CapacityLimiter(1)
+    ops = SlackFuseOpsV2(fuse_conn, tz, store_limiter)
+
+    fuse_options: set[str] = {"fsname=slack-fuse", "ro"}
+    if args.debug:
+        fuse_options.add("debug")
+    pyfuse3.init(ops, str(mountpoint), fuse_options)
+
+    async def _run() -> None:
+        async with trio.open_nursery() as nursery:
+            nursery.start_soon(watch_health, health_conn, ops.invalidate_all_primed)
+            await pyfuse3.main()
+            nursery.cancel_scope.cancel()
+
+    try:
+        trio.run(_run)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        pyfuse3.close()
+        fuse_conn.close()
+        health_conn.close()
 
 
 def cmd_unmount(args: argparse.Namespace) -> None:
@@ -326,6 +450,13 @@ def main() -> None:
         "--debug",
         action="store_true",
         help="Enable debug logging",
+    )
+    mount_parser.add_argument(
+        "--mode",
+        choices=("legacy", "split"),
+        default=None,
+        help="Adapter to mount: 'legacy' (store-backed, default) or 'split' "
+        "(Sprint-3B projections adapter). Falls back to SLACK_FUSE_MODE.",
     )
     mount_parser.set_defaults(func=cmd_mount)
 

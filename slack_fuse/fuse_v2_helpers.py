@@ -32,6 +32,18 @@ ROOT_DIRS: Final[tuple[str, ...]] = CONV_ROOTS
 CHANNEL_MD: Final = "channel.md"
 THREAD_MD: Final = "thread.md"
 
+# The `channel-list` stream is the staleness stream for channel-metadata
+# (``channel.md``) reads — channel inventory/rename/archive flow over it.
+CHANNEL_LIST_STREAM: Final = "channel-list"
+
+# WS-disconnect staleness threshold. Mirrors RFC §Configuration →
+# ``stale_after_disconnect_s`` (config.py default) and §Offline behaviour →
+# Staleness conditions #1 ("reconnecting unsuccessfully for at least 60 s").
+# Both the read-path classifier (``staleness_reason``) and the health
+# subscriber's time-aware signature key off this single constant so the
+# "trailer never lies" invariant can't drift between them.
+STALE_AFTER_DISCONNECT_S: Final = 60.0
+
 
 # ============================================================================
 # Path parsing
@@ -395,6 +407,36 @@ def fetch_conv_root_rows(conn: Connection[TupleRow], conv_root: str, *, allow_hi
         return [_channel_row_from_query(r) for r in cur.fetchall()]
 
 
+def _slug_sort_key(row: ChannelRow) -> tuple[int, str]:
+    """Ordering for slug assignment: ``hot`` channels win the unsuffixed slug,
+    ties broken by ``channel_id``.
+
+    Slug suffixes (``general-2``) depend on the order the colliding rows are
+    consumed. If ``readdir`` (hot only) and ``lookup`` (hot + hidden) assigned
+    over different row-sets, a hidden channel sorting before a hot one of the
+    same name would steal the base slug on the lookup path while ``readdir``
+    showed it on the hot one — so ``ls`` and ``cat`` disagreed (review P0-4 /
+    Gemini Class 4). Assigning over the SAME hot+hidden set in a SAME
+    deterministic order on both paths closes that hole; the ``hot``-first
+    ordering keeps the hot channel on the unsuffixed slug.
+    """
+    return (0 if row.tier == "hot" else 1, row.channel_id)
+
+
+def assign_conv_root_slugs(conn: Connection[TupleRow], conv_root: str) -> list[tuple[ChannelRow, str]]:
+    """Assign a stable slug to every ``hot``/``hidden`` channel in ``conv_root``.
+
+    The assignment is computed once over the full hot+hidden row-set so it is
+    identical regardless of whether the caller intends to filter to hot
+    (``readdir``) or allow hidden (``lookup``). ``blocked`` is never included.
+    Returned in slug-assignment order (hot-first, then ``channel_id``).
+    """
+    rows = fetch_conv_root_rows(conn, conv_root, allow_hidden=True)
+    users = fetch_users_for_dm_slugs(conn, rows)
+    counts: dict[str, int] = {}
+    return [(r, build_channel_slug(r, users, counts)) for r in sorted(rows, key=_slug_sort_key)]
+
+
 def fetch_channel_by_slug(
     conn: Connection[TupleRow],
     conv_root: str,
@@ -402,14 +444,15 @@ def fetch_channel_by_slug(
     *,
     allow_hidden: bool,
 ) -> ChannelRow | None:
-    """Replay the slug map and return the matching channel row, or ``None``."""
-    rows = fetch_conv_root_rows(conn, conv_root, allow_hidden=allow_hidden)
-    users = fetch_users_for_dm_slugs(conn, rows)
-    counts: dict[str, int] = {}
-    for r in rows:
-        cur_slug = build_channel_slug(r, users, counts)
-        if cur_slug == slug:
-            return r
+    """Replay the (hot+hidden) slug assignment and return the matching row.
+
+    ``allow_hidden=False`` additionally requires the matched row to be
+    ``hot`` — so a hidden slug is ENOENT on the readdir path but resolvable on
+    the lookup path, while both agree on which channel owns which slug.
+    """
+    for row, cur_slug in assign_conv_root_slugs(conn, conv_root):
+        if cur_slug == slug and (allow_hidden or row.tier == "hot"):
+            return row
     return None
 
 
@@ -591,6 +634,19 @@ class PersistentInodeMap:
         self._inode_to_path[inode] = path
         return path
 
+    def forget(self, inode: int) -> None:
+        """Drop the in-memory cache entry for ``inode`` (the persistent DB row
+        stays). Called from the FUSE ``forget`` callback so a long-running
+        mount doesn't accumulate the whole traversed tree in memory (review
+        P2-9 / Gemini Class 5). The next access re-reads the row from the
+        ``inodes`` table, so inode numbers remain stable.
+        """
+        if inode == ROOT_INODE:
+            return
+        path = self._inode_to_path.pop(inode, None)
+        if path is not None:
+            _ = self._path_to_inode.pop(path, None)
+
 
 # ============================================================================
 # Mention resolution + miss tracking
@@ -751,10 +807,10 @@ def staleness_reason(state: StalenessState, *, now: datetime | None = None) -> s
     if health in _DEGRADED_STATES:
         return "slack ingestion unhealthy"
 
-    # WS disconnect detection — last_frame_at older than 60s indicates we
-    # are reconnecting unsuccessfully.
+    # WS disconnect detection — last_frame_at older than the threshold
+    # indicates we are reconnecting unsuccessfully.
     now_real = now if now is not None else datetime.now(UTC)
-    if state.last_frame_at is None or (now_real - state.last_frame_at) > timedelta(seconds=60):
+    if state.last_frame_at is None or (now_real - state.last_frame_at) > timedelta(seconds=STALE_AFTER_DISCONNECT_S):
         # No frame in the last 60s: be conservative and trail. The
         # belt-and-suspenders invalidation invariant means this stops the
         # moment a frame arrives.

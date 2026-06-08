@@ -84,6 +84,9 @@ def _seed_populated_day(conn: Connection[TupleRow]) -> None:
     )
     set_connection_state(conn, last_slurper_health="healthy", last_frame_at_offset_s=1.0)
     mark_stream_caught_up(conn, "channel:C-GEN", at_offset=100)
+    # channel.md is staleness-aware off the channel-list stream (P1-5), so a
+    # fully-healthy world must mark it caught up too.
+    mark_stream_caught_up(conn, "channel-list", at_offset=100)
 
 
 @pytest.fixture
