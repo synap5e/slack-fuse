@@ -70,7 +70,7 @@ Currently at `<after-this-commit>` with Sprint 0 + POC B merged.
 | 1A slurper | claude (opus) | `sprint1a-slurper` | `synap5e/feat/sprint1a-slurper` | in flight |
 | 1B WS server | cursor (gpt-5.5-extra-high) | (killed) | `synap5e/feat/sprint1b-ws-server` | **MERGED** at `<after-this>`. Added SNAPSHOT_REQUIRED to ErrorCode enum (sanctioned per prompt). LISTEN protocol: `NOTIFY new_event, '<stream-id>'` (or empty payload for wake-all fallback) — 1A coordinates by emitting these in the offset-assignment TX. |
 | 1C HTTP /health + /metrics | cursor (gpt-5.3-codex-xhigh) | (killed) | `synap5e/feat/sprint1c-http-health-metrics` | **MERGED**. Custom trio+h11 server, no new dep. `serve_http_on_listeners` exposed for 1B WS to compose (Upgrade-header path landed in 1B's PR). |
-| 1D debug subscribe CLI | cursor (gpt-5.3-codex-xhigh) | `sprint1d-debug` | `synap5e/feat/sprint1d-debug-subscribe-cli` | in flight |
+| 1D debug subscribe CLI | cursor (gpt-5.3-codex-xhigh) | (killed) | `synap5e/feat/sprint1d-debug-subscribe-cli` | **MERGED**. `tools/debug_subscribe.py` + 7 unit tests. Auto-responds to ping with pong. Manual smoke deferred until 1A's slurper is running. |
 
 Cross-track coordination resolved: 1A → 1B `NOTIFY new_event, '<stream-id>'`
 protocol documented in 1B's commit. Owner relays to 1A worker (still
