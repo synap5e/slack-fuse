@@ -37,7 +37,7 @@ from slack_fuse_server.config import ServerConfig, load_server_config
 from slack_fuse_server.slurper.api import SlackClient
 from slack_fuse_server.slurper.health import HealthEmitter
 from slack_fuse_server.slurper.offsets import OffsetWriter
-from slack_fuse_server.slurper.socket import run_socket_mode
+from slack_fuse_server.slurper.users import populate_users_once, run_socket_mode_with_users
 
 log = logging.getLogger(__name__)
 
@@ -127,7 +127,8 @@ async def _serve(config: ServerConfig) -> None:
     auto_backfill = os.environ.get(_AUTO_BACKFILL_ENV, "").lower() in ("1", "true", "yes")
     try:
         async with trio.open_nursery() as nursery:
-            nursery.start_soon(run_socket_mode, writer, health, client, config.slack_app_token)
+            nursery.start_soon(run_socket_mode_with_users, writer, health, client, config.slack_app_token)
+            nursery.start_soon(populate_users_once, writer, client)
             if auto_backfill:
                 nursery.start_soon(_auto_backfill, config, writer, health, client, limiter)
     finally:
