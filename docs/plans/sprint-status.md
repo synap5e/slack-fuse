@@ -63,11 +63,18 @@ Currently at `<after-this-commit>` with Sprint 0 + POC B merged.
 
 ### Next owner action
 
-Spawn Sprint 1 tracks:
-- 1A (slurper, Claude Opus)
-- 1B (WS server, GPT-5.5 xhigh)
-- 1C (HTTP /health + /metrics, Codex)
-- 1D (debug subscribe CLI, Codex)
+~~Spawn Sprint 1 tracks~~ — **spawned**.
 
-All four can run in parallel; per the cap-of-3 decision, owner
-will keep ≤3 concurrent at any time.
+| Track | Model | tmux | Branch | Status |
+|---|---|---|---|---|
+| 1A slurper | claude (opus) | `sprint1a-slurper` | `synap5e/feat/sprint1a-slurper` | in flight |
+| 1B WS server | cursor (gpt-5.5-extra-high) | `sprint1b-ws-server` | `synap5e/feat/sprint1b-ws-server` | in flight |
+| 1C HTTP /health + /metrics | cursor (gpt-5.3-codex-xhigh) | `sprint1c-http` | `synap5e/feat/sprint1c-http-health-metrics` | in flight |
+| 1D debug subscribe CLI | Codex | TBD | TBD | queued (spawn when one of 1A/1B/1C completes) |
+
+Per the cap-of-3 decision, 1D queued until a slot frees.
+
+Cross-track coordination needed: 1A's slurper must `NOTIFY new_event`
+after each INSERT into the events table; 1B's tail loop `LISTEN`s.
+1B was told to document the protocol; owner monitors for either
+worker raising it.
