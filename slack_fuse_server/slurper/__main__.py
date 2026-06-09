@@ -44,6 +44,7 @@ from slack_fuse_server.dispatch import serve_dispatch
 from slack_fuse_server.http.handlers import ResolvePermalinkDeps, SnapshotDeps
 from slack_fuse_server.http.metrics import MetricsAggregator, SubscriberSnapshot
 from slack_fuse_server.slurper.api import SlackClient
+from slack_fuse_server.slurper.channels import populate_channels_once
 from slack_fuse_server.slurper.health import HealthEmitter
 from slack_fuse_server.slurper.offsets import OffsetWriter
 from slack_fuse_server.slurper.socket import SocketModeOptions, SocketModeStatus
@@ -226,6 +227,7 @@ async def _serve(config: ServerConfig) -> None:
         async with trio.open_nursery() as nursery:
             nursery.start_soon(_run_socket_mode_with_users_task, writer, health, client, config, status)
             nursery.start_soon(populate_users_once, writer, client)
+            nursery.start_soon(populate_channels_once, writer, client)
             nursery.start_soon(
                 _serve_dispatch_task,
                 config.listen_addr,
