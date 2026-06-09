@@ -150,15 +150,26 @@ Owner decision: land both deferred items as part of testing setup.
 
 ### Pre-bake-in state
 
-`main` at `31616b8`, 67 commits ahead of origin (not pushed per standing
-directive). 672 tests, 0 skipped. Legacy mount path untouched. Pre-cutover
+`main` at `4d5b7f8`, 68 commits ahead of origin (not pushed per standing
+directive). 669 tests, 0 skipped. Legacy mount path untouched. Pre-cutover
 gate cleared. Sprint 1 7-day soak still running healthy (`slack-fuse-smoke`
 tmux).
 
+**catchup_window_s resolved.** Time-window check (Meaning D) dropped at
+`4d5b7f8`; boolean "did initial replay ever complete" check (Meaning C)
+retained. Time-window check was wrong because `caught_up` is once-per-
+(re)connection per stream (RFC §Offline behaviour condition 3), not a
+heartbeat — would have trailed in steady state. The boolean check still
+catches the dangerous failure (silent partial-data after interrupted
+replay). Net -104 LOC. JSONL decisions still emit; trailer behavior
+governed by boolean + frame_stale + fallback (independent gates).
+
 ### Next owner action
 
-User-in-loop touchpoint. Decide on bake-in start + the `catchup_window_s`
-semantics resolution noted above.
+User-in-loop touchpoint. Two decisions still pending:
+- Start the 4-week `SLACK_FUSE_MODE=split` opt-in bake-in clock.
+- Push `main` to `origin/main` (held off per standing directive throughout
+  this build).
 | 2C HTTP /resolve + /permalink | cursor (gpt-5.3-codex-xhigh) | (killed) | `synap5e/feat/2c-http-resolve-permalink` | **MERGED** at `e2d8a59`. Lifting strategy: option 2 (copy bodies into server modules), keeps legacy independent. CLI gained `--server-url` proxy mode. |
 | (owner inline) flake fix | n/a | n/a | n/a | Bumped WS test timeouts (1.0→5.0s default, 0.5→3.0s explicit) — was flaking under full-suite + cold-Pg load after 2F auto-provision landed. |
 | 1G Socket Mode payload conformance | cursor (gpt-5.3-codex-xhigh) | (killed) | `synap5e/feat/sprint1g-message-payload-conformance` | **MERGED** at `06bdad6`. Live `message` events now Message.model_validate(...).model_dump('json'), byte-equivalent to backfill. Conformance test asserts the equivalence against a conversations.history-derived envelope with reactions+files+edited+reply metadata. |
