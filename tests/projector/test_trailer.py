@@ -40,22 +40,14 @@ def _state(
     health: str = "healthy",
     frame_seconds_ago: float = 1.0,
     caught_up: bool = True,
-    caught_up_seconds_ago: float | None = 1.0,
     caught_up_offset: int | None = 42,
 ) -> StalenessState:
-    """Build a ``StalenessState`` relative to ``_NOW``.
-
-    ``caught_up_seconds_ago=None`` leaves ``last_caught_up_at`` unset (the
-    pre-3C boolean-only path); a float backdates the caught_up timestamp so the
-    catch-up window can be crossed.
-    """
-    last_caught_up_at = None if caught_up_seconds_ago is None else _NOW - timedelta(seconds=caught_up_seconds_ago)
+    """Build a ``StalenessState`` relative to ``_NOW``."""
     return StalenessState(
         last_frame_at=_NOW - timedelta(seconds=frame_seconds_ago),
         last_slurper_health=health,
         last_health_update_at=_NOW,
         initial_catch_up_done_for_stream=caught_up,
-        last_caught_up_at=last_caught_up_at,
         caught_up_offset=caught_up_offset,
     )
 
@@ -103,28 +95,6 @@ def test_classify_stale_not_caught_up() -> None:
     decision = classify_trailer(_state(caught_up=False), stream="channel:C1", now=_NOW)
     assert decision.kind == "stale"
     assert decision.reasons == ["catching up after reconnect"]
-
-
-def test_classify_stale_catchup_window_crossed() -> None:
-    # Caught up (boolean True) but the caught_up timestamp predates the window.
-    decision = classify_trailer(
-        _state(caught_up_seconds_ago=30),
-        stream="channel:C1",
-        now=_NOW,
-        catchup_window_s=10.0,
-    )
-    assert decision.kind == "stale"
-    assert decision.reasons == ["catching up after reconnect"]
-
-
-def test_classify_clean_catchup_within_window() -> None:
-    decision = classify_trailer(
-        _state(caught_up_seconds_ago=5),
-        stream="channel:C1",
-        now=_NOW,
-        catchup_window_s=10.0,
-    )
-    assert decision.kind == "clean"
 
 
 def test_classify_fallback_user() -> None:

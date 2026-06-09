@@ -232,9 +232,9 @@ def mark_stream_caught_up(
 ) -> None:
     """Stamp ``stream_caught_up`` for ``stream``.
 
-    ``seconds_ago`` backdates ``caught_up_at`` (default 0 → ``now()``) so the
-    catch-up freshness window (``catchup_window_s``) can be crossed without
-    touching the wall clock.
+    ``seconds_ago`` backdates ``caught_up_at`` (default 0 → ``now()``) — the
+    classifier itself only checks for row existence (boolean), but tests that
+    inspect the timestamp use this to drive deterministic ordering.
     """
     with conn.cursor() as cur:
         cur.execute(

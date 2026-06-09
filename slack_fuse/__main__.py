@@ -331,7 +331,6 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
         tz,
         store_limiter,
         stale_after_s=config.stale_after_disconnect_s,
-        catchup_window_s=config.catchup_window_s,
         trailer_enabled=config.stale_trailer_enabled,
         trailer_log=trailer_log,
     )
@@ -387,7 +386,6 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
                     health_conn,
                     ops.invalidate_all_primed,
                     stale_after_s=config.stale_after_disconnect_s,
-                    catchup_window_s=config.catchup_window_s,
                 )
             )
             nursery.start_soon(_run_projector)

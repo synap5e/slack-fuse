@@ -68,7 +68,6 @@ from slack_fuse.fuse_v2_helpers import (
     ts_to_local_date,
 )
 from slack_fuse.projector.trailer import (
-    DEFAULT_CATCHUP_WINDOW_S,
     STALE_AFTER_DISCONNECT_S,
     TrailerDecision,
     classify_trailer,
@@ -208,7 +207,6 @@ class TrailerConfig:
 
     now: datetime
     stale_after_s: float = STALE_AFTER_DISCONNECT_S
-    catchup_window_s: float = DEFAULT_CATCHUP_WINDOW_S
     trailer_enabled: bool = True
 
 
@@ -234,7 +232,6 @@ def _decide_and_apply(
         stream=stream,
         now=cfg.now,
         stale_after_s=cfg.stale_after_s,
-        catchup_window_s=cfg.catchup_window_s,
         fallback_reasons=fallback_reasons,
     )
     had_fallback = bool(fallback_reasons)
@@ -331,7 +328,6 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         notify_store: NotifyStoreFn | None = None,
         invalidate_inode: InvalidateInodeFn | None = None,
         stale_after_s: float = STALE_AFTER_DISCONNECT_S,
-        catchup_window_s: float = DEFAULT_CATCHUP_WINDOW_S,
         trailer_enabled: bool = True,
         trailer_log: TrailerLog | None = None,
         now_fn: NowFn = _utcnow,
@@ -345,12 +341,11 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             invalidate_inode if invalidate_inode is not None else _default_invalidate_inode
         )
         # Trailer-decision wiring (Sprint 3C). ``stale_after_s`` /
-        # ``catchup_window_s`` / ``trailer_enabled`` come from ``ClientConfig``;
-        # ``trailer_log`` (when set) records one decision per read for bake-in
-        # false-positive analysis; ``now_fn`` is injectable so tests can cross
-        # the staleness / catch-up windows without sleeping.
+        # ``trailer_enabled`` come from ``ClientConfig``; ``trailer_log``
+        # (when set) records one decision per read for bake-in false-positive
+        # analysis; ``now_fn`` is injectable so tests can cross the staleness
+        # window without sleeping.
         self._stale_after_s = stale_after_s
-        self._catchup_window_s = catchup_window_s
         self._trailer_enabled = trailer_enabled
         self._trailer_log = trailer_log
         self._now_fn = now_fn
@@ -538,7 +533,6 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         cfg = TrailerConfig(
             now=now if now is not None else self._now_fn(),
             stale_after_s=self._stale_after_s,
-            catchup_window_s=self._catchup_window_s,
             trailer_enabled=self._trailer_enabled,
         )
 

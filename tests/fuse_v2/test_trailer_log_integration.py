@@ -8,7 +8,7 @@ through the real read path against a migrated client DB.
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
@@ -63,13 +63,12 @@ def _seed_day(
     )
 
 
-def _make_ops(  # noqa: PLR0913  (test helper mirroring the SlackFuseOpsV2 config knobs)
+def _make_ops(
     conn: Connection[TupleRow],
     fake: FakePyfuse3,
     *,
     trailer_log: TrailerLog | None = None,
     stale_after_s: float = 60.0,
-    catchup_window_s: float = 10.0,
     trailer_enabled: bool = True,
 ) -> SlackFuseOpsV2:
     return SlackFuseOpsV2(
@@ -80,7 +79,6 @@ def _make_ops(  # noqa: PLR0913  (test helper mirroring the SlackFuseOpsV2 confi
         invalidate_inode=fake.invalidate_inode,
         trailer_log=trailer_log,
         stale_after_s=stale_after_s,
-        catchup_window_s=catchup_window_s,
         trailer_enabled=trailer_enabled,
     )
 
@@ -334,38 +332,21 @@ async def test_b4_stale_trailer_enabled_default_appends_trailer(
 
 
 @pytest.mark.trio
-async def test_b4_catchup_window_crossing(
+async def test_boolean_caught_up_missing_trails(
     client_conn: Connection[TupleRow],
     fake_pyfuse3: FakePyfuse3,
 ) -> None:
-    """A caught_up row older than ``catchup_window_s`` is treated as still
-    catching up; a fresh one stays clean."""
+    """Boolean "did initial replay complete" check: a stream with NO caught_up
+    row trails ("catching up after reconnect"); a stream WITH any caught_up
+    row stays clean (no time-window check)."""
     _seed_day(client_conn)
     set_connection_state(client_conn, last_slurper_health="healthy", last_frame_at_offset_s=1.0)
 
-    # Caught up 30s ago, window 10s → catching up.
-    mark_stream_caught_up(client_conn, "channel:C1", at_offset=10, seconds_ago=30.0)
-    stale = await _read_day(_make_ops(client_conn, fake_pyfuse3, catchup_window_s=10.0))
+    # No caught_up row for channel:C1 → still catching up.
+    stale = await _read_day(_make_ops(client_conn, fake_pyfuse3))
     assert b"catching up after reconnect" in stale
 
-    # Re-stamp fresh (0s ago) → clean.
-    mark_stream_caught_up(client_conn, "channel:C1", at_offset=10, seconds_ago=0.0)
-    fresh = await _read_day(_make_ops(client_conn, FakePyfuse3(), catchup_window_s=10.0))
+    # Insert a caught_up row of any age → clean (boolean-only, not windowed).
+    mark_stream_caught_up(client_conn, "channel:C1", at_offset=10, seconds_ago=3600.0)
+    fresh = await _read_day(_make_ops(client_conn, FakePyfuse3()))
     assert b"Content may be stale" not in fresh
-
-
-def test_b4_catchup_window_subscriber_signature(client_conn: Connection[TupleRow]) -> None:
-    """The health signature's derived ``catchup_stale`` flips when the freshest
-    caught_up ages past ``catchup_window_s`` — with no DB mutation, only ``now``
-    advancing (mirrors the ``frame_stale`` time-driven flip)."""
-    # caught_up_at is stamped at the DB's now(), so anchor the test clock to the
-    # real clock and advance from there (frame_stale stays off across both reads
-    # because last_frame_at also tracks now()).
-    base_dt = datetime.now(UTC)
-    mark_stream_caught_up(client_conn, "channel:C1", at_offset=10)
-    set_connection_state(client_conn, last_slurper_health="healthy", last_frame_at_offset_s=1.0)
-
-    sig_fresh = read_signature(client_conn, now=base_dt, catchup_window_s=600.0)
-    sig_old = read_signature(client_conn, now=base_dt + timedelta(seconds=3600), catchup_window_s=600.0)
-    assert sig_fresh.catchup_stale is not sig_old.catchup_stale
-    assert sig_old.catchup_stale is True

@@ -56,9 +56,6 @@ class ClientConfig(BaseSettings):
     stale_trailer_enabled: bool = True
     # WS-disconnect staleness threshold (s). No frame for this long → trailer.
     stale_after_disconnect_s: float = 60.0
-    # Catch-up freshness window (s). A ``stream_caught_up`` row older than this
-    # is treated as no recent at-head confirmation (still catching up).
-    catchup_window_s: float = 10.0
     # Optional append-only JSONL log of per-read trailer decisions for bake-in
     # false-positive measurement. ``None`` disables logging. Rotation is the
     # operator's responsibility (logrotate / cron) — the writer only appends.

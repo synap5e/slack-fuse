@@ -47,7 +47,7 @@ from typing import TYPE_CHECKING, Final
 
 import trio
 
-from slack_fuse.projector.trailer import DEFAULT_CATCHUP_WINDOW_S, STALE_AFTER_DISCONNECT_S
+from slack_fuse.projector.trailer import STALE_AFTER_DISCONNECT_S
 
 if TYPE_CHECKING:
     from psycopg import Connection
@@ -86,15 +86,6 @@ class HealthSignature:
     which leaves both ``count`` and ``max_offset`` unchanged — still moves
     ``max_at`` and is detected (review P1-7 / GPT: the count+max signature
     missed the upsert path).
-
-    ``catchup_stale`` is the catch-up analogue of ``frame_stale`` (RFC
-    §Configuration → ``catchup_window_s``): a *derived* boolean recomputed
-    against ``now`` so the wall-clock crossing of the catch-up freshness window
-    fires invalidation with no DB mutation — exactly like ``frame_stale`` for
-    the disconnect threshold. It is computed from the *most recent* caught_up
-    across all streams (``max_at``); the per-stream read path is finer-grained,
-    so this is a conservative global belt-and-suspenders that re-invalidates the
-    primed-clean set when the freshest stream's catch-up confirmation ages out.
     """
 
     last_slurper_health: str | None
@@ -102,7 +93,6 @@ class HealthSignature:
     caught_up_count: int
     caught_up_max_offset: int
     caught_up_max_at: datetime | None
-    catchup_stale: bool = False
 
 
 def read_signature(
@@ -110,13 +100,12 @@ def read_signature(
     *,
     now: datetime | None = None,
     stale_after_s: float = STALE_AFTER_DISCONNECT_S,
-    catchup_window_s: float = DEFAULT_CATCHUP_WINDOW_S,
 ) -> HealthSignature:
     """SELECT the current ``HealthSignature`` from ``conn``.
 
-    ``now`` (defaulting to the real UTC clock) drives the ``frame_stale`` and
-    ``catchup_stale`` computations so callers — production poll loop and tests
-    alike — can advance wall-clock time without mutating the DB row.
+    ``now`` (defaulting to the real UTC clock) drives the ``frame_stale``
+    computation so callers — production poll loop and tests alike — can
+    advance wall-clock time without mutating the DB row.
     """
     now_real = now if now is not None else _utcnow()
     with conn.cursor() as cur:
@@ -133,18 +122,12 @@ def read_signature(
         max_offset = 0 if row2 is None else int(row2[1])
         max_at = row2[2] if row2 is not None and isinstance(row2[2], datetime) else None
     frame_stale = last_frame_at is None or (now_real - last_frame_at).total_seconds() > stale_after_s
-    # Only flip catchup_stale once a stream has actually caught up at least once
-    # (max_at is not None). With no caught_up rows yet the read path's boolean
-    # condition already drives the "catching up" trailer, and treating the empty
-    # table as "stale" here would just add a redundant baseline flip.
-    catchup_stale = max_at is not None and (now_real - max_at).total_seconds() > catchup_window_s
     return HealthSignature(
         last_slurper_health=last_slurper_health,
         frame_stale=frame_stale,
         caught_up_count=count,
         caught_up_max_offset=max_offset,
         caught_up_max_at=max_at,
-        catchup_stale=catchup_stale,
     )
 
 
@@ -157,26 +140,25 @@ async def watch_health(  # noqa: PLR0913  (keyword-only polling/test tuning knob
     *,
     poll_interval_s: float = DEFAULT_POLL_INTERVAL_S,
     stale_after_s: float = STALE_AFTER_DISCONNECT_S,
-    catchup_window_s: float = DEFAULT_CATCHUP_WINDOW_S,
     now_fn: NowFn = _utcnow,
     iterations: int | None = None,
 ) -> None:
     """Trio task: poll ``read_signature`` and fire ``on_change`` on each change.
 
     The signature is recomputed against ``now_fn()`` every tick, so the
-    wall-clock-driven ``frame_stale`` / ``catchup_stale`` flips are detected
-    within one poll interval even when no DB row changed (review P0-1).
-    ``iterations`` caps the loop count (tests use a small value); ``None`` means
-    "forever" — production spawns this under the FUSE-mount nursery and lets the
-    main scope cancel it on shutdown.
+    wall-clock-driven ``frame_stale`` flip is detected within one poll
+    interval even when no DB row changed (review P0-1). ``iterations`` caps
+    the loop count (tests use a small value); ``None`` means "forever" —
+    production spawns this under the FUSE-mount nursery and lets the main
+    scope cancel it on shutdown.
     """
-    last = read_signature(conn, now=now_fn(), stale_after_s=stale_after_s, catchup_window_s=catchup_window_s)
+    last = read_signature(conn, now=now_fn(), stale_after_s=stale_after_s)
     log.info("health_subscriber: started; baseline signature=%s", last)
     iter_count = 0
     while True:
         await trio.sleep(poll_interval_s)
         try:
-            current = read_signature(conn, now=now_fn(), stale_after_s=stale_after_s, catchup_window_s=catchup_window_s)
+            current = read_signature(conn, now=now_fn(), stale_after_s=stale_after_s)
         except Exception as exc:  # noqa: BLE001  (subscriber must not die on bursty DB)
             log.warning("health_subscriber: signature read failed: %s", exc)
         else:
@@ -194,14 +176,13 @@ async def watch_health(  # noqa: PLR0913  (keyword-only polling/test tuning knob
             return
 
 
-def watch_health_once(  # noqa: PLR0913  (keyword-only test-tuning knobs mirror watch_health)
+def watch_health_once(
     conn: Connection[TupleRow],
     last_seen: HealthSignature,
     on_change: InvalidateCallback,
     *,
     now: datetime | None = None,
     stale_after_s: float = STALE_AFTER_DISCONNECT_S,
-    catchup_window_s: float = DEFAULT_CATCHUP_WINDOW_S,
 ) -> HealthSignature:
     """Synchronous one-shot variant — useful for the integration tests.
 
@@ -209,7 +190,7 @@ def watch_health_once(  # noqa: PLR0913  (keyword-only test-tuning knobs mirror 
     the next call. ``now`` lets tests cross the staleness threshold without a
     DB mutation.
     """
-    current = read_signature(conn, now=now, stale_after_s=stale_after_s, catchup_window_s=catchup_window_s)
+    current = read_signature(conn, now=now, stale_after_s=stale_after_s)
     if current != last_seen:
         _ = on_change()
     return current

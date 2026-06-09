@@ -29,7 +29,6 @@ server_url = "ws://homelab:8765"
 database_url = "postgresql:///custom_client_db"
 mountpoint = "/mnt/slack"
 stale_trailer_enabled = false
-catchup_window_s = 4.0
 """
 
 
@@ -69,7 +68,6 @@ def test_client_config_from_toml(tmp_path: Path) -> None:
     assert cfg.database_url == "postgresql:///custom_client_db"
     assert cfg.mountpoint == "/mnt/slack"
     assert cfg.stale_trailer_enabled is False
-    assert abs(cfg.catchup_window_s - 4.0) < 1e-9
     # Default retained.
     assert abs(cfg.stale_after_disconnect_s - 60.0) < 1e-9
 

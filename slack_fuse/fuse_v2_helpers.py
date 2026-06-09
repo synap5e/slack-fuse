@@ -18,7 +18,6 @@ from typing import TYPE_CHECKING, Final
 from zoneinfo import ZoneInfo
 
 from slack_fuse.projector.trailer import (
-    DEFAULT_CATCHUP_WINDOW_S,
     FALLBACK_CHANNEL_REASON,
     FALLBACK_USER_REASON,
     STALE_AFTER_DISCONNECT_S,
@@ -37,7 +36,6 @@ from slack_fuse_render.resolvers import ChannelResolver
 # existing ``fuse_ops_v2`` / health-subscriber / test imports keep resolving
 # against ``fuse_v2_helpers`` while the pure trailer logic lives in one module.
 __all__ = [
-    "DEFAULT_CATCHUP_WINDOW_S",
     "FALLBACK_CHANNEL_REASON",
     "FALLBACK_USER_REASON",
     "STALE_AFTER_DISCONNECT_S",
@@ -787,10 +785,11 @@ def fetch_staleness_state(
 ) -> StalenessState:
     """SELECT ``connection_state`` + ``stream_caught_up`` for ``stream``.
 
-    The ``stream_caught_up`` row carries both ``caught_up_at`` (drives the
-    catch-up freshness window — RFC §Configuration → ``catchup_window_s``) and
-    ``at_offset`` (recorded on the decision so the bake-in log can correlate a
-    trailer to the stream head it was caught up to).
+    The ``stream_caught_up`` row's ``at_offset`` is recorded on the decision
+    so the bake-in log can correlate a trailer to the stream head it was
+    caught up to. The row's mere existence drives the boolean
+    ``initial_catch_up_done_for_stream`` check — the time-based catch-up
+    window check was removed (see ``trailer.StalenessState`` docstring).
     """
     with conn.cursor() as cur:
         _ = cur.execute(
@@ -804,18 +803,15 @@ def fetch_staleness_state(
             last_frame_at = row[0] if isinstance(row[0], datetime) else None
             last_slurper_health = "unknown" if row[1] is None else str(row[1])
             last_health_update_at = row[2] if isinstance(row[2], datetime) else None
-        _ = cur.execute("SELECT caught_up_at, at_offset FROM stream_caught_up WHERE stream = %s", (stream,))
+        _ = cur.execute("SELECT at_offset FROM stream_caught_up WHERE stream = %s", (stream,))
         caught_up_row = cur.fetchone()
-    last_caught_up_at: datetime | None = None
     caught_up_offset: int | None = None
     if caught_up_row is not None:
-        last_caught_up_at = caught_up_row[0] if isinstance(caught_up_row[0], datetime) else None
-        caught_up_offset = None if caught_up_row[1] is None else int(caught_up_row[1])
+        caught_up_offset = None if caught_up_row[0] is None else int(caught_up_row[0])
     return StalenessState(
         last_frame_at=last_frame_at,
         last_slurper_health=last_slurper_health,
         last_health_update_at=last_health_update_at,
         initial_catch_up_done_for_stream=caught_up_row is not None,
-        last_caught_up_at=last_caught_up_at,
         caught_up_offset=caught_up_offset,
     )

@@ -37,11 +37,6 @@ from typing import Final, Literal
 # don't pass one.
 STALE_AFTER_DISCONNECT_S: Final = 60.0
 
-# Catch-up freshness window default (RFC §Configuration → ``catchup_window_s``).
-# A ``stream_caught_up`` row older than this — relative to the read clock — is
-# treated as "no recent confirmation we're at head", i.e. still catching up.
-DEFAULT_CATCHUP_WINDOW_S: Final = 10.0
-
 # Reason strings recorded for an unresolved-mention fallback decision. These do
 # NOT append a trailer (fallback only gates ``notify_store``); they exist so the
 # JSONL decision log can attribute a non-primed read to its cause.
@@ -58,20 +53,21 @@ FALLBACK_CHANNEL_REASON: Final = "unresolved-channel-mention"
 class StalenessState:
     """Per-RFC §Offline behaviour → Source of truth for staleness.
 
-    ``last_caught_up_at`` / ``caught_up_offset`` are optional (default
-    ``None``) so callers that predate the catch-up-window wiring — and the unit
-    tests that only exercise the health/frame conditions — keep constructing
-    the state with the original four fields. When ``last_caught_up_at`` is
-    ``None`` the catch-up-window check is skipped and the boolean
-    ``initial_catch_up_done_for_stream`` is authoritative (the pre-3C
-    behaviour).
+    ``caught_up_offset`` is optional (default ``None``) and is recorded for the
+    JSONL decision log only — the classifier itself keys off the boolean
+    ``initial_catch_up_done_for_stream`` ("does a ``stream_caught_up`` row
+    exist for this stream"). The time-based catch-up freshness window
+    (``catchup_window_s``) was removed because ``caught_up`` is emitted once
+    per (re)connection per stream, not as a heartbeat — a literal `now -
+    last_caught_up_at > window` check therefore trails in steady state past
+    `window` seconds. The boolean "did initial replay ever complete" check is
+    what protects against silent partial-data reads.
     """
 
     last_frame_at: datetime | None
     last_slurper_health: str
     last_health_update_at: datetime | None
     initial_catch_up_done_for_stream: bool
-    last_caught_up_at: datetime | None = None
     caught_up_offset: int | None = None
 
 
@@ -84,7 +80,6 @@ def staleness_reason(
     *,
     now: datetime | None = None,
     stale_after_s: float = STALE_AFTER_DISCONNECT_S,
-    catchup_window_s: float = DEFAULT_CATCHUP_WINDOW_S,
 ) -> str | None:
     """Return the trailer reason string, or ``None`` if content is current.
 
@@ -92,9 +87,9 @@ def staleness_reason(
     fundamental degradation states append a trailer. The reason strings come
     from §Trailer format.
 
-    ``stale_after_s`` (the WS-disconnect threshold) and ``catchup_window_s``
-    (the catch-up freshness window) are wired from ``ClientConfig`` by the read
-    path; both keep their module-default for call sites that don't override.
+    ``stale_after_s`` (the WS-disconnect threshold) is wired from
+    ``ClientConfig`` by the read path; the module default applies at call
+    sites that don't override.
     """
     health = state.last_slurper_health
     if health == "auth_failed":
@@ -106,26 +101,14 @@ def staleness_reason(
 
     now_real = now if now is not None else datetime.now(UTC)
 
-    # Catch-up freshness (B3 / RFC §Configuration → catchup_window_s). A
-    # caught_up row older than the window means we have no *recent* confirmation
-    # the stream is at head — treat it as still catching up. ``last_caught_up_at
-    # is None`` falls back to the boolean (pre-3C behaviour), so unit tests and
-    # any caller that doesn't surface the timestamp are unaffected.
-    #
-    # CAVEAT: a ``caught_up`` frame is emitted once per (re)connection per stream
-    # (RFC §Offline behaviour → condition 3), not on a heartbeat, so once a
-    # stream has been connected longer than ``catchup_window_s`` this fires on
-    # every read. The window is therefore best paired with a server that
-    # re-emits ``caught_up`` periodically, or treated as a deliberately
-    # conservative bake-in knob (measure the rate via the trailer-decision log,
-    # and use ``stale_trailer_enabled=False`` to compare against no-trailer).
+    # "Did initial replay ever complete for this stream?" — boolean check.
+    # If a ``stream_caught_up`` row exists, the WS server confirmed it finished
+    # replaying historical events. If not, we may be serving partial data; warn.
+    # This is intentionally NOT a time-windowed check (see the StalenessState
+    # docstring): a literal `now - last_caught_up_at > window` check would trail
+    # in steady state because ``caught_up`` is once-per-(re)connection, not a
+    # heartbeat. The boolean is what protects against silent partial-data reads.
     caught_up = state.initial_catch_up_done_for_stream
-    if (
-        caught_up
-        and state.last_caught_up_at is not None
-        and (now_real - state.last_caught_up_at) > timedelta(seconds=catchup_window_s)
-    ):
-        caught_up = False
 
     # WS disconnect detection — last_frame_at older than the threshold
     # indicates we are reconnecting unsuccessfully.
@@ -191,13 +174,12 @@ class TrailerDecision:
     caught_up_offset: int | None = None
 
 
-def classify_trailer(  # noqa: PLR0913  (pure classifier with explicit state + window knobs)
+def classify_trailer(
     state: StalenessState,
     *,
     stream: str,
     now: datetime,
     stale_after_s: float = STALE_AFTER_DISCONNECT_S,
-    catchup_window_s: float = DEFAULT_CATCHUP_WINDOW_S,
     fallback_reasons: Sequence[str] = (),
 ) -> TrailerDecision:
     """Fold staleness + unresolved-mention fallback into one decision record.
@@ -208,7 +190,7 @@ def classify_trailer(  # noqa: PLR0913  (pure classifier with explicit state + w
     the single source of truth for ``kind``. The ``inode`` is stamped by the
     read path via :func:`dataclasses.replace` once it's known.
     """
-    reason = staleness_reason(state, now=now, stale_after_s=stale_after_s, catchup_window_s=catchup_window_s)
+    reason = staleness_reason(state, now=now, stale_after_s=stale_after_s)
     if reason is not None:
         kind: TrailerKind = "stale"
         reasons = [reason]
@@ -242,7 +224,6 @@ def render_trailer(decision: TrailerDecision) -> str | None:
 
 
 __all__ = [
-    "DEFAULT_CATCHUP_WINDOW_S",
     "FALLBACK_CHANNEL_REASON",
     "FALLBACK_USER_REASON",
     "STALE_AFTER_DISCONNECT_S",
