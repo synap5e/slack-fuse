@@ -225,16 +225,63 @@ async def test_subscribe_from_recent_offset_replays_gap(pg_conn: psycopg.Connect
     assert caught_up.head_offset == 3
 
 
-async def test_subscribe_unknown_stream_returns_stream_not_found(pg_conn: psycopg.Connection[TupleRow]) -> None:
+async def test_subscribe_empty_stream_accepts_live_only(pg_conn: psycopg.Connection[TupleRow]) -> None:
+    """An empty stream + since=0 is a valid live-only subscription. Previously the
+    server rejected with STREAM_NOT_FOUND, which stranded every channel the
+    projector subscribed to before any events landed (a major hole when the
+    channel-list populate discovers channels faster than messages arrive).
+    """
     database_url = _prepare_database(pg_conn)
 
     async with _running_server(database_url) as port, _connect(port) as ws:
-        await ws.send_message(SubscribeFrame(stream="channel:UNKNOWN", since=0).model_dump_json())
+        await ws.send_message(SubscribeFrame(stream="channel:EMPTY", since=0).model_dump_json())
+        frame = await _recv_frame(ws)
+
+    assert isinstance(frame, CaughtUpFrame)
+    assert frame.stream == "channel:EMPTY"
+    assert frame.head_offset == 0
+
+
+async def test_subscribe_empty_stream_delivers_future_events(pg_conn: psycopg.Connection[TupleRow]) -> None:
+    """Subscribing to a stream with no events yet must still receive events when
+    they later arrive — proves the empty-stream sub is a real live subscription,
+    not just an immediate caught-up no-op.
+    """
+    database_url = _prepare_database(pg_conn)
+    stream = "channel:LATE"
+
+    async with _running_server(database_url) as port, _connect(port) as ws:
+        await ws.send_message(SubscribeFrame(stream=stream, since=0).model_dump_json())
+        caught_up = await _recv_frame(ws)
+        assert isinstance(caught_up, CaughtUpFrame)
+        assert caught_up.head_offset == 0
+
+        offset = _append_event(pg_conn, stream, _message("1.000001", "live"))
+        event = await _recv_frame(ws)
+
+    assert isinstance(event, EventFrame)
+    assert event.stream == stream
+    assert event.offset == offset
+    assert event.payload["text"] == "live"
+
+
+async def test_subscribe_empty_stream_with_nonzero_since_returns_since_too_high(
+    pg_conn: psycopg.Connection[TupleRow],
+) -> None:
+    """``since > 0`` on a stream with no events is an inconsistency — the client
+    claims an applied offset that the server has no record of. Surface it as
+    SINCE_TOO_HIGH with head=0 instead of silently dropping the subscription.
+    """
+    database_url = _prepare_database(pg_conn)
+
+    async with _running_server(database_url) as port, _connect(port) as ws:
+        await ws.send_message(SubscribeFrame(stream="channel:EMPTY", since=5).model_dump_json())
         frame = await _recv_frame(ws)
 
     assert isinstance(frame, ErrorFrame)
-    assert frame.code is ErrorCode.STREAM_NOT_FOUND
-    assert frame.stream == "channel:UNKNOWN"
+    assert frame.code is ErrorCode.SINCE_TOO_HIGH
+    assert frame.stream == "channel:EMPTY"
+    assert frame.head_offset == 0
 
 
 async def test_subscribe_since_too_high_returns_head_offset(pg_conn: psycopg.Connection[TupleRow]) -> None:

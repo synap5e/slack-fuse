@@ -215,15 +215,35 @@ class _ConnectionHandler:
             return None
         return message
 
-    async def _handle_subscribe(self, frame: SubscribeFrame) -> None:
+    async def _handle_subscribe(self, frame: SubscribeFrame) -> None:  # noqa: C901  (linear guard chain — head_offset cases + snapshot-redirect + replay)
         if frame.since < 0:
             await self._ws.aclose(1003, "negative since")
             return
 
         head_offset = await self._tailer.get_head_offset(frame.stream)
         if head_offset is None:
-            self._subscriptions.remove(frame.stream)
-            await self._send_frame(ErrorFrame(code=ErrorCode.STREAM_NOT_FOUND, stream=frame.stream))
+            # Empty stream: accept ``since == 0`` as a live-only subscription. The
+            # stream exists conceptually (the client knows about it from
+            # channel-list / channel_added) but has no events yet, so there is
+            # nothing to replay; future events will be delivered via the
+            # NOTIFY-driven live_tail_loop the moment they arrive. Rejecting
+            # these subs (the original behaviour) stranded every channel without
+            # backfilled or live events — a major hole for fresh client mounts
+            # where the projector subscribes to every known channel at startup.
+            #
+            # ``since > 0`` on an empty stream is still an inconsistency (client
+            # claims an applied offset that the server has no record of) — flag
+            # via SINCE_TOO_HIGH with head=0 so the operator can spot mismatched
+            # cursors instead of silently dropping the subscription.
+            if frame.since > 0:
+                self._subscriptions.remove(frame.stream)
+                await self._send_frame(
+                    ErrorFrame(code=ErrorCode.SINCE_TOO_HIGH, stream=frame.stream, head_offset=0)
+                )
+                return
+            _ = self._subscriptions.subscribe(frame.stream, 0)
+            await self._send_frame(CaughtUpFrame(stream=frame.stream, head_offset=0))
+            _ = self._subscriptions.mark_caught_up(frame.stream, 0)
             return
 
         if frame.since > head_offset:
