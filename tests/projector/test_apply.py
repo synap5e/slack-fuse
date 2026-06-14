@@ -455,6 +455,179 @@ def test_channel_member_changed_revalues_tier(client_conn: psycopg.Connection[Tu
     assert _channels(client_conn)[0][2] == "hidden"
 
 
+# === always_blocked override ===
+
+
+def _row(conn: psycopg.Connection[TupleRow], channel_id: str) -> tuple[str, str, bool]:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT tier, tier_source, subscribed FROM channels WHERE channel_id = %s",
+            (channel_id,),
+        )
+        row = cur.fetchone()
+    assert row is not None
+    return (str(row[0]), str(row[1]), bool(row[2]))
+
+
+def test_always_blocked_forces_channel_added_to_blocked_manual(
+    client_conn: psycopg.Connection[TupleRow],
+) -> None:
+    """A channel_added event for an id in always_blocked is pinned to
+    tier=blocked, tier_source=manual, subscribed=FALSE, regardless of what
+    the payload says about is_member/is_archived/etc."""
+    apply_event(
+        client_conn,
+        EventFrame(
+            stream="channel-list",
+            offset=1,
+            kind="channel_added",
+            ts=None,
+            payload=_payload(id="CIGN", name="dev-notification", is_member=True),
+        ),
+        always_blocked=frozenset({"CIGN"}),
+    )
+    assert _row(client_conn, "CIGN") == ("blocked", "manual", False)
+
+
+def test_always_blocked_wins_over_prior_manual_override(
+    client_conn: psycopg.Connection[TupleRow],
+) -> None:
+    """A subsequent channel_added re-blocks a channel an operator had manually
+    promoted via the tier CLI — the config wins over CLI overrides because the
+    config is the canonical, version-controlled source of truth."""
+    # First channel_added: not in always_blocked. Lands as hot/auto.
+    apply_event(
+        client_conn,
+        EventFrame(
+            stream="channel-list",
+            offset=1,
+            kind="channel_added",
+            ts=None,
+            payload=_payload(id="CIGN", name="dev-notification", is_member=True),
+        ),
+    )
+    # Operator runs `slack-fuse tier dev-notification hot` (sets manual hot).
+    with client_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE channels SET tier = 'hot', tier_source = 'manual', subscribed = TRUE "
+            "WHERE channel_id = 'CIGN'"
+        )
+    # Then a re-populate (or live channel_added) arrives. always_blocked now has
+    # this channel id — the override must beat the manual hot.
+    apply_event(
+        client_conn,
+        EventFrame(
+            stream="channel-list",
+            offset=2,
+            kind="channel_added",
+            ts=None,
+            payload=_payload(id="CIGN", name="dev-notification", is_member=True),
+        ),
+        always_blocked=frozenset({"CIGN"}),
+    )
+    assert _row(client_conn, "CIGN") == ("blocked", "manual", False)
+
+
+def test_always_blocked_pins_through_channel_archived(client_conn: psycopg.Connection[TupleRow]) -> None:
+    """channel_archived on an always_blocked channel keeps it pinned (skips the
+    auto-tier reset to hidden)."""
+    apply_event(
+        client_conn,
+        EventFrame(
+            stream="channel-list",
+            offset=1,
+            kind="channel_added",
+            ts=None,
+            payload=_payload(id="CIGN", name="dev-notification", is_member=True),
+        ),
+        always_blocked=frozenset({"CIGN"}),
+    )
+    apply_event(
+        client_conn,
+        EventFrame(
+            stream="channel-list",
+            offset=2,
+            kind="channel_archived",
+            ts=None,
+            payload=_payload(channel_id="CIGN"),
+        ),
+        always_blocked=frozenset({"CIGN"}),
+    )
+    assert _row(client_conn, "CIGN") == ("blocked", "manual", False)
+
+
+def test_always_blocked_pins_through_channel_unarchived(client_conn: psycopg.Connection[TupleRow]) -> None:
+    """channel_unarchived on an always_blocked channel keeps it pinned
+    (skips _reevaluate_auto_tier)."""
+    apply_event(
+        client_conn,
+        EventFrame(
+            stream="channel-list",
+            offset=1,
+            kind="channel_added",
+            ts=None,
+            payload=_payload(id="CIGN", name="old-room", is_member=True, is_archived=True),
+        ),
+        always_blocked=frozenset({"CIGN"}),
+    )
+    apply_event(
+        client_conn,
+        EventFrame(
+            stream="channel-list",
+            offset=2,
+            kind="channel_unarchived",
+            ts=None,
+            payload=_payload(channel_id="CIGN"),
+        ),
+        always_blocked=frozenset({"CIGN"}),
+    )
+    assert _row(client_conn, "CIGN") == ("blocked", "manual", False)
+
+
+def test_always_blocked_pins_through_member_change(client_conn: psycopg.Connection[TupleRow]) -> None:
+    """channel_member_changed on an always_blocked channel keeps it pinned
+    (skips _reevaluate_auto_tier)."""
+    apply_event(
+        client_conn,
+        EventFrame(
+            stream="channel-list",
+            offset=1,
+            kind="channel_added",
+            ts=None,
+            payload=_payload(id="CIGN", name="dev-notification", is_member=False),
+        ),
+        always_blocked=frozenset({"CIGN"}),
+    )
+    apply_event(
+        client_conn,
+        EventFrame(
+            stream="channel-list",
+            offset=2,
+            kind="channel_member_changed",
+            ts=None,
+            payload=_payload(channel_id="CIGN", is_member=True),
+        ),
+        always_blocked=frozenset({"CIGN"}),
+    )
+    assert _row(client_conn, "CIGN") == ("blocked", "manual", False)
+
+
+def test_always_blocked_does_not_affect_other_channels(client_conn: psycopg.Connection[TupleRow]) -> None:
+    """A non-empty always_blocked set leaves channels not in the set alone."""
+    apply_event(
+        client_conn,
+        EventFrame(
+            stream="channel-list",
+            offset=1,
+            kind="channel_added",
+            ts=None,
+            payload=_payload(id="CKEEP", name="general", is_member=True),
+        ),
+        always_blocked=frozenset({"CIGN"}),
+    )
+    assert _row(client_conn, "CKEEP") == ("hot", "auto", True)
+
+
 # === users events ===
 
 

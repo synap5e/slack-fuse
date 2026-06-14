@@ -78,7 +78,7 @@ class WSClientOptions:
 class WSClient:
     """Trio WebSocket subscriber. Routes frames into per-stream appliers."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913  (keyword-only injection points)
         self,
         options: WSClientOptions,
         connection_factory: ConnectionFactory,
@@ -86,6 +86,7 @@ class WSClient:
         *,
         sink: InvalidationSink | None = None,
         http_client: httpx.AsyncClient | None = None,
+        always_blocked: frozenset[str] = frozenset(),
     ) -> None:
         self._options = options
         # Bounded pool the appliers borrow from (review P0-A): ~pool_size
@@ -96,6 +97,7 @@ class WSClient:
         self._state_conn = state_conn
         self._sink: InvalidationSink = sink if sink is not None else NullInvalidationSink()
         self._http: httpx.AsyncClient | None = http_client
+        self._always_blocked = always_blocked
         self._appliers: dict[str, StreamApplier] = {}
         self._ws: trio_websocket.WebSocketConnection | None = None
         self._send_lock = trio.Lock()
@@ -155,7 +157,7 @@ class WSClient:
     def _make_applier(self, stream: str) -> StreamApplier:
         """Construct a `StreamApplier` for `stream`. Test seam: subclasses
         override this to inject a `before_apply` hook (e.g. the HoL test)."""
-        return StreamApplier(stream, self._pool, self._sink)
+        return StreamApplier(stream, self._pool, self._sink, always_blocked=self._always_blocked)
 
     async def _ensure_applier(self, stream: str) -> StreamApplier:
         existing = self._appliers.get(stream)

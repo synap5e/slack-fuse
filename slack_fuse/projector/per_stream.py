@@ -31,6 +31,7 @@ must never silently diverge from the log.
 
 from __future__ import annotations
 
+import functools
 import logging
 import math
 from collections.abc import Awaitable, Callable
@@ -117,7 +118,7 @@ class StreamApplier:
             await applier.close()
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913  (keyword-only config + test-injection knobs)
         self,
         stream: str,
         pool: ConnectionLease,
@@ -125,10 +126,12 @@ class StreamApplier:
         *,
         queue_soft_cap: int = DEFAULT_QUEUE_SOFT_CAP,
         before_apply: Callable[[ProjectorMessage], Awaitable[None]] | None = None,
+        always_blocked: frozenset[str] = frozenset(),
     ) -> None:
         self.stream = stream
         self._pool = pool
         self._sink: InvalidationSink = sink if sink is not None else NullInvalidationSink()
+        self._always_blocked = always_blocked
         # Unbounded queue (P1-E): send_nowait never blocks the WS receive loop.
         self._send, self._receive = trio.open_memory_channel[ProjectorMessage](math.inf)
         self._soft_cap = queue_soft_cap
@@ -196,7 +199,9 @@ class StreamApplier:
     async def _apply_event_frame(self, message: EventFrame) -> None:
         conn = await self._pool.acquire()
         try:
-            result = await trio.to_thread.run_sync(apply_event, conn, message)
+            result = await trio.to_thread.run_sync(
+                functools.partial(apply_event, conn, message, always_blocked=self._always_blocked)
+            )
         except Exception as exc:
             await self._pool.release(conn, discard=True)
             # P1-D: do NOT advance the cursor past a failed offset. Poison the

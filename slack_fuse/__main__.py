@@ -343,6 +343,11 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
         shared_secret=config.shared_secret,
         pool_size=config.projector_pool_size,
     )
+    # Operator-maintained ignore list — every event that could re-tier a
+    # listed channel is forced back to blocked-manual by the projector.
+    always_blocked = frozenset(config.always_blocked_channel_ids)
+    if always_blocked:
+        log.info("always-blocked channels: %s", sorted(always_blocked))
 
     fuse_options: set[str] = {"fsname=slack-fuse", "ro"}
     if args.debug:
@@ -362,7 +367,7 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
         backoff = 2.0
         max_backoff = 300.0
         while True:
-            client = WSClient(ws_options, _open_conn, state_conn, sink=sink)
+            client = WSClient(ws_options, _open_conn, state_conn, sink=sink, always_blocked=always_blocked)
             try:
                 with state_conn.cursor() as cur:
                     cur.execute("SELECT channel_id FROM channels WHERE subscribed = TRUE")

@@ -61,6 +61,18 @@ class ClientConfig(BaseSettings):
     # operator's responsibility (logrotate / cron) — the writer only appends.
     trailer_log_path: Path | None = None
 
+    # Channel IDs the operator never wants surfaced in split mode. The projector
+    # forces ``tier='blocked'``, ``tier_source='manual'``, ``subscribed=FALSE``
+    # on every ``channel_added`` (and re-evaluation) for any id in this list,
+    # regardless of what Slack says about the channel. This wins over the
+    # ``slack-fuse tier <slug>`` CLI: re-ingesting a ``channel_added`` event
+    # for a config-blocked channel re-blocks it. To un-block, remove the id
+    # from this list and restart the mount.
+    #
+    # Use this for "planned ignore" lists that should survive DB resets,
+    # populate re-runs, and backfill discoveries.
+    always_blocked_channel_ids: list[str] = []
+
     @classmethod
     def settings_customise_sources(
         cls,
