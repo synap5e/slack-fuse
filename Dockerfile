@@ -62,6 +62,13 @@ COPY --from=builder --chown=slackfuse:root /app/slack_fuse /app/slack_fuse
 COPY --from=builder --chown=slackfuse:root /app/slack_fuse_render /app/slack_fuse_render
 COPY --from=builder --chown=slackfuse:root /app/slack_fuse_server /app/slack_fuse_server
 
+# slack_fuse.user_cache writes to $HOME/.cache/slack-fuse/users.json — for the
+# slackfuse user that's /app/.cache, which doesn't exist yet (and /app is root-
+# owned so the runtime user can't mkdir it). Pre-create and chown so the
+# user-cache populate at startup can write its snapshot.
+RUN mkdir -p /app/.cache/slack-fuse \
+    && chown -R 10001:root /app/.cache
+
 ENV PATH="/app/.venv/bin:${PATH}" \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
