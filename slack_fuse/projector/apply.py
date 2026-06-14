@@ -499,10 +499,19 @@ def _default_tier(*, is_archived: bool, is_im: bool, is_mpim: bool, is_member: b
     simplification here is `is_im → 'hot'` (treat as live) and `public not
     joined → 'hidden'`. Manual tier override (`tier_source='manual'`) is
     respected by every update path; this function is only called on initial
-    `channel_added`.
+    `channel_added` (or via :func:`_reevaluate_auto_tier` for an auto-source
+    row after `channel_unarchived` / `channel_member_changed`).
+
+    Archived channels default to `hidden` rather than `blocked`: archival is a
+    Slack-side state, not a user signal of "don't want to see this," so the
+    channel stays reachable by known path (and the projector subscribes to its
+    stream so backfilled historical messages can flow). Operators who want
+    archived channels visible in `readdir` can promote with
+    `slack-fuse tier <slug> hot`; operators who want them entirely gone can
+    `slack-fuse tier <slug> blocked` (sticky via `tier_source='manual'`).
     """
     if is_archived:
-        return "blocked"
+        return "hidden"
     if is_im or is_mpim:
         return "hot"
     if is_member:
@@ -579,10 +588,14 @@ def _apply_channel_archived(cur: Cursor[TupleRow], payload: JsonObject) -> Apply
     channel_id = payload.get("channel_id")
     if not isinstance(channel_id, str):
         return ApplyResult()
+    # Auto-source rows: archived → `hidden`, NOT `blocked` (matches
+    # ``_default_tier``'s archived branch). Hidden keeps the channel reachable
+    # by known path and the stream subscribed so any in-flight events drain
+    # cleanly. Manual-source rows keep whatever the operator set.
     cur.execute(
         "UPDATE channels SET is_archived = TRUE, "
-        "  tier = CASE WHEN tier_source = 'auto' THEN 'blocked' ELSE tier END, "
-        "  subscribed = CASE WHEN tier_source = 'auto' THEN FALSE ELSE subscribed END, "
+        "  tier = CASE WHEN tier_source = 'auto' THEN 'hidden' ELSE tier END, "
+        "  subscribed = CASE WHEN tier_source = 'auto' THEN TRUE ELSE subscribed END, "
         "  updated_at = now() "
         "WHERE channel_id = %s",
         (channel_id,),

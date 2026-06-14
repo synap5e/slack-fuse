@@ -303,7 +303,12 @@ def test_channel_added_with_member_uses_hot_tier(client_conn: psycopg.Connection
     assert rows == [("C001", "general", "hot", "auto")]
 
 
-def test_channel_added_archived_is_blocked(client_conn: psycopg.Connection[TupleRow]) -> None:
+def test_channel_added_archived_defaults_to_hidden(client_conn: psycopg.Connection[TupleRow]) -> None:
+    """Archived channels default to `hidden`, not `blocked` — they stay reachable
+    by known path (and the projector keeps subscribed=TRUE so any in-flight
+    historical events drain). Operator can promote with `slack-fuse tier
+    <slug> hot` if they want it listed, or bury with `... blocked`.
+    """
     apply_event(
         client_conn,
         EventFrame(
@@ -315,7 +320,27 @@ def test_channel_added_archived_is_blocked(client_conn: psycopg.Connection[Tuple
         ),
     )
     rows = _channels(client_conn)
-    assert rows == [("C002", "old-room", "blocked", "auto")]
+    assert rows == [("C002", "old-room", "hidden", "auto")]
+
+
+def test_channel_added_archived_stays_subscribed(client_conn: psycopg.Connection[TupleRow]) -> None:
+    """Archived → hidden (not blocked), so `subscribed=TRUE` and the projector
+    keeps consuming the per-channel stream — backfilled history flows in."""
+    apply_event(
+        client_conn,
+        EventFrame(
+            stream="channel-list",
+            offset=1,
+            kind="channel_added",
+            ts=None,
+            payload=_payload(id="C002", name="old-room", is_archived=True),
+        ),
+    )
+    with client_conn.cursor() as cur:
+        cur.execute("SELECT subscribed FROM channels WHERE channel_id = 'C002'")
+        row = cur.fetchone()
+    assert row is not None
+    assert row[0] is True
 
 
 def test_channel_renamed_updates_name(client_conn: psycopg.Connection[TupleRow]) -> None:
@@ -343,7 +368,11 @@ def test_channel_renamed_updates_name(client_conn: psycopg.Connection[TupleRow])
     assert rows[0][:2] == ("C003", "new")
 
 
-def test_channel_archived_demotes_to_blocked_when_auto(client_conn: psycopg.Connection[TupleRow]) -> None:
+def test_channel_archived_demotes_to_hidden_when_auto(client_conn: psycopg.Connection[TupleRow]) -> None:
+    """A live (hot) member channel that Slack archives demotes to `hidden`, not
+    `blocked` — reachable by known path, subscription stays open so any
+    trailing messages still drain. Matches ``_default_tier``'s archived branch.
+    """
     apply_event(
         client_conn,
         EventFrame(
@@ -365,7 +394,12 @@ def test_channel_archived_demotes_to_blocked_when_auto(client_conn: psycopg.Conn
         ),
     )
     rows = _channels(client_conn)
-    assert rows[0][2] == "blocked"
+    assert rows[0][2] == "hidden"
+    with client_conn.cursor() as cur:
+        cur.execute("SELECT subscribed FROM channels WHERE channel_id = 'C004'")
+        row = cur.fetchone()
+    assert row is not None
+    assert row[0] is True
 
 
 def test_channel_archived_respects_manual_tier(client_conn: psycopg.Connection[TupleRow]) -> None:

@@ -986,7 +986,7 @@ separate top-level-vs-reply event kinds:
 | `reaction_added` / `reaction_removed` on a reply | re-render, `UPDATE thread_chunks` |
 | `channel_added` | `INSERT INTO channels` with default tier |
 | `channel_renamed` | `UPDATE channels` |
-| `channel_archived` | `UPDATE channels SET tier = 'blocked'` if `tier_source = 'auto'` |
+| `channel_archived` | `UPDATE channels SET tier = 'hidden'` (and `subscribed = TRUE`) if `tier_source = 'auto'` |
 | `channel_unarchived` | `UPDATE channels` to re-evaluate default tier if `tier_source = 'auto'` |
 | `channel_member_changed` | `UPDATE channels`; re-evaluate default tier if `tier_source = 'auto'` |
 | `user_added` / `user_renamed` / `user_profile_changed` | `UPSERT INTO users`. **All three** trigger the invalidation pass: query `chunk_mentions` + `thread_chunk_mentions` with `mention_kind = 'user' AND mentioned_id = $uid` for affected tuples; `invalidate_inode` on each affected file. `user_added` is critical because of the cross-stream race: a `message` event on a `channel:<id>` stream can arrive (and be projected, and read by FUSE) BEFORE the `user_added` event for a mentioned UID arrives on the `users` stream. The chunk stores the `<@U…>` placeholder either way; the first read renders with the UID-literal fallback and primes the kernel cache; without `user_added` invalidation, the literal would persist forever. Same pattern for `channel_added` / `channel_renamed` with `mention_kind = 'channel'`. **No chunk rewrites required** — chunks store unresolved placeholders, the next read picks up the new display name from `users`/`channels`. |
@@ -1674,7 +1674,15 @@ assigns a default tier based on the channel's properties:
 ```python
 def default_tier(ch: Channel) -> str:
     if ch.is_archived:
-        return 'blocked'
+        # Archived → hidden (not blocked): a Slack-side state, not a user
+        # signal of "don't want to see this". Stays reachable by known path
+        # (so historical/backfilled data is still cat-able) and the projector
+        # keeps the per-channel stream subscribed so any in-flight messages
+        # drain. Operators who want archived channels listed can promote
+        # with `slack-fuse tier <slug> hot`; operators who want them entirely
+        # gone can `slack-fuse tier <slug> blocked` (sticky via
+        # `tier_source='manual'`).
+        return 'hidden'
     if ch.is_im:
         # Replaces the existing _is_dormant_dm filter in store.py.
         if has_any_chunks(ch.channel_id):
@@ -1696,6 +1704,13 @@ show up in `ls ~/views/slack/other-channels/` as a wall of channels you
 don't follow. Proposed: that directory is empty by default; specific
 channels are made visible via `slack-fuse tier <slug> hot`. This is the
 biggest user-visible behavioral change in v1.
+
+**Archived semantics**: legacy mount lists archived channels in their
+parent conv-root. Split mount defaults archived to `hidden` — not
+listed but reachable by known path. Promotion via `slack-fuse tier
+<slug> hot` is the explicit opt-in for visibility. This deliberately
+diverges from legacy to keep `channels/` clean by default; the
+historical data stays accessible to anyone who knows the slug.
 
 ### Manual override CLI
 
