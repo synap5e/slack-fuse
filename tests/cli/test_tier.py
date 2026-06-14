@@ -24,7 +24,14 @@ from psycopg import sql
 from psycopg.rows import TupleRow
 
 import slack_fuse.migrations as client_migrations
-from slack_fuse.cli.tier import TierCommandError, TierName, TierUpdateResult, cmd_tier, set_channel_tier
+from slack_fuse.cli.tier import (
+    TierCommandError,
+    TierName,
+    TierUpdateResult,
+    cmd_tier,
+    reset_channel_tier_to_auto,
+    set_channel_tier,
+)
 from slack_fuse.fuse_v2_helpers import fetch_channel_by_slug
 from slack_fuse.migrations.runner import apply_migrations
 
@@ -289,7 +296,7 @@ def test_cmd_tier_unknown_slug_exits_non_zero(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setenv("SLACK_FUSE_DATABASE_URL", client_database_url)
-    args = argparse.Namespace(slug_or_channel_id="nope", tier="hot")
+    args = argparse.Namespace(slug_or_channel_id="nope", tier="hot", reset_to_auto=False)
 
     with pytest.raises(SystemExit) as exc_info:
         cmd_tier(args)
@@ -298,3 +305,178 @@ def test_cmd_tier_unknown_slug_exits_non_zero(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "Error: unknown channel slug or id: nope" in captured.err
+
+
+# ----------------------------------------------------------------------
+# --reset-to-auto
+# ----------------------------------------------------------------------
+
+
+def test_reset_to_auto_recomputes_member_channel_to_hot(client_database_url: str) -> None:
+    """A member channel manually buried to 'blocked' resets back to 'hot' (the
+    default-tier output for is_member=True / is_archived=False) when the
+    operator runs `--reset-to-auto`. tier_source flips back to 'auto'."""
+    conn = _connect(client_database_url)
+    try:
+        _insert_channel(
+            conn,
+            _ChannelSeed(
+                channel_id="C400",
+                name="ops",
+                tier="blocked",
+                tier_source="manual",
+                subscribed=False,
+                is_member=True,
+            ),
+        )
+
+        result = reset_channel_tier_to_auto(
+            database_url=client_database_url,
+            slug_or_channel_id="C400",
+        )
+
+        assert result == TierUpdateResult(
+            channel_id="C400", tier="hot", changed=True, tier_source="auto"
+        )
+        assert _channel_row(conn, "C400")[:3] == ("hot", "auto", True)
+    finally:
+        conn.close()
+
+
+def test_reset_to_auto_archived_channel_recomputes_to_hidden(client_database_url: str) -> None:
+    """An archived channel manually promoted to 'hot' resets to 'hidden' (the
+    archived default after B1) and subscribed stays TRUE."""
+    conn = _connect(client_database_url)
+    try:
+        _insert_channel(
+            conn,
+            _ChannelSeed(
+                channel_id="C401",
+                name="old-project",
+                tier="hot",
+                tier_source="manual",
+                subscribed=True,
+                is_member=True,
+                is_archived=True,
+            ),
+        )
+
+        result = reset_channel_tier_to_auto(
+            database_url=client_database_url,
+            slug_or_channel_id="C401",
+        )
+
+        assert result == TierUpdateResult(
+            channel_id="C401", tier="hidden", changed=True, tier_source="auto"
+        )
+        assert _channel_row(conn, "C401")[:3] == ("hidden", "auto", True)
+    finally:
+        conn.close()
+
+
+def test_reset_to_auto_noop_when_already_auto_and_matching(client_database_url: str) -> None:
+    """If the row is already auto AND the current tier already matches what
+    _default_tier would compute, no write happens (xmin unchanged)."""
+    conn = _connect(client_database_url)
+    try:
+        _insert_channel(
+            conn,
+            _ChannelSeed(
+                channel_id="C402",
+                name="general",
+                tier="hot",
+                tier_source="auto",
+                subscribed=True,
+                is_member=True,
+            ),
+        )
+        before_xmin = _channel_row(conn, "C402")[3]
+
+        result = reset_channel_tier_to_auto(
+            database_url=client_database_url,
+            slug_or_channel_id="C402",
+        )
+
+        after_row = _channel_row(conn, "C402")
+        assert result == TierUpdateResult(
+            channel_id="C402", tier="hot", changed=False, tier_source="auto"
+        )
+        assert after_row[:3] == ("hot", "auto", True)
+        assert after_row[3] == before_xmin  # xmin proves no write
+    finally:
+        conn.close()
+
+
+def test_reset_to_auto_unknown_slug_raises_not_found(client_database_url: str) -> None:
+    with pytest.raises(TierCommandError, match="unknown channel slug or id: missing-room") as exc_info:
+        reset_channel_tier_to_auto(
+            database_url=client_database_url,
+            slug_or_channel_id="missing-room",
+        )
+    assert exc_info.value.exit_code == 2
+
+
+def test_cmd_tier_reset_to_auto_via_cli(
+    client_database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """End-to-end through cmd_tier: --reset-to-auto with no tier arg flips the
+    row back to auto and prints the resulting tier."""
+    monkeypatch.setenv("SLACK_FUSE_DATABASE_URL", client_database_url)
+    conn = _connect(client_database_url)
+    try:
+        _insert_channel(
+            conn,
+            _ChannelSeed(
+                channel_id="C500",
+                name="ops",
+                tier="blocked",
+                tier_source="manual",
+                subscribed=False,
+                is_member=True,
+            ),
+        )
+    finally:
+        conn.close()
+
+    args = argparse.Namespace(slug_or_channel_id="C500", tier=None, reset_to_auto=True)
+    cmd_tier(args)
+
+    captured = capsys.readouterr()
+    assert "C500: tier set to hot (tier_source=auto)" in captured.out
+    assert captured.err == ""
+
+
+def test_cmd_tier_reset_with_tier_arg_is_rejected(
+    client_database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Combining --reset-to-auto with a tier argument is a CLI usage error."""
+    monkeypatch.setenv("SLACK_FUSE_DATABASE_URL", client_database_url)
+    args = argparse.Namespace(slug_or_channel_id="anything", tier="hot", reset_to_auto=True)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_tier(args)
+
+    assert exc_info.value.code == 2
+    captured = capsys.readouterr()
+    assert "cannot be combined with a tier value" in captured.err
+
+
+def test_cmd_tier_missing_tier_without_reset_flag_is_rejected(
+    client_database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Without --reset-to-auto, the positional tier is required."""
+    monkeypatch.setenv("SLACK_FUSE_DATABASE_URL", client_database_url)
+    args = argparse.Namespace(slug_or_channel_id="anything", tier=None, reset_to_auto=False)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_tier(args)
+
+    assert exc_info.value.code == 2
+    captured = capsys.readouterr()
+    assert "tier is required unless --reset-to-auto is set" in captured.err
