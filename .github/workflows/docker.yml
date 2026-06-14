@@ -10,6 +10,14 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
+    paths:
+      - Dockerfile
+      - pyproject.toml
+      - uv.lock
+      - slack_fuse/**
+      - slack_fuse_render/**
+      - slack_fuse_server/**
+      - .github/workflows/docker.yml
   workflow_dispatch: {}
   pull_request:
     branches: [main]
