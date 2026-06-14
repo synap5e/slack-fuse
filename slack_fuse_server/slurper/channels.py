@@ -110,3 +110,41 @@ async def populate_channels_once(writer: OffsetWriter, client: SlackClient) -> N
         inserted,
         total - inserted,
     )
+
+
+def _ensure_channel_added_sync(writer: OffsetWriter, client: SlackClient, channel_id: str) -> bool:
+    """Synchronous body of :func:`ensure_channel_added`. Returns True if a new
+    event was inserted, False if one already existed (idempotent re-run).
+
+    Raises ``SlackAPIError`` if ``conversations.info`` rejects the channel —
+    the caller (admin backfill flow) should refuse to proceed because there's
+    no safe way to project events for a channel the server can't even describe.
+    """
+    with writer.conn.transaction(), writer.conn.cursor() as cur:
+        _lock_channel_list_stream(cur)
+        if channel_id in _existing_channel_added_ids(cur):
+            return False
+        # No prior channel_added event — fetch current channel metadata so the
+        # synthetic event mirrors the live socket-mode shape exactly.
+        channel = client.get_channel_info(channel_id)
+        _ = _insert_channel_added(cur, channel)
+        return True
+
+
+async def ensure_channel_added(writer: OffsetWriter, client: SlackClient, channel_id: str) -> bool:
+    """Guarantee that ``channel-list`` has a ``channel_added`` event for
+    ``channel_id`` before any per-channel events are written.
+
+    Used by the admin backfill path so that legacy-cache imports (or any other
+    source that names a channel directly) bring the channel under the
+    projector's normal subscription/tier model. Without this, backfilled events
+    land on a ``channel:<id>`` stream the projector has no row for in its
+    ``channels`` table, so it never subscribes and the events are orphaned on
+    the server forever.
+
+    Returns True if a new event was inserted, False if one already existed.
+    """
+    return await trio.to_thread.run_sync(
+        lambda: _ensure_channel_added_sync(writer, client, channel_id),
+        limiter=writer.limiter,
+    )

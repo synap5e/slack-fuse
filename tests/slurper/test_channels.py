@@ -7,13 +7,15 @@ from typing import cast
 
 import httpx
 import psycopg
+import pytest
 import trio
 from psycopg.rows import TupleRow
 
-from slack_fuse_server.slurper.api import SlackClient
-from slack_fuse_server.slurper.channels import populate_channels_once
+from slack_fuse_server.slurper.api import SlackAPIError, SlackClient
+from slack_fuse_server.slurper.channels import ensure_channel_added, populate_channels_once
 from slack_fuse_server.slurper.offsets import OffsetWriter
 from slack_fuse_server.slurper.socket import _channel_added_write
+from tests._fake_slack import make_fake_slack_transport
 
 
 def _make_client(http: httpx.Client) -> SlackClient:
@@ -106,3 +108,86 @@ def test_populate_payload_matches_live_socket_mode_shape(
         assert live_record.kind == "channel_added"
         assert live_record.stream == "channel-list"
         assert populated[channel.id] == live_record.payload
+
+
+# ----------------------------------------------------------------------
+# ensure_channel_added — pre-backfill channel discovery
+# ----------------------------------------------------------------------
+
+
+def test_ensure_channel_added_emits_when_channel_not_previously_seen(
+    server_conn: psycopg.Connection[TupleRow],
+    fake_slack_http: httpx.Client,
+) -> None:
+    """Fresh server: no prior channel_added events. ensure_channel_added calls
+    conversations.info, writes the synthetic event, returns True.
+    """
+    writer = OffsetWriter(server_conn, trio.CapacityLimiter(1))
+    client = _make_client(fake_slack_http)
+
+    emitted = trio.run(ensure_channel_added, writer, client, "C0001")
+
+    assert emitted is True
+    rows = _channel_rows(server_conn)
+    assert len(rows) == 1
+    _, kind, payload = rows[0]
+    assert kind == "channel_added"
+    assert isinstance(payload, dict)
+    payload_dict = cast(dict[str, object], payload)
+    assert payload_dict["id"] == "C0001"
+
+
+def test_ensure_channel_added_is_idempotent_on_repeat(
+    server_conn: psycopg.Connection[TupleRow],
+    fake_slack_http: httpx.Client,
+) -> None:
+    """Second call sees the existing event and returns False without writing."""
+    writer = OffsetWriter(server_conn, trio.CapacityLimiter(1))
+    client = _make_client(fake_slack_http)
+
+    first = trio.run(ensure_channel_added, writer, client, "C0001")
+    second = trio.run(ensure_channel_added, writer, client, "C0001")
+
+    assert first is True
+    assert second is False
+    assert len(_channel_rows(server_conn)) == 1
+
+
+def test_ensure_channel_added_is_noop_after_populate(
+    server_conn: psycopg.Connection[TupleRow],
+    fake_slack_http: httpx.Client,
+) -> None:
+    """If `populate_channels_once` has already emitted channel_added for this
+    channel, ensure_channel_added detects it and skips the conversations.info
+    call. (Exercises the same dedup path as repeat ensure_channel_added.)"""
+    writer = OffsetWriter(server_conn, trio.CapacityLimiter(1))
+    client = _make_client(fake_slack_http)
+
+    trio.run(populate_channels_once, writer, client)
+    before_offset = _channel_list_next_offset(server_conn)
+
+    emitted = trio.run(ensure_channel_added, writer, client, "C0001")
+
+    assert emitted is False
+    assert _channel_list_next_offset(server_conn) == before_offset
+
+
+def test_ensure_channel_added_raises_on_unknown_channel(
+    server_conn: psycopg.Connection[TupleRow],
+) -> None:
+    """conversations.info ok=false → SlackAPIError. The admin backfill flow
+    surfaces this and refuses to write per-channel events for a channel the
+    server can't describe."""
+    transport = make_fake_slack_transport(
+        overrides={"conversations.info": {"ok": False, "error": "channel_not_found"}}
+    )
+    http_client = httpx.Client(transport=transport, base_url="https://slack.com/api")
+    client = SlackClient("xoxp-test")
+    client._http = http_client
+    writer = OffsetWriter(server_conn, trio.CapacityLimiter(1))
+
+    with pytest.raises(SlackAPIError):
+        _ = trio.run(ensure_channel_added, writer, client, "C-GONE")
+
+    # No row was written.
+    assert _channel_rows(server_conn) == []

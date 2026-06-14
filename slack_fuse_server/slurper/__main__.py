@@ -43,8 +43,8 @@ from slack_fuse_server.config import ServerConfig, load_server_config
 from slack_fuse_server.dispatch import serve_dispatch
 from slack_fuse_server.http.handlers import ResolvePermalinkDeps, SnapshotDeps
 from slack_fuse_server.http.metrics import MetricsAggregator, SubscriberSnapshot
-from slack_fuse_server.slurper.api import SlackClient
-from slack_fuse_server.slurper.channels import populate_channels_once
+from slack_fuse_server.slurper.api import SlackAPIError, SlackClient
+from slack_fuse_server.slurper.channels import ensure_channel_added, populate_channels_once
 from slack_fuse_server.slurper.health import HealthEmitter
 from slack_fuse_server.slurper.offsets import OffsetWriter
 from slack_fuse_server.slurper.socket import SocketModeOptions, SocketModeStatus
@@ -314,18 +314,32 @@ async def _run_backfill(
     limiter = trio.CapacityLimiter(1)
     writer = OffsetWriter(conn, limiter)
     health = HealthEmitter(writer)
-    client: SlackClient | None = None
-    if source == "slack-api":
-        client = SlackClient(config.slack_user_token)
+    # The SlackClient is required for `slack-api` source (history fetch) AND for
+    # every source so we can call `conversations.info` to emit a synthetic
+    # `channel_added` event before any per-channel writes. Without this, a
+    # backfill on a channel the slurper's startup populate never saw (e.g.
+    # archived → excluded by populate; or "channel I joined while server was
+    # down") writes events on a `channel:<id>` stream the client projector has
+    # no row for in its `channels` table, never subscribes, and orphans them.
+    client = SlackClient(config.slack_user_token)
     backfiller = _make_backfiller(source, client=client, limiter=limiter, config=config)
 
     abort_at = _resolve_abort_at(conn, channel_id, config, allow_large=allow_large, max_messages=max_messages)
     ctx = BackfillContext(writer=writer, health=health, warn_at=config.backfill_warn_at, abort_at=abort_at)
     try:
+        # Bring the channel under the projector's normal model BEFORE we write
+        # any per-channel events. Refuses the backfill if conversations.info
+        # rejects the channel — better to fail loud than orphan events.
+        try:
+            emitted = await ensure_channel_added(writer, client, channel_id)
+        except SlackAPIError as exc:
+            log.error("backfill: cannot establish channel_added for %s: %s", channel_id, exc)
+            raise
+        if emitted:
+            log.info("backfill: emitted synthetic channel_added for %s", channel_id)
         result = await backfill_channel(backfiller, ChannelId(channel_id), ctx)
     finally:
-        if client is not None:
-            client.close()
+        client.close()
         conn.close()
 
     status = "ABORTED" if result.aborted else "completed"
