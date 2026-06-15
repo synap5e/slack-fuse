@@ -152,15 +152,30 @@ async def watch_health(  # noqa: PLR0913  (keyword-only polling/test tuning knob
     production spawns this under the FUSE-mount nursery and lets the main
     scope cancel it on shutdown.
     """
-    last = read_signature(conn, now=now_fn(), stale_after_s=stale_after_s)
+    try:
+        last = read_signature(conn, now=now_fn(), stale_after_s=stale_after_s)
+    except Exception as exc:
+        # If the baseline read fails on an already-dead conn, raise to the
+        # supervisor; warn-and-continue with no baseline would never detect a
+        # real change.
+        msg = "health_subscriber: baseline read failed; raising to supervisor"
+        raise RuntimeError(msg) from exc
     log.info("health_subscriber: started; baseline signature=%s", last)
     iter_count = 0
     while True:
         await trio.sleep(poll_interval_s)
         try:
             current = read_signature(conn, now=now_fn(), stale_after_s=stale_after_s)
-        except Exception as exc:  # noqa: BLE001  (subscriber must not die on bursty DB)
+        except Exception as exc:
             log.warning("health_subscriber: signature read failed: %s", exc)
+            # If the connection itself died, the per-iteration warning would
+            # spin forever (the connection won't recover on its own). Surface
+            # to the supervisor so it can rebuild with a fresh conn. Any other
+            # transient error (single failed query, lock timeout, etc.) keeps
+            # the warn-and-continue contract.
+            if conn.closed:
+                msg = "health_subscriber: connection closed; raising to supervisor"
+                raise RuntimeError(msg) from exc
         else:
             if current != last:
                 log.info("health_subscriber: state change detected, firing invalidator")

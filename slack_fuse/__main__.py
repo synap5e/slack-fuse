@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-import functools
+import contextlib
 import logging
 import os
 import signal
@@ -313,8 +313,9 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
     # One connection per concurrent consumer; sharing a psycopg connection
     # across the FUSE callbacks (worker threads), the health poll loop, the
     # projector bookkeeping, and the invalidation sink would race.
+    # (health subscriber opens its own conn inside `_run_health_subscriber`
+    # so we can reconnect cleanly after a closed-connection event.)
     fuse_conn = _open_conn()
-    health_conn = _open_conn()
     state_conn = _open_conn()
     sink_conn = _open_conn()
 
@@ -383,16 +384,38 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
                 backoff = 2.0
                 await trio.sleep(1.0)
 
-    async def _run() -> None:
-        async with trio.open_nursery() as nursery:
-            nursery.start_soon(
-                functools.partial(
-                    watch_health,
-                    health_conn,
+    async def _run_health_subscriber() -> None:
+        """Supervised wrapper around ``watch_health``.
+
+        ``watch_health`` raises on a closed connection (the inner conn can't
+        self-heal). On any exit we close the broken conn, sleep with backoff,
+        reopen a fresh conn, and resume. Mirrors the ``_run_projector`` pattern.
+        """
+        backoff = 2.0
+        max_backoff = 60.0
+        while True:
+            conn = _open_conn()
+            try:
+                await watch_health(
+                    conn,
                     ops.invalidate_all_primed,
                     stale_after_s=config.stale_after_disconnect_s,
                 )
-            )
+            except Exception as exc:  # noqa: BLE001 — supervisor must outlive any DB blip
+                log.warning("health_subscriber exited (%s); reconnecting in %.0fs", exc, backoff)
+                await trio.sleep(backoff)
+                backoff = min(backoff * 2, max_backoff)
+            else:
+                # Clean exit (iterations cap hit during a test, etc.) — retry promptly.
+                backoff = 2.0
+                await trio.sleep(1.0)
+            finally:
+                with contextlib.suppress(Exception):
+                    conn.close()
+
+    async def _run() -> None:
+        async with trio.open_nursery() as nursery:
+            nursery.start_soon(_run_health_subscriber)
             nursery.start_soon(_run_projector)
             await pyfuse3.main()
             nursery.cancel_scope.cancel()
@@ -404,7 +427,6 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
     finally:
         pyfuse3.close()
         fuse_conn.close()
-        health_conn.close()
         state_conn.close()
         sink_conn.close()
         if trailer_log is not None:

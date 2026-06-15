@@ -99,3 +99,51 @@ def test_signature_is_frozen_dataclass(client_conn: Connection[TupleRow]) -> Non
     assert isinstance(sig, HealthSignature)
     with pytest.raises((AttributeError, Exception)):
         sig.caught_up_count = 99  # pyright: ignore[reportAttributeAccessIssue]
+
+
+@pytest.mark.trio
+async def test_watch_health_raises_when_connection_closes_mid_loop(
+    client_conn: Connection[TupleRow],
+) -> None:
+    """Regression: a 2026-06-15 incident left the projector running with a
+    closed health_conn, hot-spinning on 'the connection is closed' warnings
+    for hours without surfacing the failure. The fix is: raise on a closed
+    conn so the outer supervisor reopens with a fresh conn.
+
+    Reproduce the prod scenario: connection alive at baseline, then closes
+    during the poll loop. watch_health must surface the failure.
+    """
+
+    async def closer() -> None:
+        # Let watch_health take its baseline, then close the conn so the
+        # next read fails with "the connection is closed".
+        await trio.sleep(0.005)
+        client_conn.close()
+
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(closer)
+        with pytest.raises(RuntimeError, match="connection closed"):
+            await watch_health(
+                client_conn,
+                lambda: 0,
+                poll_interval_s=0.001,
+                iterations=20,  # plenty of room for the closer to fire
+            )
+
+
+@pytest.mark.trio
+async def test_watch_health_raises_when_connection_closed_before_baseline(
+    client_conn: Connection[TupleRow],
+) -> None:
+    """If the conn is already dead before the baseline read, watch_health
+    must raise (the supervisor reopens). Warn-and-continue with no baseline
+    would never detect a real change anyway.
+    """
+    client_conn.close()
+    with pytest.raises(RuntimeError, match="baseline read failed"):
+        await watch_health(
+            client_conn,
+            lambda: 0,
+            poll_interval_s=0.001,
+            iterations=1,
+        )
