@@ -148,7 +148,7 @@ class SlackApiBackfiller:
         while True:
             if page > 0:
                 await trio.sleep(random.uniform(self._sleeps.page_min_s, self._sleeps.page_max_s))
-            resp = await self._history_page(channel_id, cursor)
+            resp = await self._history_page(channel_id, cursor, oldest=since_ts)
             if resp is None:  # rate-limited; _history_page already slept — retry same cursor
                 continue
             for msg in reversed(resp.messages):
@@ -180,10 +180,16 @@ class SlackApiBackfiller:
                 if _passes_since(reply.ts, since_ts):
                     yield reply
 
-    async def _history_page(self, channel_id: str, cursor: str) -> ConversationsHistoryResponse | None:
+    async def _history_page(
+        self,
+        channel_id: str,
+        cursor: str,
+        oldest: float | None = None,
+    ) -> ConversationsHistoryResponse | None:
         try:
             return await trio.to_thread.run_sync(
-                lambda: self._client.get_history_page(channel_id, cursor), limiter=self._limiter
+                lambda: self._client.get_history_page(channel_id, cursor, oldest),
+                limiter=self._limiter,
             )
         except RateLimitedError as exc:
             await _sleep_rate_limited(exc.retry_after)

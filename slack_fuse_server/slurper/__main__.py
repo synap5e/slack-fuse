@@ -302,7 +302,7 @@ async def _auto_backfill(
 # === Backfill (admin) mode ===
 
 
-async def _run_backfill(
+async def _run_backfill(  # noqa: PLR0913 — thin CLI thunk; bundling into options dataclass adds more noise than it saves
     config: ServerConfig,
     channel_id: str,
     *,

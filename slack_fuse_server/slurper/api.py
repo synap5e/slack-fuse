@@ -222,14 +222,24 @@ class SlackClient:
         self,
         channel_id: str,
         cursor: str = "",
+        oldest: float | None = None,
     ) -> ConversationsHistoryResponse:
-        """Fetch a single page of conversation history (used by backfill)."""
+        """Fetch a single page of conversation history (used by backfill).
+
+        `oldest` (Slack's API parameter name) is the inclusive lower bound on
+        ts. Setting it tells Slack to skip messages older than the cutoff
+        before paging starts, which is critical for gap-fill efficiency: a
+        24-hour-old `--since` against a 2-year-old channel should be one
+        page of API spend, not 30.
+        """
         params: dict[str, str] = {
             "channel": channel_id,
             "limit": "200",
         }
         if cursor:
             params["cursor"] = cursor
+        if oldest is not None:
+            params["oldest"] = f"{oldest:.6f}"
         return self._get("conversations.history", params, ConversationsHistoryResponse)
 
     def get_replies(self, channel_id: str, thread_ts: str) -> Thread:
