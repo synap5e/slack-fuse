@@ -148,6 +148,59 @@ external policy (like `always_blocked_channel_ids`).
 
 ---
 
+### FUSE mount can be wedged by any single slow callback
+
+**Discovered**: 2026-06-15. After a cluster rollout + DM backfill landed a
+burst of projector writes, `cat /views/slack-split/dms/luke/channel.md`
+went into D-state and never returned. A follow-up `head` on the same
+file also D-stated on the same `folio_wait_bit_common` wchan. Mount was
+unrecoverable without `fusermount3 -uz` + service restart.
+
+**Root cause (architectural, not the trigger)**: `cmd_mount_split` in
+`slack_fuse/__main__.py:323` creates a `CapacityLimiter(1)` and shares it
+across every FUSE callback (`getattr`, `lookup`, `readdir`, `opendir`,
+`open`, `read` in `fuse_ops_v2.py`). The limiter exists because all FUSE
+work runs on a single shared `psycopg` connection (`fuse_conn`) which
+isn't thread-safe. Capacity 1 = strictly serial. Any callback that
+takes a long time (PG query stalled behind WAL fsyncs during heavy
+projector writes, swap stall on the daemon process, etc.) holds the
+slot; every subsequent FUSE upcall queues behind it. The kernel pages
+allocated for queued reads stay locked → callers go D-state → mount
+looks dead from outside.
+
+A read of `channel.md` during heavy projector activity is exactly the
+trigger shape that exposes this: render walks `chunks` + `thread_chunks`
++ `chunk_mentions`, all heavily contended by the projector's UPSERT
+storm at that moment.
+
+**Fix candidates** (ranked by invasiveness):
+
+1. **Pool the FUSE-side PG connections**, drop the limiter (or raise it
+   to match the pool). Each callback borrows a connection from a small
+   pool (size 4–8), runs its read, returns it. One slow callback no
+   longer blocks the others.
+2. **Timeout the FUSE callbacks** (Slack convention: 30s+). Failing
+   callbacks return EIO instead of D-stating the kernel forever.
+   Defense-in-depth even after #1; without it, a *truly* stuck callback
+   still wedges its own caller (just not the mount).
+3. **Cap concurrent in-flight callbacks** to a number larger than 1 but
+   smaller than infinity, so a stuck-callback storm can't exhaust the
+   process. ~equivalent to #1 with pool size = cap.
+4. **Move FUSE I/O to async psycopg** so a single conn can serve
+   concurrent callbacks. Bigger change; only worth it if #1 isn't
+   enough.
+
+**Recommendation**: #1 + #2. Pool of 4 connections + 30s timeout. ~50
+lines. Removes the structural fragility without rewriting the I/O model.
+
+**Why this is the most important open BACKLOG item**: the other
+findings are correctness/cleanliness with no user-visible failure mode
+under normal operation. This one can take the mount down on a normal
+read during normal load — and the recovery requires the operator to
+know about `fusermount3 -uz`.
+
+---
+
 ### ~~Projector stalls indefinitely when WS connection drops mid-run~~ (fixed `758274b`)
 
 **Discovered**: 2026-06-15 while measuring projection rate post-gap-fill.
