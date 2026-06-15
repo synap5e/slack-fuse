@@ -115,7 +115,10 @@ def test_backfill_channel_aborts_at_threshold(server_conn: psycopg.Connection[Tu
     # Stops after abort_at messages — only the truncated head is written.
     assert result.messages == 3
     assert _events_count(server_conn, "channel:CBIG") == 3
-    assert _health_kinds(server_conn) == ["backfill_started", "slack_degraded", "backfill_aborted"]
+    # warn_at triggers a per-channel BACKFILL_WARN_LARGE (not SLACK_DEGRADED —
+    # one channel hitting its size cap is observability, not a global
+    # ingestion-health signal; see BACKLOG entry on health hysteresis).
+    assert _health_kinds(server_conn) == ["backfill_started", "backfill_warn_large", "backfill_aborted"]
 
 
 def _health_rows(conn: psycopg.Connection[TupleRow]) -> list[tuple[str, object]]:

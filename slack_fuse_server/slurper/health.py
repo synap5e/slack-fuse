@@ -32,7 +32,19 @@ _HEALTH_STREAM = "slurper-health"
 
 
 class HealthKind(StrEnum):
-    """The allowed `slurper-health` event kinds (RFC §Slurper health stream)."""
+    """The allowed `slurper-health` event kinds (RFC §Slurper health stream).
+
+    Global-health kinds (drive ``connection_state.last_slurper_health`` on
+    the client and the FUSE staleness trailer):
+    ``SLACK_HEALTHY``, ``SLACK_DEGRADED``, ``SOCKET_MODE_DISCONNECTED``,
+    ``SOCKET_MODE_RECONNECTED``, ``AUTH_TOKEN_INVALID``.
+
+    Per-channel kinds (observability only; never affect the global trailer
+    state, because one channel hitting a backfill size cap is not a workspace
+    ingestion-health concern):
+    ``BACKFILL_STARTED``, ``BACKFILL_PROGRESS``, ``BACKFILL_COMPLETED``,
+    ``BACKFILL_ABORTED``, ``BACKFILL_WARN_LARGE``.
+    """
 
     SLACK_HEALTHY = "slack_healthy"
     SLACK_DEGRADED = "slack_degraded"
@@ -43,6 +55,7 @@ class HealthKind(StrEnum):
     BACKFILL_PROGRESS = "backfill_progress"
     BACKFILL_COMPLETED = "backfill_completed"
     BACKFILL_ABORTED = "backfill_aborted"
+    BACKFILL_WARN_LARGE = "backfill_warn_large"
 
 
 class HealthEmitter:

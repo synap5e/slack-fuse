@@ -229,10 +229,12 @@ async def backfill_channel(
 ) -> BackfillResult:
     """Drive one channel's backfill: write `message` events, honour thresholds.
 
-    Emits the `backfill_started` / `slack_degraded(backfill_large)` /
+    Emits the `backfill_started` / `backfill_warn_large{channel_id}` /
     `backfill_progress{channel_id, messages_so_far}` (every `ctx.progress_every`
     messages) / `backfill_completed` / `backfill_aborted` health events around
-    the run. `/metrics` reads the latest `backfill_progress` payload to populate
+    the run. All five are per-channel observability and do NOT affect the
+    client's global ingestion-health state — see `HealthKind` for the split.
+    `/metrics` reads the latest `backfill_progress` payload to populate
     `in_progress.messages_so_far`.
     """
     cid = channel_id.value
@@ -253,7 +255,11 @@ async def backfill_channel(
             messages += 1
             if not warned and messages >= ctx.warn_at:
                 warned = True
-                await ctx.health.emit(HealthKind.SLACK_DEGRADED, {"reason": "backfill_large", "channel_id": cid})
+                # Per-channel size warning; doesn't affect global slurper health.
+                # (Previously emitted SLACK_DEGRADED here, which flipped the
+                # workspace-wide trailer for hours after a single large
+                # backfill — see BACKLOG entry on health hysteresis.)
+                await ctx.health.emit(HealthKind.BACKFILL_WARN_LARGE, {"channel_id": cid})
             if ctx.progress_every > 0 and messages % ctx.progress_every == 0:
                 await ctx.health.emit(HealthKind.BACKFILL_PROGRESS, {"channel_id": cid, "messages_so_far": messages})
             record = EventRecord(
