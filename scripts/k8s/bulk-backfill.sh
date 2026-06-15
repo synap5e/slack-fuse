@@ -82,11 +82,14 @@ if [ "$GAP_FILL" -eq 1 ]; then
     ALREADY=""
 else
     # Initial bulk mode: candidates = legacy-cache directories.
+    # Channel ID prefixes: C = public/private, D = direct message,
+    # G = group DM. The original C-only filter silently dropped 48 DMs
+    # on the 2026-06-15 bulk run; the regex now covers all three.
     if [ ! -d "$CACHE_DIR" ]; then
         echo "no cache dir at $CACHE_DIR" >&2
         exit 1
     fi
-    CANDIDATES=$(ls "$CACHE_DIR" | grep -E '^C[A-Z0-9]{10}$' | sort -u)
+    CANDIDATES=$(ls "$CACHE_DIR" | grep -E '^[CDG][A-Z0-9]{10}$' | sort -u)
     TOTAL=$(echo "$CANDIDATES" | wc -l)
     echo "Cache holds $TOTAL channel directories"
 
