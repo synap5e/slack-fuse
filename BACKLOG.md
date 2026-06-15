@@ -50,14 +50,42 @@ stream; consumers needing names must derive them via JSON queries.
 `SELECT DISTINCT ON (payload->>'id') ... FROM events WHERE stream='channel-list' ORDER BY id DESC`
 instead of a clean join. Works but ugly and slower as event count grows.
 
-**Fix**: have the slurper UPSERT into `channels` whenever it emits a
-`channel_added` / `channel_renamed` / `channel_archived` / `channel_member_changed`
-event, mirroring how the client-side projector maintains its `channels`
-table. ~30 lines of code, no schema change needed.
+**Fix (recommended)**: replace the empty table with a regular `VIEW`
+backed by the events log:
+
+```sql
+DROP TABLE channels;
+CREATE VIEW channels AS
+  SELECT DISTINCT ON (payload->>'id')
+    payload->>'id'         AS channel_id,
+    payload->>'name'       AS name,
+    (payload->>'is_im')::boolean    AS is_im,
+    (payload->>'is_mpim')::boolean  AS is_mpim,
+    (payload->>'is_member')::boolean AS is_member,
+    -- … other columns …
+  FROM events
+  WHERE stream = 'channel-list'
+    AND kind IN ('channel_added', 'channel_renamed', 'channel_archived', 'channel_unarchived')
+    AND payload ? 'id'
+  ORDER BY payload->>'id', id DESC;
+```
+
+The view is always fresh, has zero dual-write risk, and tooling can
+`JOIN channels USING (channel_id)` like a normal table.
+
+**Alternatives considered**:
+- *UPSERT into the table from the slurper write path* — rejected: that's a
+  dual-write (event + side-effect mutation in the same module). Same
+  failure modes as any non-atomic write pair.
+- *Separate server-side projector task* (mirroring the client projector):
+  architecturally correct, more code; promote to this if `channels` ever
+  needs to be on a hot read path.
+- *Materialized view with scheduled REFRESH*: pragmatic if the VIEW gets
+  too slow, but for ~400 channels the live query is fast.
 
 ---
 
-### Live-events gap between legacy-cache cutoff and Socket Mode start
+### ~~Live-events gap between legacy-cache cutoff and Socket Mode start~~ (fixed `f6119a8` + bulk-backfill run)
 
 **Discovered**: 2026-06-15 during projection-coverage check.
 
@@ -65,22 +93,67 @@ table. ~30 lines of code, no schema change needed.
 ranges from 2026-05-08 to 2026-06-09; cluster Socket Mode first delivered
 events at 2026-06-14 22:31 (after Event Subscriptions were enabled in the
 Slack app config). Messages posted in the gap window — up to ~5 weeks for
-some channels — are missing from both sources.
+some channels — were missing from both sources.
 
-**Fix**: expose `--since TS` on `scripts/k8s/backfill-job.sh` (both
-backfillers already accept `since_ts`), then per-channel:
+**Fix landed**: `--since EPOCH` wired through the slurper CLI, plus a
+`--gap-fill` mode on `scripts/k8s/bulk-backfill.sh` that computes the
+per-channel `since` from cluster `max(ts)` and runs slack-api backfills.
+Bug along the way: the slurper was only filtering yielded messages and
+not passing `oldest=` to Slack, so a 1-day gap against a 2-year channel
+would repaginate the whole history; fixed in `f6119a8`.
 
+**Backfill result**: 22,264 messages caught across 352 channels (~0.8%
+of channels failed with `channel_not_found` — same root cause as item 1).
+
+**Forward operational practice**: any new gap (slurper outage, network
+blip wider than Delayed Events covers) → re-run `scripts/k8s/bulk-backfill.sh
+--gap-fill`. The `events_message_dedup` index makes re-runs idempotent.
+
+---
+
+### ES audit: non-event mutations to projection state
+
+**Discovered**: 2026-06-15 audit after recognising the `channels`-UPSERT
+proposal was a dual-write anti-pattern.
+
+Three places mutate projection / materialization state outside the event
+log. None are silent-divergence risks today (each has rationale or scope
+limits), but they shape badly if the system ever needs full replay or
+multi-consumer projections.
+
+**3a. `slack-fuse tier` CLI directly UPDATEs `channels`** (`slack_fuse/cli/tier.py:195, 266`)
+
+`set_channel_tier` and `reset_channel_tier_to_auto` mutate the projection
+without emitting an event. Replaying events to rebuild the projection
+would lose every manual tier override. Same shape as the ad-hoc raw psql
+`UPDATE` an operator might run (and did, in this session, to flip two
+firehose channels to blocked).
+
+**Cleanest fix**: introduce a `client-overrides` stream and event types
+like `manual_tier_set { channel_id, tier }`. The CLI emits an event;
+`apply_event` handles it like any other. Replay works.
+
+**3b. `slurper/health.py` dual-writes event + `health_log` in one TX**
+(`slack_fuse_server/slurper/health.py:60`)
+
+```python
+with conn.transaction(), conn.cursor() as cur:
+    insert_event(cur, offset, record)          # to events
+    cur.execute("INSERT INTO health_log ...")  # to derived table
 ```
-since = (SELECT max(ts::numeric) FROM events WHERE stream='channel:CXXX' AND kind='message')
-```
 
-Run the gap-fill via `--source slack-api --since <since>`. The
-`events_message_dedup` partial unique index makes it idempotent — any
-overlap with the existing backfilled range gets dropped at insert.
+Atomic, so no drift risk; but `health_log` is just
+`events WHERE stream='slurper-health'` rematerialized. Same anti-pattern
+as the channels table — solved the same way: drop the table, expose a
+VIEW.
 
-**Workflow**: use `channel-volume.sh` first to identify firehose channels
-to add to `always_blocked_channel_ids`, then run the gap-fill on the
-remainder.
+**3c. The empty cluster `channels` table** — covered in its own entry above.
+
+**Why none of these are P0**: the projections work correctly today; the
+audit is forward-looking. Real concern is the day someone tries to
+rebuild projections from the event log and silently loses operator-set
+state. Either move overrides into events (3a) or be explicit they're
+external policy (like `always_blocked_channel_ids`).
 
 ---
 
