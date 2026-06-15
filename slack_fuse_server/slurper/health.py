@@ -21,7 +21,6 @@ from collections.abc import Callable
 from enum import StrEnum
 
 import trio
-from psycopg.types.json import Jsonb
 
 from slack_fuse_server._json import JsonObject
 from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter, assign_offset, insert_event
@@ -69,15 +68,16 @@ class HealthEmitter:
         self._writer = writer
 
     def _emit_sync(self, kind: HealthKind, payload: JsonObject) -> int:
+        # Single write to `events` (stream='slurper-health'). The old
+        # `health_log` table was a dual-write of the same data for operator
+        # convenience; migration 0005 replaces it with a VIEW over `events`,
+        # so operators can still `SELECT … FROM health_log …` without the
+        # dual-write anti-pattern. See BACKLOG / ES audit findings.
         conn = self._writer.conn
         record = EventRecord(stream=_HEALTH_STREAM, kind=str(kind), ts=None, payload=payload)
         with conn.transaction(), conn.cursor() as cur:
             offset = assign_offset(cur, _HEALTH_STREAM)
             insert_event(cur, offset, record)
-            cur.execute(
-                "INSERT INTO health_log (kind, payload) VALUES (%s, %s)",
-                (str(kind), Jsonb(payload)),
-            )
         return offset
 
     async def emit(self, kind: HealthKind, payload: JsonObject | None = None) -> int:

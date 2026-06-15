@@ -43,7 +43,7 @@ from slack_fuse_server.config import ServerConfig, load_server_config
 from slack_fuse_server.dispatch import serve_dispatch
 from slack_fuse_server.http.handlers import ResolvePermalinkDeps, SnapshotDeps
 from slack_fuse_server.http.metrics import MetricsAggregator, SubscriberSnapshot
-from slack_fuse_server.slurper.api import SlackAPIError, SlackClient
+from slack_fuse_server.slurper.api import ChannelNotFoundError, SlackAPIError, SlackClient
 from slack_fuse_server.slurper.channels import ensure_channel_added, populate_channels_once
 from slack_fuse_server.slurper.health import HealthEmitter
 from slack_fuse_server.slurper.offsets import OffsetWriter
@@ -329,10 +329,19 @@ async def _run_backfill(  # noqa: PLR0913 — thin CLI thunk; bundling into opti
     ctx = BackfillContext(writer=writer, health=health, warn_at=config.backfill_warn_at, abort_at=abort_at)
     try:
         # Bring the channel under the projector's normal model BEFORE we write
-        # any per-channel events. Refuses the backfill if conversations.info
-        # rejects the channel — better to fail loud than orphan events.
+        # any per-channel events. A channel the user token can't describe
+        # (left/closed DMs, archived-then-purged) gets skipped cleanly so the
+        # admin Job exits 0; any other API failure still fails loud because it
+        # would orphan events otherwise.
         try:
             emitted = await ensure_channel_added(writer, client, channel_id)
+        except ChannelNotFoundError:
+            log.warning(
+                "backfill: channel %s not accessible (channel_not_found); skipping cleanly. "
+                "Channel cache may still hold legacy data but the user token can't describe it.",
+                channel_id,
+            )
+            return
         except SlackAPIError as exc:
             log.error("backfill: cannot establish channel_added for %s: %s", channel_id, exc)
             raise

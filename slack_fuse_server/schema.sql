@@ -65,22 +65,27 @@ CREATE TABLE snapshot_uses (
 CREATE INDEX snapshot_uses_lookup_idx
     ON snapshot_uses (snapshot_stream, snapshot_at_offset);
 
--- Workspace inventory. Mirrored from Slack via events into a queryable
--- materialization for fast channel-list answers (so subscribe to
--- channel-list isn't required for cold metadata reads).
-CREATE TABLE channels (
-    channel_id TEXT PRIMARY KEY,
-    name TEXT,
-    is_im BOOLEAN,
-    is_mpim BOOLEAN,
-    is_member BOOLEAN,
-    is_archived BOOLEAN,
-    im_user_id TEXT,
-    topic TEXT,
-    purpose TEXT,
-    num_members INT,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
+-- Workspace inventory: a VIEW (not a table) derived from `channel_added`
+-- events on the channel-list stream. Operators can SELECT it like a table.
+-- See migrations/0004_channels_view.sql for the definition + rationale.
+-- (Previously a table with no writer; now ES-clean — one source of truth.)
+CREATE VIEW channels AS
+SELECT DISTINCT ON (payload->>'id')
+    payload->>'id'                       AS channel_id,
+    payload->>'name'                     AS name,
+    (payload->>'is_im')::boolean         AS is_im,
+    (payload->>'is_mpim')::boolean       AS is_mpim,
+    (payload->>'is_member')::boolean     AS is_member,
+    (payload->>'is_archived')::boolean   AS is_archived,
+    payload->>'im_user_id'               AS im_user_id,
+    payload->>'topic'                    AS topic,
+    payload->>'purpose'                  AS purpose,
+    (payload->>'num_members')::int       AS num_members
+FROM events
+WHERE stream = 'channel-list'
+  AND kind = 'channel_added'
+  AND payload ? 'id'
+ORDER BY payload->>'id', id DESC;
 
 CREATE TABLE users (
     user_id TEXT PRIMARY KEY,
@@ -96,15 +101,14 @@ CREATE TABLE stream_heads (
     next_offset BIGINT NOT NULL DEFAULT 1
 );
 
--- Append-only log of slurper health transitions. Mirrors what the
--- server publishes on the slurper-health stream; here so an operator
--- can SELECT directly without parsing the event log.
-CREATE TABLE health_log (
-    id BIGSERIAL PRIMARY KEY,
-    kind TEXT NOT NULL,
-    payload JSONB NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
+-- Append-only log of slurper health transitions: a VIEW over the
+-- slurper-health stream in `events`. Operator-convenience SELECT shape,
+-- no dual-write — the event log is the only writer.
+-- See migrations/0005_health_log_view.sql.
+CREATE VIEW health_log AS
+SELECT id, kind, payload, created_at
+FROM events
+WHERE stream = 'slurper-health';
 
 -- Per-channel backfill size overrides. Persists so re-runs honour the
 -- operator's --allow-large / --max-messages decision. (RFC §Backfill →

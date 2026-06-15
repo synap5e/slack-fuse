@@ -65,26 +65,31 @@ def test_collect_metrics_aggregates_events_health_and_subscribers(
                 )
             """
         )
+        # health_log is now a VIEW over events. Write directly to events
+        # with stream='slurper-health'; the view reflects them automatically.
         cur.execute(
             """
-            INSERT INTO health_log (kind, payload, created_at)
+            INSERT INTO events (stream, offset_in_stream, kind, ts, payload, created_at)
             VALUES
                 (
-                    'backfill_started',
+                    'slurper-health', 1, 'backfill_started', NULL,
                     '{"channel_id":"C111","messages_so_far":42}'::jsonb,
                     now() - interval '30 seconds'
                 ),
                 (
-                    'backfill_completed',
+                    'slurper-health', 2, 'backfill_completed', NULL,
                     '{"channel_id":"C222","events_written":99}'::jsonb,
                     now() - interval '20 seconds'
                 ),
                 (
-                    'backfill_aborted',
+                    'slurper-health', 3, 'backfill_aborted', NULL,
                     '{"channel_id":"C333","reason":"exceeded_default_limit"}'::jsonb,
                     now() - interval '15 seconds'
                 ),
-                ('slack_healthy', '{}'::jsonb, now() - interval '1 seconds')
+                (
+                    'slurper-health', 4, 'slack_healthy', NULL,
+                    '{}'::jsonb, now() - interval '1 seconds'
+                )
             """
         )
         cur.execute("INSERT INTO backfill_overrides (channel_id, max_messages) VALUES ('C111', 50000)")
@@ -112,11 +117,17 @@ def test_collect_metrics_aggregates_events_health_and_subscribers(
     assert metrics.slack.last_health_kind == "slack_healthy"
 
     streams_by_name = {item.stream: item for item in metrics.streams}
-    assert set(streams_by_name) == {"users", "channel:C111"}
+    # `slurper-health` now appears as a stream in metrics: previously the
+    # health events were in a separate `health_log` table (dual-written),
+    # so metrics — which aggregates `events` — never saw them. After
+    # migration 0005 the dual-write is gone; health events are only in
+    # `events`, so they show up alongside the user-facing streams.
+    assert set(streams_by_name) == {"users", "channel:C111", "slurper-health"}
     assert streams_by_name["users"].head_offset == 2
     assert streams_by_name["users"].events_per_min == 1
     assert streams_by_name["channel:C111"].head_offset == 1
     assert streams_by_name["channel:C111"].events_per_min == 1
+    assert streams_by_name["slurper-health"].head_offset == 4
 
     assert metrics.backfill.completed_count == 1
     assert metrics.backfill.aborted_count == 1

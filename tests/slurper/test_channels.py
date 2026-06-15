@@ -11,7 +11,7 @@ import pytest
 import trio
 from psycopg.rows import TupleRow
 
-from slack_fuse_server.slurper.api import SlackAPIError, SlackClient
+from slack_fuse_server.slurper.api import ChannelNotFoundError, SlackAPIError, SlackClient
 from slack_fuse_server.slurper.channels import ensure_channel_added, populate_channels_once
 from slack_fuse_server.slurper.offsets import OffsetWriter
 from slack_fuse_server.slurper.socket import _channel_added_write
@@ -172,12 +172,15 @@ def test_ensure_channel_added_is_noop_after_populate(
     assert _channel_list_next_offset(server_conn) == before_offset
 
 
-def test_ensure_channel_added_raises_on_unknown_channel(
+def test_ensure_channel_added_raises_channel_not_found_for_inaccessible(
     server_conn: psycopg.Connection[TupleRow],
 ) -> None:
-    """conversations.info ok=false → SlackAPIError. The admin backfill flow
-    surfaces this and refuses to write per-channel events for a channel the
-    server can't describe."""
+    """conversations.info ok=false channel_not_found → ChannelNotFoundError
+    (a SlackAPIError subclass). The admin backfill flow catches this specific
+    subclass and skips the channel cleanly so the Job exits 0 — the user
+    token no longer has access to the channel; failing the whole Job for an
+    expected condition is unhelpful. The existing broad SlackAPIError catch
+    still works for the same reason."""
     transport = make_fake_slack_transport(
         overrides={"conversations.info": {"ok": False, "error": "channel_not_found"}}
     )
@@ -186,8 +189,12 @@ def test_ensure_channel_added_raises_on_unknown_channel(
     client._http = http_client
     writer = OffsetWriter(server_conn, trio.CapacityLimiter(1))
 
-    with pytest.raises(SlackAPIError):
+    # Specific subclass for callers that want skip-not-fail semantics.
+    with pytest.raises(ChannelNotFoundError):
         _ = trio.run(ensure_channel_added, writer, client, "C-GONE")
+
+    # Subclass relationship: existing broad handlers still catch it.
+    assert issubclass(ChannelNotFoundError, SlackAPIError)
 
     # No row was written.
     assert _channel_rows(server_conn) == []

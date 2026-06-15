@@ -27,14 +27,26 @@ def test_discover_server_migrations() -> None:
         "0001_init.sql",
         "0002_users_dedup.sql",
         "0003_channels_dedup.sql",
+        "0004_channels_view.sql",
+        "0005_health_log_view.sql",
     ]
 
 
-def _table_exists(conn: psycopg.Connection[TupleRow], name: str) -> bool:
+def _relkind(conn: psycopg.Connection[TupleRow], name: str) -> str | None:
+    """Returns 'r' for ordinary table, 'v' for view, None if absent."""
     with conn.cursor() as cur:
-        cur.execute("SELECT to_regclass(%s)", (name,))
+        cur.execute(
+            "SELECT relkind FROM pg_class c "
+            "JOIN pg_namespace n ON n.oid=c.relnamespace "
+            "WHERE c.relname=%s AND n.nspname=current_schema()",
+            (name,),
+        )
         row = cur.fetchone()
-    return row is not None and row[0] is not None
+    return None if row is None else str(row[0])
+
+
+def _table_exists(conn: psycopg.Connection[TupleRow], name: str) -> bool:
+    return _relkind(conn, name) == "r"
 
 
 def test_apply_server_migrations_idempotent(pg_conn: psycopg.Connection[TupleRow]) -> None:
@@ -42,10 +54,16 @@ def test_apply_server_migrations_idempotent(pg_conn: psycopg.Connection[TupleRow
         "0001_init.sql",
         "0002_users_dedup.sql",
         "0003_channels_dedup.sql",
+        "0004_channels_view.sql",
+        "0005_health_log_view.sql",
     ]
     assert _table_exists(pg_conn, "events")
     assert _table_exists(pg_conn, "snapshots")
     assert _table_exists(pg_conn, "backfill_overrides")
+    # 0004 / 0005 replaced the empty `channels` / `health_log` tables with
+    # VIEWs over the events log (ES-clean: one source of truth, no dual write).
+    assert _relkind(pg_conn, "channels") == "v"
+    assert _relkind(pg_conn, "health_log") == "v"
     # The partial dedup indexes exist (message, users-added, channels-added).
     for index in ("events_message_dedup", "events_users_added_dedup", "events_channels_added_dedup"):
         with pg_conn.cursor() as cur:

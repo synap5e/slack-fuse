@@ -65,6 +65,16 @@ class FatalAPIError(SlackAPIError):
     """401/403 or unrecoverable body error — stop retrying."""
 
 
+class ChannelNotFoundError(SlackAPIError):
+    """``conversations.info`` (etc.) returned ``ok=false, error=channel_not_found``.
+
+    Distinct from the generic ``SlackAPIError`` so callers can choose to skip
+    that channel cleanly (e.g. admin backfill for a channel the user token no
+    longer has access to) instead of failing the whole operation. Subclass of
+    ``SlackAPIError`` so existing broad catches still cover it.
+    """
+
+
 # === Client ===
 
 
@@ -128,6 +138,8 @@ class SlackClient:
             error = error_val if isinstance(error_val, str) else "unknown"
             if error in _FATAL_BODY_ERRORS:
                 raise FatalAPIError(f"Slack API error: {error}")
+            if error == "channel_not_found":
+                raise ChannelNotFoundError(f"Slack API error on {method}: {error}")
             raise SlackAPIError(f"Slack API error on {method}: {error}")
         return body
 

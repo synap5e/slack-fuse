@@ -6,7 +6,7 @@ Tracked issues that aren't blocking but should be revisited. Add new entries wit
 
 ## Open
 
-### Backfill: `channel_not_found` on `conversations.info` aborts the Job
+### ~~Backfill: `channel_not_found` on `conversations.info` aborts the Job~~ (fixed, pending image rollout)
 
 **Discovered**: 2026-06-15 during bulk legacy-cache backfill of ~380 channels.
 
@@ -35,7 +35,7 @@ option 2 is nice-to-have if archived history of left-channels matters.
 
 ---
 
-### Slurper-side `channels` table is never populated
+### ~~Slurper-side `channels` table is never populated~~ (fixed: migration 0004 replaces with VIEW, pending image rollout)
 
 **Discovered**: 2026-06-15 while building `scripts/k8s/channel-volume.sh`.
 
@@ -133,21 +133,12 @@ firehose channels to blocked).
 like `manual_tier_set { channel_id, tier }`. The CLI emits an event;
 `apply_event` handles it like any other. Replay works.
 
-**3b. `slurper/health.py` dual-writes event + `health_log` in one TX**
-(`slack_fuse_server/slurper/health.py:60`)
+**3b. ~~`slurper/health.py` dual-writes event + `health_log` in one TX~~**
+(fixed: migration 0005 drops the table + creates a VIEW, dual-write
+removed from `slurper/health.py`, pending image rollout)
 
-```python
-with conn.transaction(), conn.cursor() as cur:
-    insert_event(cur, offset, record)          # to events
-    cur.execute("INSERT INTO health_log ...")  # to derived table
-```
-
-Atomic, so no drift risk; but `health_log` is just
-`events WHERE stream='slurper-health'` rematerialized. Same anti-pattern
-as the channels table — solved the same way: drop the table, expose a
-VIEW.
-
-**3c. The empty cluster `channels` table** — covered in its own entry above.
+**3c. ~~The empty cluster `channels` table~~** — fixed alongside 3b in
+migrations 0004/0005.
 
 **Why none of these are P0**: the projections work correctly today; the
 audit is forward-looking. Real concern is the day someone tries to
