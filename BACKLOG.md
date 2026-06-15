@@ -81,3 +81,45 @@ overlap with the existing backfilled range gets dropped at insert.
 **Workflow**: use `channel-volume.sh` first to identify firehose channels
 to add to `always_blocked_channel_ids`, then run the gap-fill on the
 remainder.
+
+---
+
+### Projector stalls indefinitely when WS connection drops mid-run
+
+**Discovered**: 2026-06-15 while measuring projection rate post-gap-fill.
+
+**Symptom**: Apply rate observed to be exactly zero (Δ0 chunks, Δ0
+applied_offset in 30s) despite the local service being `active` per
+systemd and the cluster having ~32k unapplied events ready to deliver.
+
+Logs revealed two stuck loops running side-by-side for ~2 hours:
+
+1. `slack_fuse.projector.health_subscriber: signature read failed: the
+   connection is closed` — fired **once per second**, indicating the
+   health subscriber task is hot-spinning on a closed connection
+   without reopening it.
+2. `slack_fuse.__main__: projector exited (the connection is closed);
+   reconnecting in 300s` — fires every 5 minutes (the outer projector
+   reconnect backoff), but each reconnect attempt fails immediately
+   and triggers another 5-min wait.
+
+The outer reconnect doesn't tear down + recreate the health
+subscriber's connection state, so the subscriber remains stuck even
+across reconnect attempts. Net effect: process alive, no work done.
+
+**Workaround**: `systemctl --user restart slack-fuse-split.service`
+clears it. Post-restart, apply rate is healthy (~7000 events/min in
+the observed run).
+
+**Fix candidates**:
+1. Make the health subscriber abort + reraise on consecutive
+   connection-closed reads instead of warn-and-retry. The outer
+   reconnect would catch the failure and rebuild the whole projector
+   task tree including the subscriber.
+2. Tie the health subscriber's lifecycle explicitly to the WS connection
+   lifetime (cancel on disconnect, restart on connect) so it can't
+   outlive the connection it's reading from.
+
+**Impact**: silent data divergence between cluster and client until the
+operator notices. Worth fixing relatively soon; for now monitoring is
+"is `applied_offset` advancing?"
