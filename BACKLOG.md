@@ -32,3 +32,52 @@ inspects job state.
 
 **Recommendation**: option 1 (skip + log) is the cheapest correct behaviour;
 option 2 is nice-to-have if archived history of left-channels matters.
+
+---
+
+### Slurper-side `channels` table is never populated
+
+**Discovered**: 2026-06-15 while building `scripts/k8s/channel-volume.sh`.
+
+**Symptom**: `slack_fuse_server/schema.sql` defines a `channels` table
+intended as "Workspace inventory. Mirrored from Slack via events into a
+queryable materialization for fast channel-list answers." The table exists
+on the cluster but contains 0 rows. All channel metadata lives only in the
+`channel_added` / `channel_renamed` event payloads on the `channel-list`
+stream; consumers needing names must derive them via JSON queries.
+
+**Current behaviour**: tools that want channel names have to do
+`SELECT DISTINCT ON (payload->>'id') ... FROM events WHERE stream='channel-list' ORDER BY id DESC`
+instead of a clean join. Works but ugly and slower as event count grows.
+
+**Fix**: have the slurper UPSERT into `channels` whenever it emits a
+`channel_added` / `channel_renamed` / `channel_archived` / `channel_member_changed`
+event, mirroring how the client-side projector maintains its `channels`
+table. ~30 lines of code, no schema change needed.
+
+---
+
+### Live-events gap between legacy-cache cutoff and Socket Mode start
+
+**Discovered**: 2026-06-15 during projection-coverage check.
+
+**Symptom**: Per-channel "newest cached day" in the operator's legacy cache
+ranges from 2026-05-08 to 2026-06-09; cluster Socket Mode first delivered
+events at 2026-06-14 22:31 (after Event Subscriptions were enabled in the
+Slack app config). Messages posted in the gap window — up to ~5 weeks for
+some channels — are missing from both sources.
+
+**Fix**: expose `--since TS` on `scripts/k8s/backfill-job.sh` (both
+backfillers already accept `since_ts`), then per-channel:
+
+```
+since = (SELECT max(ts::numeric) FROM events WHERE stream='channel:CXXX' AND kind='message')
+```
+
+Run the gap-fill via `--source slack-api --since <since>`. The
+`events_message_dedup` partial unique index makes it idempotent — any
+overlap with the existing backfilled range gets dropped at insert.
+
+**Workflow**: use `channel-volume.sh` first to identify firehose channels
+to add to `always_blocked_channel_ids`, then run the gap-fill on the
+remainder.
