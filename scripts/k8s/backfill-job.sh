@@ -70,7 +70,10 @@ IMAGE="${SLACK_FUSE_IMAGE:-ghcr.io/synap5e/slack-fuse:sha-b921e88@sha256:ca2e4fd
 NAME="slack-fuse-backfill-$(echo "$CHANNEL_ID" | tr '[:upper:]' '[:lower:]')-$(date +%s)"
 
 CLI_ARGS=("backfill" "$CHANNEL_ID" "--source" "$SOURCE" "${EXTRA_ARGS[@]}")
-ARGS_YAML=$(printf '            - %s\n' "${CLI_ARGS[@]}")
+# Each arg as a double-quoted YAML scalar so float values (e.g. --since
+# 1778275867.152699) don't get parsed as numbers and rejected by k8s.
+# None of our args contain double quotes, so no escaping needed.
+ARGS_YAML=$(printf '            - "%s"\n' "${CLI_ARGS[@]}")
 
 # Legacy-cache source requires the operator's ~/.cache/slack-fuse/messages
 # directory mounted at the path the LegacyCacheBackfiller expects in-pod:
