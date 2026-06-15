@@ -26,7 +26,7 @@
 set -euo pipefail
 
 if [ $# -lt 1 ]; then
-    echo "usage: $0 <channel-id> [--source slack-api|legacy-cache] [--allow-large] [--max-messages N] [--watch]" >&2
+    echo "usage: $0 <channel-id> [--source slack-api|legacy-cache] [--allow-large] [--max-messages N] [--since EPOCH] [--watch]" >&2
     exit 64
 fi
 
@@ -45,6 +45,11 @@ while [ $# -gt 0 ]; do
         --source) SOURCE="$2"; shift 2 ;;
         --allow-large) EXTRA_ARGS+=("--allow-large"); shift ;;
         --max-messages) EXTRA_ARGS+=("--max-messages" "$2"); shift 2 ;;
+        # --since EPOCH: lower bound on ts. Use this for gap-fills against
+        # slack-api so we don't repaginate the whole channel history. The
+        # events_message_dedup index makes overlap free, but pagination still
+        # costs API budget.
+        --since) EXTRA_ARGS+=("--since" "$2"); shift 2 ;;
         *) echo "unknown flag: $1" >&2; exit 64 ;;
     esac
 done

@@ -309,6 +309,7 @@ async def _run_backfill(
     allow_large: bool,
     max_messages: int | None,
     source: BackfillSource,
+    since_ts: float | None = None,
 ) -> None:
     conn = _connect_and_migrate(config.database_url)
     limiter = trio.CapacityLimiter(1)
@@ -337,7 +338,7 @@ async def _run_backfill(
             raise
         if emitted:
             log.info("backfill: emitted synthetic channel_added for %s", channel_id)
-        result = await backfill_channel(backfiller, ChannelId(channel_id), ctx)
+        result = await backfill_channel(backfiller, ChannelId(channel_id), ctx, since_ts=since_ts)
     finally:
         client.close()
         conn.close()
@@ -370,6 +371,15 @@ def _build_parser() -> argparse.ArgumentParser:
         default="slack-api",
         help="backfill source implementation to use",
     )
+    bf.add_argument(
+        "--since",
+        type=float,
+        default=None,
+        metavar="EPOCH",
+        help="only fetch messages with ts > EPOCH (Slack ts is float seconds since epoch). "
+        "Bounds pagination at the source; combined with the events_message_dedup index "
+        "this makes per-channel gap-fills cheap and idempotent.",
+    )
     return parser
 
 
@@ -383,6 +393,7 @@ def main() -> None:
         allow_large: bool = args.allow_large
         max_messages: int | None = args.max_messages
         source: BackfillSource = args.source
+        since_ts: float | None = args.since
 
         async def _thunk() -> None:
             await _run_backfill(
@@ -391,6 +402,7 @@ def main() -> None:
                 allow_large=allow_large,
                 max_messages=max_messages,
                 source=source,
+                since_ts=since_ts,
             )
 
         trio.run(_thunk)
