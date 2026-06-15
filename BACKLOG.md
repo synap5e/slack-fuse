@@ -148,7 +148,58 @@ external policy (like `always_blocked_channel_ids`).
 
 ---
 
-### ~~FUSE mount can be wedged by any single slow callback~~ (fixed)
+### FUSE mount wedge — architectural fix landed, host-level condition still seen
+
+**Status**: architectural fix landed (`87487d0`). Per-callback connection
+pool + 30s trio timeout + 25s PG ``statement_timeout``. Concurrent
+callbacks no longer serialize behind one limiter slot; a slow SQL aborts
+at the PG layer and surfaces as ``FUSEError(EIO)``; a pure-Python hang
+times out at the trio layer with the same result. 4 regression tests
+pin the new behaviour.
+
+**Smoke test after deploy revealed a separate host-level issue.** With
+the fix running, two concurrent ``cat`` operations on different
+``channel.md`` files still wedged the mount: process went D-state on
+``folio_wait_bit_common`` (same wchan as the original report), but
+``VmSwap=0`` on the fresh process and the disk was idle — *not* a swap
+stall. Scanning the wider system found:
+
+- A `claude` process D-state on FUSE wchan for **2 days**
+- A `bat` process D-state on FUSE wchan for ~2.5 hours
+- Other long-lived D-states from before today's session
+
+So the host has an accumulating supply of FUSE-wedged processes
+unrelated to slack-fuse's architecture — possibly a kernel bug, a
+specific FUSE/pyfuse3 race, or a system condition (memory allocator
+pressure, cgroup, or zram interaction — system has 27 GB used in zram
+swap with 14-day uptime).
+
+**Reproduction shape on the new code**: open two concurrent reads on
+different channel.md files; slack-fuse goes D-state on
+``folio_wait_bit_common``; the cats D-state on ``fuse_s``. Recovery
+needs ``fusermount3 -uz`` + service restart.
+
+**Next steps** (handing off to operator — needs root + kernel
+diagnostic tooling I don't have):
+
+1. ``cat /proc/<pid>/stack`` on a wedged slack-fuse — needs CAP_SYS_PTRACE
+   or matching uid + ``ptrace_scope=0``. Will name the actual kernel
+   function holding the wait, narrows to swap-in / writeback / lock /
+   FUSE-channel-write.
+2. ``dmesg`` for ``hung task`` warnings (sysctl
+   ``kernel.hung_task_timeout_secs``) — the kernel logs a stack trace
+   when D-state exceeds the threshold.
+3. Check whether other FUSE filesystems on the host (claude-session-fuse,
+   fireflies-meetings, slack-fuse legacy) are also showing wedges; if
+   yes, it's host-level. If only slack-fuse, dig into pyfuse3 trio
+   integration.
+4. As a temporary mitigation: lower
+   ``vm.swappiness`` and/or disable zram, restart everything, see if
+   the wedge stops happening.
+
+The architectural fix is correct and lands real concurrency benefits
+when the host cooperates; this entry stays open as "host-level FUSE
+behaviour" pending the root-cause diagnostic above.
 
 **Discovered**: 2026-06-15. After a cluster rollout + DM backfill landed a
 burst of projector writes, `cat /views/slack-split/dms/luke/channel.md`
