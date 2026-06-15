@@ -84,7 +84,7 @@ remainder.
 
 ---
 
-### Projector stalls indefinitely when WS connection drops mid-run
+### ~~Projector stalls indefinitely when WS connection drops mid-run~~ (fixed `758274b`)
 
 **Discovered**: 2026-06-15 while measuring projection rate post-gap-fill.
 
