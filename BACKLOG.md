@@ -179,27 +179,70 @@ different channel.md files; slack-fuse goes D-state on
 ``folio_wait_bit_common``; the cats D-state on ``fuse_s``. Recovery
 needs ``fusermount3 -uz`` + service restart.
 
-**Next steps** (handing off to operator — needs root + kernel
-diagnostic tooling I don't have):
+**Root cause (diagnosed via ``agent-sudo`` + ``/proc/<pid>/stack``)**:
+the wedged slack-fuse daemons have IDENTICAL kernel stacks:
 
-1. ``cat /proc/<pid>/stack`` on a wedged slack-fuse — needs CAP_SYS_PTRACE
-   or matching uid + ``ptrace_scope=0``. Will name the actual kernel
-   function holding the wait, narrows to swap-in / writeback / lock /
-   FUSE-channel-write.
-2. ``dmesg`` for ``hung task`` warnings (sysctl
-   ``kernel.hung_task_timeout_secs``) — the kernel logs a stack trace
-   when D-state exceeds the threshold.
-3. Check whether other FUSE filesystems on the host (claude-session-fuse,
-   fireflies-meetings, slack-fuse legacy) are also showing wedges; if
-   yes, it's host-level. If only slack-fuse, dig into pyfuse3 trio
-   integration.
-4. As a temporary mitigation: lower
-   ``vm.swappiness`` and/or disable zram, restart everything, see if
-   the wedge stops happening.
+```
+folio_wait_bit_common
+__filemap_get_folio_mpol.cold
+fuse_dev_do_write
+fuse_dev_write
+do_iter_readv_writev
+do_writev
+```
 
-The architectural fix is correct and lands real concurrency benefits
-when the host cooperates; this entry stays open as "host-level FUSE
-behaviour" pending the root-cause diagnostic above.
+This is the kernel-side of ``write(fuse_dev_fd, response, ...)``. The
+daemon's Python code finished computing the response and called write
+to send it back; the kernel can't allocate a folio to receive it and
+sleeps on the folio's bit. Every downstream FUSE client (``cat``,
+``head``, ``bat``, ``claude``, ``stat``) is correctly waiting on
+``fuse_simple_request`` for that response. The wedge starts at the
+daemon's write path, not in slack-fuse Python.
+
+This is reproduced for non-slack-fuse FUSE workloads on the same host
+(``claude`` D-state on FUSE for 2 days; ``bat`` for 2.5 hours). The
+condition is host-level, not slack-fuse-specific.
+
+**Likely host trigger** — vm tunables hostile to FUSE under memory
+pressure:
+
+```
+vm.swappiness = 150        (very aggressive; default ~60)
+vm.dirty_ratio = 0         (default 20)
+vm.dirty_background_ratio = 0  (default 10)
+zram0: 24.6 GB compressed-swap used
+```
+
+With both dirty ratios at 0, every dirty FUSE-response page is flagged
+for immediate writeback. FUSE has no real backing storage, so the
+writeback can't complete cleanly under memory pressure → folio stays
+locked → ``write()`` waits indefinitely. Swappiness 150 keeps reclaim
+hot, amplifying the rate of folios falling into that state.
+
+**Operator mitigation** (system-level — needs ``sysctl`` as root):
+
+```sh
+sudo sysctl vm.dirty_ratio=20
+sudo sysctl vm.dirty_background_ratio=10
+sudo sysctl vm.swappiness=60
+```
+
+Persist via ``/etc/sysctl.d/99-fuse-friendly.conf``. After applying,
+restart all FUSE-mounted services to clear any current wedged daemons.
+
+**Status of the slack-fuse architectural fix** (``87487d0``): still
+correct and worth keeping — removes the v1-derived
+``CapacityLimiter(1)`` bottleneck, gives concurrent FUSE callbacks
+distinct postgres connections, surfaces SQL timeouts as
+``FUSEError(EIO)`` instead of indefinite stalls. Independently of the
+host vm config, this prevents one slow query from queueing every
+subsequent FUSE upcall — a real concurrency win the host has to be
+healthy enough to deliver.
+
+The architectural fix lives at ``87487d0`` + ``f817a35``. This entry
+stays open as "host-level FUSE wedge" until the operator applies the
+``vm.dirty_*`` mitigation, since slack-fuse cannot fix it from
+userspace.
 
 **Discovered**: 2026-06-15. After a cluster rollout + DM backfill landed a
 burst of projector writes, `cat /views/slack-split/dms/luke/channel.md`
