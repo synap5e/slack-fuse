@@ -148,7 +148,7 @@ external policy (like `always_blocked_channel_ids`).
 
 ---
 
-### FUSE mount can be wedged by any single slow callback
+### ~~FUSE mount can be wedged by any single slow callback~~ (fixed)
 
 **Discovered**: 2026-06-15. After a cluster rollout + DM backfill landed a
 burst of projector writes, `cat /views/slack-split/dms/luke/channel.md`

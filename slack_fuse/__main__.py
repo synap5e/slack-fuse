@@ -279,6 +279,7 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
     from slack_fuse.fuse_ops_v2 import SlackFuseOpsV2, V2InvalidationSink
     from slack_fuse.migrations.runner import apply_migrations
     from slack_fuse.projector.health_subscriber import watch_health
+    from slack_fuse.projector.pool import ConnectionPool as ProjectorConnectionPool
     from slack_fuse.projector.trailer_log import TrailerLog
     from slack_fuse.projector.ws_client import SINGLETON_STREAMS, WSClient, WSClientOptions
 
@@ -301,6 +302,20 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
         conn.autocommit = True
         return conn
 
+    def _open_fuse_pool_conn() -> psycopg.Connection[TupleRow]:
+        """Factory for FUSE pool connections.
+
+        Per-conn ``statement_timeout`` caps any single query: a SELECT
+        stalled behind WAL fsync contention from the projector aborts at
+        postgres instead of holding the FUSE upcall open and queueing every
+        subsequent FUSE callback behind it. See BACKLOG for the wedge
+        scenario this fixes.
+        """
+        conn = _open_conn()
+        with conn.cursor() as cur:
+            _ = cur.execute("SET statement_timeout = '25s'")
+        return conn
+
     # One-time migrations so the projections schema exists.
     migrate_conn = _open_conn()
     try:
@@ -315,9 +330,17 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
     # projector bookkeeping, and the invalidation sink would race.
     # (health subscriber opens its own conn inside `_run_health_subscriber`
     # so we can reconnect cleanly after a closed-connection event.)
-    fuse_conn = _open_conn()
+    fuse_conn = _open_conn()  # dedicated inode-map conn (fallback for non-pool callers)
     state_conn = _open_conn()
     sink_conn = _open_conn()
+
+    # Bounded pool for the FUSE read path. Each callback borrows a conn,
+    # runs its SQL under PG ``statement_timeout``, returns it. Replaces the
+    # single-conn-with-CapacityLimiter(1) bottleneck that could wedge the
+    # whole mount on any one slow callback. Pool size 4 fits comfortably
+    # under the local Postgres connection budget (default max_connections=100
+    # minus the projector pool of 8 + the four fixed conns above).
+    fuse_pool = ProjectorConnectionPool(_open_fuse_pool_conn, max_size=4)
 
     tz = _resolve_local_zoneinfo()
     store_limiter = trio.CapacityLimiter(1)
@@ -331,6 +354,7 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
         fuse_conn,
         tz,
         store_limiter,
+        pool=fuse_pool,
         stale_after_s=config.stale_after_disconnect_s,
         trailer_enabled=config.stale_trailer_enabled,
         trailer_log=trailer_log,
@@ -414,11 +438,18 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
                     conn.close()
 
     async def _run() -> None:
-        async with trio.open_nursery() as nursery:
-            nursery.start_soon(_run_health_subscriber)
-            nursery.start_soon(_run_projector)
-            await pyfuse3.main()
-            nursery.cancel_scope.cancel()
+        try:
+            async with trio.open_nursery() as nursery:
+                nursery.start_soon(_run_health_subscriber)
+                nursery.start_soon(_run_projector)
+                await pyfuse3.main()
+                nursery.cancel_scope.cancel()
+        finally:
+            # Close pooled FUSE conns inside the trio scope (``aclose`` is
+            # async). Idle conns are closed; borrowed ones close as soon as
+            # their callback releases them.
+            with trio.CancelScope(shield=True):
+                await fuse_pool.aclose()
 
     try:
         trio.run(_run)

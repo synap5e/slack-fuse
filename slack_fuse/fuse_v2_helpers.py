@@ -11,6 +11,8 @@ Per RFC §FUSE read path and §Three-tier visibility model.
 
 from __future__ import annotations
 
+import threading
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -61,6 +63,20 @@ THREAD_MD: Final = "thread.md"
 # The `channel-list` stream is the staleness stream for channel-metadata
 # (``channel.md``) reads — channel inventory/rename/archive flow over it.
 CHANNEL_LIST_STREAM: Final = "channel-list"
+
+
+#: Per-call FUSE conn borrowed from the connection pool. Set by
+#: ``SlackFuseOpsV2._run_sync`` around every FUSE callback so the sync body
+#: (helpers + ``PersistentInodeMap``) all use one connection owned by *that*
+#: callback alone. Lives in ``fuse_v2_helpers`` (not ``fuse_ops_v2``) because
+#: it's read from helpers; placing it here avoids a circular import.
+#:
+#: ``None`` means "pool mode is off" — the legacy conn-only-with-limiter
+#: shape used by tests and the original v1 startup. In that case, callers
+#: fall back to their own dedicated connection.
+borrowed_fuse_conn: ContextVar[Connection[TupleRow] | None] = ContextVar(
+    "borrowed_fuse_conn", default=None
+)
 
 
 # ============================================================================
@@ -601,15 +617,34 @@ class PersistentInodeMap:
     """
 
     def __init__(self, conn: Connection[TupleRow]) -> None:
-        self._conn = conn
+        # Fallback connection for when no per-call conn is set on the
+        # ``_borrowed_fuse_conn`` ContextVar (i.e. legacy conn-only mode in
+        # tests, or callers like the invalidation sink that resolve paths
+        # off the event loop). In pool mode, every method below picks up
+        # the per-callback borrowed conn instead, so concurrent FUSE
+        # callbacks never share a psycopg connection.
+        self._fallback_conn = conn
+        # Cross-thread cache + DB-call serialization. Even in pool mode the
+        # in-memory dicts are touched by every callback; without a lock,
+        # concurrent ``get_or_create`` on the same path can race. The lock
+        # is cheap (microseconds) and only held during dict mutation +
+        # DB call; the FUSE callback's main render work happens outside it.
+        self._cache_lock = threading.Lock()
         self._path_to_inode: dict[str, int] = {"/": ROOT_INODE}
         self._inode_to_path: dict[int, str] = {ROOT_INODE: "/"}
 
+    def _conn_for_io(self) -> Connection[TupleRow]:
+        """Per-call borrowed conn (pool mode), else the fallback (tests)."""
+        borrowed = borrowed_fuse_conn.get()
+        return borrowed if borrowed is not None else self._fallback_conn
+
     def get_or_create(self, path: str) -> int:
-        cached = self._path_to_inode.get(path)
-        if cached is not None:
-            return cached
-        with self._conn.cursor() as cur:
+        with self._cache_lock:
+            cached = self._path_to_inode.get(path)
+            if cached is not None:
+                return cached
+        conn = self._conn_for_io()
+        with conn.cursor() as cur:
             _ = cur.execute(
                 "INSERT INTO inodes (path) VALUES (%s) "
                 "ON CONFLICT (path) DO UPDATE SET path = EXCLUDED.path RETURNING inode",
@@ -620,36 +655,43 @@ class PersistentInodeMap:
             msg = f"failed to allocate inode for {path!r}"
             raise RuntimeError(msg)
         inode = int(row[0])
-        self._path_to_inode[path] = inode
-        self._inode_to_path[inode] = path
+        with self._cache_lock:
+            self._path_to_inode[path] = inode
+            self._inode_to_path[inode] = path
         return inode
 
     def get_inode(self, path: str) -> int | None:
-        cached = self._path_to_inode.get(path)
-        if cached is not None:
-            return cached
-        with self._conn.cursor() as cur:
+        with self._cache_lock:
+            cached = self._path_to_inode.get(path)
+            if cached is not None:
+                return cached
+        conn = self._conn_for_io()
+        with conn.cursor() as cur:
             _ = cur.execute("SELECT inode FROM inodes WHERE path = %s", (path,))
             row = cur.fetchone()
         if row is None:
             return None
         inode = int(row[0])
-        self._path_to_inode[path] = inode
-        self._inode_to_path[inode] = path
+        with self._cache_lock:
+            self._path_to_inode[path] = inode
+            self._inode_to_path[inode] = path
         return inode
 
     def get_path(self, inode: int) -> str | None:
-        cached = self._inode_to_path.get(inode)
-        if cached is not None:
-            return cached
-        with self._conn.cursor() as cur:
+        with self._cache_lock:
+            cached = self._inode_to_path.get(inode)
+            if cached is not None:
+                return cached
+        conn = self._conn_for_io()
+        with conn.cursor() as cur:
             _ = cur.execute("SELECT path FROM inodes WHERE inode = %s", (inode,))
             row = cur.fetchone()
         if row is None:
             return None
         path = str(row[0])
-        self._path_to_inode[path] = inode
-        self._inode_to_path[inode] = path
+        with self._cache_lock:
+            self._path_to_inode[path] = inode
+            self._inode_to_path[inode] = path
         return path
 
     def forget(self, inode: int) -> None:

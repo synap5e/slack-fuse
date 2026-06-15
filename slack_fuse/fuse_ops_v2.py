@@ -33,7 +33,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from decimal import Decimal
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, TypeVar
 from zoneinfo import ZoneInfo
 
 import pyfuse3
@@ -47,6 +47,7 @@ from slack_fuse.fuse_v2_helpers import (
     ChannelRow,
     PersistentInodeMap,
     assign_conv_root_slugs,
+    borrowed_fuse_conn,
     channel_meta_frontmatter,
     conv_root_for,
     day_channel_frontmatter,
@@ -79,7 +80,20 @@ if TYPE_CHECKING:
     from psycopg.rows import TupleRow
 
     from slack_fuse.projector.apply import ChunkRef, ThreadChunkRef
+    from slack_fuse.projector.pool import ConnectionPool
     from slack_fuse.projector.trailer_log import TrailerLog
+
+
+#: Default per-callback timeout when running in pool mode. The PG-level
+#: ``statement_timeout`` (set at conn creation by ``__main__``) catches slow
+#: SQL — the dominant risk. This trio-level deadline is belt-and-suspenders
+#: for any pure-Python hang (CPU loop, regex catastrophe, etc.). 30s is well
+#: above any healthy chunk render and well below user patience.
+DEFAULT_CALLBACK_TIMEOUT_S: Final = 30.0
+
+#: Generic for ``_run_sync``: the worker's return type flows through to the
+#: caller so each callback gets the right narrowed type.
+_TSync = TypeVar("_TSync")
 
 
 def _utcnow() -> datetime:
@@ -325,6 +339,8 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         local_tz: ZoneInfo,
         limiter: trio.CapacityLimiter,
         *,
+        pool: ConnectionPool | None = None,
+        callback_timeout_s: float = DEFAULT_CALLBACK_TIMEOUT_S,
         notify_store: NotifyStoreFn | None = None,
         invalidate_inode: InvalidateInodeFn | None = None,
         stale_after_s: float = STALE_AFTER_DISCONNECT_S,
@@ -333,7 +349,14 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         now_fn: NowFn = _utcnow,
     ) -> None:
         super().__init__()
-        self._conn = conn
+        # ``conn`` is the inode-map's dedicated connection. In pool mode (``pool``
+        # set), per-callback FUSE work borrows a separate conn from the pool; in
+        # legacy conn-only mode (no pool — test fixtures), every callback runs
+        # serially against ``conn`` via ``self._limiter``. The ``self._conn``
+        # property resolves to the right one per call.
+        self._inode_conn = conn
+        self._pool = pool
+        self._callback_timeout_s = callback_timeout_s
         self._tz = local_tz
         self._limiter = limiter
         self._notify_store: NotifyStoreFn = notify_store if notify_store is not None else _default_notify_store
@@ -363,6 +386,72 @@ class SlackFuseOpsV2(pyfuse3.Operations):
     # ------------------------------------------------------------------
     # Public surface used by the health subscriber + tests
     # ------------------------------------------------------------------
+
+    @property
+    def _conn(self) -> Connection[TupleRow]:
+        """Resolve the connection sync FUSE code should use for queries.
+
+        Pool mode: the per-callback borrowed connection set by
+        :meth:`_run_sync` lives in the ``borrowed_fuse_conn`` ContextVar
+        (declared in ``fuse_v2_helpers`` so both classes can read it).
+        Outside a callback (or in conn-only test mode), fall back to the
+        inode connection — the legacy single-conn-with-limiter behaviour.
+        """
+        borrowed = borrowed_fuse_conn.get()
+        if borrowed is not None:
+            return borrowed
+        return self._inode_conn
+
+    async def _run_sync(self, sync_fn: Callable[[], _TSync]) -> _TSync:
+        """Dispatch ``sync_fn`` to a worker thread under the right isolation.
+
+        Pool mode (``self._pool`` set): borrow a connection from the pool,
+        pin it to the ``_borrowed_fuse_conn`` ContextVar for the duration of
+        the call so the sync body's ``self._conn`` resolves to it, run the
+        body in a worker thread with two layers of timeout protection:
+
+        1. *PG ``statement_timeout``* (set by the pool's factory in
+           ``__main__``) catches slow SQL — the dominant risk under heavy
+           projector contention. The statement aborts, exception propagates
+           back through the thread normally, conn returns to the pool.
+        2. *trio ``fail_after``* catches the remaining failure mode:
+           pure-Python hangs (CPU loops, bad data triggering an infinite
+           regex, etc.). Cancellation raises ``TooSlowError`` in this task;
+           the worker thread is *abandoned* (it keeps running pure-Python
+           work but any further DB op fails because we close its conn).
+           Caller sees ``FUSEError(EIO)`` — no kernel page stays locked
+           waiting for a never-completing upcall.
+
+        Conn-only mode (no pool — tests, also the legacy v1 shape): serial
+        execution under ``self._limiter`` against ``self._inode_conn``. One
+        callback at a time; preserves the existing test contract. No
+        per-callback timeout — tests are deterministic and would only see
+        spurious cancellations under that policy.
+        """
+        if self._pool is None:
+            return await trio.to_thread.run_sync(sync_fn, limiter=self._limiter)
+        conn = await self._pool.acquire()
+        token = borrowed_fuse_conn.set(conn)
+        released = False
+        try:
+            with trio.fail_after(self._callback_timeout_s):
+                return await trio.to_thread.run_sync(sync_fn, abandon_on_cancel=True)
+        except trio.TooSlowError:
+            # Close the conn so any SQL the abandoned thread is still running
+            # aborts; the pool slot is freed for the next caller. The thread
+            # itself keeps running pure-Python work but can't touch the DB.
+            log.warning(
+                "FUSE callback exceeded %.1fs timeout — returning EIO and "
+                "discarding the borrowed conn",
+                self._callback_timeout_s,
+            )
+            await self._pool.release(conn, discard=True)
+            released = True
+            raise pyfuse3.FUSEError(errno.EIO) from None
+        finally:
+            borrowed_fuse_conn.reset(token)
+            if not released:
+                await self._pool.release(conn)
 
     @property
     def inodes(self) -> PersistentInodeMap:
@@ -590,7 +679,7 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             content, _trailer, _fallback = resolved
             return _make_file_attr(inode, len(content), timeout_s=_file_attr_timeout(path, self._tz))
 
-        result = await trio.to_thread.run_sync(_sync, limiter=self._limiter)
+        result = await self._run_sync(_sync)
         if result is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
         return result
@@ -624,7 +713,7 @@ class SlackFuseOpsV2(pyfuse3.Operations):
                     return _make_file_attr(inode, len(content), timeout_s=_file_attr_timeout(child_path, self._tz))
             return None
 
-        result = await trio.to_thread.run_sync(_sync, limiter=self._limiter)
+        result = await self._run_sync(_sync)
         if result is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
         return result
@@ -665,7 +754,7 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         path = self._inodes.get_path(inode)
         if path is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
-        snapshot = await trio.to_thread.run_sync(lambda: self._snapshot_dir(path), limiter=self._limiter)
+        snapshot = await self._run_sync(lambda: self._snapshot_dir(path))
         return self._register_dir_handle(snapshot)
 
     async def readdir(
@@ -720,7 +809,7 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             content, trailer, fallback, decision = resolved
             return content, trailer, fallback, decision, path
 
-        result = await trio.to_thread.run_sync(_sync, limiter=self._limiter)
+        result = await self._run_sync(_sync)
         if result is None:
             raise pyfuse3.FUSEError(errno.EIO)
         content, had_trailer, had_fallback, decision, real_path = result
