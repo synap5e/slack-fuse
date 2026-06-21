@@ -1,0 +1,15 @@
+[Unit]
+Description=Periodic wedge check for slack-fuse-split
+Requires=slack-fuse-watchdog.service
+
+[Timer]
+# Run every 30s. The watchdog tracks consecutive D-state across runs and
+# only acts once WEDGE_THRESHOLD_S (default 90s) is exceeded, so this
+# cadence gives ~3 samples per threshold window — enough to ride out a
+# transient D-state without acting prematurely.
+OnUnitActiveSec=30s
+OnBootSec=1min
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,9 @@
+[Unit]
+Description=One-shot wedge check for slack-fuse-split
+
+[Service]
+Type=oneshot
+ExecStart=%h/agentic/slack-fuse/scripts/watchdog/slack-fuse-watchdog.sh
+# fusermount3 needs no special privileges; the script reads /proc which
+# is allowed for processes in the same uid. Run with the same user the
+# slack-fuse-split.service runs as.
