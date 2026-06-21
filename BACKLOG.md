@@ -233,6 +233,18 @@ cause (in no particular order):
 Restarting an individual daemon clears its own wedge but doesn't
 prevent recurrence; the other 6 FUSE mounts continue to wedge.
 
+**Defense in depth shipped** (``scripts/watchdog/``): a small
+systemd timer-driven watchdog that detects D-state on
+``slack-fuse-split.service`` via ``/proc/<pid>/stat`` (never touches
+the FUSE path), and after a configurable threshold runs
+``fusermount3 -uz`` plus ``systemctl --user restart`` to recover.
+The lazy unmount works even against a D-state daemon because it
+operates on the kernel mount table. systemd starts a fresh PID; the
+wedged daemon orphans harmlessly. Live-verified against the 6h53m
+wedge on 2026-06-21: full recovery in under 5s, projection state
+preserved. Doesn't fix the trigger but bounds the impact to the
+watchdog interval (default 90s + 30s polling).
+
 **Status of the slack-fuse architectural fix** (``87487d0``): still
 correct and worth keeping — removes the v1-derived
 ``CapacityLimiter(1)`` bottleneck, gives concurrent FUSE callbacks
