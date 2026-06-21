@@ -203,47 +203,64 @@ This is reproduced for non-slack-fuse FUSE workloads on the same host
 (``claude`` D-state on FUSE for 2 days; ``bat`` for 2.5 hours). The
 condition is host-level, not slack-fuse-specific.
 
-**Trigger: unidentified.** Earlier passes attributed this to host vm
-config (``vm.swappiness=150``, ``vm.dirty_ratio=0``,
-``vm.dirty_background_ratio=0``). Both were wrong:
+**Trigger identified (2026-06-22) — `game-mode on` tears down
+backing services that slack-fuse-split is in-flight against.**
+Evidence (none of it my inference; all grounded in operator's own
+documented experience):
 
-- ``vm.swappiness=150`` biases reclaim AWAY from file-cache pages —
-  the wrong direction for the file-cache folio in the stack.
-- ``vm.dirty_ratio=0`` / ``vm.dirty_background_ratio=0`` are just the
-  ratio-side reading of a bytes-side config (``vm.dirty_bytes=256M``,
-  ``vm.dirty_background_bytes=64M`` — sensible values, currently 21
-  MB dirty / 0 writeback). Not at threshold, not actively pressuring.
+- ``/home/simon/bin/game-mode`` ``cmd_on`` comment, verbatim:
+  *"a session that's holding a FUSE handle or a postgres connection
+  when its backing service stops can end up in
+  ``__fuse_simple_request`` / connection-reset wedges that only
+  SIGKILL-after-FUSE-abort recovers from (see
+  lesson_fuse_orphan_recovery.md). Freezing first puts sessions in
+  cgroup-v2 TASK_FROZEN — they can't issue new requests, can't be
+  wedged."*
+- ``GAME_MODE_STOP_SERVICES`` includes ``claude-hooks-postgres.service``,
+  the local Postgres backing slack-fuse-split's projector. Its lesson
+  comment cites: *"stopping claude-hooks-postgres cascaded to
+  claude-hooksd → claude-session-fuse → /views/claude-sessions became
+  a stale mount."*
+- ``lesson_fuse_orphan_recovery.md`` documents the kernel stack we
+  observed (``fuse_s``, ``__fuse_simple_request``) and prescribes
+  ``echo 1 > /sys/fs/fuse/connections/<id>/abort`` as the only
+  always-works recovery primitive.
+- slack-fuse-split runs as a user systemd unit in ``app.slice``, NOT
+  in tmux. ``game-mode --freeze`` only freezes tmux sessions
+  (``session-freeze``), so slack-fuse-split stays runnable while its
+  PG socket disappears. It's the workflow event, not any system-wide
+  config, that triggers the wedge.
+- Timing: client crash logs show ``psycopg.OperationalError:
+  connection is bad: connection to server on socket
+  /run/user/1000/local-postgres/...`` exactly matching game-mode-on
+  events.
 
-The wedge is real and reproducible, the stack is consistent, multiple
-unrelated FUSE filesystems on the host are vulnerable, but I do not
-have a defensible mechanism. Candidates that could be the actual
-cause (in no particular order):
-
-- Kernel regression in 7.0.10-2-cachyos's FUSE module
-- Page-allocator fragmentation under sustained zram use forcing the
-  ``__filemap_get_folio_mpol.cold`` slow path to spin
-- Cross-filesystem contention on shared FUSE kernel state when 7
-  FUSE daemons (codex-chats, fireflies-meetings, slack-fuse,
-  slack-fuse-split, linear-fuse, notion-fuse, claude-sessions) all
-  live on the host
-- A bug specific to one daemon whose wedge takes down the kernel-side
-  pool the others share
+(Earlier passes wrongly blamed ``vm.swappiness=150`` and the
+``vm.dirty_ratio=0`` readings. Both were retracted under pressure;
+neither was mechanism-grounded.)
 
 **No operator mitigation here** until the actual trigger is named.
 Restarting an individual daemon clears its own wedge but doesn't
 prevent recurrence; the other 6 FUSE mounts continue to wedge.
 
-**Defense in depth shipped** (``scripts/watchdog/``): a small
-systemd timer-driven watchdog that detects D-state on
-``slack-fuse-split.service`` via ``/proc/<pid>/stat`` (never touches
-the FUSE path), and after a configurable threshold runs
-``fusermount3 -uz`` plus ``systemctl --user restart`` to recover.
-The lazy unmount works even against a D-state daemon because it
-operates on the kernel mount table. systemd starts a fresh PID; the
-wedged daemon orphans harmlessly. Live-verified against the 6h53m
-wedge on 2026-06-21: full recovery in under 5s, projection state
-preserved. Doesn't fix the trigger but bounds the impact to the
-watchdog interval (default 90s + 30s polling).
+**Defenses shipped:**
+
+1. **Recovery watchdog** (``scripts/watchdog/``): systemd timer-driven
+   detection via ``/proc/<pid>/stat`` (never touches the FUSE path);
+   threshold default 90s. Recovery now follows the lesson_fuse_orphan_
+   recovery sequence: ``echo 1 > /sys/fs/fuse/connections/<id>/abort``
+   (the only always-works primitive — pure sysfs write, no FUSE
+   traffic) → ``fusermount3 -uz`` → ``systemctl restart``. Live-verified
+   against the 6h53m wedge on 2026-06-21: full recovery in under 5s,
+   projection state preserved. Bounds impact to ~120s worst case.
+
+**Prevention not yet implemented** — add
+``slack-fuse-split.service`` to ``game-mode``'s
+``GAME_MODE_STOP_SERVICES`` so it gets cleanly stopped before
+``claude-hooks-postgres.service`` is torn down, then restarted in
+``cmd_off``. Mirrors the protection tmux sessions get via ``--freeze``.
+This is operator-side (their ``/home/simon/bin/game-mode``), not a
+slack-fuse code change. Left as a follow-up for the operator.
 
 **Status of the slack-fuse architectural fix** (``87487d0``): still
 correct and worth keeping — removes the v1-derived

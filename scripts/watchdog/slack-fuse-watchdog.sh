@@ -97,21 +97,45 @@ if (( AGE < THRESHOLD_S )); then
     exit 0
 fi
 
-# Threshold exceeded — full recovery has two steps:
+# Threshold exceeded — full recovery has three steps. Order and primitive
+# choice matter; see ``lesson_fuse_orphan_recovery.md`` for the rationale.
 #
-# 1. ``fusermount3 -uz`` (lazy unmount). Detaches the mount from the
-#    namespace immediately; works regardless of daemon state because it
-#    operates on the kernel mount table. After this, any FUSE clients
-#    blocked on ``fuse_simple_request`` see the channel torn down.
+# 1. ``echo 1 > /sys/fs/fuse/connections/<id>/abort`` — the ONLY recovery
+#    primitive that always works. Pure sysfs write, no FUSE traffic, so
+#    it can't itself wedge. Marks the kernel-side connection aborted →
+#    every queued client request gets ENODEV/EIO and wakes up → the
+#    daemon's ``read /dev/fuse`` returns ENODEV and its main loop exits.
+#    ``fusermount3 -uz`` is documented as race-prone (talks to the
+#    daemon implicitly), so abort comes first.
 #
-# 2. ``systemctl --user restart`` the unit. The daemon stays D-state
-#    (its `write()` is still waiting on a folio bit even after the
-#    channel is gone), but systemd is happy to start a fresh instance
-#    with a new PID — it logs "Found left-over process … Ignoring" and
-#    proceeds. The orphan daemon dies whenever its kernel wait
-#    eventually returns (which it may never, but it's harmless: takes
-#    no FUSE traffic, just sits in kernel sleep).
+# 2. ``fusermount3 -uz`` to clean up the now-stale mount entry. Safe
+#    now that the connection is dead; clients won't block.
+#
+# 3. ``systemctl --user restart`` to bring the unit back. The orphan
+#    daemon's kernel wait may resolve later (now that the connection
+#    is aborted) or never; either way it's harmless.
 log "PID $PID in D-state for ${AGE}s — exceeding ${THRESHOLD_S}s. Triggering recovery."
+
+# Map mount path → FUSE connection id via /proc/self/mountinfo. Field 3
+# is "<major>:<minor>" and the minor IS the conn id. This is pure kernel
+# data — never poisons the caller.
+MOUNT_LINE=$(awk -v m="$MOUNT" '$5==m {print; exit}' /proc/self/mountinfo)
+if [[ -n "$MOUNT_LINE" ]]; then
+    DEV=$(awk '{print $3}' <<<"$MOUNT_LINE")
+    CONN_ID="${DEV#*:}"
+    ABORT_FILE="/sys/fs/fuse/connections/$CONN_ID/abort"
+    if [[ -w "$ABORT_FILE" ]]; then
+        if echo 1 > "$ABORT_FILE" 2>&1; then
+            log "FUSE conn $CONN_ID aborted via sysfs"
+        else
+            log "abort write failed; continuing to fusermount3"
+        fi
+    else
+        log "no writable abort file at $ABORT_FILE (conn already gone?); continuing"
+    fi
+else
+    log "$MOUNT not in /proc/self/mountinfo; mount may already be gone"
+fi
 
 if fusermount3 -uz "$MOUNT" 2>&1 | sed 's/^/[watchdog]   fusermount3: /' >&2; then
     log "fusermount3 -uz succeeded; mount detached"
