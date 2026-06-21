@@ -179,6 +179,14 @@ class _ConnectionHandler:
                 nursery.start_soon(self._live_tail_loop)
                 await self._receive_loop(nursery)
                 nursery.cancel_scope.cancel()
+        except* ConnectionClosed:
+            # Normal client disconnect — any child task hitting send/receive
+            # on the closed socket raises ConnectionClosed. The whole nursery
+            # winds down; nothing actually broke. Without this catch the
+            # exception propagates out of ``serve_connection`` and kills the
+            # server process. (Observed: 10 cluster restarts over 1 week
+            # correlated 1:1 with local mount restarts.)
+            pass
         finally:
             await self._ws.aclose()
 

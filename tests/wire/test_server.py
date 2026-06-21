@@ -456,3 +456,15 @@ async def test_empty_notify_payload_checks_all_subscriptions(pg_conn: psycopg.Co
 
     assert isinstance(frame, EventFrame)
     assert frame.offset == offset
+
+
+# NOTE: a regression test for the 2026-06-21 production crash (10 cluster
+# restarts/week from ``ConnectionClosed`` propagating out of
+# ``_heartbeat_loop`` and killing the process) would belong here, but the
+# crash only surfaces via the production code path
+# (``serve_dispatch`` → ``trio.serve_tcp`` → ``serve_connection``), not via
+# ``WireServer.serve``'s direct ``trio_websocket.serve_websocket`` loop —
+# the latter quietly swallows per-handler exceptions, so any in-this-file
+# regression test passes both with and without the ``except*
+# ConnectionClosed`` guard. An integration test against the dispatch
+# stack would catch it; not added here yet.
