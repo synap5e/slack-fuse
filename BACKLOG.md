@@ -203,43 +203,35 @@ This is reproduced for non-slack-fuse FUSE workloads on the same host
 (``claude`` D-state on FUSE for 2 days; ``bat`` for 2.5 hours). The
 condition is host-level, not slack-fuse-specific.
 
-**Likely host trigger** — vm dirty-page tunables:
+**Trigger: unidentified.** Earlier passes attributed this to host vm
+config (``vm.swappiness=150``, ``vm.dirty_ratio=0``,
+``vm.dirty_background_ratio=0``). Both were wrong:
 
-```
-vm.dirty_ratio = 0             (default 20)
-vm.dirty_background_ratio = 0  (default 10)
-```
+- ``vm.swappiness=150`` biases reclaim AWAY from file-cache pages —
+  the wrong direction for the file-cache folio in the stack.
+- ``vm.dirty_ratio=0`` / ``vm.dirty_background_ratio=0`` are just the
+  ratio-side reading of a bytes-side config (``vm.dirty_bytes=256M``,
+  ``vm.dirty_background_bytes=64M`` — sensible values, currently 21
+  MB dirty / 0 writeback). Not at threshold, not actively pressuring.
 
-At 0%, every dirty page is under immediate-writeback pressure. The
-daemon's ``write(fuse_dev_fd, response, …)`` allocates a page-cache
-folio to deliver the response; with these settings the folio's
-writeback bit gets set as soon as it has data, and the writer waits
-on that bit to clear before reusing the slot. For a normal block
-device backed file the writeback completes against the device; for a
-FUSE device fd there *is* no block device — the consumer of the
-response is the FUSE client process. Under memory pressure, that
-window of "bit set, no clean drain" widens until the writer effectively
-stalls indefinitely. That's the credible mechanism for the stack we
-see.
+The wedge is real and reproducible, the stack is consistent, multiple
+unrelated FUSE filesystems on the host are vulnerable, but I do not
+have a defensible mechanism. Candidates that could be the actual
+cause (in no particular order):
 
-(Note: ``vm.swappiness=150`` and the 24.6 GB zram usage are visible on
-this host but don't have a clean causal link to *this* stack — file
-cache pages are what's stuck, not anon, and high swappiness biases
-reclaim AWAY from file pages. Including them earlier was reach-for-
-salience, not mechanism. Mentioning here only because someone else may
-also notice and wonder.)
+- Kernel regression in 7.0.10-2-cachyos's FUSE module
+- Page-allocator fragmentation under sustained zram use forcing the
+  ``__filemap_get_folio_mpol.cold`` slow path to spin
+- Cross-filesystem contention on shared FUSE kernel state when 7
+  FUSE daemons (codex-chats, fireflies-meetings, slack-fuse,
+  slack-fuse-split, linear-fuse, notion-fuse, claude-sessions) all
+  live on the host
+- A bug specific to one daemon whose wedge takes down the kernel-side
+  pool the others share
 
-**Operator mitigation** (system-level — needs ``sysctl`` as root):
-
-```sh
-sudo sysctl vm.dirty_ratio=20
-sudo sysctl vm.dirty_background_ratio=10
-```
-
-Persist via ``/etc/sysctl.d/99-fuse-friendly.conf``. After applying,
-restart all FUSE-mounted services to clear any current wedged daemons.
-Verify: a ``cat /views/slack-split/channels/<X>/channel.md`` should
-return without D-stating the process.
+**No operator mitigation here** until the actual trigger is named.
+Restarting an individual daemon clears its own wedge but doesn't
+prevent recurrence; the other 6 FUSE mounts continue to wedge.
 
 **Status of the slack-fuse architectural fix** (``87487d0``): still
 correct and worth keeping — removes the v1-derived
