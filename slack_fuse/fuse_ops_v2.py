@@ -466,7 +466,19 @@ class SlackFuseOpsV2(pyfuse3.Operations):
                 log.exception("FUSE sync body (conn-only) raised; returning EIO")
                 raise pyfuse3.FUSEError(errno.EIO) from None
         try:
-            conn = await self._pool.acquire()
+            # IMPORTANT: pool acquire must also be inside a timeout. If all
+            # pool slots are held by worker threads stuck in PG / kernel
+            # (the host-level FUSE wedge documented in BACKLOG), an
+            # unbounded acquire blocks every subsequent callback for as
+            # long as the wedge persists. Found 2026-06-22 via the new
+            # slow-op logging: an unprotected acquire let one read sit
+            # 115s on a wedge before completing. Use the same per-callback
+            # budget for the whole borrow → run → release cycle.
+            with trio.fail_after(self._callback_timeout_s):
+                conn = await self._pool.acquire()
+        except trio.TooSlowError:
+            log.warning("pool acquire timed out after %.1fs; returning EIO", self._callback_timeout_s)
+            raise pyfuse3.FUSEError(errno.EIO) from None
         except psycopg.OperationalError as exc:
             # Pool factory couldn't open a fresh conn — PG socket is gone.
             self._maybe_mark_pg_down(exc)

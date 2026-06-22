@@ -313,3 +313,46 @@ def test_callback_guard_marks_pg_down_on_operational_error(
         raise psycopg.OperationalError(msg)
     assert exc_info.value.errno == errno.EIO
     assert pg.is_down() is True
+
+
+@pytest.mark.trio
+async def test_pool_acquire_also_obeys_callback_timeout(
+    client_conn: Connection[TupleRow],
+    client_conn_factory: ClientConnFactory,
+    local_tz: ZoneInfo,
+) -> None:
+    """Bug discovered 2026-06-22 via the new slow-op logging: an unprotected
+    ``pool.acquire`` let a single read sit ~115s on a wedge before the
+    underlying ``trio.fail_after`` even got to wrap the sync body. The fix
+    extends the timeout to cover the acquire too. If all pool slots are
+    held by worker threads stuck on a wedged conn, ``acquire`` waits at
+    most ``callback_timeout_s`` before raising EIO.
+    """
+    pool = ConnectionPool(client_conn_factory, max_size=1)
+    ops = _ops(client_conn, local_tz, pool=pool, timeout_s=0.1)
+
+    # Take the only slot and hold it. Use a fresh task so it stays held
+    # across the callback under test.
+    holder_done = trio.Event()
+    release_holder = trio.Event()
+
+    async def _holder() -> None:
+        conn = await pool.acquire()
+        holder_done.set()
+        await release_holder.wait()
+        await pool.release(conn)
+
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(_holder)
+        await holder_done.wait()
+        # Now the pool is exhausted. _run_sync must time out the acquire,
+        # not block forever.
+        start = trio.current_time()
+        with pytest.raises(pyfuse3.FUSEError) as exc_info:
+            _ = await ops._run_sync(lambda: 0)  # pyright: ignore[reportPrivateUsage]
+        elapsed = trio.current_time() - start
+        assert exc_info.value.errno == errno.EIO
+        # Acquire was bounded by the callback timeout (with a small slack
+        # for scheduler/probe latency).
+        assert elapsed < 1.0, f"acquire took {elapsed:.3f}s — timeout did not apply"
+        release_holder.set()
