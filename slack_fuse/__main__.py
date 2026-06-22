@@ -278,6 +278,7 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
     from slack_fuse.config import load_client_config
     from slack_fuse.fuse_ops_v2 import SlackFuseOpsV2, V2InvalidationSink
     from slack_fuse.migrations.runner import apply_migrations
+    from slack_fuse.pg_health import PgHealth
     from slack_fuse.projector.health_subscriber import watch_health
     from slack_fuse.projector.pool import ConnectionPool as ProjectorConnectionPool
     from slack_fuse.projector.trailer_log import TrailerLog
@@ -345,6 +346,14 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
     tz = _resolve_local_zoneinfo()
     store_limiter = trio.CapacityLimiter(1)
 
+    # PG-down tolerance: when the local Postgres vanishes (game-mode on
+    # stops claude-hooks-postgres.service, manual restart, crash …) the
+    # FUSE callbacks fast-fail with EIO instead of crashing the process,
+    # and the mount root surfaces a `NO_POSTGRES` virtual file with the
+    # recovery story. A background trio task probes PG to flip back to
+    # up; the file disappears the moment PG returns.
+    pg_health = PgHealth(_open_conn)
+
     # Optional per-read trailer-decision JSONL log (bake-in observability).
     trailer_log = TrailerLog.open(config.trailer_log_path) if config.trailer_log_path is not None else None
     if trailer_log is not None:
@@ -355,6 +364,7 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
         tz,
         store_limiter,
         pool=fuse_pool,
+        pg_health=pg_health,
         stale_after_s=config.stale_after_disconnect_s,
         trailer_enabled=config.stale_trailer_enabled,
         trailer_log=trailer_log,
@@ -442,6 +452,7 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
             async with trio.open_nursery() as nursery:
                 nursery.start_soon(_run_health_subscriber)
                 nursery.start_soon(_run_projector)
+                nursery.start_soon(pg_health.run)
                 await pyfuse3.main()
                 nursery.cancel_scope.cancel()
         finally:
