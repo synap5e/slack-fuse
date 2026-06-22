@@ -70,6 +70,7 @@ from slack_fuse.fuse_v2_helpers import (
     thread_frontmatter,
     ts_to_local_date,
 )
+from slack_fuse.logctx import fuse_op, set_path
 from slack_fuse.pg_health import NO_POSTGRES_INODE, NO_POSTGRES_NAME
 from slack_fuse.projector.trailer import (
     STALE_AFTER_DISCONNECT_S,
@@ -522,8 +523,20 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             self._pg_health.mark_down(reason=reason)
 
     @contextlib.contextmanager
-    def _callback_guard(self, op: str) -> Iterator[None]:
+    def _callback_guard(
+        self,
+        op: str,
+        *,
+        inode: int | None = None,
+        path: str | None = None,
+    ) -> Iterator[None]:
         """Wrap a FUSE callback body so any uncaught exception becomes EIO.
+
+        Opens a :func:`fuse_op` logging scope at the same time so every
+        log line inside this callback (including from worker threads,
+        helpers, ``psycopg``) carries ``req_id``, ``op``, ``inode``, and
+        ``path`` — making it trivial to grep one logical operation out
+        of a busy journal and trace it end-to-end.
 
         The contract every callback honours after this:
 
@@ -532,26 +545,27 @@ class SlackFuseOpsV2(pyfuse3.Operations):
 
         Any other exception — psycopg failure, KeyError from a render
         edge case, AttributeError after a refactor regression, anything —
-        gets logged with full traceback and converted to ``EIO``. The
-        process never dies from a single bad callback. Combined with the
-        per-callback timeout in :meth:`_run_sync`, every callback either
-        succeeds, returns a clean error code, or surfaces EIO within
-        ``callback_timeout_s``.
+        gets logged with full traceback (including the FUSE scope
+        context) and converted to ``EIO``. The process never dies from a
+        single bad callback. Combined with the per-callback timeout in
+        :meth:`_run_sync`, every callback either succeeds, returns a
+        clean error code, or surfaces EIO within ``callback_timeout_s``.
         """
-        try:
-            yield
-        except pyfuse3.FUSEError:
-            raise
-        except psycopg.OperationalError as exc:
-            # Pre-``_run_sync`` PG access (e.g. inode lookup on cache miss)
-            # can still hit a dead socket. Mark down so subsequent callbacks
-            # fast-fail; surface as EIO to this caller.
-            self._maybe_mark_pg_down(exc)
-            log.warning("FUSE %s hit PG OperationalError: %s", op, exc)
-            raise pyfuse3.FUSEError(errno.EIO) from None
-        except Exception:
-            log.exception("FUSE %s raised unexpected error; returning EIO", op)
-            raise pyfuse3.FUSEError(errno.EIO) from None
+        with fuse_op(op, inode=inode, path=path):
+            try:
+                yield
+            except pyfuse3.FUSEError:
+                raise
+            except psycopg.OperationalError as exc:
+                # Pre-``_run_sync`` PG access (e.g. inode lookup on cache miss)
+                # can still hit a dead socket. Mark down so subsequent callbacks
+                # fast-fail; surface as EIO to this caller.
+                self._maybe_mark_pg_down(exc)
+                log.warning("hit PG OperationalError: %s", exc)
+                raise pyfuse3.FUSEError(errno.EIO) from None
+            except Exception:
+                log.exception("unexpected error; returning EIO")
+                raise pyfuse3.FUSEError(errno.EIO) from None
 
     @property
     def inodes(self) -> PersistentInodeMap:
@@ -766,15 +780,17 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         inode: int,
         ctx: pyfuse3.RequestContext,
     ) -> pyfuse3.EntryAttributes:
-        with self._callback_guard("getattr"):
+        with self._callback_guard("getattr", inode=inode):
             # The reserved NO_POSTGRES inode is handled entirely without DB
             # access — it has to be, because PG being down is the whole
             # reason this file exists.
             if inode == NO_POSTGRES_INODE:
+                set_path(f"/{NO_POSTGRES_NAME}")
                 return self._no_postgres_attr_or_enoent()
             path = self._inodes.get_path(inode)
             if path is None:
                 raise pyfuse3.FUSEError(errno.ENOENT)
+            set_path(path)
 
             def _sync() -> pyfuse3.EntryAttributes | None:
                 if self._is_dir(path):
@@ -806,7 +822,7 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         name: bytes,
         ctx: pyfuse3.RequestContext,
     ) -> pyfuse3.EntryAttributes:
-        with self._callback_guard("lookup"):
+        with self._callback_guard("lookup", inode=parent_inode):
             parent_path = self._inodes.get_path(parent_inode)
             if parent_path is None:
                 raise pyfuse3.FUSEError(errno.ENOENT)
@@ -815,8 +831,10 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             # in-process PgHealth flag, no DB hit. Pre-empts ``_list_dir``
             # which would otherwise need PG to enumerate the root.
             if parent_inode == ROOT_INODE and child_name == NO_POSTGRES_NAME:
+                set_path(f"/{NO_POSTGRES_NAME}")
                 return self._no_postgres_attr_or_enoent()
             child_path = f"/{child_name}" if parent_path == "/" else f"{parent_path}/{child_name}"
+            set_path(child_path)
 
             def _sync() -> pyfuse3.EntryAttributes | None:
                 # ``for_lookup=True`` so hidden conv-root channels resolve by their
@@ -890,10 +908,11 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         inode: int,
         ctx: pyfuse3.RequestContext,
     ) -> int:
-        with self._callback_guard("opendir"):
+        with self._callback_guard("opendir", inode=inode):
             path = self._inodes.get_path(inode)
             if path is None:
                 raise pyfuse3.FUSEError(errno.ENOENT)
+            set_path(path)
             snapshot = await self._run_sync(lambda: self._snapshot_dir(path))
             return self._register_dir_handle(snapshot)
 
@@ -927,10 +946,11 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         flags: int,
         ctx: pyfuse3.RequestContext,
     ) -> pyfuse3.FileInfo:
-        with self._callback_guard("open"):
+        with self._callback_guard("open", inode=inode):
             # NO_POSTGRES is a virtual file backed by in-process bytes; no inode
             # map lookup needed (and shouldn't be — PG is the thing that's down).
             if inode == NO_POSTGRES_INODE:
+                set_path(f"/{NO_POSTGRES_NAME}")
                 if self._pg_health is None or not self._pg_health.is_down():
                     raise pyfuse3.FUSEError(errno.ENOENT)
                 fi = pyfuse3.FileInfo()
@@ -938,8 +958,10 @@ class SlackFuseOpsV2(pyfuse3.Operations):
                 # Don't cache: the file disappears when PG comes back up.
                 fi.keep_cache = False  # pyright: ignore[reportAttributeAccessIssue]
                 return fi
-            if self._inodes.get_path(inode) is None:
+            path = self._inodes.get_path(inode)
+            if path is None:
                 raise pyfuse3.FUSEError(errno.ENOENT)
+            set_path(path)
             fi = pyfuse3.FileInfo()
             fi.fh = inode  # pyright: ignore[reportAttributeAccessIssue]
             # Kernel page-cache caching is gated by the trailer + fallback rules
@@ -949,9 +971,10 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             return fi
 
     async def read(self, fh: int, off: int, size: int) -> bytes:
-        with self._callback_guard("read"):
+        with self._callback_guard("read", inode=fh):
             # NO_POSTGRES virtual read: pure in-process bytes, no DB hit.
             if fh == NO_POSTGRES_INODE:
+                set_path(f"/{NO_POSTGRES_NAME}")
                 if self._pg_health is None or not self._pg_health.is_down():
                     raise pyfuse3.FUSEError(errno.EIO)
                 data = self._pg_health.explanation_bytes
@@ -959,6 +982,7 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             path = self._inodes.get_path(fh)
             if path is None:
                 raise pyfuse3.FUSEError(errno.EIO)
+            set_path(path)
 
             def _sync() -> tuple[bytes, bool, bool, TrailerDecision, str] | None:
                 resolved = self._resolve_decision(path)

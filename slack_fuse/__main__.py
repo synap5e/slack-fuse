@@ -292,10 +292,22 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
 
     _sp.run(["fusermount3", "-uz", str(mountpoint)], capture_output=True)
 
+    # Format includes the FUSE-request context fields (req_id, op, inode,
+    # path) injected by ``FuseContextFilter``. Outside a callback scope
+    # these read as ``-``. The filter is attached to the root handler so
+    # every logger benefits — projector, ws_client, helpers, etc.
+    from slack_fuse.logctx import FuseContextFilter
+
     logging.basicConfig(
         level=logging.DEBUG if args.debug else logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        format=(
+            "%(asctime)s %(levelname)s %(name)s "
+            "[%(req_id)s op=%(fuse_op)s ino=%(inode)s path=%(fuse_path)s] "
+            "%(message)s"
+        ),
     )
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(FuseContextFilter())
     log = logging.getLogger(__name__)
 
     def _open_conn() -> psycopg.Connection[TupleRow]:
