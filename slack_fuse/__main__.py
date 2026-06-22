@@ -440,13 +440,26 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
         backoff = 2.0
         max_backoff = 60.0
         while True:
-            conn = _open_conn()
+            # IMPORTANT: connect is INSIDE the try/except so PG-down at
+            # connect time (vs. during a query) doesn't escape and kill
+            # the process. Caught 2026-06-22 by the break-test harness:
+            # when local-postgres goes down before the supervisor's next
+            # iteration, ``psycopg.connect`` raises OperationalError that
+            # used to propagate to the nursery and take the daemon down.
+            conn: psycopg.Connection[TupleRow] | None = None
             try:
+                conn = _open_conn()
+                pg_health.mark_up()
                 await watch_health(
                     conn,
                     ops.invalidate_all_primed,
                     stale_after_s=config.stale_after_disconnect_s,
                 )
+            except psycopg.OperationalError as exc:
+                pg_health.mark_down(reason=f"health_subscriber: {exc}")
+                log.warning("health_subscriber connect/query failed (%s); reconnecting in %.0fs", exc, backoff)
+                await trio.sleep(backoff)
+                backoff = min(backoff * 2, max_backoff)
             except Exception as exc:  # noqa: BLE001 — supervisor must outlive any DB blip
                 log.warning("health_subscriber exited (%s); reconnecting in %.0fs", exc, backoff)
                 await trio.sleep(backoff)
@@ -456,8 +469,9 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
                 backoff = 2.0
                 await trio.sleep(1.0)
             finally:
-                with contextlib.suppress(Exception):
-                    conn.close()
+                if conn is not None:
+                    with contextlib.suppress(Exception):
+                        conn.close()
 
     async def _run() -> None:
         try:

@@ -79,7 +79,7 @@ def test_pg_health_explanation_bytes_describe_game_mode() -> None:
     body = pg.explanation_bytes
     # The text is the user-facing recovery guide; it must name the
     # service + socket so an operator can act on it directly.
-    assert b"claude-hooks-postgres" in body
+    assert b"local-postgres" in body
     assert b"/run/user/1000/local-postgres" in body
     assert b"game-mode" in body
 

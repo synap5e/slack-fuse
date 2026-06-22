@@ -59,7 +59,7 @@ _NO_POSTGRES_EXPLANATION = b"""\
 # Postgres is currently unreachable
 
 The local Postgres database that backs the slack-fuse projector
-(`claude-hooks-postgres.service` on UID 1000, socket
+(`local-postgres.service` on UID 1000, socket
 `/run/user/1000/local-postgres/.s.PGSQL.5433`) is not responding.
 
 While this is the case:
@@ -72,17 +72,19 @@ While this is the case:
 
 ## Common causes
 
-- `game-mode on` stops `claude-hooks-postgres.service` as part of its
-  `GAME_MODE_STOP_SERVICES`. The service comes back via `game-mode off`.
-  See `BACKLOG.md` for the FUSE-wedge mechanism this used to trigger
-  before the projector learned to tolerate it.
-- Manual `systemctl --user stop claude-hooks-postgres.service`.
-- Postgres pod / process crash.
+- `game-mode on` stops local-postgres-adjacent services as part of its
+  `GAME_MODE_STOP_SERVICES`; downstream consumers (including this
+  projector) can be left holding broken connections. See `BACKLOG.md`
+  for the FUSE-wedge mechanism this used to trigger before the
+  projector learned to tolerate it.
+- Manual `systemctl --user stop local-postgres.service`.
+- pg_ctl crash; check the postgres log.
 
 ## How to investigate
 
-    systemctl --user status claude-hooks-postgres.service
-    journalctl --user -u claude-hooks-postgres.service --since '5 min ago'
+    systemctl --user status local-postgres.service
+    journalctl --user -u local-postgres.service --since '5 min ago'
+    tail -100 ~/.local/state/local-postgres/postgres.log
 
 If you just ran `game-mode on`, run `game-mode off` to restore.
 """
