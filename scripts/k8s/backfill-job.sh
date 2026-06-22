@@ -65,7 +65,7 @@ NAMESPACE="${NAMESPACE:-apps}"
 # Pinned image must match what's deployed for the slack-fuse-server. If you
 # bump the server image, bump this too — backfill writes events with the same
 # schema the server projects, so the two must agree.
-IMAGE="${SLACK_FUSE_IMAGE:-ghcr.io/synap5e/slack-fuse:sha-b921e88@sha256:ca2e4fdd459786f6ab8dc3e0ab27a720ab1bf6d2626ba8ae0438e98d10302208}"
+IMAGE="${SLACK_FUSE_IMAGE:-ghcr.io/synap5e/slack-fuse:sha-a9117fe@sha256:ec43a78f73703e70c5fec2ac8be5c264e38abc023c627abf702577c81530cb9b}"
 
 NAME="slack-fuse-backfill-$(echo "$CHANNEL_ID" | tr '[:upper:]' '[:lower:]')-$(date +%s)"
 
