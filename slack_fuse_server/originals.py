@@ -143,9 +143,17 @@ def _replay_history(  # noqa: C901 - linear walk over event kinds; splitting hur
         builder = by_ts.setdefault(ts_dec, _MessageHistoryBuilder())
         if kind == "message" and builder.original_message is None:
             try:
-                builder.original_message = Message.model_validate(payload)
+                message = Message.model_validate(payload)
             except Exception:  # noqa: BLE001 — a malformed message is unrenderable; skip
                 continue
+            # Mirror channel.md: thread replies live in thread.md, not
+            # channel.md. Skipping them here keeps the originals view
+            # aligned with what ``ls`` shows next door. ``_is_thread_reply``
+            # in apply.py uses the same rule: thread_ts set and pointing
+            # somewhere other than ts itself.
+            if message.thread_ts is not None and message.thread_ts != message.ts:
+                continue
+            builder.original_message = message
         elif kind == "message_changed":
             builder.add_edit(created_at.timestamp())
         elif kind == "message_deleted":

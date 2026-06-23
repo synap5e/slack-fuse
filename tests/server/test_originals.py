@@ -34,20 +34,22 @@ def _ts(offset_s: float) -> str:
     return f"{_FROM_EPOCH + offset_s:.6f}"
 
 
-def _seed_message(
+def _seed_message(  # noqa: PLR0913 — test seed mirrors message-event shape.
     conn: psycopg.Connection[TupleRow],
     *,
     ts: str,
     text: str,
     user: str = "U123ALICE",
+    thread_ts: str | None = None,
+    reply_count: int = 0,
 ) -> None:
     payload: JsonObject = {
         "ts": ts,
         "user": user,
         "text": text,
         "subtype": None,
-        "thread_ts": None,
-        "reply_count": 0,
+        "thread_ts": thread_ts,
+        "reply_count": reply_count,
         "files": [],
         "edited": None,
         "reactions": [],
@@ -242,6 +244,49 @@ def test_originals_distinguishes_per_message_history(
     # the message texts above are chosen to NOT contain "edited" / "deleted".
     assert body.count(b"edited") == 1
     assert body.count(b"deleted") == 1
+
+
+def test_thread_replies_are_excluded(
+    server_conn: psycopg.Connection[TupleRow],
+) -> None:
+    """The originals view mirrors channel.md, which lists parents only and
+    summarises threads as ``Thread: N replies``. Replies (``thread_ts`` set
+    and pointing somewhere other than ``ts`` itself) live in thread.md, not
+    here. Seeing reply text expanded inline here was the 2026-06-24 visual
+    bug the user flagged on the first live render.
+    """
+    parent_ts = _ts(60.0)
+    reply_ts = _ts(120.0)  # 1 minute later
+    # The parent — non-threaded (thread_ts None) at seed time.
+    _seed_message(server_conn, ts=parent_ts, text="thread parent post")
+    # The reply — thread_ts points back to the parent.
+    _seed_message(
+        server_conn,
+        ts=reply_ts,
+        text="some thread reply text",
+        thread_ts=parent_ts,
+    )
+    body = render_originals_for_range(server_conn, _CH, from_epoch=_FROM_EPOCH, to_epoch=_TO_EPOCH)
+    assert b"thread parent post" in body
+    assert b"some thread reply text" not in body
+
+
+def test_thread_parent_with_self_referencing_thread_ts_is_kept(
+    server_conn: psycopg.Connection[TupleRow],
+) -> None:
+    """Some message events have ``thread_ts == ts`` (the parent's own ts).
+    That's the parent itself, not a reply — must remain in the view.
+    """
+    parent_ts = _ts(60.0)
+    _seed_message(
+        server_conn,
+        ts=parent_ts,
+        text="self-referencing parent",
+        thread_ts=parent_ts,
+        reply_count=2,
+    )
+    body = render_originals_for_range(server_conn, _CH, from_epoch=_FROM_EPOCH, to_epoch=_TO_EPOCH)
+    assert b"self-referencing parent" in body
 
 
 def test_ts_decimal_precision_preserved(
