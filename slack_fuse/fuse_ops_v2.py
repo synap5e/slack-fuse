@@ -542,7 +542,8 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         inode: int | None = None,
         path: str | None = None,
     ) -> Iterator[None]:
-        """Wrap a FUSE callback body so any uncaught exception becomes EIO.
+        """Wrap a FUSE callback body so any uncaught exception becomes EIO,
+        and the WHOLE body honours a single ``callback_timeout_s`` budget.
 
         Opens a :func:`fuse_op` logging scope at the same time so every
         log line inside this callback (including from worker threads,
@@ -552,22 +553,33 @@ class SlackFuseOpsV2(pyfuse3.Operations):
 
         The contract every callback honours after this:
 
-        - Return valid data, or
+        - Return valid data within ``callback_timeout_s``, or
         - Raise ``FUSEError(<errno>)`` (ENOENT, EIO, ENOTDIR, …) intentionally.
 
-        Any other exception — psycopg failure, KeyError from a render
-        edge case, AttributeError after a refactor regression, anything —
-        gets logged with full traceback (including the FUSE scope
+        Any other exception — psycopg failure, KeyError from a render edge
+        case, AttributeError after a refactor regression, a slow stage,
+        anything — gets logged with full traceback (including the FUSE scope
         context) and converted to ``EIO``. The process never dies from a
-        single bad callback. Combined with the per-callback timeout in
-        :meth:`_run_sync`, every callback either succeeds, returns a
-        clean error code, or surfaces EIO within ``callback_timeout_s``.
+        single bad callback.
+
+        The budget wraps the OUTER callback body (this was the 2026-06-24
+        wedge: ``_run_sync`` had its own fail_after but the read method did
+        work AFTER ``_run_sync`` returned — the ``notify_store`` call past
+        that inner guard had unbounded time. One outer budget makes every
+        callback either succeed or surface EIO within
+        ``callback_timeout_s``, no matter which stage stalls).
         """
         with fuse_op(op, inode=inode, path=path):
             try:
-                yield
+                with trio.fail_after(self._callback_timeout_s):
+                    yield
             except pyfuse3.FUSEError:
                 raise
+            except trio.TooSlowError:
+                log.warning(
+                    "callback exceeded %.1fs budget; returning EIO", self._callback_timeout_s
+                )
+                raise pyfuse3.FUSEError(errno.EIO) from None
             except psycopg.OperationalError as exc:
                 # Pre-``_run_sync`` PG access (e.g. inode lookup on cache miss)
                 # can still hit a dead socket. Mark down so subsequent callbacks

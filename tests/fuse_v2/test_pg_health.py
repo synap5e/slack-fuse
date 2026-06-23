@@ -298,10 +298,13 @@ def test_callback_guard_converts_unexpected_to_eio(
     assert exc_info.value.errno == errno.EIO
 
 
-def test_callback_guard_marks_pg_down_on_operational_error(
+@pytest.mark.trio
+async def test_callback_guard_marks_pg_down_on_operational_error(
     client_conn: Connection[TupleRow],
     local_tz: ZoneInfo,
 ) -> None:
+    # 2026-06-24: _callback_guard gained a trio.fail_after for the outer
+    # callback budget, so it now requires a running trio loop.
     pg = PgHealth(MagicMock())
     ops = _ops(client_conn, local_tz, pg_health=pg)
 
