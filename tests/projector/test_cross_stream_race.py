@@ -295,9 +295,11 @@ async def test_adversarial_user_added_lookup_before_message_commit(
     # TX-B commits: UADV becomes resolvable workspace-wide.
     user_conn.commit()
 
-    # The next read picks up the user and primes clean bytes.
+    # The next read picks up the user and marks the inode primed.
+    # 2026-06-24: notify_store was removed from the read path (deadlock fix);
+    # the priming-decision is tracked via primed_inodes instead.
     content_resolved = await ops.read(inode, 0, 131072)
     assert b"@Adv User" in content_resolved
     assert b"@UADV" not in content_resolved
-    assert len(fake.notify_calls) == 1
-    assert fake.notify_calls[0].inode == inode
+    assert fake.notify_calls == []
+    assert ops.primed_inodes_snapshot == frozenset({inode})

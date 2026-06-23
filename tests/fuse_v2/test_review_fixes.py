@@ -94,9 +94,11 @@ async def test_p0_1_time_crossing_invalidates_without_db_mutation(
     ops = _make_ops(client_conn, fake_pyfuse3)
     inode = ops.inodes.get_or_create(DAY_PATH)
 
-    # Prime while healthy + caught up.
+    # Prime while healthy + caught up. (2026-06-24: notify_store removed
+    # from the read path; the priming-decision bookkeeping is kept so the
+    # invalidator still knows what to drop.)
     _ = await ops.read(inode, 0, 131072)
-    assert len(fake_pyfuse3.notify_calls) == 1
+    assert fake_pyfuse3.notify_calls == []
     assert ops.primed_inodes_snapshot == frozenset({inode})
 
     # Baseline now (frame fresh) → not stale.
@@ -127,7 +129,7 @@ async def test_p0_1_read_after_threshold_trailers_and_skips_notify(
     inode = ops.inodes.get_or_create(DAY_PATH)
 
     _ = await ops.read(inode, 0, 131072)
-    assert len(fake_pyfuse3.notify_calls) == 1
+    assert ops.primed_inodes_snapshot == frozenset({inode})
 
     # Frame frozen 61s in the past (server died, no new frames): the read path
     # classifies this as stale by wall-clock.
@@ -136,8 +138,9 @@ async def test_p0_1_read_after_threshold_trailers_and_skips_notify(
 
     assert b"Content may be stale" in content
     assert b"server unreachable" in content
-    # No additional notify_store beyond the first (clean) prime.
-    assert len(fake_pyfuse3.notify_calls) == 1
+    # Stale reads are NOT re-primed (trailer present → keep_cache off).
+    # The earlier clean prime is still tracked; the stale read doesn't add to it.
+    assert fake_pyfuse3.notify_calls == []
 
 
 # ============================================================================

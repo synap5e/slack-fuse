@@ -106,13 +106,20 @@ async def test_invariant_1_trailer_suppresses_notify_store(
 
 
 @pytest.mark.trio
-async def test_invariant_1_no_trailer_does_notify_store(
+async def test_invariant_1_no_trailer_marks_inode_primed(
     client_conn: Connection[TupleRow],
     fake_pyfuse3: FakePyfuse3,
     channel_path: str,
 ) -> None:
-    """Mirror image of invariant 1: when the bytes are clean, notify_store
-    IS called and the inode is tracked as primed."""
+    """Mirror image of invariant 1: when the bytes are clean, the inode is
+    tracked as primed.
+
+    2026-06-24: notify_store was removed from the read path (it deadlocked
+    against in-flight kernel reads — see fuse_ops_v2.read). The kernel
+    caches the bytes via ``fi.keep_cache=True`` instead. The priming-decision
+    bookkeeping (``primed_inodes``) is preserved so the invalidator still
+    knows which inodes' caches to drop on health changes.
+    """
     _seed_clean_world(client_conn)
     ops = SlackFuseOpsV2(
         conn=client_conn,
@@ -125,8 +132,7 @@ async def test_invariant_1_no_trailer_does_notify_store(
     content = await ops.read(inode, 0, 131072)
 
     assert b"\xe2\x9a\xa0 Content may be stale" not in content
-    assert len(fake_pyfuse3.notify_calls) == 1
-    assert fake_pyfuse3.notify_calls[0].inode == inode
+    assert fake_pyfuse3.notify_calls == []
     assert ops.primed_inodes_snapshot == frozenset({inode})
 
 
@@ -176,15 +182,16 @@ async def test_invariant_2_unresolved_user_fallback_suppresses_notify_store(
 
 
 @pytest.mark.trio
-async def test_invariant_2_subsequent_read_after_user_added_does_notify_store(
+async def test_invariant_2_subsequent_read_after_user_added_marks_inode_primed(
     client_conn: Connection[TupleRow],
     fake_pyfuse3: FakePyfuse3,
     channel_path: str,
 ) -> None:
     """After the missing user_added arrives, the next read substitutes the
-    display name AND calls notify_store — the RFC's "next read re-renders
+    display name AND marks the inode primed (the RFC's "next read re-renders
     against the now-populated users/channels tables and notify_stores the
-    correct bytes."
+    correct bytes" — see 2026-06-24 note in
+    test_invariant_1_no_trailer_marks_inode_primed).
     """
     seed_channel(client_conn, "C1", "general", tier="hot")
     seed_chunk(
@@ -206,6 +213,7 @@ async def test_invariant_2_subsequent_read_after_user_added_does_notify_store(
     inode = ops.inodes.get_or_create(channel_path)
     content_pre = await ops.read(inode, 0, 131072)
     assert fake_pyfuse3.notify_calls == []
+    assert ops.primed_inodes_snapshot == frozenset()
 
     # user_added arrives.
     seed_user(client_conn, "U999", "carla")
@@ -213,8 +221,9 @@ async def test_invariant_2_subsequent_read_after_user_added_does_notify_store(
 
     assert b"@carla" in content_post
     assert b"@U999" not in content_post
-    # And now notify_store fires.
-    assert len(fake_pyfuse3.notify_calls) == 1
+    # And now priming is recorded.
+    assert ops.primed_inodes_snapshot == frozenset({inode})
+    assert fake_pyfuse3.notify_calls == []
     # The fallback first read produced bytes that include the literal.
     assert b"@U999" in content_pre
 

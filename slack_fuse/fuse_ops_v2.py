@@ -1030,13 +1030,20 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             # on tier = 'hot' reads.").
             # -------------------------------------------------------
             if not had_trailer and not had_fallback and self._is_hot(real_path):
-                # ``pyfuse3.notify_store`` writes a notify message to /dev/fuse
-                # and can block waiting for the kernel to ack. The kernel may
-                # be waiting for *this* daemon to service a concurrent upcall,
-                # so blocking here on the trio event-loop thread deadlocks the
-                # whole mount in ``folio_wait_bit_common`` (2026-06-24 wedge).
-                # Dispatch to a worker so the event loop stays free.
-                await trio.to_thread.run_sync(self._notify_store, fh, 0, content)
+                # 2026-06-24 wedge — notify_store call removed. The original
+                # rationale was "prime the kernel page cache so subsequent
+                # reads skip the daemon"; but ``fi.keep_cache=True`` (set in
+                # open()) already makes the kernel cache the bytes from the
+                # read response we're about to send. notify_store would do
+                # the same thing redundantly — except it has to TAKE the
+                # page lock the kernel holds for the in-flight read, and
+                # that's a strict deadlock (kernel waits for read response;
+                # notify_store waits for page lock; we haven't yet replied).
+                # Dispatching to a worker thread only moved the deadlock off
+                # the event loop without breaking it. Drop the call and let
+                # keep_cache handle priming organically; live-tail updates
+                # still drop the cache via the invalidator path (which runs
+                # post-commit, after any in-flight reads have completed).
                 self._track_primed(fh)
 
             return content[off : off + size]

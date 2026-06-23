@@ -309,7 +309,9 @@ async def test_b4_stale_trailer_disabled_skips_trailer(
     assert b"Content may be stale" not in content
     assert b"socket-mode disconnected" not in content
     # Staleness no longer gates priming when the trailer is disabled.
-    assert fake_pyfuse3.notify_calls != []
+    # 2026-06-24: notify_store calls were removed; the priming-decision is
+    # still tracked via primed_inodes (asserted in the kernel_cache_invariants
+    # suite). The classification check below is what this test is about.
     # ...but the classification is still recorded for false-positive analysis.
     decision = _decisions(log_path)[-1]
     assert decision.kind == "stale"

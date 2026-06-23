@@ -355,9 +355,11 @@ async def test_end_to_end_message_before_user_added(
     # The day-file inode the kernel cached the fallback into is dropped.
     assert inode in fake_pyfuse3.invalidate_calls
 
-    # Next read renders the resolved display name AND primes (clean bytes).
+    # Next read renders the resolved display name AND marks the inode primed
+    # (clean bytes). 2026-06-24: notify_store was removed from the read path
+    # to fix a folio_wait deadlock; ``primed_inodes`` is the surviving signal.
     content_post = await ops.read(inode, 0, 131072)
     assert b"@Alice" in content_post
     assert b"@UNEW" not in content_post
-    assert len(fake_pyfuse3.notify_calls) == 1
-    assert fake_pyfuse3.notify_calls[0].inode == inode
+    assert fake_pyfuse3.notify_calls == []
+    assert ops.primed_inodes_snapshot == frozenset({inode})
