@@ -180,7 +180,11 @@ async def watch_health(  # noqa: PLR0913  (keyword-only polling/test tuning knob
             if current != last:
                 log.info("health_subscriber: state change detected, firing invalidator")
                 try:
-                    invalidated = on_change()
+                    # ``on_change`` calls ``pyfuse3.invalidate_inode`` which
+                    # can block on writeback; running it inline on the trio
+                    # event-loop thread can deadlock against in-flight FUSE
+                    # reads (2026-06-24 wedge). Dispatch to a worker thread.
+                    invalidated = await trio.to_thread.run_sync(on_change)
                 except Exception as exc:  # noqa: BLE001  (subscriber must not die on FUSE quirks)
                     log.warning("health_subscriber: invalidator raised: %s", exc)
                 else:

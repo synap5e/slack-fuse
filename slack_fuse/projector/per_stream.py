@@ -218,7 +218,14 @@ class StreamApplier:
             raise
         await self._pool.release(conn)
         self._applied_offset = max(self._applied_offset, message.offset)
-        self._fire_invalidations(result)
+        # Invalidations call ``pyfuse3.invalidate_inode`` which can block on
+        # writeback. Calling it from the trio event-loop thread can deadlock
+        # against in-flight FUSE reads (the kernel is mid-read of an inode
+        # we're trying to invalidate; invalidate waits for the read; the read
+        # needs the event loop). Dispatch to a worker thread — matches v1's
+        # InodeInvalidator threading contract (see fuse_ops.py:678-685).
+        # 2026-06-24 wedge: this used to run inline → folio_wait_bit_common.
+        await trio.to_thread.run_sync(self._fire_invalidations, result)
 
     async def _record_caught_up_frame(self, message: CaughtUpFrame) -> None:
         conn = await self._pool.acquire()

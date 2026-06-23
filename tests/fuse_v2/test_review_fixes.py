@@ -347,41 +347,44 @@ def _ctx() -> pyfuse3.RequestContext:
 
 
 # ============================================================================
-# P1-7: an upsert of an existing caught-up stream (no count change, no
-# max-offset change) still moves the signature.
+# P1-7 (RETRACTED 2026-06-24): an upsert of an existing caught-up stream with
+# no count/max-offset change should NOT move the signature.
+#
+# The original P1-7 review suggested adding caught_up_at to the signature so
+# upserts at the same offset were detected. In production this caused a
+# once-per-second invalidator storm (live tail re-stamps caught_up_at on
+# every CaughtUpFrame) that wedged the daemon in folio_wait_bit_common after
+# the 2026-06-23 bulk backfill. A re-stamp at the same offset doesn't change
+# staleness_reason for any stream, so detecting it adds no observable value
+# and only churns the kernel cache.
 # ============================================================================
 
 
-def test_p1_7_caught_up_upsert_changes_signature(
+def test_caught_up_upsert_same_offset_does_not_move_signature(
     client_conn: Connection[TupleRow],
 ) -> None:
     mark_stream_caught_up(client_conn, "channel:C1", at_offset=10)
     baseline = read_signature(client_conn)
-
-    # Re-mark the SAME stream with the SAME offset: GREATEST keeps 10, so both
-    # COUNT(*) and MAX(at_offset) are unchanged — the pre-fix signature missed
-    # this. caught_up_at is restamped to now(), so the fixed signature differs.
-    time.sleep(0.002)  # ensure now() advances a microsecond tick
+    time.sleep(0.002)  # advance now() so caught_up_at would differ if we used it
     mark_stream_caught_up(client_conn, "channel:C1", at_offset=10)
     after = read_signature(client_conn)
 
     assert after.caught_up_count == baseline.caught_up_count
     assert after.caught_up_max_offset == baseline.caught_up_max_offset
-    assert after != baseline
+    assert after == baseline
 
 
-def test_p1_7_caught_up_lower_offset_upsert_changes_signature(
+def test_caught_up_lower_offset_upsert_does_not_move_signature(
     client_conn: Connection[TupleRow],
 ) -> None:
-    """A lower offset (GREATEST keeps the old) is also a transition worth
-    detecting — covered by the restamped caught_up_at."""
+    """GREATEST keeps the higher offset; no FUSE-observable change."""
     mark_stream_caught_up(client_conn, "channel:C1", at_offset=10)
     baseline = read_signature(client_conn)
     time.sleep(0.002)
     mark_stream_caught_up(client_conn, "channel:C1", at_offset=5)
     after = read_signature(client_conn)
-    assert after.caught_up_max_offset == 10  # unchanged
-    assert after != baseline
+    assert after.caught_up_max_offset == 10
+    assert after == baseline
 
 
 # ============================================================================
