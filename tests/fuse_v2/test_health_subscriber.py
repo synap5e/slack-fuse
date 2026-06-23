@@ -42,6 +42,25 @@ def test_signature_changes_when_stream_caught_up_added(client_conn: Connection[T
     assert after.caught_up_count == baseline.caught_up_count + 1
 
 
+def test_signature_stable_when_caught_up_restamped_same_offset(
+    client_conn: Connection[TupleRow],
+) -> None:
+    """Regression: 2026-06-24 incident — once-per-second invalidator storm.
+
+    `record_caught_up` is an UPSERT; the live tail re-stamps `caught_up_at`
+    every time the WS server sends a CaughtUpFrame for a stream that's
+    already at the head, even when nothing FUSE-observable changed. The
+    signature must NOT flap on these re-stamps; otherwise the invalidator
+    fires every second and eventually wedges the daemon in
+    folio_wait_bit_common.
+    """
+    mark_stream_caught_up(client_conn, "channel:CABC", at_offset=7)
+    baseline = read_signature(client_conn)
+    mark_stream_caught_up(client_conn, "channel:CABC", at_offset=7)
+    after = read_signature(client_conn)
+    assert after == baseline
+
+
 def test_watch_health_once_skips_when_unchanged(client_conn: Connection[TupleRow]) -> None:
     calls = [0]
 

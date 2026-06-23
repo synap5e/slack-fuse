@@ -80,19 +80,21 @@ class HealthSignature:
       carrying it would only cause spurious invalidations on redundant health
       events.
 
-    Catch-up state is folded in as ``(count, max_offset, max_at)``. ``max_at``
-    is load-bearing: ``record_caught_up`` is an UPSERT that always restamps
-    ``caught_up_at = now()``, so an existing stream being re-marked caught-up —
-    which leaves both ``count`` and ``max_offset`` unchanged — still moves
-    ``max_at`` and is detected (review P1-7 / GPT: the count+max signature
-    missed the upsert path).
+    Catch-up state is folded in as ``(count, max_offset)``. We DELIBERATELY do
+    NOT carry ``MAX(caught_up_at)``: ``record_caught_up`` is an UPSERT that
+    always restamps ``caught_up_at = now()``, so the live-tail's per-stream
+    "still caught up at offset X" frame would move ``max_at`` every second
+    even when nothing FUSE-observable changed. After the 2026-06-23 bulk
+    backfill the resulting once-per-second invalidator storm wedged the
+    daemon in ``folio_wait_bit_common``. The earlier P1-7 review note (add
+    ``max_at`` to catch the upsert path) was wrong: a re-stamp at the same
+    offset has no effect on ``staleness_reason``, so missing it is correct.
     """
 
     last_slurper_health: str | None
     frame_stale: bool
     caught_up_count: int
     caught_up_max_offset: int
-    caught_up_max_at: datetime | None
 
 
 def read_signature(
@@ -116,18 +118,16 @@ def read_signature(
         if row is not None:
             last_frame_at = row[0] if isinstance(row[0], datetime) else None
             last_slurper_health = None if row[1] is None else str(row[1])
-        _ = cur.execute("SELECT COUNT(*), COALESCE(MAX(at_offset), 0), MAX(caught_up_at) FROM stream_caught_up")
+        _ = cur.execute("SELECT COUNT(*), COALESCE(MAX(at_offset), 0) FROM stream_caught_up")
         row2 = cur.fetchone()
         count = 0 if row2 is None else int(row2[0])
         max_offset = 0 if row2 is None else int(row2[1])
-        max_at = row2[2] if row2 is not None and isinstance(row2[2], datetime) else None
     frame_stale = last_frame_at is None or (now_real - last_frame_at).total_seconds() > stale_after_s
     return HealthSignature(
         last_slurper_health=last_slurper_health,
         frame_stale=frame_stale,
         caught_up_count=count,
         caught_up_max_offset=max_offset,
-        caught_up_max_at=max_at,
     )
 
 
