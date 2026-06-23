@@ -1030,7 +1030,13 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             # on tier = 'hot' reads.").
             # -------------------------------------------------------
             if not had_trailer and not had_fallback and self._is_hot(real_path):
-                self._notify_store(fh, 0, content)
+                # ``pyfuse3.notify_store`` writes a notify message to /dev/fuse
+                # and can block waiting for the kernel to ack. The kernel may
+                # be waiting for *this* daemon to service a concurrent upcall,
+                # so blocking here on the trio event-loop thread deadlocks the
+                # whole mount in ``folio_wait_bit_common`` (2026-06-24 wedge).
+                # Dispatch to a worker so the event loop stays free.
+                await trio.to_thread.run_sync(self._notify_store, fh, 0, content)
                 self._track_primed(fh)
 
             return content[off : off + size]
