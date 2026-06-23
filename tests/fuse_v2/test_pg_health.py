@@ -308,6 +308,7 @@ async def test_callback_guard_marks_pg_down_on_operational_error(
     pg = PgHealth(MagicMock())
     ops = _ops(client_conn, local_tz, pg_health=pg)
 
+    await trio.lowlevel.checkpoint()  # establish trio context for fail_after
     with (
         pytest.raises(pyfuse3.FUSEError) as exc_info,
         ops._callback_guard("synthetic-op"),  # pyright: ignore[reportPrivateUsage]

@@ -290,13 +290,22 @@ def _build_headers(shared_secret: str | None) -> list[tuple[bytes, bytes]]:
     return headers
 
 
-def _derive_http_base(ws_url: str) -> str:
-    """Best-effort: `ws://host:port` → `http://host:port`."""
+def derive_http_base(ws_url: str) -> str:
+    """Best-effort: `ws://host:port` → `http://host:port`.
+
+    Public for reuse by the originals fetcher (``slack_fuse.__main__`` wires
+    a sync httpx client for the ``channel.original.md`` ghost file against
+    the same server origin).
+    """
     if ws_url.startswith("wss://"):
         return "https://" + ws_url.removeprefix("wss://").split("/", maxsplit=1)[0]
     if ws_url.startswith("ws://"):
         return "http://" + ws_url.removeprefix("ws://").split("/", maxsplit=1)[0]
     return ws_url
+
+
+# Backwards-compat alias for the previous private name.
+_derive_http_base = derive_http_base
 
 
 def _frame_to_json(frame: object) -> str:

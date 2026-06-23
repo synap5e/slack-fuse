@@ -19,10 +19,12 @@ from slack_fuse_server.http.dto import (
     ResolveRequest,
 )
 from slack_fuse_server.http.handlers import (
+    OriginalsDeps,
     ResolvePermalinkDeps,
     SnapshotDeps,
     handle_health,
     handle_metrics,
+    handle_originals,
     handle_permalink,
     handle_resolve,
     handle_snapshot,
@@ -80,6 +82,7 @@ def route_request(  # noqa: C901 - endpoint routing dispatch hub.
     metrics_source: MetricsSource,
     resolve_permalink_deps: ResolvePermalinkDeps | None = None,
     snapshot_deps: SnapshotDeps | None = None,
+    originals_deps: OriginalsDeps | None = None,
 ) -> HttpResponse:
     """Pure routing table for supported HTTP endpoints."""
     if request.path == "/health":
@@ -118,16 +121,31 @@ def route_request(  # noqa: C901 - endpoint routing dispatch hub.
             return _error_response(status_code=400, code="bad_request")
         return _handle_snapshot(snapshot_stream, at=at, since=since, deps=snapshot_deps)
 
+    originals_channel = _originals_channel_from_path(request.path)
+    if originals_channel is not None:
+        if request.method != "GET":
+            return _error_response(status_code=405, code="method_not_allowed")
+        if originals_deps is None:
+            return _error_response(status_code=503, code="service_unavailable")
+        try:
+            from_epoch, to_epoch = _parse_originals_query(request.target)
+        except ValueError:
+            return _error_response(status_code=400, code="bad_request")
+        return _handle_originals(
+            originals_channel, from_epoch=from_epoch, to_epoch=to_epoch, deps=originals_deps
+        )
+
     return _error_response(status_code=404, code="not_found")
 
 
-async def serve_http(
+async def serve_http(  # noqa: PLR0913 - HTTP wiring needs explicit deps.
     *,
     host: str,
     port: int,
     metrics_source: MetricsSource,
     resolve_permalink_deps: ResolvePermalinkDeps | None = None,
     snapshot_deps: SnapshotDeps | None = None,
+    originals_deps: OriginalsDeps | None = None,
 ) -> None:
     """Serve HTTP endpoints on the given host/port."""
     handler = partial(
@@ -135,6 +153,7 @@ async def serve_http(
         metrics_source=metrics_source,
         resolve_permalink_deps=resolve_permalink_deps,
         snapshot_deps=snapshot_deps,
+        originals_deps=originals_deps,
     )
     await trio.serve_tcp(handler, port=port, host=host)
 
@@ -144,6 +163,7 @@ async def serve_http_on_listeners(
     metrics_source: MetricsSource,
     resolve_permalink_deps: ResolvePermalinkDeps | None = None,
     snapshot_deps: SnapshotDeps | None = None,
+    originals_deps: OriginalsDeps | None = None,
 ) -> None:
     """Serve on already-open listeners (useful for tests and shared-port setups)."""
     handler = partial(
@@ -151,6 +171,7 @@ async def serve_http_on_listeners(
         metrics_source=metrics_source,
         resolve_permalink_deps=resolve_permalink_deps,
         snapshot_deps=snapshot_deps,
+        originals_deps=originals_deps,
     )
     await trio.serve_listeners(handler, listeners)
 
@@ -161,6 +182,7 @@ async def serve_http_from_listen_addr(
     metrics_source: MetricsSource,
     resolve_permalink_deps: ResolvePermalinkDeps | None = None,
     snapshot_deps: SnapshotDeps | None = None,
+    originals_deps: OriginalsDeps | None = None,
 ) -> None:
     """Serve HTTP endpoints using an RFC-style `listen_addr` string."""
     host, port = parse_listen_addr(listen_addr)
@@ -170,6 +192,7 @@ async def serve_http_from_listen_addr(
         metrics_source=metrics_source,
         resolve_permalink_deps=resolve_permalink_deps,
         snapshot_deps=snapshot_deps,
+        originals_deps=originals_deps,
     )
 
 
@@ -179,6 +202,7 @@ async def serve_http_connection(
     metrics_source: MetricsSource,
     resolve_permalink_deps: ResolvePermalinkDeps | None = None,
     snapshot_deps: SnapshotDeps | None = None,
+    originals_deps: OriginalsDeps | None = None,
 ) -> None:
     """Serve a single already-accepted connection as HTTP.
 
@@ -191,6 +215,7 @@ async def serve_http_connection(
         metrics_source=metrics_source,
         resolve_permalink_deps=resolve_permalink_deps,
         snapshot_deps=snapshot_deps,
+        originals_deps=originals_deps,
     )
 
 
@@ -200,6 +225,7 @@ async def _serve_connection(
     metrics_source: MetricsSource,
     resolve_permalink_deps: ResolvePermalinkDeps | None = None,
     snapshot_deps: SnapshotDeps | None = None,
+    originals_deps: OriginalsDeps | None = None,
 ) -> None:
     conn = h11.Connection(h11.SERVER)
     try:
@@ -211,6 +237,7 @@ async def _serve_connection(
             metrics_source=metrics_source,
             resolve_permalink_deps=resolve_permalink_deps,
             snapshot_deps=snapshot_deps,
+            originals_deps=originals_deps,
         )
         await _send_response(conn, stream, response)
     except h11.RemoteProtocolError:
@@ -358,3 +385,42 @@ def _parse_non_negative_int(text: str) -> int:
     if value < 0:
         raise ValueError("snapshot query offsets must be >= 0")
     return value
+
+
+def _originals_channel_from_path(path: str) -> str | None:
+    parts = path.split("/")
+    if len(parts) != 3 or parts[1] != "originals":
+        return None
+    encoded = parts[2]
+    if not encoded:
+        return None
+    channel = unquote(encoded)
+    return channel or None
+
+
+def _parse_originals_query(target: str) -> tuple[float, float]:
+    query = parse_qs(urlsplit(target).query, keep_blank_values=False)
+    from_raw = _single_query_value(query, "from")
+    to_raw = _single_query_value(query, "to")
+    assert from_raw is not None and to_raw is not None  # required=True
+    from_epoch = float(from_raw)
+    to_epoch = float(to_raw)
+    if not (from_epoch >= 0.0 and to_epoch >= 0.0):
+        raise ValueError("originals query epochs must be >= 0")
+    if to_epoch <= from_epoch:
+        raise ValueError("originals query 'to' must be > 'from'")
+    return from_epoch, to_epoch
+
+
+def _handle_originals(
+    channel_id: str,
+    *,
+    from_epoch: float,
+    to_epoch: float,
+    deps: OriginalsDeps,
+) -> HttpResponse:
+    try:
+        body = handle_originals(channel_id, from_epoch=from_epoch, to_epoch=to_epoch, deps=deps)
+    except psycopg.Error:
+        return _error_response(status_code=503, code="service_unavailable")
+    return HttpResponse(status_code=200, body=body, content_type="text/markdown; charset=utf-8")

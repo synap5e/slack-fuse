@@ -371,6 +371,25 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
     if trailer_log is not None:
         log.info("trailer decision log: %s", config.trailer_log_path)
 
+    # Sync httpx client for the ``channel.original.md`` ghost-file fetcher.
+    # The fetcher runs in FUSE worker threads (dispatched by ``_run_sync``),
+    # so a sync client fits cleanly — no trio context to thread through.
+    # Long-lived: one process, connection-pooled.
+    from slack_fuse.projector.originals_fetch import fetch_originals
+    from slack_fuse.projector.ws_client import derive_http_base
+
+    originals_http_client = httpx.Client(timeout=httpx.Timeout(connect=2.0, read=5.0, write=2.0, pool=5.0))
+    originals_base_http_url = derive_http_base(config.server_url)
+
+    def _originals_fetch_sync(channel_id: str, from_epoch: float, to_epoch: float) -> bytes:
+        return fetch_originals(
+            originals_http_client,
+            originals_base_http_url,
+            channel_id,
+            from_epoch=from_epoch,
+            to_epoch=to_epoch,
+        )
+
     ops = SlackFuseOpsV2(
         fuse_conn,
         tz,
@@ -380,6 +399,7 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
         stale_after_s=config.stale_after_disconnect_s,
         trailer_enabled=config.stale_trailer_enabled,
         trailer_log=trailer_log,
+        originals_fetch=_originals_fetch_sync,
     )
 
     # The projector's post-commit sink: maps ChunkRef / ThreadChunkRef /

@@ -32,7 +32,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, replace
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, Final, TypeVar
 from zoneinfo import ZoneInfo
@@ -44,6 +44,7 @@ import trio
 from slack_fuse.fuse_v2_helpers import (
     CHANNEL_LIST_STREAM,
     CHANNEL_MD,
+    CHANNEL_ORIGINAL_MD,
     CONV_ROOTS,
     THREAD_MD,
     ChannelRow,
@@ -118,8 +119,74 @@ log = logging.getLogger(__name__)
 
 NotifyStoreFn = Callable[[int, int, bytes], None]
 InvalidateInodeFn = Callable[[int], None]
+# ``OriginalsFetchFn(channel_id, from_epoch, to_epoch) -> response bytes``.
+# Bytes are the server's placeholder-markdown body (same shape as
+# ``chunks.content_md``); the FUSE side resolves mentions before serving.
+# Production wires this to a sync httpx GET (see projector/originals_fetch.py);
+# tests pass a fake.
+OriginalsFetchFn = Callable[[str, float, float], bytes]
 
 ROOT_INODE: Final = 1
+
+# Bounded TTL cache for channel.original.md renders.
+# - getattr → render-to-compute-size; read → render-to-return-bytes. Without
+#   a cache the same (channel, day) would replay the server's events twice
+#   for a single ``cat``.
+# - TTL is short (10s) so a fresh edit/delete shows up quickly on the next
+#   read but stat+read+rapid-follow-up all share one fetch.
+# - Capacity is bounded so a recursive scan that DID find these files (e.g.
+#   someone running ``rg`` with a pattern that matches the literal filename)
+#   doesn't grow memory unbounded.
+_ORIGINALS_CACHE_TTL_S: Final = 10.0
+_ORIGINALS_CACHE_MAX_ENTRIES: Final = 64
+
+
+@dataclass(slots=True)
+class _CachedOriginal:
+    content: bytes
+    cached_at_monotonic: float
+
+
+class _OriginalsCache:
+    """Bounded TTL cache keyed by (channel_id, isoformat-date).
+
+    Thread-safe: a stat+read pair from one process arrives on different worker
+    threads, so the cache lookup needs a lock. The lock is held only across
+    the dict ops, never across an HTTP fetch.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_entries: int = _ORIGINALS_CACHE_MAX_ENTRIES,
+        ttl_s: float = _ORIGINALS_CACHE_TTL_S,
+    ) -> None:
+        self._max = max_entries
+        self._ttl = ttl_s
+        self._entries: dict[tuple[str, str], _CachedOriginal] = {}
+        self._lock = threading.Lock()
+
+    def get(self, channel_id: str, day_iso: str) -> bytes | None:
+        key = (channel_id, day_iso)
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                return None
+            if time.monotonic() - entry.cached_at_monotonic > self._ttl:
+                _ = self._entries.pop(key, None)
+                return None
+            return entry.content
+
+    def put(self, channel_id: str, day_iso: str, content: bytes) -> None:
+        key = (channel_id, day_iso)
+        now = time.monotonic()
+        with self._lock:
+            if len(self._entries) >= self._max and key not in self._entries:
+                # Cheap FIFO eviction (insertion order). True LRU isn't worth
+                # the bookkeeping for this rarely-touched cache.
+                first_key = next(iter(self._entries))
+                _ = self._entries.pop(first_key, None)
+            self._entries[key] = _CachedOriginal(content=content, cached_at_monotonic=now)
 
 
 # errnos that are benign during a teardown/unmount race: the inode the kernel
@@ -359,6 +426,7 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         trailer_enabled: bool = True,
         trailer_log: TrailerLog | None = None,
         now_fn: NowFn = _utcnow,
+        originals_fetch: OriginalsFetchFn | None = None,
     ) -> None:
         super().__init__()
         # ``conn`` is the inode-map's dedicated connection. In pool mode (``pool``
@@ -398,6 +466,15 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         self._dir_handles: dict[int, list[tuple[str, pyfuse3.EntryAttributes, int]]] = {}
         self._dir_handle_seq = 0
         self._dir_handle_lock = threading.Lock()
+        # ``channel.original.md`` ghost-file plumbing. When ``originals_fetch``
+        # is None (most tests, and any deployment where the feature is gated
+        # off), the ghost file is invisible and any lookup of it returns
+        # ENOENT — the dispatch is centralised in ``_resolve_content`` /
+        # ``_list_dir(for_lookup=True)``.
+        self._originals_fetch = originals_fetch
+        self._originals_cache: _OriginalsCache | None = (
+            _OriginalsCache() if originals_fetch is not None else None
+        )
 
     # ------------------------------------------------------------------
     # Public surface used by the health subscriber + tests
@@ -683,6 +760,13 @@ class SlackFuseOpsV2(pyfuse3.Operations):
                 return []
             parents = fetch_day_thread_parents(self._conn, row.channel_id, day, self._tz)
             result: list[tuple[str, bool]] = [(CHANNEL_MD, False)]
+            # Ghost file: surfaced ONLY on the lookup path. readdir omits it
+            # (no recursive scan should hit the events-replay slow path), but
+            # a direct ``cat /…/channel.original.md`` must succeed. Gated on
+            # ``originals_fetch`` being wired — without a fetcher, the file
+            # cannot render, so don't pretend it exists.
+            if for_lookup and self._originals_fetch is not None:
+                result.append((CHANNEL_ORIGINAL_MD, False))
             for slug in dedup_thread_slug_map(parents):
                 result.append((slug, True))
             return result
@@ -716,7 +800,7 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         if depth == 4:
             return is_valid_month(parts[2]) and is_valid_day(parts[3])
         if depth == 5:
-            return parts[4] != CHANNEL_MD
+            return parts[4] not in (CHANNEL_MD, CHANNEL_ORIGINAL_MD)
         if depth == 6:
             return parts[5] != THREAD_MD
         return False
@@ -737,7 +821,7 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         content, had_trailer, had_fallback, _decision = resolved
         return content, had_trailer, had_fallback
 
-    def _resolve_decision(
+    def _resolve_decision(  # noqa: C901  (path-depth dispatch hub)
         self,
         path: str,
         now: datetime | None = None,
@@ -776,6 +860,22 @@ class SlackFuseOpsV2(pyfuse3.Operations):
                 return None
             return _assemble_channel_day(self._conn, row, day, self._tz, cfg)
 
+        # /<conv-root>/<slug>/<YYYY-MM>/<DD>/channel.original.md  (ghost file)
+        # Reached only via direct lookup — readdir does not list it. Renders
+        # by replaying the cluster's events table; cached in-process for the
+        # duration of one stat+read pair so a single ``cat`` doesn't replay
+        # the events twice.
+        if (
+            depth == 5
+            and parts[4] == CHANNEL_ORIGINAL_MD
+            and self._originals_fetch is not None
+            and self._originals_cache is not None
+        ):
+            day = parse_day_date(parts[2], parts[3])
+            if day is None:
+                return None
+            return self._assemble_channel_original_day(row, day, cfg)
+
         # /<conv-root>/<slug>/<YYYY-MM>/<DD>/<thread-slug>/thread.md
         if depth == 6 and parts[5] == THREAD_MD:
             day = parse_day_date(parts[2], parts[3])
@@ -794,6 +894,51 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         # If the slug map missed (no thread by that name yet under this day),
         # no thread file exists.
         return slug_map.get(thread_slug)
+
+    def _assemble_channel_original_day(
+        self,
+        row: ChannelRow,
+        day: date,
+        cfg: TrailerConfig,
+    ) -> tuple[bytes, bool, bool, TrailerDecision] | None:
+        """Assemble bytes for ``channel.original.md`` (events-replay view).
+
+        Fetches the raw originals body from the slurper-server (cached for a
+        short window so stat+read share one fetch), then runs the standard
+        mention-resolver pipeline against the client's local users/channels
+        tables so display names render as for ``channel.md``.
+
+        Returns ``None`` when there's nothing to render (no message events in
+        the day on the server side), making the file ``ENOENT``-like — a
+        ``lookup`` of ``channel.original.md`` on an empty day succeeds for
+        the *parent* but yields no resolved attrs, so ``lookup`` raises
+        ``ENOENT`` to userspace. Same shape as the channel.md empty-day case.
+        """
+        assert self._originals_fetch is not None
+        assert self._originals_cache is not None
+        day_iso = day.isoformat()
+        cached = self._originals_cache.get(row.channel_id, day_iso)
+        if cached is None:
+            day_start_local = datetime.combine(day, datetime.min.time()).replace(tzinfo=self._tz)
+            day_end_local = day_start_local + timedelta(days=1)
+            from_epoch = day_start_local.timestamp()
+            to_epoch = day_end_local.timestamp()
+            # Any exception (httpx network error, server 5xx, etc.) propagates
+            # to ``_callback_guard``, which logs full traceback and surfaces
+            # EIO — same path as any other callback-stage failure.
+            raw = self._originals_fetch(row.channel_id, from_epoch, to_epoch)
+            self._originals_cache.put(row.channel_id, day_iso, raw)
+            cached = raw
+        if not cached:
+            return None
+        users, channels = sql_resolvers_for(self._conn)
+        resolved, fallback_reasons = resolve_with_miss_tracking(cached.decode("utf-8"), users, channels)
+        # Same frontmatter as channel.md plus an originals marker line so a
+        # human eyeballing the file immediately knows what they're reading.
+        frontmatter = day_channel_frontmatter(row, day)
+        marker = "<!-- originals view: replay of events log; edits/deletes annotated inline -->\n\n"
+        base = frontmatter + marker + resolved
+        return _decide_and_apply(self._conn, base, f"channel:{row.channel_id}", fallback_reasons, cfg)
 
     # ------------------------------------------------------------------
     # FUSE callbacks

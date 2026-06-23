@@ -41,7 +41,7 @@ from slack_fuse_server.backfill.legacy import LegacyCacheBackfiller
 from slack_fuse_server.backfill.types import Backfiller
 from slack_fuse_server.config import ServerConfig, load_server_config
 from slack_fuse_server.dispatch import serve_dispatch
-from slack_fuse_server.http.handlers import ResolvePermalinkDeps, SnapshotDeps
+from slack_fuse_server.http.handlers import OriginalsDeps, ResolvePermalinkDeps, SnapshotDeps
 from slack_fuse_server.http.metrics import MetricsAggregator, SubscriberSnapshot
 from slack_fuse_server.slurper.api import ChannelNotFoundError, SlackAPIError, SlackClient
 from slack_fuse_server.slurper.channels import ensure_channel_added, populate_channels_once
@@ -203,6 +203,7 @@ async def _serve(config: ServerConfig) -> None:
         workspace_url=os.environ.get("SLACK_WORKSPACE_URL"),
     )
     snapshot_deps = SnapshotDeps(database_url=config.database_url)
+    originals_deps = OriginalsDeps(database_url=config.database_url)
     limiter = trio.CapacityLimiter(1)
     writer = OffsetWriter(conn, limiter)
     health = HealthEmitter(writer)
@@ -235,6 +236,7 @@ async def _serve(config: ServerConfig) -> None:
                 metrics,
                 resolve_permalink_deps,
                 snapshot_deps,
+                originals_deps,
             )
             nursery.start_soon(snapshot_scheduler.run)
             if auto_backfill:
@@ -260,12 +262,13 @@ async def _run_socket_mode_with_users_task(
     await run_socket_mode_with_users(writer, health, client, config.slack_app_token, options=options)
 
 
-async def _serve_dispatch_task(
+async def _serve_dispatch_task(  # noqa: PLR0913, PLR0917 - dispatch wiring needs explicit deps.
     listen_addr: str,
     wire_server: WireServer,
     metrics: MetricsAggregator,
     resolve_permalink_deps: ResolvePermalinkDeps,
     snapshot_deps: SnapshotDeps,
+    originals_deps: OriginalsDeps,
 ) -> None:
     await serve_dispatch(
         listen_addr=listen_addr,
@@ -273,6 +276,7 @@ async def _serve_dispatch_task(
         metrics_source=metrics,
         resolve_permalink_deps=resolve_permalink_deps,
         snapshot_deps=snapshot_deps,
+        originals_deps=originals_deps,
     )
 
 

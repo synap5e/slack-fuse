@@ -59,6 +59,14 @@ ROOT_DIRS: Final[tuple[str, ...]] = CONV_ROOTS
 # Slugs we use for the channel root metadata + day files.
 CHANNEL_MD: Final = "channel.md"
 THREAD_MD: Final = "thread.md"
+# Ghost file: an originals-view of a day (pre-edit text + crossed-out deletes).
+# Reachable via direct ``lookup`` (e.g. ``bat channel.original.md``) but
+# DELIBERATELY excluded from ``readdir`` so recursive listings — including
+# ``ls -la`` and find/rg sweeps — never accidentally trigger the slow,
+# events-replay render path on the server side. See
+# ``fuse_ops_v2.SlackFuseOpsV2._list_dir`` for the ``for_lookup=True`` branch
+# that surfaces this name.
+CHANNEL_ORIGINAL_MD: Final = "channel.original.md"
 
 # The `channel-list` stream is the staleness stream for channel-metadata
 # (``channel.md``) reads — channel inventory/rename/archive flow over it.

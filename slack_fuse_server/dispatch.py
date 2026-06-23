@@ -30,7 +30,7 @@ import h11
 import trio
 from trio_websocket import wrap_server_stream
 
-from slack_fuse_server.http.handlers import ResolvePermalinkDeps, SnapshotDeps
+from slack_fuse_server.http.handlers import OriginalsDeps, ResolvePermalinkDeps, SnapshotDeps
 from slack_fuse_server.http.metrics import MetricsSource
 from slack_fuse_server.http.server import parse_listen_addr, serve_http_connection
 from slack_fuse_server.wire.server import WireServer
@@ -149,13 +149,14 @@ async def _serve_websocket(stream: trio.abc.Stream, wire_server: WireServer) -> 
         await stream.aclose()
 
 
-async def serve_connection(
+async def serve_connection(  # noqa: PLR0913 - dispatch wiring needs explicit deps.
     stream: trio.SocketStream,
     *,
     wire_server: WireServer,
     metrics_source: MetricsSource,
     resolve_permalink_deps: ResolvePermalinkDeps | None = None,
     snapshot_deps: SnapshotDeps | None = None,
+    originals_deps: OriginalsDeps | None = None,
 ) -> None:
     """Classify one accepted connection and route it to WS or HTTP."""
     raw, peeked = await _peek(stream)
@@ -168,6 +169,7 @@ async def serve_connection(
             metrics_source=metrics_source,
             resolve_permalink_deps=resolve_permalink_deps,
             snapshot_deps=snapshot_deps,
+            originals_deps=originals_deps,
         )
 
 
@@ -178,6 +180,7 @@ async def serve_dispatch(  # noqa: PLR0913 - dispatch wiring needs explicit deps
     metrics_source: MetricsSource,
     resolve_permalink_deps: ResolvePermalinkDeps | None = None,
     snapshot_deps: SnapshotDeps | None = None,
+    originals_deps: OriginalsDeps | None = None,
     task_status: trio.TaskStatus[list[trio.SocketListener]] = trio.TASK_STATUS_IGNORED,
 ) -> None:
     """Bind `listen_addr` and serve HTTP + WS on the one port."""
@@ -188,17 +191,19 @@ async def serve_dispatch(  # noqa: PLR0913 - dispatch wiring needs explicit deps
         metrics_source=metrics_source,
         resolve_permalink_deps=resolve_permalink_deps,
         snapshot_deps=snapshot_deps,
+        originals_deps=originals_deps,
     )
     await trio.serve_tcp(handler, port=port, host=host, task_status=task_status)
 
 
-async def serve_dispatch_on_listeners(
+async def serve_dispatch_on_listeners(  # noqa: PLR0913 - dispatch wiring needs explicit deps.
     listeners: list[trio.SocketListener],
     *,
     wire_server: WireServer,
     metrics_source: MetricsSource,
     resolve_permalink_deps: ResolvePermalinkDeps | None = None,
     snapshot_deps: SnapshotDeps | None = None,
+    originals_deps: OriginalsDeps | None = None,
 ) -> None:
     """Serve on already-open listeners (tests bind port 0 and read the port back)."""
     handler = partial(
@@ -207,5 +212,6 @@ async def serve_dispatch_on_listeners(
         metrics_source=metrics_source,
         resolve_permalink_deps=resolve_permalink_deps,
         snapshot_deps=snapshot_deps,
+        originals_deps=originals_deps,
     )
     await trio.serve_listeners(handler, listeners)
