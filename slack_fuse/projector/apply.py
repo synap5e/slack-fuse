@@ -498,6 +498,14 @@ def _dispatch_channel_list_event(
 ) -> ApplyResult:
     if kind == "channel_added":
         return _apply_channel_added(cur, payload, always_blocked)
+    if kind == "channel_info_refreshed":
+        # Same shape as channel_added — a fresh ``conversations.info``
+        # response carrying full channel metadata. The
+        # ``ON CONFLICT DO UPDATE`` in ``_apply_channel_added`` handles
+        # the upsert; auto-tier re-evaluates against current is_member /
+        # is_archived so a "we just joined" refresh promotes hidden →
+        # hot, and a "we left" refresh demotes hot → hidden.
+        return _apply_channel_added(cur, payload, always_blocked)
     if kind == "channel_renamed":
         return _apply_channel_renamed(cur, payload)
     if kind == "channel_archived":

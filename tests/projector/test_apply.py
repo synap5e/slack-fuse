@@ -288,6 +288,91 @@ def test_message_deleted_reply_removes_thread_chunk_and_refreshes_parent(
 # === channel-list events ===
 
 
+def test_channel_info_refreshed_upserts_membership_and_promotes_tier(
+    client_conn: psycopg.Connection[TupleRow],
+) -> None:
+    """The 2026-06-27 refresh sweep emits ``channel_info_refreshed`` events
+    when the most recent payload differs from a fresh ``conversations.info``
+    response. Pre-fix the projector treated it as an unknown kind and the
+    local ``channels.is_member`` stayed stuck at whatever ``channel_added``
+    set — concretely: a channel you joined still appeared with
+    ``is_member=false`` and ``tier=hidden``, so it wasn't even in
+    ``readdir`` until you manually patched the row.
+
+    Now we dispatch ``channel_info_refreshed`` to the same handler as
+    ``channel_added`` — same payload shape, ``ON CONFLICT DO UPDATE``
+    handles the upsert. Auto-tier re-evaluates against the new is_member
+    so a "we just joined" refresh promotes hidden → hot.
+    """
+    # Seed: original channel_added when we weren't a member yet.
+    apply_event(
+        client_conn,
+        EventFrame(
+            stream="channel-list",
+            offset=1,
+            kind="channel_added",
+            ts=None,
+            payload=_payload(id="C001", name="frontend-nightly", is_member=False),
+        ),
+    )
+    rows_before = _channels(client_conn)
+    assert rows_before == [("C001", "frontend-nightly", "hidden", "auto")]
+
+    # Refresh sweep delivers the new state: is_member=true.
+    apply_event(
+        client_conn,
+        EventFrame(
+            stream="channel-list",
+            offset=2,
+            kind="channel_info_refreshed",
+            ts=None,
+            payload=_payload(id="C001", name="frontend-nightly", is_member=True),
+        ),
+    )
+    rows_after = _channels(client_conn)
+    assert rows_after == [("C001", "frontend-nightly", "hot", "auto")]
+
+
+def test_channel_info_refreshed_preserves_manual_tier_override(
+    client_conn: psycopg.Connection[TupleRow],
+) -> None:
+    """``tier_source='manual'`` survives across refreshes — an operator
+    who explicitly hid a channel via ``slack-fuse tier <slug> hidden``
+    shouldn't have it auto-promoted back to hot by the next refresh."""
+    apply_event(
+        client_conn,
+        EventFrame(
+            stream="channel-list",
+            offset=1,
+            kind="channel_added",
+            ts=None,
+            payload=_payload(id="C001", name="noisy", is_member=True),
+        ),
+    )
+    # Operator pins it to hidden / manual.
+    with client_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE channels SET tier = 'hidden', tier_source = 'manual' "
+            "WHERE channel_id = %s",
+            ("C001",),
+        )
+
+    apply_event(
+        client_conn,
+        EventFrame(
+            stream="channel-list",
+            offset=2,
+            kind="channel_info_refreshed",
+            ts=None,
+            payload=_payload(id="C001", name="noisy", is_member=True),
+        ),
+    )
+    rows = _channels(client_conn)
+    # Manual override holds — refresh DOES update name/membership but
+    # NOT tier.
+    assert rows == [("C001", "noisy", "hidden", "manual")]
+
+
 def test_channel_added_with_member_uses_hot_tier(client_conn: psycopg.Connection[TupleRow]) -> None:
     apply_event(
         client_conn,
