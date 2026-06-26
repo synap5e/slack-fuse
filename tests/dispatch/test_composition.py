@@ -28,6 +28,7 @@ import slack_fuse_server.migrations as server_migrations
 from slack_fuse.migrations.runner import apply_migrations
 from slack_fuse_server._json import JsonObject
 from slack_fuse_server.dispatch import serve_dispatch_on_listeners
+from slack_fuse_server.http.handlers import GapsDeps, OriginalsDeps
 from slack_fuse_server.http.dto import MetricsResponse
 from slack_fuse_server.http.metrics import MetricsAggregator, SubscriberSnapshot
 from slack_fuse_server.wire.frames import CaughtUpFrame, EventFrame, Frame, FrameAdapter, SubscribeFrame
@@ -82,7 +83,12 @@ def _build_metrics(database_url: str, wire_server: WireServer) -> MetricsAggrega
 
 
 @asynccontextmanager
-async def _running_dispatch(database_url: str) -> AsyncIterator[tuple[int, WireServer]]:
+async def _running_dispatch(
+    database_url: str,
+    *,
+    gaps_deps: GapsDeps | None = None,
+    originals_deps: OriginalsDeps | None = None,
+) -> AsyncIterator[tuple[int, WireServer]]:
     wire_server = WireServer(
         database_url,
         options=WireServerOptions(heartbeat_interval_s=_NO_HEARTBEAT_S, client_timeout_s=_NO_HEARTBEAT_S),
@@ -90,7 +96,14 @@ async def _running_dispatch(database_url: str) -> AsyncIterator[tuple[int, WireS
     metrics = _build_metrics(database_url, wire_server)
     listeners = await trio.open_tcp_listeners(0, host="127.0.0.1")
     port = cast(tuple[str, int], listeners[0].socket.getsockname())[1]
-    handler = partial(serve_dispatch_on_listeners, listeners, wire_server=wire_server, metrics_source=metrics)
+    handler = partial(
+        serve_dispatch_on_listeners,
+        listeners,
+        wire_server=wire_server,
+        metrics_source=metrics,
+        gaps_deps=gaps_deps,
+        originals_deps=originals_deps,
+    )
     async with trio.open_nursery() as nursery:
         nursery.start_soon(handler)
         await trio.sleep(0.05)
@@ -138,6 +151,54 @@ async def test_unknown_path_returns_404_on_shared_port(pg_conn: psycopg.Connecti
     ):
         response = await client.get("/nope")
     assert response.status_code == 404
+
+
+async def test_gaps_endpoint_forwards_deps_through_dispatch(
+    pg_conn: psycopg.Connection[TupleRow],
+) -> None:
+    """Regression for the 2026-06-26 wiring leak: ``serve_connection`` in
+    dispatch.py accepted ``gaps_deps`` as a kwarg but didn't forward it to
+    ``serve_http_connection``, so ``GET /gaps`` always returned 503
+    ``service_unavailable`` even with deps wired upstream. The whole point of
+    this test is to walk the EXACT call chain the production slurper uses
+    (dispatch → connection → http → route) and prove deps survive the trip.
+
+    The same shape catches future regressions when someone adds a new deps
+    kwarg to one layer but forgets a downstream forwarder.
+    """
+    database_url = _prepare_database(pg_conn)
+    gaps_deps = GapsDeps(database_url=database_url)
+    async with (
+        _running_dispatch(database_url, gaps_deps=gaps_deps) as (port, _wire),
+        httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client,
+    ):
+        response = await client.get("/gaps")
+    # The body might say "No gaps detected" — what we care about is that
+    # the route handler ran with deps, NOT that it returned 503 because
+    # the dispatch dropped the kwarg.
+    assert response.status_code == 200, (
+        f"got {response.status_code}; dispatch wiring likely dropped gaps_deps. "
+        f"body={response.text[:200]}"
+    )
+    assert response.headers["content-type"].startswith("text/markdown")
+
+
+async def test_gaps_endpoint_503_without_deps_proves_503_is_the_failure_mode(
+    pg_conn: psycopg.Connection[TupleRow],
+) -> None:
+    """Pin the negative side: when gaps_deps isn't wired AT ALL (production
+    bug we want to catch elsewhere), the route returns 503 — not 404, not
+    a crash. This pins the production diagnostic so the dispatch-wiring
+    test above doesn't accidentally pass via the 404 path if the route
+    block ever gets reordered.
+    """
+    database_url = _prepare_database(pg_conn)
+    async with (
+        _running_dispatch(database_url, gaps_deps=None) as (port, _wire),
+        httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client,
+    ):
+        response = await client.get("/gaps")
+    assert response.status_code == 503
 
 
 async def test_websocket_served_on_shared_port(pg_conn: psycopg.Connection[TupleRow]) -> None:

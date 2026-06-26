@@ -171,6 +171,7 @@ async def serve_connection(  # noqa: PLR0913 - dispatch wiring needs explicit de
             resolve_permalink_deps=resolve_permalink_deps,
             snapshot_deps=snapshot_deps,
             originals_deps=originals_deps,
+            gaps_deps=gaps_deps,
         )
 
 
