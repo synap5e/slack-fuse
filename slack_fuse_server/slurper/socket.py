@@ -49,12 +49,11 @@ from slack_fuse.models import (
     GRACEFUL_DISCONNECT_REASONS,
     AppsConnectionsOpenResponse,
     Channel,
-    Message,
     SocketEnvelope,
     SocketEventPayload,
 )
 from slack_fuse_server._json import JsonObject
-from slack_fuse_server.slurper.api import SlackAPIError, SlackClient
+from slack_fuse_server.slurper.api import SlackAPIError, SlackClient, Validated
 from slack_fuse_server.slurper.health import HealthEmitter, HealthKind, SlackDegradedTracker
 from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter
 
@@ -126,11 +125,17 @@ def _classify_open_failure(exc: BaseException) -> str:
     return "api_error"
 
 
-def translate_message_event(event: SocketEventPayload) -> EventRecord | None:
+def translate_message_event(event: SocketEventPayload, raw_event: JsonObject) -> EventRecord | None:
     """Translate a `message`-type socket event to a `channel:<id>` write.
 
-    Pure: no API calls. Returns None when the event carries no usable channel
-    or timestamp (nothing to write).
+    Persists the RAW event dict (lossless) — ``event`` is used only for
+    in-process logic (membership / typing checks), the payload comes from
+    ``raw_event``. Pydantic ``model_dump`` reshapes nested fields and
+    drops anything we don't declare; the events table stays the source
+    of truth so future projections can read fields we don't know yet.
+
+    Pure: no API calls. Returns None when the event carries no usable
+    channel or timestamp (nothing to write).
     """
     channel_id = event.channel
     if not channel_id:
@@ -141,7 +146,16 @@ def translate_message_event(event: SocketEventPayload) -> EventRecord | None:
         new_msg = event.message
         if new_msg is None:
             return None
-        payload: JsonObject = {"message": new_msg.model_dump(mode="json"), "previous_ts": new_msg.ts}
+        # Persist the raw nested message + the previous_ts marker. The
+        # nested message dict is the wire shape under
+        # ``raw_event["message"]``; defensively fall back to a dump if
+        # the wire payload is shaped unexpectedly.
+        raw_msg = raw_event.get("message")
+        if isinstance(raw_msg, dict):
+            msg_dict: JsonObject = cast(JsonObject, raw_msg)
+        else:
+            msg_dict = cast(JsonObject, new_msg.model_dump(mode="json"))
+        payload: JsonObject = {"message": msg_dict, "previous_ts": new_msg.ts}
         return EventRecord(stream=stream, kind="message_changed", ts=new_msg.ts, payload=payload)
 
     if event.subtype == "message_deleted":
@@ -149,26 +163,48 @@ def translate_message_event(event: SocketEventPayload) -> EventRecord | None:
         if not deleted_ts:
             return None
         prev = event.previous_message
-        del_payload: JsonObject = {
-            "deleted_ts": deleted_ts,
-            "previous_message": prev.model_dump(mode="json") if prev is not None else None,
-        }
+        raw_prev = raw_event.get("previous_message")
+        prev_dict: JsonObject | None
+        if isinstance(raw_prev, dict):
+            prev_dict = cast(JsonObject, raw_prev)
+        elif prev is not None:
+            prev_dict = cast(JsonObject, prev.model_dump(mode="json"))
+        else:
+            prev_dict = None
+        del_payload: JsonObject = {"deleted_ts": deleted_ts, "previous_message": prev_dict}
         return EventRecord(stream=stream, kind="message_deleted", ts=deleted_ts, payload=del_payload)
 
     ts = event.ts
     if not ts:
         return None
-    msg_source: object
-    if event.message is not None:
-        msg_source = event.message.model_dump(mode="json")
-    else:
-        msg_source = event.model_dump(mode="json")
-    msg = Message.model_validate(msg_source)
-    return EventRecord(stream=stream, kind="message", ts=msg.ts, payload=msg.model_dump(mode="json"), dedup=True)
+    # For the top-level "message" subtype, the raw event dict already IS
+    # the message shape (after _normalize_message_event flattens it for
+    # validation). Persist as-is.
+    nested = raw_event.get("message")
+    msg_payload: JsonObject = cast(JsonObject, nested) if isinstance(nested, dict) else raw_event
+    return EventRecord(stream=stream, kind="message", ts=ts, payload=msg_payload, dedup=True)
 
 
-def _channel_added_write(channel: Channel) -> EventRecord:
-    return EventRecord(stream="channel-list", kind="channel_added", ts=None, payload=channel.model_dump(mode="json"))
+def extract_raw_event(raw_envelope: JsonObject) -> JsonObject:
+    """Pull the raw per-event dict out of the events_api envelope. Returns
+    an empty dict if the envelope shape is unexpected — the typed model
+    has already passed validation by the time we call this, so a missing
+    event field is genuinely unusual but shouldn't crash the loop."""
+    payload = raw_envelope.get("payload")
+    if isinstance(payload, dict):
+        event = payload.get("event")
+        if isinstance(event, dict):
+            return cast(JsonObject, event)
+    return {}
+
+
+def _channel_added_write(channel_raw: JsonObject) -> EventRecord:
+    """Persist the RAW channel dict (lossless). See the
+    ``_insert_channel_added`` docstring in ``slurper/channels.py`` for the
+    full rationale — Pydantic ``model_dump`` reshapes nested fields and
+    silently drops anything we haven't declared, so we keep the wire dict.
+    """
+    return EventRecord(stream="channel-list", kind="channel_added", ts=None, payload=channel_raw)
 
 
 class SocketModeRunner:
@@ -270,9 +306,10 @@ class SocketModeRunner:
         try:
             while True:
                 message = await ws.get_message()
-                envelope = _parse_envelope(message)
-                if envelope is None:
+                parsed = _parse_envelope(message)
+                if parsed is None:
                     continue
+                envelope, raw_envelope = parsed
                 if envelope.type == "hello":
                     log.info("socket-mode: hello (num_connections=%d)", envelope.num_connections)
                     await self._on_hello()
@@ -283,14 +320,17 @@ class SocketModeRunner:
                     continue
                 await ws.send_message(_ack(envelope.envelope_id))
                 if envelope.type == "events_api" and envelope.payload is not None:
-                    await self._handle_event(envelope.payload.event)
+                    # Pull the raw per-event dict alongside the validated
+                    # model so message persistence is lossless.
+                    raw_event = extract_raw_event(raw_envelope)
+                    await self._handle_event(envelope.payload.event, raw_event)
         except ConnectionClosed:
             return False
 
-    async def _handle_event(self, event: SocketEventPayload) -> None:
+    async def _handle_event(self, event: SocketEventPayload, raw_event: JsonObject) -> None:
         """Translate one socket event and write the resulting wire events."""
         if event.type == "message":
-            write = translate_message_event(event)
+            write = translate_message_event(event, raw_event)
             if write is not None:
                 await self._writer.write_event(write)
             return
@@ -327,11 +367,12 @@ class SocketModeRunner:
                 stream="channel-list", kind="channel_unarchived", ts=None, payload={"channel_id": channel_id}
             )
 
-        channel = await self._fetch_channel(channel_id)
-        if channel is None:
+        validated = await self._fetch_channel(channel_id)
+        if validated is None:
             return None
+        channel = validated.model
         if etype in _CREATE_EVENTS:
-            return _channel_added_write(channel)
+            return _channel_added_write(validated.raw)
         if etype in _RENAME_EVENTS:
             payload = {"channel_id": channel_id, "new_name": channel.name}
             return EventRecord(stream="channel-list", kind="channel_renamed", ts=None, payload=payload)
@@ -341,7 +382,7 @@ class SocketModeRunner:
         log.debug("socket-mode: no structural translation for %s", etype)
         return None
 
-    async def _fetch_channel(self, channel_id: str) -> Channel | None:
+    async def _fetch_channel(self, channel_id: str) -> Validated[Channel] | None:
         try:
             return await trio.to_thread.run_sync(
                 lambda: self._client.get_channel_info(channel_id), limiter=self._limiter
@@ -377,8 +418,15 @@ def _normalize_message_event(envelope: JsonObject) -> JsonObject:
     return cast(JsonObject, normalized_envelope)
 
 
-def _parse_envelope(message: str | bytes) -> SocketEnvelope | None:
-    """Validate a raw frame into a typed envelope, logging and skipping on error."""
+def _parse_envelope(message: str | bytes) -> tuple[SocketEnvelope, JsonObject] | None:
+    """Validate a raw frame into a typed envelope, returning the validated
+    model alongside the raw normalized envelope dict.
+
+    The raw is what gets persisted by the message handlers — Pydantic
+    ``model_dump`` reshapes nested fields and drops anything we don't
+    declare, so we keep the wire dict and use the model only for in-process
+    logic.
+    """
     try:
         raw = json.loads(message)
     except json.JSONDecodeError as exc:
@@ -389,7 +437,7 @@ def _parse_envelope(message: str | bytes) -> SocketEnvelope | None:
         return None
     normalized = _normalize_message_event(cast(JsonObject, raw))
     try:
-        return SocketEnvelope.model_validate(normalized)
+        return SocketEnvelope.model_validate(normalized), normalized
     except ValidationError as exc:
         log.warning("socket-mode: envelope parse error: %s", exc)
         return None

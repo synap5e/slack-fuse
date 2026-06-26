@@ -21,13 +21,15 @@ import logging
 import random
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from typing import cast
 
 import trio
 
 from slack_fuse.models import ConversationsHistoryResponse, Message, Thread
 from slack_fuse_render import ChannelId
+from slack_fuse_server._json import JsonObject
 from slack_fuse_server.backfill.types import BackfillAbortReason, Backfiller, BackfillResult
-from slack_fuse_server.slurper.api import FatalAPIError, RateLimitedError, SlackClient
+from slack_fuse_server.slurper.api import FatalAPIError, RateLimitedError, SlackClient, Validated
 from slack_fuse_server.slurper.health import HealthEmitter, HealthKind
 from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter
 
@@ -115,7 +117,8 @@ class SlackApiBackfiller:
     async def channels_to_backfill(self) -> AsyncIterator[ChannelId]:
         """Yield every member channel (non-archived) the user can see."""
         channels = await trio.to_thread.run_sync(self._client.list_conversations, limiter=self._limiter)
-        for channel in channels:
+        for validated in channels:
+            channel = validated.model
             # DMs / group DMs are always accessible; public/private need membership.
             if channel.is_member or channel.is_im or channel.is_mpim:
                 yield ChannelId(channel.id)
@@ -124,7 +127,7 @@ class SlackApiBackfiller:
         self,
         channel_id: ChannelId,
         since_ts: float | None = None,
-    ) -> AsyncIterator[Message]:
+    ) -> AsyncIterator[Validated[Message]]:
         """Yield historical messages for `channel_id`, newest pages first.
 
         Top-level messages stream out as history pages arrive (so an aborting
@@ -142,21 +145,29 @@ class SlackApiBackfiller:
         channel_id: str,
         since_ts: float | None,
         thread_parents: list[str],
-    ) -> AsyncIterator[Message]:
+    ) -> AsyncIterator[Validated[Message]]:
         cursor = ""
         page = 0
         while True:
             if page > 0:
                 await trio.sleep(random.uniform(self._sleeps.page_min_s, self._sleeps.page_max_s))
-            resp = await self._history_page(channel_id, cursor, oldest=since_ts)
-            if resp is None:  # rate-limited; _history_page already slept — retry same cursor
+            wrapped = await self._history_page(channel_id, cursor, oldest=since_ts)
+            if wrapped is None:  # rate-limited; _history_page already slept — retry same cursor
                 continue
-            for msg in reversed(resp.messages):
+            resp = wrapped.model
+            # Pair raw with validated by index. The wire response's
+            # ``messages`` array maps 1:1 to ``resp.messages``.
+            raw_msgs = wrapped.raw.get("messages")
+            raw_list: list[object] = list(raw_msgs) if isinstance(raw_msgs, list) else []
+            paired = list(zip(raw_list, resp.messages, strict=False))
+            for raw_msg, msg in reversed(paired):
+                if not isinstance(raw_msg, dict):
+                    continue
                 if _is_thread_parent(msg):
                     thread_parents.append(msg.ts)
                 if not _passes_since(msg.ts, since_ts):
                     continue
-                yield msg
+                yield Validated(raw=cast(JsonObject, raw_msg), model=msg)
             page += 1
             if not resp.has_more:
                 break
@@ -169,23 +180,27 @@ class SlackApiBackfiller:
         channel_id: str,
         since_ts: float | None,
         thread_parents: list[str],
-    ) -> AsyncIterator[Message]:
+    ) -> AsyncIterator[Validated[Message]]:
         for i, thread_ts in enumerate(thread_parents):
             if i > 0:
                 await trio.sleep(random.uniform(self._sleeps.thread_min_s, self._sleeps.thread_max_s))
             thread = await self._replies(channel_id, thread_ts)
             if thread is None:
                 continue
+            # ``get_replies`` doesn't expose raw today — bridge by re-dumping
+            # the validated model. ``get_replies`` is the smaller surface
+            # (per-thread, not per-channel); follow-up commit can promote it
+            # to Validated[Thread] for full losslessness.
             for reply in thread.replies:
                 if _passes_since(reply.ts, since_ts):
-                    yield reply
+                    yield Validated(raw=cast(JsonObject, reply.model_dump(mode="json")), model=reply)
 
     async def _history_page(
         self,
         channel_id: str,
         cursor: str,
         oldest: float | None = None,
-    ) -> ConversationsHistoryResponse | None:
+    ) -> Validated[ConversationsHistoryResponse] | None:
         try:
             return await trio.to_thread.run_sync(
                 lambda: self._client.get_history_page(channel_id, cursor, oldest),
@@ -248,7 +263,8 @@ async def backfill_channel(
     aborted = False
 
     try:
-        async for msg in backfiller.messages_for_channel(channel_id, since_ts):
+        async for wrapped in backfiller.messages_for_channel(channel_id, since_ts):
+            msg = wrapped.model
             if ctx.abort_at is not None and messages >= ctx.abort_at:
                 aborted = True
                 break
@@ -262,8 +278,11 @@ async def backfill_channel(
                 await ctx.health.emit(HealthKind.BACKFILL_WARN_LARGE, {"channel_id": cid})
             if ctx.progress_every > 0 and messages % ctx.progress_every == 0:
                 await ctx.health.emit(HealthKind.BACKFILL_PROGRESS, {"channel_id": cid, "messages_so_far": messages})
+            # Persist the RAW message dict, not model_dump (see Validated
+            # docstring). The events log stays lossless; future projections
+            # can read fields the Message model doesn't declare today.
             record = EventRecord(
-                stream=stream, kind="message", ts=msg.ts, payload=msg.model_dump(mode="json"), dedup=True
+                stream=stream, kind="message", ts=msg.ts, payload=wrapped.raw, dedup=True
             )
             offset = await ctx.writer.write_event(record)
             if offset is not None:

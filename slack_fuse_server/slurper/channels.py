@@ -24,14 +24,12 @@ client projector's `apply_event` processes startup and live events identically.
 from __future__ import annotations
 
 import logging
-from typing import cast
 
 import httpx
 import trio
 from psycopg import Cursor
 from psycopg.rows import TupleRow
 
-from slack_fuse.models import Channel
 from slack_fuse_server._json import JsonObject
 from slack_fuse_server.slurper.api import SlackAPIError, SlackClient
 from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter, assign_offset, insert_event
@@ -39,10 +37,6 @@ from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter, assign_
 log = logging.getLogger(__name__)
 
 _CHANNEL_LIST_STREAM = "channel-list"
-
-
-def _channel_payload(channel: Channel) -> JsonObject:
-    return cast(JsonObject, channel.model_dump(mode="json"))
 
 
 def _lock_channel_list_stream(cur: Cursor[TupleRow]) -> None:
@@ -72,9 +66,16 @@ def _existing_channel_added_ids(cur: Cursor[TupleRow]) -> set[str]:
     return existing
 
 
-def _insert_channel_added(cur: Cursor[TupleRow], channel: Channel) -> int:
+def _insert_channel_added(cur: Cursor[TupleRow], channel_raw: JsonObject) -> int:
+    """Persist the RAW channel dict as the payload, not ``model_dump`` output.
+
+    Pydantic ``model_dump`` reshapes nested fields (our ``topic`` is the
+    flat string lifted from ``topic: {value, creator, last_set}``) and
+    silently drops fields the model doesn't declare. The events table is
+    the lossless source of truth, so we store what Slack actually sent.
+    """
     offset = assign_offset(cur, _CHANNEL_LIST_STREAM)
-    record = EventRecord(stream=_CHANNEL_LIST_STREAM, kind="channel_added", ts=None, payload=_channel_payload(channel))
+    record = EventRecord(stream=_CHANNEL_LIST_STREAM, kind="channel_added", ts=None, payload=channel_raw)
     insert_event(cur, offset, record)
     return offset
 
@@ -85,10 +86,11 @@ def _populate_channels_once_sync(writer: OffsetWriter, client: SlackClient) -> t
     with writer.conn.transaction(), writer.conn.cursor() as cur:
         _lock_channel_list_stream(cur)
         existing = _existing_channel_added_ids(cur)
-        for channel in channels:
+        for validated in channels:
+            channel = validated.model
             if channel.id in existing:
                 continue
-            _insert_channel_added(cur, channel)
+            _insert_channel_added(cur, validated.raw)
             existing.add(channel.id)
             inserted += 1
     return (len(channels), inserted)
@@ -126,8 +128,8 @@ def _ensure_channel_added_sync(writer: OffsetWriter, client: SlackClient, channe
             return False
         # No prior channel_added event — fetch current channel metadata so the
         # synthetic event mirrors the live socket-mode shape exactly.
-        channel = client.get_channel_info(channel_id)
-        _ = _insert_channel_added(cur, channel)
+        validated = client.get_channel_info(channel_id)
+        _ = _insert_channel_added(cur, validated.raw)
         return True
 
 

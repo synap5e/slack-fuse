@@ -45,8 +45,8 @@ async def _collect_messages(
     since_ts: float | None = None,
 ) -> list[Message]:
     out: list[Message] = []
-    async for msg in backfiller.messages_for_channel(ChannelId(channel_id), since_ts=since_ts):
-        out.append(msg)
+    async for wrapped in backfiller.messages_for_channel(ChannelId(channel_id), since_ts=since_ts):
+        out.append(wrapped.model)
     return out
 
 

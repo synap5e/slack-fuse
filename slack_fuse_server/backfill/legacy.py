@@ -24,6 +24,8 @@ from pydantic import ValidationError
 
 from slack_fuse.models import Message
 from slack_fuse_render import ChannelId
+from slack_fuse_server._json import JsonObject
+from slack_fuse_server.slurper.api import Validated
 
 log = logging.getLogger(__name__)
 
@@ -59,7 +61,7 @@ class LegacyCacheBackfiller:
         self,
         channel_id: ChannelId,
         since_ts: float | None = None,
-    ) -> AsyncIterator[Message]:
+    ) -> AsyncIterator[Validated[Message]]:
         day_files = await trio.to_thread.run_sync(
             lambda: _discover_day_files(self._messages_dir / channel_id.value),
             limiter=self._limiter,
@@ -69,9 +71,9 @@ class LegacyCacheBackfiller:
                 lambda p=day_file: _read_day_messages(p),
                 limiter=self._limiter,
             )
-            for message in messages:
-                if _passes_since(message.ts, since_ts):
-                    yield message
+            for wrapped in messages:
+                if _passes_since(wrapped.model.ts, since_ts):
+                    yield wrapped
 
 
 def _discover_channels_with_content(messages_dir: Path) -> list[ChannelId]:
@@ -102,7 +104,13 @@ def _discover_day_files(channel_dir: Path) -> list[Path]:
     return sorted((path for path in channel_dir.glob("*.json") if path.is_file()), key=lambda p: p.name)
 
 
-def _read_day_messages(path: Path) -> list[Message]:
+def _read_day_messages(path: Path) -> list[Validated[Message]]:
+    """Read one cache day file, returning each entry paired raw+validated.
+
+    The raw dict (the on-disk JSON entry) is what gets persisted to the
+    events table, so the cache backfill is lossless w.r.t. whatever the
+    cache file contains — same shape as the live slack-api backfill.
+    """
     try:
         raw = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError):
@@ -112,16 +120,18 @@ def _read_day_messages(path: Path) -> list[Message]:
         log.debug("legacy-cache: skipping non-list json %s", path)
         return []
 
-    messages: list[Message] = []
+    out: list[Validated[Message]] = []
     entries = cast("list[object]", raw)
     for entry in entries:
         if not isinstance(entry, dict):
             continue
         try:
-            messages.append(Message.model_validate(entry))
+            model = Message.model_validate(entry)
         except ValidationError:
             log.debug("legacy-cache: skipping invalid message in %s", path)
-    return messages
+            continue
+        out.append(Validated(raw=cast(JsonObject, entry), model=model))
+    return out
 
 
 def _passes_since(ts: str, since_ts: float | None) -> bool:

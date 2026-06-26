@@ -103,11 +103,11 @@ def test_populate_payload_matches_live_socket_mode_shape(
         populated[raw_id] = payload_dict
 
     # Build the live-path payload for the same channels and compare.
-    for channel in client.list_conversations():
-        live_record = _channel_added_write(channel)
+    for validated in client.list_conversations():
+        live_record = _channel_added_write(validated.raw)
         assert live_record.kind == "channel_added"
         assert live_record.stream == "channel-list"
-        assert populated[channel.id] == live_record.payload
+        assert populated[validated.model.id] == live_record.payload
 
 
 # ----------------------------------------------------------------------

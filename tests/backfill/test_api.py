@@ -10,6 +10,7 @@ needing the API at all.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from typing import cast
 
 import httpx
 import psycopg
@@ -18,8 +19,9 @@ from psycopg.rows import TupleRow
 
 from slack_fuse.models import Message
 from slack_fuse_render import ChannelId
+from slack_fuse_server._json import JsonObject
 from slack_fuse_server.backfill.api import BackfillContext, SlackApiBackfiller, SleepBounds, backfill_channel
-from slack_fuse_server.slurper.api import SlackClient
+from slack_fuse_server.slurper.api import SlackClient, Validated
 from slack_fuse_server.slurper.health import HealthEmitter
 from slack_fuse_server.slurper.offsets import OffsetWriter
 
@@ -40,8 +42,8 @@ def test_messages_for_channel_yields_history_and_thread_replies(fake_slack_http:
 
     async def collect() -> list[Message]:
         out: list[Message] = []
-        async for msg in backfiller.messages_for_channel(ChannelId("C0001")):
-            out.append(msg)
+        async for wrapped in backfiller.messages_for_channel(ChannelId("C0001")):
+            out.append(wrapped.model)
         return out
 
     messages = trio.run(collect)
@@ -71,10 +73,11 @@ class _StubBackfiller:
         self,
         channel_id: ChannelId,
         since_ts: float | None = None,
-    ) -> AsyncIterator[Message]:
+    ) -> AsyncIterator[Validated[Message]]:
         for i in range(self._count):
             ts = f"{1000 + i}.{i:06d}"
-            yield Message(ts=ts, user="U1", text=f"m{i}")
+            msg = Message(ts=ts, user="U1", text=f"m{i}")
+            yield Validated(raw=cast(JsonObject, msg.model_dump(mode="json")), model=msg)
 
 
 def _events_count(conn: psycopg.Connection[TupleRow], stream: str) -> int:

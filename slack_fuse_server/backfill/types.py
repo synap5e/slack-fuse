@@ -22,6 +22,7 @@ from typing import Protocol
 
 from slack_fuse.models import Message
 from slack_fuse_render import ChannelId
+from slack_fuse_server.slurper.api import Validated
 
 
 class BackfillAbortReason(StrEnum):
@@ -78,10 +79,15 @@ class Backfiller(Protocol):
         self,
         channel_id: ChannelId,
         since_ts: float | None = None,
-    ) -> AsyncIterator[Message]:
+    ) -> AsyncIterator[Validated[Message]]:
         """Yield historical messages for `channel_id`, oldest first.
 
-        `since_ts=None` means from the oldest available; a value means only
-        messages newer than it (used to gap-fill after the legacy cache's tip).
+        Each yield is the lossless ``Validated`` pair: the raw wire / cache
+        dict for persistence, plus the validated ``Message`` model for any
+        in-process logic (thread-parent detection, since-filter).
+
+        ``since_ts=None`` means from the oldest available; a value means
+        only messages newer than it (used to gap-fill after the legacy
+        cache's tip).
         """
         ...

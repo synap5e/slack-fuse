@@ -30,10 +30,10 @@ from slack_fuse.models import (
     UsersListResponse,
 )
 from slack_fuse_server._json import JsonObject
-from slack_fuse_server.slurper.api import SlackAPIError, SlackClient
+from slack_fuse_server.slurper.api import SlackAPIError, SlackClient, Validated
 from slack_fuse_server.slurper.health import HealthEmitter
 from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter, assign_offset, insert_event
-from slack_fuse_server.slurper.socket import SocketModeOptions, SocketModeRunner
+from slack_fuse_server.slurper.socket import SocketModeOptions, SocketModeRunner, extract_raw_event
 
 log = logging.getLogger(__name__)
 
@@ -48,16 +48,10 @@ class _UserState:
     profile_fields: JsonObject
 
 
-def _user_payload(user: SlackUser) -> JsonObject:
-    return cast(JsonObject, user.model_dump(mode="json"))
-
-
-def _profile_payload(user: SlackUser) -> JsonObject:
-    return cast(JsonObject, user.profile.model_dump(mode="json"))
-
-
-def _fetch_workspace_users(client: SlackClient) -> list[SlackUser]:
-    users: list[SlackUser] = []
+def _fetch_workspace_users(client: SlackClient) -> list[Validated[SlackUser]]:
+    """Iterate ``users.list`` paginated; pair each member dict (raw) with
+    its validated model so the persistence site below writes raw."""
+    users: list[Validated[SlackUser]] = []
     cursor = ""
     while True:
         params: dict[str, str] = {"limit": "200"}
@@ -65,25 +59,34 @@ def _fetch_workspace_users(client: SlackClient) -> list[SlackUser]:
             params["cursor"] = cursor
         resp = client.http.get(_USERS_LIST_URL, params=params, timeout=30.0)
         resp.raise_for_status()
-        parsed = UsersListResponse.model_validate_json(resp.content)
+        raw_body = cast(JsonObject, json.loads(resp.content))
+        parsed = UsersListResponse.model_validate(raw_body)
         if not parsed.ok:
             raise SlackAPIError(f"users.list failed: {parsed.error or 'unknown'}")
-        users.extend(parsed.members)
+        raw_members = raw_body.get("members")
+        raw_list: list[object] = list(raw_members) if isinstance(raw_members, list) else []
+        for raw_member, model_member in zip(raw_list, parsed.members, strict=False):
+            if isinstance(raw_member, dict):
+                users.append(Validated(raw=cast(JsonObject, raw_member), model=model_member))
         cursor = parsed.response_metadata.next_cursor
         if not cursor:
             break
     return users
 
 
-def _fetch_user(client: SlackClient, user_id: str) -> SlackUser:
+def _fetch_user(client: SlackClient, user_id: str) -> Validated[SlackUser]:
     resp = client.http.get(_USERS_INFO_URL, params={"user": user_id}, timeout=30.0)
     resp.raise_for_status()
-    parsed = UsersInfoResponse.model_validate_json(resp.content)
+    raw_body = cast(JsonObject, json.loads(resp.content))
+    parsed = UsersInfoResponse.model_validate(raw_body)
     if not parsed.ok:
         raise SlackAPIError(f"users.info failed for {user_id}: {parsed.error or 'unknown'}")
     if parsed.user is None:
         raise SlackAPIError(f"users.info returned no user for {user_id}")
-    return parsed.user
+    raw_user = raw_body.get("user")
+    if not isinstance(raw_user, dict):
+        raise SlackAPIError(f"users.info returned non-dict user for {user_id}")
+    return Validated(raw=cast(JsonObject, raw_user), model=parsed.user)
 
 
 def _lock_users_stream(cur: Cursor[TupleRow]) -> None:
@@ -113,9 +116,11 @@ def _existing_user_added_ids(cur: Cursor[TupleRow]) -> set[str]:
     return existing
 
 
-def _insert_user_added(cur: Cursor[TupleRow], user: SlackUser) -> int:
+def _insert_user_added(cur: Cursor[TupleRow], user_raw: JsonObject) -> int:
+    """Persist the RAW user dict — same lossless contract as
+    ``channels._insert_channel_added``."""
     offset = assign_offset(cur, _USERS_STREAM)
-    record = EventRecord(stream=_USERS_STREAM, kind="user_added", ts=None, payload=_user_payload(user))
+    record = EventRecord(stream=_USERS_STREAM, kind="user_added", ts=None, payload=user_raw)
     insert_event(cur, offset, record)
     return offset
 
@@ -126,10 +131,11 @@ def _populate_users_once_sync(writer: OffsetWriter, client: SlackClient) -> tupl
     with writer.conn.transaction(), writer.conn.cursor() as cur:
         _lock_users_stream(cur)
         existing = _existing_user_added_ids(cur)
-        for user in users:
+        for validated in users:
+            user = validated.model
             if user.id in existing:
                 continue
-            _insert_user_added(cur, user)
+            _insert_user_added(cur, validated.raw)
             existing.add(user.id)
             inserted += 1
     return (len(users), inserted)
@@ -171,7 +177,7 @@ def _load_user_state(cur: Cursor[TupleRow], user_id: str) -> _UserState | None:
             except ValidationError:
                 continue
             display_name = member.display()
-            profile_fields = _profile_payload(member)
+            profile_fields = cast(JsonObject, member.profile.model_dump(mode="json"))
             continue
         if kind == "user_renamed":
             renamed = payload.get("new_display_name")
@@ -188,9 +194,14 @@ def _load_user_state(cur: Cursor[TupleRow], user_id: str) -> _UserState | None:
 
 
 def _apply_user_change_sync(writer: OffsetWriter, client: SlackClient, user_id: str) -> tuple[bool, bool, bool]:
-    member = _fetch_user(client, user_id)
+    validated = _fetch_user(client, user_id)
+    member = validated.model
     new_display_name = member.display()
-    new_profile_fields = _profile_payload(member)
+    # ``profile_fields`` for diff stays model-derived: it's the in-process
+    # comparison signal, not what we persist. The user_profile_changed
+    # event's payload still includes it (callers may want the delta
+    # explicitly even if they could re-derive from the new user_added).
+    new_profile_fields = cast(JsonObject, member.profile.model_dump(mode="json"))
 
     wrote_user_added = False
     wrote_renamed = False
@@ -199,7 +210,7 @@ def _apply_user_change_sync(writer: OffsetWriter, client: SlackClient, user_id: 
         _lock_users_stream(cur)
         previous = _load_user_state(cur, user_id)
         if previous is None:
-            _insert_user_added(cur, member)
+            _insert_user_added(cur, validated.raw)
             wrote_user_added = True
         else:
             if previous.display_name != new_display_name:
@@ -284,16 +295,31 @@ def _normalize_user_change_envelope(message: str | bytes) -> JsonObject | None:
     return cast(JsonObject, normalized)
 
 
-def _parse_envelope_allow_user_change(message: str | bytes) -> SocketEnvelope | None:
+def _parse_envelope_allow_user_change(
+    message: str | bytes,
+) -> tuple[SocketEnvelope, JsonObject] | None:
+    """Validate + return paired (model, raw normalized dict).
+
+    See base ``_parse_envelope`` for the rationale on returning the raw
+    dict — message persistence is lossless against the wire shape.
+    """
     try:
-        return SocketEnvelope.model_validate_json(message)
+        raw = json.loads(message)
+    except json.JSONDecodeError as exc:
+        log.warning("socket-mode: envelope parse error: %s", exc)
+        return None
+    if not isinstance(raw, dict):
+        return None
+    raw_envelope = cast(JsonObject, raw)
+    try:
+        return SocketEnvelope.model_validate(raw_envelope), raw_envelope
     except ValidationError as exc:
         normalized = _normalize_user_change_envelope(message)
         if normalized is None:
             log.warning("socket-mode: envelope parse error: %s", exc)
             return None
         try:
-            return SocketEnvelope.model_validate(normalized)
+            return SocketEnvelope.model_validate(normalized), normalized
         except ValidationError as fallback_exc:
             log.warning("socket-mode: envelope parse error: %s", fallback_exc)
             return None
@@ -319,20 +345,21 @@ class UsersSocketModeRunner(SocketModeRunner):
         self._users_writer = writer
         self._users_client = client
 
-    async def _handle_event(self, event: SocketEventPayload) -> None:
+    async def _handle_event(self, event: SocketEventPayload, raw_event: JsonObject) -> None:
         if event.type == "user_change":
             await apply_user_change_event(self._users_writer, self._users_client, event)
             return
-        await super()._handle_event(event)
+        await super()._handle_event(event, raw_event)
 
     async def _message_loop(self, ws: WebSocketConnection) -> bool:
         """Base loop with user-change envelope normalization."""
         try:
             while True:
                 message = await ws.get_message()
-                envelope = _parse_envelope_allow_user_change(message)
-                if envelope is None:
+                parsed = _parse_envelope_allow_user_change(message)
+                if parsed is None:
                     continue
+                envelope, raw_envelope = parsed
                 if envelope.type == "hello":
                     log.info("socket-mode: hello (num_connections=%d)", envelope.num_connections)
                     await self._on_hello()
@@ -343,7 +370,8 @@ class UsersSocketModeRunner(SocketModeRunner):
                     continue
                 await ws.send_message(_ack(envelope.envelope_id))
                 if envelope.type == "events_api" and envelope.payload is not None:
-                    await self._handle_event(envelope.payload.event)
+                    raw_event = extract_raw_event(raw_envelope)
+                    await self._handle_event(envelope.payload.event, raw_event)
         except ConnectionClosed:
             return False
 

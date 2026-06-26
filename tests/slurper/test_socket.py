@@ -27,9 +27,16 @@ from tests._fake_slack import load_fixtures
 # === Pure translation ===
 
 
+def _raw_for(event: SocketEventPayload) -> JsonObject:
+    """Build a raw event dict from a typed event for tests that don't care
+    about lossless preservation (they're testing the translate dispatch
+    logic, not the raw-persistence guarantee)."""
+    return cast(JsonObject, event.model_dump(mode="json", exclude_none=True))
+
+
 def test_translate_new_top_level_message() -> None:
     event = SocketEventPayload(type="message", channel="C1", ts="100.0001", user="U1", text="hello")
-    write = translate_message_event(event)
+    write = translate_message_event(event, _raw_for(event))
     assert write is not None
     assert (write.stream, write.kind, write.ts, write.dedup) == ("channel:C1", "message", "100.0001", True)
     assert write.payload["ts"] == "100.0001"
@@ -38,7 +45,7 @@ def test_translate_new_top_level_message() -> None:
 
 def test_translate_thread_reply_keeps_thread_ts() -> None:
     event = SocketEventPayload(type="message", channel="C1", ts="101.0", user="U1", text="re", thread_ts="100.0")
-    write = translate_message_event(event)
+    write = translate_message_event(event, _raw_for(event))
     assert write is not None
     assert write.kind == "message"
     assert write.payload["thread_ts"] == "100.0"
@@ -47,7 +54,7 @@ def test_translate_thread_reply_keeps_thread_ts() -> None:
 def test_translate_message_changed() -> None:
     new = Message(ts="100.0001", user="U1", text="edited")
     event = SocketEventPayload(type="message", subtype="message_changed", channel="C1", message=new)
-    write = translate_message_event(event)
+    write = translate_message_event(event, _raw_for(event))
     assert write is not None
     assert (write.kind, write.ts, write.dedup) == ("message_changed", "100.0001", False)
     assert write.payload["previous_ts"] == "100.0001"
@@ -55,14 +62,15 @@ def test_translate_message_changed() -> None:
 
 def test_translate_message_deleted() -> None:
     event = SocketEventPayload(type="message", subtype="message_deleted", channel="C1", deleted_ts="100.0001")
-    write = translate_message_event(event)
+    write = translate_message_event(event, _raw_for(event))
     assert write is not None
     assert (write.kind, write.ts) == ("message_deleted", "100.0001")
     assert write.payload["deleted_ts"] == "100.0001"
 
 
 def test_translate_missing_channel_returns_none() -> None:
-    assert translate_message_event(SocketEventPayload(type="message", ts="1.0")) is None
+    event = SocketEventPayload(type="message", ts="1.0")
+    assert translate_message_event(event, _raw_for(event)) is None
 
 
 def test_translate_message_payload_matches_backfill_shape() -> None:
@@ -107,14 +115,17 @@ def test_translate_message_payload_matches_backfill_shape() -> None:
     )
     parsed = _parse_envelope(raw_envelope)
     assert parsed is not None
-    assert parsed.payload is not None
+    envelope, raw_env = parsed
+    assert envelope.payload is not None
 
-    write = translate_message_event(parsed.payload.event)
+    raw_event_dict = cast(JsonObject, raw_env["payload"]["event"])  # pyright: ignore[reportArgumentType, reportIndexIssue]
+    write = translate_message_event(envelope.payload.event, raw_event_dict)
     assert write is not None
 
-    expected_payload = Message.model_validate(rich_message_event).model_dump(mode="json")
-    assert write.payload == expected_payload
-    assert json.dumps(write.payload, sort_keys=True) == json.dumps(expected_payload, sort_keys=True)
+    # 2026-06-27: the payload is now the RAW event dict (lossless), not
+    # ``Message.model_dump`` output. We persist what Slack sent so future
+    # projections can read fields the model doesn't declare today.
+    assert write.payload == rich_message_event
 
 
 # === DB-backed integration ===
@@ -143,7 +154,7 @@ def test_handle_message_event_writes_channel_stream(
     runner = _make_runner(server_conn, fake_slack_http)
     event = SocketEventPayload(type="message", channel="C1", ts="100.0001", user="U1", text="hi")
 
-    trio.run(runner._handle_event, event)
+    trio.run(runner._handle_event, event, _raw_for(event))
 
     rows = _rows(server_conn, "channel:C1")
     assert len(rows) == 1
@@ -162,7 +173,7 @@ def test_handle_structural_event_enriches_via_conversations_info(
     # current name from the fetched channel object.
     event = SocketEventPayload(type="channel_rename", channel="C0001")
 
-    trio.run(runner._handle_event, event)
+    trio.run(runner._handle_event, event, _raw_for(event))
 
     rows = _rows(server_conn, "channel-list")
     assert len(rows) == 1

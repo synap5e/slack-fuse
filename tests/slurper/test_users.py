@@ -128,8 +128,9 @@ def test_parse_envelope_allows_user_change_payload_with_nested_user() -> None:
             },
         },
     )
-    envelope = _parse_envelope_allow_user_change(raw)
-    assert envelope is not None
+    parsed = _parse_envelope_allow_user_change(raw)
+    assert parsed is not None
+    envelope, _raw_env = parsed
     assert envelope.payload is not None
     assert envelope.payload.event.type == "user_change"
     assert envelope.payload.event.user == "U0001"

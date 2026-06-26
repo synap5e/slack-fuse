@@ -90,7 +90,9 @@ def build_channel_slug(
 
 
 def _load_channels(client: SlackClient) -> list[Channel]:
-    return client.list_conversations()
+    # In-process consumer (permalink resolution doesn't persist) — unwrap to
+    # the validated model.
+    return [v.model for v in client.list_conversations()]
 
 
 def find_channel(
@@ -108,7 +110,7 @@ def find_channel(
             return channel, slug
 
     # Channel missing from list: fallback to direct lookup.
-    channel = client.get_channel_info(channel_id)
+    channel = client.get_channel_info(channel_id).model
     return channel, build_channel_slug(channel, users, {})
 
 

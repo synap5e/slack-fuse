@@ -15,7 +15,8 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import TypeVar
+from dataclasses import dataclass
+from typing import TypeVar, cast
 
 import httpx
 from pydantic import BaseModel
@@ -43,6 +44,28 @@ _BASE_URL = "https://slack.com/api"
 _PAGE_DELAY = 0.1  # Internal apps get generous rate limits
 
 _T = TypeVar("_T", bound=BaseModel)
+
+
+@dataclass(frozen=True, slots=True)
+class Validated[M]:
+    """Lossless capture of a Slack API response.
+
+    Event sourcing's value is being able to go back and project information
+    we weren't using at the time — but only if we KEPT it. Pydantic
+    ``model_dump`` drops fields we don't declare and reshapes nested ones
+    (e.g. our ``topic`` is the flat string lifted from
+    ``topic: {value, creator, last_set}``). Persisting that to the events
+    table threw away everything we hadn't thought to use yet.
+
+    ``Validated`` pairs the raw dict from the wire (the slurper persists
+    this) with the validated model (the slurper uses this for in-process
+    logic). The events table stays the lossless source of truth; future
+    projections can read fields the current model doesn't even know about.
+    """
+
+    raw: JsonObject
+    model: M
+
 
 # Slack ok=False values that mean "stop, this won't recover"
 _FATAL_BODY_ERRORS = frozenset({"token_revoked", "invalid_auth", "account_inactive"})
@@ -149,8 +172,29 @@ class SlackClient:
         params: dict[str, str] | None,
         response_type: type[_T],
     ) -> _T:
-        """Typed GET — validates the response into the given Pydantic model."""
+        """Typed GET — validates the response into the given Pydantic model.
+
+        Use this for endpoints whose response is consumed in-process only
+        (huddle index, permalink lookup, etc). For endpoints whose response
+        we PERSIST to the events table, use :meth:`_get_validated` so the
+        raw payload survives the trip.
+        """
         return response_type.model_validate(self._get_raw(method, params))
+
+    def _get_validated(
+        self,
+        method: str,
+        params: dict[str, str] | None,
+        response_type: type[_T],
+    ) -> Validated[_T]:
+        """GET that preserves the raw wire dict alongside the validated model.
+
+        Callers that persist response data to the events table use
+        ``Validated.raw`` for the payload and ``Validated.model`` for any
+        in-process logic.
+        """
+        raw = self._get_raw(method, params)
+        return Validated(raw=raw, model=response_type.model_validate(raw))
 
     def _post(
         self,
@@ -166,9 +210,14 @@ class SlackClient:
     def list_conversations(
         self,
         types: str = "public_channel,private_channel,mpim,im",
-    ) -> list[Channel]:
-        """List all conversations the user has access to."""
-        channels: list[Channel] = []
+    ) -> list[Validated[Channel]]:
+        """List all conversations the user has access to.
+
+        Returns each channel as a ``Validated[Channel]`` so persistence
+        sites can write the raw dict (lossless) while in-process logic
+        keeps using the typed model.
+        """
+        channels: list[Validated[Channel]] = []
         cursor = ""
         while True:
             params: dict[str, str] = {
@@ -178,20 +227,35 @@ class SlackClient:
             }
             if cursor:
                 params["cursor"] = cursor
-            resp = self._get("conversations.list", params, ConversationsListResponse)
-            channels.extend(resp.channels)
-            cursor = resp.response_metadata.next_cursor
+            page = self._get_validated("conversations.list", params, ConversationsListResponse)
+            # Pair each validated model with its raw dict by index — the raw
+            # array in ``page.raw["channels"]`` matches ``page.model.channels``
+            # one-to-one because both come from the same wire payload.
+            raw_list = page.raw.get("channels")
+            if not isinstance(raw_list, list):
+                raw_list = []
+            for raw_item, model_item in zip(raw_list, page.model.channels, strict=False):
+                if isinstance(raw_item, dict):
+                    channels.append(Validated(raw=cast(JsonObject, raw_item), model=model_item))
+            cursor = page.model.response_metadata.next_cursor
             if not cursor:
                 break
             time.sleep(_PAGE_DELAY)
         return channels
 
-    def get_channel_info(self, channel_id: str) -> Channel:
-        """Fetch info for a single channel by ID."""
-        resp = self._get("conversations.info", {"channel": channel_id}, ConversationsInfoResponse)
-        if resp.channel is None:
+    def get_channel_info(self, channel_id: str) -> Validated[Channel]:
+        """Fetch info for a single channel by ID, lossless."""
+        page = self._get_validated(
+            "conversations.info", {"channel": channel_id}, ConversationsInfoResponse
+        )
+        if page.model.channel is None:
             raise SlackAPIError(f"conversations.info returned no channel for {channel_id}")
-        return resp.channel
+        raw_channel = page.raw.get("channel")
+        if not isinstance(raw_channel, dict):
+            # ``page.model.channel`` was validated above so the dict IS there;
+            # this only fires if the wire response was reshaped after validate.
+            raise SlackAPIError(f"conversations.info missing 'channel' dict for {channel_id}")
+        return Validated(raw=cast(JsonObject, raw_channel), model=page.model.channel)
 
     def get_history(
         self,
@@ -235,7 +299,7 @@ class SlackClient:
         channel_id: str,
         cursor: str = "",
         oldest: float | None = None,
-    ) -> ConversationsHistoryResponse:
+    ) -> Validated[ConversationsHistoryResponse]:
         """Fetch a single page of conversation history (used by backfill).
 
         `oldest` (Slack's API parameter name) is the inclusive lower bound on
@@ -243,6 +307,10 @@ class SlackClient:
         before paging starts, which is critical for gap-fill efficiency: a
         24-hour-old `--since` against a 2-year-old channel should be one
         page of API spend, not 30.
+
+        Returns the wrapped response so the backfill loop can persist the
+        raw message dicts (lossless) — index-pair ``page.raw["messages"][i]``
+        with ``page.model.messages[i]``.
         """
         params: dict[str, str] = {
             "channel": channel_id,
@@ -252,7 +320,7 @@ class SlackClient:
             params["cursor"] = cursor
         if oldest is not None:
             params["oldest"] = f"{oldest:.6f}"
-        return self._get("conversations.history", params, ConversationsHistoryResponse)
+        return self._get_validated("conversations.history", params, ConversationsHistoryResponse)
 
     def get_replies(self, channel_id: str, thread_ts: str) -> Thread:
         """Fetch all replies in a thread."""
