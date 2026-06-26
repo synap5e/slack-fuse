@@ -46,7 +46,9 @@ from slack_fuse.fuse_v2_helpers import (
     CHANNEL_MD,
     CHANNEL_ORIGINAL_MD,
     CONV_ROOTS,
+    GAPS_MD,
     THREAD_MD,
+    WORKSPACE_DIR,
     ChannelRow,
     PersistentInodeMap,
     assign_conv_root_slugs,
@@ -125,6 +127,12 @@ InvalidateInodeFn = Callable[[int], None]
 # Production wires this to a sync httpx GET (see projector/originals_fetch.py);
 # tests pass a fake.
 OriginalsFetchFn = Callable[[str, float, float], bytes]
+# ``ChannelGapsFetchFn(channel_id) -> markdown body``.
+# Per-channel ``gaps.md`` ghost file fetcher.
+ChannelGapsFetchFn = Callable[[str], bytes]
+# ``WorkspaceGapsFetchFn() -> markdown body``.
+# ``/_workspace/gaps.md`` workspace-wide summary fetcher.
+WorkspaceGapsFetchFn = Callable[[], bytes]
 
 ROOT_INODE: Final = 1
 
@@ -147,12 +155,15 @@ class _CachedOriginal:
     cached_at_monotonic: float
 
 
-class _OriginalsCache:
-    """Bounded TTL cache keyed by (channel_id, isoformat-date).
+class _BytesCache:
+    """Bounded TTL cache over byte payloads keyed by arbitrary hashable keys.
 
-    Thread-safe: a stat+read pair from one process arrives on different worker
-    threads, so the cache lookup needs a lock. The lock is held only across
-    the dict ops, never across an HTTP fetch.
+    Used by the originals view (keyed by ``(channel_id, day_iso)``), the
+    per-channel gaps view (keyed by ``(channel_id,)``), and the workspace
+    gaps view (single-cell, keyed by ``()``). Thread-safe: a stat+read
+    pair from one process arrives on different worker threads, so the
+    cache lookup needs a lock. The lock is held only across the dict ops,
+    never across an HTTP fetch.
     """
 
     def __init__(
@@ -163,11 +174,10 @@ class _OriginalsCache:
     ) -> None:
         self._max = max_entries
         self._ttl = ttl_s
-        self._entries: dict[tuple[str, str], _CachedOriginal] = {}
+        self._entries: dict[tuple[object, ...], _CachedOriginal] = {}
         self._lock = threading.Lock()
 
-    def get(self, channel_id: str, day_iso: str) -> bytes | None:
-        key = (channel_id, day_iso)
+    def get(self, *key: object) -> bytes | None:
         with self._lock:
             entry = self._entries.get(key)
             if entry is None:
@@ -177,8 +187,7 @@ class _OriginalsCache:
                 return None
             return entry.content
 
-    def put(self, channel_id: str, day_iso: str, content: bytes) -> None:
-        key = (channel_id, day_iso)
+    def put(self, *key: object, content: bytes) -> None:
         now = time.monotonic()
         with self._lock:
             if len(self._entries) >= self._max and key not in self._entries:
@@ -187,6 +196,10 @@ class _OriginalsCache:
                 first_key = next(iter(self._entries))
                 _ = self._entries.pop(first_key, None)
             self._entries[key] = _CachedOriginal(content=content, cached_at_monotonic=now)
+
+
+# Backwards-compat alias so the originals tests' import keeps working.
+_OriginalsCache = _BytesCache
 
 
 # errnos that are benign during a teardown/unmount race: the inode the kernel
@@ -427,6 +440,8 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         trailer_log: TrailerLog | None = None,
         now_fn: NowFn = _utcnow,
         originals_fetch: OriginalsFetchFn | None = None,
+        channel_gaps_fetch: ChannelGapsFetchFn | None = None,
+        workspace_gaps_fetch: WorkspaceGapsFetchFn | None = None,
     ) -> None:
         super().__init__()
         # ``conn`` is the inode-map's dedicated connection. In pool mode (``pool``
@@ -472,8 +487,20 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         # ENOENT — the dispatch is centralised in ``_resolve_content`` /
         # ``_list_dir(for_lookup=True)``.
         self._originals_fetch = originals_fetch
-        self._originals_cache: _OriginalsCache | None = (
-            _OriginalsCache() if originals_fetch is not None else None
+        self._originals_cache: _BytesCache | None = (
+            _BytesCache() if originals_fetch is not None else None
+        )
+        # Gaps ghost-file plumbing. Two caches because the access patterns
+        # differ — per-channel gaps mirror originals (many keys), workspace
+        # gaps is a single-cell cache. Both gated on the corresponding
+        # fetcher: a missing fetcher hides the file (mirrors originals).
+        self._channel_gaps_fetch = channel_gaps_fetch
+        self._channel_gaps_cache: _BytesCache | None = (
+            _BytesCache() if channel_gaps_fetch is not None else None
+        )
+        self._workspace_gaps_fetch = workspace_gaps_fetch
+        self._workspace_gaps_cache: _BytesCache | None = (
+            _BytesCache(max_entries=1) if workspace_gaps_fetch is not None else None
         )
 
     # ------------------------------------------------------------------
@@ -715,7 +742,20 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         parts = parse_path(path)
         depth = len(parts)
         if depth == 0:
-            return [(d, True) for d in CONV_ROOTS]
+            # ``_workspace/`` is a sibling of the conv-roots — a discoverable
+            # namespace for read-only diagnostic surfaces. Listed on both the
+            # readdir AND lookup paths so ``ls /views/slack-split`` shows it.
+            roots: list[tuple[str, bool]] = [(d, True) for d in CONV_ROOTS]
+            if self._workspace_gaps_fetch is not None:
+                roots.append((WORKSPACE_DIR, True))
+            return roots
+
+        # Top-level ``_workspace/`` namespace. Currently contains only
+        # ``gaps.md``; future read-only diagnostic ghost files land here too.
+        if parts[0] == WORKSPACE_DIR:
+            if depth == 1 and self._workspace_gaps_fetch is not None:
+                return [(GAPS_MD, False)]
+            return []
 
         if parts[0] not in CONV_ROOTS:
             return []
@@ -746,7 +786,14 @@ class SlackFuseOpsV2(pyfuse3.Operations):
 
         if depth == 2:
             months = fetch_known_months(self._conn, row.channel_id, self._tz)
-            return [(CHANNEL_MD, False), *((m, True) for m in months)]
+            result_root: list[tuple[str, bool]] = [(CHANNEL_MD, False)]
+            # gaps.md is a ghost: lookup resolves it, readdir does not list
+            # it (same pattern as channel.original.md — keep recursive ``rg``
+            # off the slow path).
+            if for_lookup and self._channel_gaps_fetch is not None:
+                result_root.append((GAPS_MD, False))
+            result_root.extend((m, True) for m in months)
+            return result_root
 
         if depth == 3:
             if not is_valid_month(parts[2]):
@@ -776,11 +823,13 @@ class SlackFuseOpsV2(pyfuse3.Operations):
 
         return []
 
-    def _is_dir(self, path: str) -> bool:
+    def _is_dir(self, path: str) -> bool:  # noqa: C901  (path-depth dispatch hub)
         parts = parse_path(path)
         depth = len(parts)
         if depth == 0:
             return True
+        if parts[0] == WORKSPACE_DIR:
+            return depth == 1
         if parts[0] not in CONV_ROOTS:
             return False
         if depth == 1:
@@ -796,7 +845,7 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         if depth == 2:
             return True
         if depth == 3:
-            return parts[2] != CHANNEL_MD and is_valid_month(parts[2])
+            return parts[2] not in (CHANNEL_MD, GAPS_MD) and is_valid_month(parts[2])
         if depth == 4:
             return is_valid_month(parts[2]) and is_valid_day(parts[3])
         if depth == 5:
@@ -834,6 +883,20 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         """
         parts = parse_path(path)
         depth = len(parts)
+
+        # ``/_workspace/gaps.md`` — workspace-wide gaps summary, fetched
+        # from the slurper-server's events table. Same cache-then-fetch
+        # pattern as the channel-level gaps below. No mention resolution
+        # needed — the server returns plain markdown.
+        if (
+            depth == 2
+            and parts[0] == WORKSPACE_DIR
+            and parts[1] == GAPS_MD
+            and self._workspace_gaps_fetch is not None
+            and self._workspace_gaps_cache is not None
+        ):
+            return self._assemble_workspace_gaps()
+
         if depth < 3 or parts[0] not in CONV_ROOTS:
             return None
 
@@ -852,6 +915,19 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         # (review P1-5).
         if depth == 3 and parts[2] == CHANNEL_MD:
             return _assemble_channel_meta(self._conn, row, cfg)
+
+        # /<conv-root>/<slug>/gaps.md  (ghost diagnostic file)
+        # Lists UTC days with no message events on this channel that are
+        # bounded by days with events. Lookup-only (not in readdir) so a
+        # recursive ``rg`` doesn't trigger the events aggregation on the
+        # server. Empty body → ENOENT (no gaps to show).
+        if (
+            depth == 3
+            and parts[2] == GAPS_MD
+            and self._channel_gaps_fetch is not None
+            and self._channel_gaps_cache is not None
+        ):
+            return self._assemble_channel_gaps(row.channel_id)
 
         # /<conv-root>/<slug>/<YYYY-MM>/<DD>/channel.md
         if depth == 5 and parts[4] == CHANNEL_MD:
@@ -927,7 +1003,7 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             # to ``_callback_guard``, which logs full traceback and surfaces
             # EIO — same path as any other callback-stage failure.
             raw = self._originals_fetch(row.channel_id, from_epoch, to_epoch)
-            self._originals_cache.put(row.channel_id, day_iso, raw)
+            self._originals_cache.put(row.channel_id, day_iso, content=raw)
             cached = raw
         if not cached:
             return None
@@ -939,6 +1015,41 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         marker = "<!-- originals view: replay of events log; edits/deletes annotated inline -->\n\n"
         base = frontmatter + marker + resolved
         return _decide_and_apply(self._conn, base, f"channel:{row.channel_id}", fallback_reasons, cfg)
+
+    def _assemble_channel_gaps(
+        self,
+        channel_id: str,
+    ) -> tuple[bytes, bool, bool, TrailerDecision] | None:
+        """``/<conv>/<slug>/gaps.md`` — fetched from the slurper-server's
+        ``/gaps/{channel_id}`` endpoint, cached briefly so stat+read share
+        one fetch. Empty body → ENOENT-like ``None`` so a clean channel
+        doesn't materialize an empty ghost file.
+        """
+        assert self._channel_gaps_fetch is not None
+        assert self._channel_gaps_cache is not None
+        cached = self._channel_gaps_cache.get(channel_id)
+        if cached is None:
+            cached = self._channel_gaps_fetch(channel_id)
+            self._channel_gaps_cache.put(channel_id, content=cached)
+        if not cached:
+            return None
+        # No staleness trailer / mention resolution: the server returns
+        # plain markdown referencing channel names + ISO dates only.
+        return cached, False, False, TrailerDecision(kind="clean", stream=f"channel:{channel_id}")
+
+    def _assemble_workspace_gaps(self) -> tuple[bytes, bool, bool, TrailerDecision] | None:
+        """``/_workspace/gaps.md`` — workspace-wide gaps summary fetched
+        from ``/gaps``. Single-cell cache because there's only one body.
+        """
+        assert self._workspace_gaps_fetch is not None
+        assert self._workspace_gaps_cache is not None
+        cached = self._workspace_gaps_cache.get()
+        if cached is None:
+            cached = self._workspace_gaps_fetch()
+            self._workspace_gaps_cache.put(content=cached)
+        if not cached:
+            return None
+        return cached, False, False, TrailerDecision(kind="clean", stream="workspace-gaps")
 
     # ------------------------------------------------------------------
     # FUSE callbacks

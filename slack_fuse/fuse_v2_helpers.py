@@ -68,6 +68,18 @@ THREAD_MD: Final = "thread.md"
 # that surfaces this name.
 CHANNEL_ORIGINAL_MD: Final = "channel.original.md"
 
+# Diagnostic ghost file at the channel root: lists UTC days with no message
+# events bounded by days that DO have events. Same hide-from-readdir pattern
+# as ``channel.original.md`` so a recursive ``rg`` never hits the
+# events-aggregation slow path. Workspace-wide summary lives at
+# ``/_workspace/gaps.md``.
+GAPS_MD: Final = "gaps.md"
+# Top-level namespace for read-only diagnostic surfaces (currently just
+# gaps; future control-surface ghost files land here too). Listed by the
+# root readdir so it's discoverable; its contents are listed normally
+# inside.
+WORKSPACE_DIR: Final = "_workspace"
+
 # The `channel-list` stream is the staleness stream for channel-metadata
 # (``channel.md``) reads — channel inventory/rename/archive flow over it.
 CHANNEL_LIST_STREAM: Final = "channel-list"

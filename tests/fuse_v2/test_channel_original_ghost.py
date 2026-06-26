@@ -252,9 +252,9 @@ def test_cache_eviction_when_max_entries_exceeded(
     """Tight FIFO cap so a perverse recursive scan can't grow memory
     unbounded. Verify by overrunning the bound with a tiny cache."""
     cache = _OriginalsCache(max_entries=2, ttl_s=60.0)
-    cache.put("C1", "2026-06-01", b"a")
-    cache.put("C1", "2026-06-02", b"b")
-    cache.put("C1", "2026-06-03", b"c")  # evicts 2026-06-01
+    cache.put("C1", "2026-06-01", content=b"a")
+    cache.put("C1", "2026-06-02", content=b"b")
+    cache.put("C1", "2026-06-03", content=b"c")  # evicts 2026-06-01
     assert cache.get("C1", "2026-06-01") is None
     assert cache.get("C1", "2026-06-02") == b"b"
     assert cache.get("C1", "2026-06-03") == b"c"
@@ -266,7 +266,7 @@ def test_cache_ttl_expiry(
     """A short TTL forces the cache to refetch after expiry."""
 
     cache = _OriginalsCache(max_entries=8, ttl_s=0.05)
-    cache.put("C1", "2026-06-01", b"snapshot")
+    cache.put("C1", "2026-06-01", content=b"snapshot")
     assert cache.get("C1", "2026-06-01") == b"snapshot"
     time.sleep(0.1)
     assert cache.get("C1", "2026-06-01") is None

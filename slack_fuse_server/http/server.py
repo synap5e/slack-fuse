@@ -19,15 +19,18 @@ from slack_fuse_server.http.dto import (
     ResolveRequest,
 )
 from slack_fuse_server.http.handlers import (
+    GapsDeps,
     OriginalsDeps,
     ResolvePermalinkDeps,
     SnapshotDeps,
+    handle_channel_gaps,
     handle_health,
     handle_metrics,
     handle_originals,
     handle_permalink,
     handle_resolve,
     handle_snapshot,
+    handle_workspace_gaps,
 )
 from slack_fuse_server.http.metrics import MetricsSource
 from slack_fuse_server.http.snapshot import SnapshotNotFoundError
@@ -76,13 +79,14 @@ def parse_listen_addr(listen_addr: str) -> tuple[str, int]:
     return host, int(port_text)
 
 
-def route_request(  # noqa: C901 - endpoint routing dispatch hub.
+def route_request(  # noqa: C901, PLR0913 - endpoint routing dispatch hub.
     request: HttpRequest,
     *,
     metrics_source: MetricsSource,
     resolve_permalink_deps: ResolvePermalinkDeps | None = None,
     snapshot_deps: SnapshotDeps | None = None,
     originals_deps: OriginalsDeps | None = None,
+    gaps_deps: GapsDeps | None = None,
 ) -> HttpResponse:
     """Pure routing table for supported HTTP endpoints."""
     if request.path == "/health":
@@ -135,6 +139,21 @@ def route_request(  # noqa: C901 - endpoint routing dispatch hub.
             originals_channel, from_epoch=from_epoch, to_epoch=to_epoch, deps=originals_deps
         )
 
+    if request.path == "/gaps":
+        if request.method != "GET":
+            return _error_response(status_code=405, code="method_not_allowed")
+        if gaps_deps is None:
+            return _error_response(status_code=503, code="service_unavailable")
+        return _handle_workspace_gaps(deps=gaps_deps)
+
+    gaps_channel = _gaps_channel_from_path(request.path)
+    if gaps_channel is not None:
+        if request.method != "GET":
+            return _error_response(status_code=405, code="method_not_allowed")
+        if gaps_deps is None:
+            return _error_response(status_code=503, code="service_unavailable")
+        return _handle_channel_gaps(gaps_channel, deps=gaps_deps)
+
     return _error_response(status_code=404, code="not_found")
 
 
@@ -146,6 +165,7 @@ async def serve_http(  # noqa: PLR0913 - HTTP wiring needs explicit deps.
     resolve_permalink_deps: ResolvePermalinkDeps | None = None,
     snapshot_deps: SnapshotDeps | None = None,
     originals_deps: OriginalsDeps | None = None,
+    gaps_deps: GapsDeps | None = None,
 ) -> None:
     """Serve HTTP endpoints on the given host/port."""
     handler = partial(
@@ -154,16 +174,18 @@ async def serve_http(  # noqa: PLR0913 - HTTP wiring needs explicit deps.
         resolve_permalink_deps=resolve_permalink_deps,
         snapshot_deps=snapshot_deps,
         originals_deps=originals_deps,
+        gaps_deps=gaps_deps,
     )
     await trio.serve_tcp(handler, port=port, host=host)
 
 
-async def serve_http_on_listeners(
+async def serve_http_on_listeners(  # noqa: PLR0913, PLR0917 - HTTP wiring needs explicit deps.
     listeners: list[trio.SocketListener],
     metrics_source: MetricsSource,
     resolve_permalink_deps: ResolvePermalinkDeps | None = None,
     snapshot_deps: SnapshotDeps | None = None,
     originals_deps: OriginalsDeps | None = None,
+    gaps_deps: GapsDeps | None = None,
 ) -> None:
     """Serve on already-open listeners (useful for tests and shared-port setups)."""
     handler = partial(
@@ -172,17 +194,19 @@ async def serve_http_on_listeners(
         resolve_permalink_deps=resolve_permalink_deps,
         snapshot_deps=snapshot_deps,
         originals_deps=originals_deps,
+        gaps_deps=gaps_deps,
     )
     await trio.serve_listeners(handler, listeners)
 
 
-async def serve_http_from_listen_addr(
+async def serve_http_from_listen_addr(  # noqa: PLR0913 - HTTP wiring needs explicit deps.
     *,
     listen_addr: str,
     metrics_source: MetricsSource,
     resolve_permalink_deps: ResolvePermalinkDeps | None = None,
     snapshot_deps: SnapshotDeps | None = None,
     originals_deps: OriginalsDeps | None = None,
+    gaps_deps: GapsDeps | None = None,
 ) -> None:
     """Serve HTTP endpoints using an RFC-style `listen_addr` string."""
     host, port = parse_listen_addr(listen_addr)
@@ -193,16 +217,18 @@ async def serve_http_from_listen_addr(
         resolve_permalink_deps=resolve_permalink_deps,
         snapshot_deps=snapshot_deps,
         originals_deps=originals_deps,
+        gaps_deps=gaps_deps,
     )
 
 
-async def serve_http_connection(
+async def serve_http_connection(  # noqa: PLR0913 - HTTP wiring needs explicit deps.
     stream: trio.abc.Stream,
     *,
     metrics_source: MetricsSource,
     resolve_permalink_deps: ResolvePermalinkDeps | None = None,
     snapshot_deps: SnapshotDeps | None = None,
     originals_deps: OriginalsDeps | None = None,
+    gaps_deps: GapsDeps | None = None,
 ) -> None:
     """Serve a single already-accepted connection as HTTP.
 
@@ -216,16 +242,18 @@ async def serve_http_connection(
         resolve_permalink_deps=resolve_permalink_deps,
         snapshot_deps=snapshot_deps,
         originals_deps=originals_deps,
+        gaps_deps=gaps_deps,
     )
 
 
-async def _serve_connection(
+async def _serve_connection(  # noqa: PLR0913 - HTTP wiring needs explicit deps.
     stream: trio.abc.Stream,
     *,
     metrics_source: MetricsSource,
     resolve_permalink_deps: ResolvePermalinkDeps | None = None,
     snapshot_deps: SnapshotDeps | None = None,
     originals_deps: OriginalsDeps | None = None,
+    gaps_deps: GapsDeps | None = None,
 ) -> None:
     conn = h11.Connection(h11.SERVER)
     try:
@@ -238,6 +266,7 @@ async def _serve_connection(
             resolve_permalink_deps=resolve_permalink_deps,
             snapshot_deps=snapshot_deps,
             originals_deps=originals_deps,
+            gaps_deps=gaps_deps,
         )
         await _send_response(conn, stream, response)
     except h11.RemoteProtocolError:
@@ -421,6 +450,33 @@ def _handle_originals(
 ) -> HttpResponse:
     try:
         body = handle_originals(channel_id, from_epoch=from_epoch, to_epoch=to_epoch, deps=deps)
+    except psycopg.Error:
+        return _error_response(status_code=503, code="service_unavailable")
+    return HttpResponse(status_code=200, body=body, content_type="text/markdown; charset=utf-8")
+
+
+def _gaps_channel_from_path(path: str) -> str | None:
+    parts = path.split("/")
+    if len(parts) != 3 or parts[1] != "gaps":
+        return None
+    encoded = parts[2]
+    if not encoded:
+        return None
+    channel = unquote(encoded)
+    return channel or None
+
+
+def _handle_channel_gaps(channel_id: str, *, deps: GapsDeps) -> HttpResponse:
+    try:
+        body = handle_channel_gaps(channel_id, deps=deps)
+    except psycopg.Error:
+        return _error_response(status_code=503, code="service_unavailable")
+    return HttpResponse(status_code=200, body=body, content_type="text/markdown; charset=utf-8")
+
+
+def _handle_workspace_gaps(*, deps: GapsDeps) -> HttpResponse:
+    try:
+        body = handle_workspace_gaps(deps=deps)
     except psycopg.Error:
         return _error_response(status_code=503, code="service_unavailable")
     return HttpResponse(status_code=200, body=body, content_type="text/markdown; charset=utf-8")

@@ -56,6 +56,19 @@ class OriginalsDeps:
     database_url: str
 
 
+@dataclass(frozen=True, slots=True)
+class GapsDeps:
+    """Dependencies required by ``GET /gaps`` and ``GET /gaps/{channel_id}``.
+
+    Same shape as :class:`OriginalsDeps`: a forensic read-only surface that
+    opens its own conn per request. The workspace-wide query is one scan
+    over the events table, so the per-request overhead beats holding a
+    long-lived conn for an endpoint that's hit rarely.
+    """
+
+    database_url: str
+
+
 def handle_health() -> HealthResponse:
     """`GET /health` liveness probe."""
     return HealthResponse(ok=True)
@@ -98,6 +111,26 @@ def handle_snapshot(
         requested_at=at,
         client_since_offset=since,
     )
+
+
+def handle_channel_gaps(channel_id: str, *, deps: GapsDeps) -> bytes:
+    """``GET /gaps/{channel_id}`` — per-channel rendered gaps view."""
+    import psycopg  # noqa: PLC0415
+
+    from slack_fuse_server.gaps import render_channel_gaps  # noqa: PLC0415
+
+    with psycopg.connect(deps.database_url, autocommit=True) as conn:
+        return render_channel_gaps(conn, channel_id)
+
+
+def handle_workspace_gaps(*, deps: GapsDeps) -> bytes:
+    """``GET /gaps`` — workspace-wide rendered gaps summary."""
+    import psycopg  # noqa: PLC0415
+
+    from slack_fuse_server.gaps import render_workspace_gaps  # noqa: PLC0415
+
+    with psycopg.connect(deps.database_url, autocommit=True) as conn:
+        return render_workspace_gaps(conn)
 
 
 def handle_originals(

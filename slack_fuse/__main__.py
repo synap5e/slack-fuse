@@ -375,20 +375,29 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
     # The fetcher runs in FUSE worker threads (dispatched by ``_run_sync``),
     # so a sync client fits cleanly — no trio context to thread through.
     # Long-lived: one process, connection-pooled.
+    from slack_fuse.projector.gaps_fetch import fetch_channel_gaps, fetch_workspace_gaps
     from slack_fuse.projector.originals_fetch import fetch_originals
     from slack_fuse.projector.ws_client import derive_http_base
 
-    originals_http_client = httpx.Client(timeout=httpx.Timeout(connect=2.0, read=5.0, write=2.0, pool=5.0))
-    originals_base_http_url = derive_http_base(config.server_url)
+    # One shared sync httpx.Client for all the ghost-file fetchers (originals,
+    # gaps). They run in FUSE worker threads, so a sync client fits.
+    ghost_http_client = httpx.Client(timeout=httpx.Timeout(connect=2.0, read=5.0, write=2.0, pool=5.0))
+    ghost_base_http_url = derive_http_base(config.server_url)
 
     def _originals_fetch_sync(channel_id: str, from_epoch: float, to_epoch: float) -> bytes:
         return fetch_originals(
-            originals_http_client,
-            originals_base_http_url,
+            ghost_http_client,
+            ghost_base_http_url,
             channel_id,
             from_epoch=from_epoch,
             to_epoch=to_epoch,
         )
+
+    def _channel_gaps_fetch_sync(channel_id: str) -> bytes:
+        return fetch_channel_gaps(ghost_http_client, ghost_base_http_url, channel_id)
+
+    def _workspace_gaps_fetch_sync() -> bytes:
+        return fetch_workspace_gaps(ghost_http_client, ghost_base_http_url)
 
     ops = SlackFuseOpsV2(
         fuse_conn,
@@ -400,6 +409,8 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
         trailer_enabled=config.stale_trailer_enabled,
         trailer_log=trailer_log,
         originals_fetch=_originals_fetch_sync,
+        channel_gaps_fetch=_channel_gaps_fetch_sync,
+        workspace_gaps_fetch=_workspace_gaps_fetch_sync,
     )
 
     # The projector's post-commit sink: maps ChunkRef / ThreadChunkRef /
