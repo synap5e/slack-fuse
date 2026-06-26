@@ -123,9 +123,14 @@ class _FakeRefreshTrigger:
     def __init__(self, *, ready: bool = True) -> None:
         self.ready = ready
         self.calls = 0
+        self.channel_calls: list[str] = []
 
     def request(self) -> bool:
         self.calls += 1
+        return self.ready
+
+    def request_channel(self, channel_id: str) -> bool:
+        self.channel_calls.append(channel_id)
         return self.ready
 
 
@@ -343,6 +348,55 @@ async def test_refresh_endpoint_returns_503_without_deps(
     ):
         response = await client.post("/refresh-channels")
     assert response.status_code == 503
+
+
+async def test_refresh_channel_endpoint_routes_channel_id(
+    pg_conn: psycopg.Connection[TupleRow],
+) -> None:
+    """``POST /refresh-channels/{channel_id}`` reaches the per-channel
+    branch of the trigger (``request_channel``), not the workspace one."""
+    database_url = _prepare_database(pg_conn)
+    trigger = _FakeRefreshTrigger(ready=True)
+    deps = RefreshDeps(shared_secret=None, trigger=trigger)
+    async with (
+        _running_dispatch(database_url, refresh_deps=deps) as (port, _wire),
+        httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client,
+    ):
+        response = await client.post("/refresh-channels/C0ALLT6Q3SQ")
+    assert response.status_code == 202
+    assert response.json() == {"status": "refresh queued for C0ALLT6Q3SQ"}
+    assert trigger.channel_calls == ["C0ALLT6Q3SQ"]
+    # Workspace path NOT called.
+    assert trigger.calls == 0
+
+
+async def test_refresh_channel_endpoint_returns_409_when_busy(
+    pg_conn: psycopg.Connection[TupleRow],
+) -> None:
+    database_url = _prepare_database(pg_conn)
+    trigger = _FakeRefreshTrigger(ready=False)
+    deps = RefreshDeps(shared_secret=None, trigger=trigger)
+    async with (
+        _running_dispatch(database_url, refresh_deps=deps) as (port, _wire),
+        httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client,
+    ):
+        response = await client.post("/refresh-channels/C0ALLT6Q3SQ")
+    assert response.status_code == 409
+
+
+async def test_refresh_channel_endpoint_requires_secret_when_configured(
+    pg_conn: psycopg.Connection[TupleRow],
+) -> None:
+    database_url = _prepare_database(pg_conn)
+    trigger = _FakeRefreshTrigger()
+    deps = RefreshDeps(shared_secret="s3cret", trigger=trigger)
+    async with (
+        _running_dispatch(database_url, refresh_deps=deps) as (port, _wire),
+        httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client,
+    ):
+        response = await client.post("/refresh-channels/C0ALLT6Q3SQ")
+    assert response.status_code == 401
+    assert trigger.channel_calls == []
 
 
 async def test_refresh_endpoint_rejects_non_post(

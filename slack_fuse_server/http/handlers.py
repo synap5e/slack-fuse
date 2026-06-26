@@ -71,14 +71,20 @@ class GapsDeps:
 
 
 class RefreshTrigger(Protocol):
-    """``POST /refresh-channels`` hands the request off to a long-lived
-    background consumer via this trigger. The HTTP request returns 202
-    immediately; the actual ``conversations.info`` sweep runs in the
-    main nursery."""
+    """``POST /refresh-channels[/<channel_id>]`` hands the request off
+    to a long-lived background consumer via this trigger. The HTTP
+    request returns 202 immediately; the actual ``conversations.info``
+    call(s) run in the main nursery."""
 
     def request(self) -> bool:
-        """Queue a refresh. Returns True if accepted (consumer was idle),
-        False if one is already in progress (caller should treat as 409)."""
+        """Queue a workspace-wide refresh. Returns True if accepted
+        (consumer was idle), False if one is already in progress
+        (caller should treat as 409)."""
+        ...
+
+    def request_channel(self, channel_id: str) -> bool:
+        """Queue a single-channel refresh. Same return contract as
+        ``request()``."""
         ...
 
 
@@ -165,7 +171,7 @@ def handle_refresh_channels(
     *,
     deps: RefreshDeps,
 ) -> tuple[int, str]:
-    """``POST /refresh-channels`` — queue a one-shot refresh cycle.
+    """``POST /refresh-channels`` — queue a workspace-wide refresh.
 
     Returns ``(status_code, message)``:
       * 202 — accepted, refresh queued
@@ -179,6 +185,25 @@ def handle_refresh_channels(
         return 401, "unauthorized"
     if deps.trigger.request():
         return 202, "refresh queued"
+    return 409, "refresh already in progress"
+
+
+def handle_refresh_channel(
+    channel_id: str,
+    headers: Sequence[tuple[bytes, bytes]],
+    *,
+    deps: RefreshDeps,
+) -> tuple[int, str]:
+    """``POST /refresh-channels/{channel_id}`` — refresh a single channel.
+
+    Same response shape as :func:`handle_refresh_channels`. Cheap (one
+    ``conversations.info`` call), but still serialised through the
+    consumer so it can't overlap a workspace sweep.
+    """
+    if not is_http_authorized(headers, deps.shared_secret):
+        return 401, "unauthorized"
+    if deps.trigger.request_channel(channel_id):
+        return 202, f"refresh queued for {channel_id}"
     return 409, "refresh already in progress"
 
 

@@ -198,21 +198,37 @@ async def refresh_channels_once(writer: OffsetWriter, client: SlackClient) -> No
 
 
 class RefreshTrigger:
-    """Rendezvous-channel trigger used by the ``POST /refresh-channels``
-    endpoint to ask the in-process consumer for a sweep.
+    """Rendezvous-channel trigger used by the refresh HTTP endpoints to
+    ask the in-process consumer for a sweep.
+
+    Two modes:
+    - ``request()`` (no arg): full workspace sweep
+    - ``request_channel(channel_id)``: just one channel
 
     Rendezvous mode (``max_buffer_size=0``) gives "one in flight at a
     time" for free: ``send_nowait`` only succeeds if the consumer is
     currently parked in ``recv.receive()`` — if a sweep is already
     running, the call returns False and the endpoint responds 409.
+
+    A per-channel refresh and a workspace refresh compete for the same
+    slot, which is intentional: the workspace sweep is sequential and
+    will pick the channel up anyway, so layering a per-channel request
+    on top of a running workspace one would be redundant.
     """
 
     def __init__(self) -> None:
-        self._send, self._recv = trio.open_memory_channel[None](max_buffer_size=0)
+        # Item is ``None`` for workspace sweep, or a channel id string.
+        self._send, self._recv = trio.open_memory_channel[str | None](max_buffer_size=0)
 
     def request(self) -> bool:
+        return self._try_send(None)
+
+    def request_channel(self, channel_id: str) -> bool:
+        return self._try_send(channel_id)
+
+    def _try_send(self, item: str | None) -> bool:
         try:
-            self._send.send_nowait(None)
+            self._send.send_nowait(item)
         except trio.WouldBlock:
             return False
         return True
@@ -226,10 +242,15 @@ class RefreshTrigger:
 
         Spawned in the main nursery alongside the periodic task. The two
         coexist cleanly — periodic ticks at 6h, HTTP triggers fire ad
-        hoc; both call ``_refresh_all_once``.
+        hoc; both share ``_refresh_all_once`` / ``_refresh_one``.
         """
-        async for _ in self._recv:
+        async for item in self._recv:
             try:
-                await _refresh_all_once(writer, client)
+                if item is None:
+                    await _refresh_all_once(writer, client)
+                else:
+                    await _refresh_one(writer, client, item)
+            except ChannelNotFoundError:
+                log.info("refresh: HTTP-triggered run for %s: channel not found", item)
             except Exception:
                 log.exception("refresh: HTTP-triggered run failed")

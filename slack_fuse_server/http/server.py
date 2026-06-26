@@ -29,6 +29,7 @@ from slack_fuse_server.http.handlers import (
     handle_metrics,
     handle_originals,
     handle_permalink,
+    handle_refresh_channel,
     handle_refresh_channels,
     handle_resolve,
     handle_snapshot,
@@ -156,6 +157,18 @@ def route_request(  # noqa: C901, PLR0913 - endpoint routing dispatch hub.
         if refresh_deps is None:
             return _error_response(status_code=503, code="service_unavailable")
         status_code, message = handle_refresh_channels(request.headers, deps=refresh_deps)
+        body = json.dumps({"status": message}, separators=(",", ":")).encode("utf-8")
+        return HttpResponse(status_code=status_code, body=body)
+
+    refresh_channel_id = _refresh_channel_from_path(request.path)
+    if refresh_channel_id is not None:
+        if request.method != "POST":
+            return _error_response(status_code=405, code="method_not_allowed")
+        if refresh_deps is None:
+            return _error_response(status_code=503, code="service_unavailable")
+        status_code, message = handle_refresh_channel(
+            refresh_channel_id, request.headers, deps=refresh_deps
+        )
         body = json.dumps({"status": message}, separators=(",", ":")).encode("utf-8")
         return HttpResponse(status_code=status_code, body=body)
 
@@ -492,6 +505,19 @@ def _gaps_channel_from_path(path: str) -> str | None:
         return None
     channel = unquote(encoded)
     return channel or None
+
+
+def _refresh_channel_from_path(path: str) -> str | None:
+    """Parse ``/refresh-channels/<channel_id>`` (note: hyphenated, same as
+    the workspace route). Returns the decoded channel id or ``None`` when
+    the path doesn't match."""
+    parts = path.split("/")
+    if len(parts) != 3 or parts[1] != "refresh-channels":
+        return None
+    encoded = parts[2]
+    if not encoded:
+        return None
+    return unquote(encoded) or None
 
 
 def _handle_channel_gaps(channel_id: str, *, deps: GapsDeps) -> HttpResponse:
