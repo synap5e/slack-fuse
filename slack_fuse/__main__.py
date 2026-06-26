@@ -504,12 +504,36 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
                     with contextlib.suppress(Exception):
                         conn.close()
 
+    # Background warmer for the gaps ghost-file caches. The FUSE callbacks
+    # never block on HTTP (the workspace query alone runs ~2s server-side
+    # and would blow the 1s per-callback budget); this task feeds the
+    # in-process cache periodically so callbacks just read from it.
+    from slack_fuse.projector.gaps_warmer import warm_gaps_periodically
+
+    def _list_known_channel_ids() -> list[str]:
+        # Fresh conn per call so we don't contend with FUSE pool conns.
+        with _open_conn() as conn, conn.cursor() as cur:
+            _ = cur.execute("SELECT channel_id FROM channels WHERE tier != 'blocked' ORDER BY channel_id")
+            return [str(r[0]) for r in cur.fetchall()]
+
+    async def _run_gaps_warmer() -> None:
+        try:
+            await warm_gaps_periodically(
+                ops,
+                workspace_gaps_fetch=_workspace_gaps_fetch_sync,
+                channel_gaps_fetch=_channel_gaps_fetch_sync,
+                list_channel_ids=_list_known_channel_ids,
+            )
+        except Exception as exc:  # noqa: BLE001 — supervisor must outlive any warmer error
+            log.warning("gaps warmer exited (%s); not restarting (gaps will fall back to ENOENT)", exc)
+
     async def _run() -> None:
         try:
             async with trio.open_nursery() as nursery:
                 nursery.start_soon(_run_health_subscriber)
                 nursery.start_soon(_run_projector)
                 nursery.start_soon(pg_health.run)
+                nursery.start_soon(_run_gaps_warmer)
                 await pyfuse3.main()
                 nursery.cancel_scope.cancel()
         finally:

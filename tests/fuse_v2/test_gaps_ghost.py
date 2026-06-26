@@ -142,16 +142,25 @@ def test_channel_root_lookup_omits_gaps_md_when_no_fetcher(
     assert GAPS_MD not in names
 
 
-def test_channel_gaps_resolve_returns_fetcher_body(
+def test_channel_gaps_resolve_returns_warmed_cache_body(
     client_conn: Connection[TupleRow],
 ) -> None:
+    """The FUSE callback never fetches — it serves the in-process cache
+    populated by the background warmer. Pre-warm via the dedicated
+    ``put_channel_gaps_cached`` mutator (the same entry point the warmer
+    uses) and assert the next resolve returns the cached bytes."""
     _seed_channel_with_data(client_conn)
     fetcher = _CountingChannelGapsFetcher(b"# Gaps for general\n\nFour day hole here\n")
     ops = _make_ops(client_conn, channel_gaps_fetch=fetcher)
+    ops.put_channel_gaps_cached("C1", b"# Gaps for general\n\nFour day hole here\n")
     resolved = ops.resolve_content_for_test(_CHANNEL_GAPS_PATH)
     assert resolved is not None
     content, _trailer, _fallback = resolved
     assert b"Four day hole here" in content
+    # CRITICAL: the FUSE callback path MUST NOT have called the fetcher.
+    # Any synchronous fetch inside a callback re-introduces the 1s budget
+    # blow-up we shipped this background-warmer architecture to avoid.
+    assert fetcher.calls == []
 
 
 def test_channel_gaps_empty_body_resolves_to_none(
@@ -177,27 +186,38 @@ def test_channel_gaps_classified_as_file_not_dir(
 # ============================================================================
 
 
-def test_channel_gaps_cache_dedupes_repeated_resolves(
+def test_channel_gaps_resolve_returns_none_without_warmed_cache(
     client_conn: Connection[TupleRow],
 ) -> None:
+    """Cold cache → ENOENT-like ``None``. The FUSE side surfaces this as
+    "file does not exist yet" to userspace; userspace retries after the
+    next warmer cycle and sees content."""
     _seed_channel_with_data(client_conn)
     fetcher = _CountingChannelGapsFetcher()
     ops = _make_ops(client_conn, channel_gaps_fetch=fetcher)
-    _ = ops.resolve_content_for_test(_CHANNEL_GAPS_PATH)
-    _ = ops.resolve_content_for_test(_CHANNEL_GAPS_PATH)
-    assert fetcher.calls == ["C1"]
+    assert ops.resolve_content_for_test(_CHANNEL_GAPS_PATH) is None
+    # No fetch from inside the callback path — the warmer is the only path.
+    assert fetcher.calls == []
 
 
-def test_channel_gaps_cache_keys_per_channel(
+def test_channel_gaps_cache_isolates_per_channel(
     client_conn: Connection[TupleRow],
 ) -> None:
+    """Two channels warmed separately don't share cache entries."""
     _seed_channel_with_data(client_conn)
     seed_channel(client_conn, "C2", "alpha", tier="hot")
     fetcher = _CountingChannelGapsFetcher()
     ops = _make_ops(client_conn, channel_gaps_fetch=fetcher)
-    _ = ops.resolve_content_for_test(_CHANNEL_GAPS_PATH)
-    _ = ops.resolve_content_for_test(f"/channels/alpha/{GAPS_MD}")
-    assert sorted(fetcher.calls) == ["C1", "C2"]
+    ops.put_channel_gaps_cached("C1", b"# Gaps for general\n\nA hole\n")
+    ops.put_channel_gaps_cached("C2", b"# Gaps for alpha\n\nDifferent hole\n")
+
+    resolved_c1 = ops.resolve_content_for_test(_CHANNEL_GAPS_PATH)
+    resolved_c2 = ops.resolve_content_for_test(f"/channels/alpha/{GAPS_MD}")
+    assert resolved_c1 is not None and b"general" in resolved_c1[0]
+    assert resolved_c2 is not None and b"alpha" in resolved_c2[0]
+    # Asserts content didn't cross-contaminate.
+    assert b"alpha" not in resolved_c1[0]
+    assert b"general" not in resolved_c2[0]
 
 
 # ============================================================================
@@ -248,25 +268,29 @@ def test_workspace_dir_lists_gaps_md(
     assert names == [GAPS_MD]
 
 
-def test_workspace_gaps_resolve_returns_fetcher_body(
+def test_workspace_gaps_resolve_returns_warmed_cache_body(
     client_conn: Connection[TupleRow],
 ) -> None:
+    """Pre-warm via ``put_workspace_gaps_cached``; the FUSE callback never
+    fetches synchronously, just reads the cache."""
     fetcher = _CountingWorkspaceGapsFetcher(b"# Workspace gaps\n\n3 channel(s) with gaps.\n")
     ops = _make_ops(client_conn, workspace_gaps_fetch=fetcher)
+    ops.put_workspace_gaps_cached(b"# Workspace gaps\n\n3 channel(s) with gaps.\n")
     resolved = ops.resolve_content_for_test(_WORKSPACE_GAPS_PATH)
     assert resolved is not None
     content, _trailer, _fallback = resolved
     assert b"3 channel(s) with gaps" in content
+    # No synchronous fetch from inside the callback path.
+    assert fetcher.calls == 0
 
 
-def test_workspace_gaps_cache_dedupes_repeated_resolves(
+def test_workspace_gaps_resolve_returns_none_without_warmed_cache(
     client_conn: Connection[TupleRow],
 ) -> None:
     fetcher = _CountingWorkspaceGapsFetcher()
     ops = _make_ops(client_conn, workspace_gaps_fetch=fetcher)
-    _ = ops.resolve_content_for_test(_WORKSPACE_GAPS_PATH)
-    _ = ops.resolve_content_for_test(_WORKSPACE_GAPS_PATH)
-    assert fetcher.calls == 1
+    assert ops.resolve_content_for_test(_WORKSPACE_GAPS_PATH) is None
+    assert fetcher.calls == 0
 
 
 def test_workspace_gaps_resolves_to_none_when_no_fetcher(

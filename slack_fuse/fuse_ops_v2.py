@@ -494,13 +494,18 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         # differ — per-channel gaps mirror originals (many keys), workspace
         # gaps is a single-cell cache. Both gated on the corresponding
         # fetcher: a missing fetcher hides the file (mirrors originals).
+        # Cache TTL for the gaps views is intentionally LONG (10min). The
+        # background warmer refreshes every 5min; the longer TTL means a
+        # missed warmer cycle still serves slightly-stale-but-correct data
+        # rather than ENOENT. Mirrors the "forensic snapshot, not a live
+        # view" framing.
         self._channel_gaps_fetch = channel_gaps_fetch
         self._channel_gaps_cache: _BytesCache | None = (
-            _BytesCache() if channel_gaps_fetch is not None else None
+            _BytesCache(max_entries=512, ttl_s=600.0) if channel_gaps_fetch is not None else None
         )
         self._workspace_gaps_fetch = workspace_gaps_fetch
         self._workspace_gaps_cache: _BytesCache | None = (
-            _BytesCache(max_entries=1) if workspace_gaps_fetch is not None else None
+            _BytesCache(max_entries=1, ttl_s=600.0) if workspace_gaps_fetch is not None else None
         )
 
     # ------------------------------------------------------------------
@@ -1020,36 +1025,53 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         self,
         channel_id: str,
     ) -> tuple[bytes, bool, bool, TrailerDecision] | None:
-        """``/<conv>/<slug>/gaps.md`` — fetched from the slurper-server's
-        ``/gaps/{channel_id}`` endpoint, cached briefly so stat+read share
-        one fetch. Empty body → ENOENT-like ``None`` so a clean channel
-        doesn't materialize an empty ghost file.
+        """``/<conv>/<slug>/gaps.md`` — pure cache lookup, never fetches.
+
+        The server-side workspace gap aggregation runs ~2s; doing the HTTP
+        fetch synchronously inside the FUSE callback would blow the 1s
+        per-callback budget AND tie up a pool slot while waiting, queueing
+        every other callback behind us. The background warmer task
+        (:func:`slack_fuse.projector.gaps_warmer.warm_gaps_periodically`)
+        populates the cache; this method just reads from it.
+
+        Cache miss → ``None`` (ENOENT-like) — userspace sees the file
+        "not yet" and the next try after the warmer cycle returns content.
         """
-        assert self._channel_gaps_fetch is not None
-        assert self._channel_gaps_cache is not None
+        if self._channel_gaps_cache is None:
+            return None
         cached = self._channel_gaps_cache.get(channel_id)
-        if cached is None:
-            cached = self._channel_gaps_fetch(channel_id)
-            self._channel_gaps_cache.put(channel_id, content=cached)
         if not cached:
             return None
-        # No staleness trailer / mention resolution: the server returns
-        # plain markdown referencing channel names + ISO dates only.
         return cached, False, False, TrailerDecision(kind="clean", stream=f"channel:{channel_id}")
 
     def _assemble_workspace_gaps(self) -> tuple[bytes, bool, bool, TrailerDecision] | None:
-        """``/_workspace/gaps.md`` — workspace-wide gaps summary fetched
-        from ``/gaps``. Single-cell cache because there's only one body.
+        """``/_workspace/gaps.md`` — pure cache lookup, never fetches.
+        See :meth:`_assemble_channel_gaps` for the rationale.
         """
-        assert self._workspace_gaps_fetch is not None
-        assert self._workspace_gaps_cache is not None
+        if self._workspace_gaps_cache is None:
+            return None
         cached = self._workspace_gaps_cache.get()
-        if cached is None:
-            cached = self._workspace_gaps_fetch()
-            self._workspace_gaps_cache.put(content=cached)
         if not cached:
             return None
         return cached, False, False, TrailerDecision(kind="clean", stream="workspace-gaps")
+
+    # ------------------------------------------------------------------
+    # Cache mutators used by the background warmer (off the FUSE path).
+    # ------------------------------------------------------------------
+
+    def put_channel_gaps_cached(self, channel_id: str, content: bytes) -> None:
+        """Background warmer entry point — populate the per-channel cache
+        without going through the FUSE callback path."""
+        if self._channel_gaps_cache is None:
+            return
+        self._channel_gaps_cache.put(channel_id, content=content)
+
+    def put_workspace_gaps_cached(self, content: bytes) -> None:
+        """Background warmer entry point — populate the workspace cache
+        without going through the FUSE callback path."""
+        if self._workspace_gaps_cache is None:
+            return
+        self._workspace_gaps_cache.put(content=content)
 
     # ------------------------------------------------------------------
     # FUSE callbacks
