@@ -312,6 +312,29 @@ async def _auto_backfill(
     log.info("auto-backfill: complete")
 
 
+# === refresh-channels (admin one-shot) ===
+
+
+async def _run_refresh_channels_once(config: ServerConfig) -> None:
+    """One-shot CLI: run a single channel-metadata refresh cycle.
+
+    Same job the in-process periodic task does — useful when an operator
+    just joined a channel and wants the projector to see the new
+    ``is_member`` state without waiting for the next scheduled cycle.
+    """
+    from slack_fuse_server.slurper.refresh import refresh_channels_once  # noqa: PLC0415
+
+    conn = _connect_and_migrate(config.database_url)
+    limiter = trio.CapacityLimiter(1)
+    writer = OffsetWriter(conn, limiter)
+    client = SlackClient(config.slack_user_token)
+    try:
+        await refresh_channels_once(writer, client)
+    finally:
+        client.close()
+        conn.close()
+
+
 # === Backfill (admin) mode ===
 
 
@@ -383,6 +406,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="slack-fuse-server", description="slack-fuse event-sourced backend")
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("serve", help="run the slurper (default)")
+    sub.add_parser(
+        "refresh-channels",
+        help="run one channel-metadata refresh cycle (diff-and-emit "
+        "channel_info_refreshed events). Same job the periodic in-process "
+        "task does — exposed as a one-shot so operators can trigger drift "
+        "catchup on demand.",
+    )
     bf = sub.add_parser("backfill", help="backfill one channel's history")
     bf.add_argument("channel_id", help="Slack channel id, e.g. C0AKQ5DS0FQ")
     bf.add_argument("--allow-large", action="store_true", help="lift the per-channel size limit entirely")
@@ -410,6 +440,9 @@ def main() -> None:
     args = _build_parser().parse_args()
     config = load_server_config()
 
+    if args.command == "refresh-channels":
+        trio.run(_run_refresh_channels_once, config)
+        return
     if args.command == "backfill":
         channel_id: str = args.channel_id
         allow_large: bool = args.allow_large
