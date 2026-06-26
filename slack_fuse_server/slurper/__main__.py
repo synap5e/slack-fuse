@@ -47,6 +47,7 @@ from slack_fuse_server.slurper.api import ChannelNotFoundError, SlackAPIError, S
 from slack_fuse_server.slurper.channels import ensure_channel_added, populate_channels_once
 from slack_fuse_server.slurper.health import HealthEmitter
 from slack_fuse_server.slurper.offsets import OffsetWriter
+from slack_fuse_server.slurper.refresh import refresh_channels_periodically
 from slack_fuse_server.slurper.socket import SocketModeOptions, SocketModeStatus
 from slack_fuse_server.slurper.users import populate_users_once, run_socket_mode_with_users
 from slack_fuse_server.snapshot import SnapshotScheduler
@@ -241,6 +242,10 @@ async def _serve(config: ServerConfig) -> None:
                 gaps_deps,
             )
             nursery.start_soon(snapshot_scheduler.run)
+            # Periodic ``conversations.info`` refresh: backfills lossy
+            # legacy channel_added payloads (pre raw-persistence) and
+            # catches drift the webhook flow doesn't surface.
+            nursery.start_soon(refresh_channels_periodically, writer, client)
             if auto_backfill:
                 nursery.start_soon(_auto_backfill, config, writer, health, client, limiter)
             log.info("slack-fuse-server listening on %s (HTTP /health, /metrics + WS /ws)", config.listen_addr)

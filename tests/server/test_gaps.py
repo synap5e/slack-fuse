@@ -125,6 +125,41 @@ def test_bounded_gaps_leading_silence_excluded() -> None:
     assert result == []
 
 
+def test_bounded_gaps_left_bound_creates_leading_gap() -> None:
+    """When the caller provides a left bound (channel creation day), the
+    silence between creation and first activity becomes a real gap."""
+    result = _bounded_gaps(
+        [date(2026, 6, 10)],
+        left_bound=date(2026, 6, 1),
+    )
+    assert result == [GapRange(start=date(2026, 6, 2), end=date(2026, 6, 9))]
+
+
+def test_bounded_gaps_left_bound_matching_first_active_day_yields_no_gap() -> None:
+    """Channel created on the same day as the first activity = no leading gap."""
+    result = _bounded_gaps(
+        [date(2026, 6, 10), date(2026, 6, 12)],
+        left_bound=date(2026, 6, 10),
+    )
+    assert result == [GapRange(start=date(2026, 6, 11), end=date(2026, 6, 11))]
+
+
+def test_bounded_gaps_left_bound_after_first_active_day_is_a_no_op() -> None:
+    """A degenerate left bound > first active day (impossible in practice
+    but worth pinning) shouldn't drop the leading days."""
+    result = _bounded_gaps(
+        [date(2026, 6, 1), date(2026, 6, 5)],
+        left_bound=date(2026, 6, 3),  # later than first activity
+    )
+    # The left bound gets inserted via `sorted([left_bound, *days])` — so
+    # the resulting sequence is [06-01, 06-03, 06-05]. 06-01 → 06-03 has
+    # 06-02 missing; 06-03 → 06-05 has 06-04 missing. Two gaps.
+    assert result == [
+        GapRange(start=date(2026, 6, 2), end=date(2026, 6, 2)),
+        GapRange(start=date(2026, 6, 4), end=date(2026, 6, 4)),
+    ]
+
+
 # ============================================================================
 # Integration: SQL → days → gaps
 # ============================================================================
@@ -310,3 +345,90 @@ def test_render_workspace_gaps_ranks_by_total_missing_days(
     idx_large = body.index("C_L")
     idx_small = body.index("C_S")
     assert idx_large < idx_small
+
+
+# ============================================================================
+# Phase 5: `created` as left bound — channel-create→first-message gaps
+# ============================================================================
+
+
+def _seed_channel_added_with_created(
+    conn: psycopg.Connection[TupleRow],
+    *,
+    channel_id: str,
+    name: str,
+    created_epoch: int,
+) -> None:
+    payload: JsonObject = {"id": channel_id, "name": name, "created": created_epoch}
+    _ = write_event(
+        conn,
+        EventRecord(stream="channel-list", kind="channel_added", ts=None, payload=payload),
+    )
+
+
+def test_find_gaps_includes_creation_to_first_message_gap(
+    server_conn: psycopg.Connection[TupleRow],
+) -> None:
+    """End-to-end: when the channel-list payload carries `created`, the gap
+    detector treats it as a virtual left bound. A channel created earlier
+    than its first observed message shows that span as a gap."""
+    creation_day = date(2026, 6, 1)
+    creation_epoch = int(_ts_for_day(creation_day).split(".")[0])
+    _seed_channel_added_with_created(
+        server_conn,
+        channel_id=_CH,
+        name="proj",
+        created_epoch=creation_epoch,
+    )
+    _seed_message(server_conn, day=date(2026, 6, 6))
+    _seed_message(server_conn, day=date(2026, 6, 7))
+    gaps = find_gaps_for_channel(server_conn, _CH)
+    assert gaps == [GapRange(start=date(2026, 6, 2), end=date(2026, 6, 5))]
+
+
+def test_find_gaps_legacy_channel_added_without_created_falls_back(
+    server_conn: psycopg.Connection[TupleRow],
+) -> None:
+    """Backwards-compat: legacy `channel_added` payloads (pre-raw-
+    persistence) don't carry `created`. The gap detector must NOT fabricate
+    a leading gap in that case — it just behaves as it did before."""
+    payload: JsonObject = {"id": _CH, "name": "proj"}
+    _ = write_event(
+        server_conn,
+        EventRecord(stream="channel-list", kind="channel_added", ts=None, payload=payload),
+    )
+    _seed_message(server_conn, day=date(2026, 6, 6))
+    _seed_message(server_conn, day=date(2026, 6, 7))
+    gaps = find_gaps_for_channel(server_conn, _CH)
+    assert gaps == []
+
+
+def test_find_gaps_channel_info_refreshed_supplies_created(
+    server_conn: psycopg.Connection[TupleRow],
+) -> None:
+    """The drift-refresh sweep emits `channel_info_refreshed` events.
+    Those payloads carry `created` for any channel whose original
+    `channel_added` was lossy."""
+    # Lossy original (no created field).
+    legacy: JsonObject = {"id": _CH, "name": "proj"}
+    _ = write_event(
+        server_conn,
+        EventRecord(stream="channel-list", kind="channel_added", ts=None, payload=legacy),
+    )
+    # Refresh carries raw payload including created.
+    creation_day = date(2026, 6, 1)
+    refreshed: JsonObject = {
+        "id": _CH,
+        "name": "proj",
+        "created": int(_ts_for_day(creation_day).split(".")[0]),
+    }
+    _ = write_event(
+        server_conn,
+        EventRecord(
+            stream="channel-list", kind="channel_info_refreshed", ts=None, payload=refreshed
+        ),
+    )
+    _seed_message(server_conn, day=date(2026, 6, 4))
+    _seed_message(server_conn, day=date(2026, 6, 5))
+    gaps = find_gaps_for_channel(server_conn, _CH)
+    assert gaps == [GapRange(start=date(2026, 6, 2), end=date(2026, 6, 3))]

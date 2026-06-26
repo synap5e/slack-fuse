@@ -128,6 +128,12 @@ class Channel(_FrozenModel):
     num_members: int = 0
     is_member: bool = False
     im_user_id: str | None = None
+    # Slack's channel-creation Unix epoch. None for ``channel_added``
+    # payloads written before 2026-06-27 (the slurper switched to
+    # raw-persistence then), and for any channel where Slack's response
+    # omits the field. Used as the left bound by the gap detector — see
+    # ``slack_fuse_server.gaps``.
+    created: int | None = None
 
     @model_validator(mode="before")
     @classmethod

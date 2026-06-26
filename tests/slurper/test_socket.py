@@ -118,7 +118,11 @@ def test_translate_message_payload_matches_backfill_shape() -> None:
     envelope, raw_env = parsed
     assert envelope.payload is not None
 
-    raw_event_dict = cast(JsonObject, raw_env["payload"]["event"])  # pyright: ignore[reportArgumentType, reportIndexIssue]
+    payload_dict = raw_env["payload"]
+    assert isinstance(payload_dict, dict)
+    event_dict = payload_dict["event"]
+    assert isinstance(event_dict, dict)
+    raw_event_dict = cast(JsonObject, event_dict)
     write = translate_message_event(envelope.payload.event, raw_event_dict)
     assert write is not None
 

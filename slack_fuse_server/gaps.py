@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -106,15 +106,29 @@ def _collect_active_days_workspace(
     return by_channel
 
 
-def _bounded_gaps(active_days: Iterable[date]) -> list[GapRange]:
+def _bounded_gaps(
+    active_days: Iterable[date],
+    *,
+    left_bound: date | None = None,
+) -> list[GapRange]:
     """Walk a sorted, distinct day sequence and emit gap ranges between them.
 
-    Leading silence (before first active day) and trailing silence (after
-    last active day) are NOT emitted — by definition a gap is bounded on
-    both sides by activity. A single-day stream yields no gaps; an empty
-    stream yields no gaps.
+    ``left_bound`` lets the caller anchor a virtual "channel exists from
+    here" day so the gap between channel creation and the first observed
+    message becomes a real bounded gap (rather than ignored leading
+    silence). When ``None`` (no creation timestamp captured), behaviour
+    matches the pre-Phase-5 contract: leading silence is never emitted.
+
+    Trailing silence after the last observed day is still NOT emitted —
+    by definition a gap is bounded on both sides by activity, and the
+    trailing edge could just mean "channel went quiet" or "we haven't
+    ticked yet today".
     """
     days = list(active_days)
+    if left_bound is not None and left_bound not in days:
+        # Insert as a virtual day-with-events so the first real message
+        # closes the leading gap from creation to first activity.
+        days = sorted([left_bound, *days])
     if len(days) < 2:
         return []
     gaps: list[GapRange] = []
@@ -129,9 +143,57 @@ def _bounded_gaps(active_days: Iterable[date]) -> list[GapRange]:
     return gaps
 
 
+def _fetch_channel_created(
+    conn: Connection[TupleRow],
+    channel_id: str,
+) -> date | None:
+    """Return the channel's creation date (UTC) from its latest
+    ``channel_added`` / ``channel_info_refreshed`` payload, or ``None``
+    if the field isn't present.
+
+    Older ``channel_added`` payloads written before the slurper's
+    raw-persistence switch (2026-06-27) don't have ``created`` — they'll
+    return ``None`` here until the refresh sweep catches up. For those
+    channels the gap detector falls back to its pre-Phase-5 behaviour
+    (no leading gap).
+    """
+    with conn.cursor() as cur:
+        _ = cur.execute(
+            """
+            SELECT payload->>'created'
+            FROM events
+            WHERE stream = 'channel-list'
+              AND kind IN ('channel_added', 'channel_info_refreshed')
+              AND payload->>'id' = %s
+              AND payload ? 'created'
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (channel_id,),
+        )
+        row = cur.fetchone()
+    if row is None or row[0] is None:
+        return None
+    try:
+        epoch = int(row[0])
+    except (ValueError, TypeError):
+        return None
+    return datetime.fromtimestamp(epoch, tz=UTC).date()
+
+
 def find_gaps_for_channel(conn: Connection[TupleRow], channel_id: str) -> list[GapRange]:
-    """All bounded gap ranges for one channel, ordered earliest first."""
-    return _bounded_gaps(_collect_active_days(conn, channel_id))
+    """All bounded gap ranges for one channel, ordered earliest first.
+
+    When the latest ``channel_added`` / ``channel_info_refreshed`` payload
+    carries the Slack ``created`` field, that day is used as the left
+    bound — surfacing the gap between channel creation and first observed
+    message. When it's missing (legacy lossy payloads), behaviour is
+    unchanged: leading silence isn't reported.
+    """
+    return _bounded_gaps(
+        _collect_active_days(conn, channel_id),
+        left_bound=_fetch_channel_created(conn, channel_id),
+    )
 
 
 def find_gaps_workspace(conn: Connection[TupleRow]) -> dict[str, list[GapRange]]:
@@ -140,14 +202,50 @@ def find_gaps_workspace(conn: Connection[TupleRow]) -> dict[str, list[GapRange]]
     Channels with no events at all are omitted. Channels with no gaps are
     also omitted — the workspace view is "where the holes are", not a
     full inventory.
+
+    Like :func:`find_gaps_for_channel`, uses the channel's ``created``
+    field (when present in the latest channel-list payload) as the left
+    bound so creation→first-message gaps surface.
     """
     active_by_channel = _collect_active_days_workspace(conn)
+    created_by_channel = _fetch_channel_created_all(conn)
     result: dict[str, list[GapRange]] = {}
     for channel_id, days in active_by_channel.items():
-        gaps = _bounded_gaps(days)
+        gaps = _bounded_gaps(days, left_bound=created_by_channel.get(channel_id))
         if gaps:
             result[channel_id] = gaps
     return result
+
+
+def _fetch_channel_created_all(conn: Connection[TupleRow]) -> dict[str, date]:
+    """Bulk version of ``_fetch_channel_created`` — one query for the
+    workspace path so we don't fire one round-trip per channel."""
+    with conn.cursor() as cur:
+        _ = cur.execute(
+            """
+            SELECT DISTINCT ON (payload->>'id')
+                payload->>'id' AS chid,
+                payload->>'created' AS created_raw
+            FROM events
+            WHERE stream = 'channel-list'
+              AND kind IN ('channel_added', 'channel_info_refreshed')
+              AND payload ? 'created'
+            ORDER BY payload->>'id', id DESC
+            """,
+        )
+        rows = cur.fetchall()
+    out: dict[str, date] = {}
+    for chid_raw, created_raw in rows:
+        if not isinstance(chid_raw, str) or not chid_raw:
+            continue
+        try:
+            epoch = int(created_raw) if created_raw is not None else None
+        except (ValueError, TypeError):
+            continue
+        if epoch is None:
+            continue
+        out[chid_raw] = datetime.fromtimestamp(epoch, tz=UTC).date()
+    return out
 
 
 # ============================================================================
