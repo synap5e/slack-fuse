@@ -28,8 +28,8 @@ import slack_fuse_server.migrations as server_migrations
 from slack_fuse.migrations.runner import apply_migrations
 from slack_fuse_server._json import JsonObject
 from slack_fuse_server.dispatch import serve_dispatch_on_listeners
-from slack_fuse_server.http.handlers import GapsDeps, OriginalsDeps
 from slack_fuse_server.http.dto import MetricsResponse
+from slack_fuse_server.http.handlers import GapsDeps, OriginalsDeps
 from slack_fuse_server.http.metrics import MetricsAggregator, SubscriberSnapshot
 from slack_fuse_server.wire.frames import CaughtUpFrame, EventFrame, Frame, FrameAdapter, SubscribeFrame
 from slack_fuse_server.wire.server import WireServer, WireServerOptions
