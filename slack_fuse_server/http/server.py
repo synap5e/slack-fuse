@@ -21,6 +21,7 @@ from slack_fuse_server.http.dto import (
 from slack_fuse_server.http.handlers import (
     GapsDeps,
     OriginalsDeps,
+    RefreshDeps,
     ResolvePermalinkDeps,
     SnapshotDeps,
     handle_channel_gaps,
@@ -28,6 +29,7 @@ from slack_fuse_server.http.handlers import (
     handle_metrics,
     handle_originals,
     handle_permalink,
+    handle_refresh_channels,
     handle_resolve,
     handle_snapshot,
     handle_workspace_gaps,
@@ -53,6 +55,7 @@ class HttpRequest:
     method: str
     target: str
     body: bytes = b""
+    headers: tuple[tuple[bytes, bytes], ...] = ()
 
     @property
     def path(self) -> str:
@@ -87,6 +90,7 @@ def route_request(  # noqa: C901, PLR0913 - endpoint routing dispatch hub.
     snapshot_deps: SnapshotDeps | None = None,
     originals_deps: OriginalsDeps | None = None,
     gaps_deps: GapsDeps | None = None,
+    refresh_deps: RefreshDeps | None = None,
 ) -> HttpResponse:
     """Pure routing table for supported HTTP endpoints."""
     if request.path == "/health":
@@ -146,6 +150,15 @@ def route_request(  # noqa: C901, PLR0913 - endpoint routing dispatch hub.
             return _error_response(status_code=503, code="service_unavailable")
         return _handle_workspace_gaps(deps=gaps_deps)
 
+    if request.path == "/refresh-channels":
+        if request.method != "POST":
+            return _error_response(status_code=405, code="method_not_allowed")
+        if refresh_deps is None:
+            return _error_response(status_code=503, code="service_unavailable")
+        status_code, message = handle_refresh_channels(request.headers, deps=refresh_deps)
+        body = json.dumps({"status": message}, separators=(",", ":")).encode("utf-8")
+        return HttpResponse(status_code=status_code, body=body)
+
     gaps_channel = _gaps_channel_from_path(request.path)
     if gaps_channel is not None:
         if request.method != "GET":
@@ -166,6 +179,7 @@ async def serve_http(  # noqa: PLR0913 - HTTP wiring needs explicit deps.
     snapshot_deps: SnapshotDeps | None = None,
     originals_deps: OriginalsDeps | None = None,
     gaps_deps: GapsDeps | None = None,
+    refresh_deps: RefreshDeps | None = None,
 ) -> None:
     """Serve HTTP endpoints on the given host/port."""
     handler = partial(
@@ -175,6 +189,7 @@ async def serve_http(  # noqa: PLR0913 - HTTP wiring needs explicit deps.
         snapshot_deps=snapshot_deps,
         originals_deps=originals_deps,
         gaps_deps=gaps_deps,
+        refresh_deps=refresh_deps,
     )
     await trio.serve_tcp(handler, port=port, host=host)
 
@@ -186,6 +201,7 @@ async def serve_http_on_listeners(  # noqa: PLR0913, PLR0917 - HTTP wiring needs
     snapshot_deps: SnapshotDeps | None = None,
     originals_deps: OriginalsDeps | None = None,
     gaps_deps: GapsDeps | None = None,
+    refresh_deps: RefreshDeps | None = None,
 ) -> None:
     """Serve on already-open listeners (useful for tests and shared-port setups)."""
     handler = partial(
@@ -195,6 +211,7 @@ async def serve_http_on_listeners(  # noqa: PLR0913, PLR0917 - HTTP wiring needs
         snapshot_deps=snapshot_deps,
         originals_deps=originals_deps,
         gaps_deps=gaps_deps,
+        refresh_deps=refresh_deps,
     )
     await trio.serve_listeners(handler, listeners)
 
@@ -207,6 +224,7 @@ async def serve_http_from_listen_addr(  # noqa: PLR0913 - HTTP wiring needs expl
     snapshot_deps: SnapshotDeps | None = None,
     originals_deps: OriginalsDeps | None = None,
     gaps_deps: GapsDeps | None = None,
+    refresh_deps: RefreshDeps | None = None,
 ) -> None:
     """Serve HTTP endpoints using an RFC-style `listen_addr` string."""
     host, port = parse_listen_addr(listen_addr)
@@ -218,6 +236,7 @@ async def serve_http_from_listen_addr(  # noqa: PLR0913 - HTTP wiring needs expl
         snapshot_deps=snapshot_deps,
         originals_deps=originals_deps,
         gaps_deps=gaps_deps,
+        refresh_deps=refresh_deps,
     )
 
 
@@ -229,6 +248,7 @@ async def serve_http_connection(  # noqa: PLR0913 - HTTP wiring needs explicit d
     snapshot_deps: SnapshotDeps | None = None,
     originals_deps: OriginalsDeps | None = None,
     gaps_deps: GapsDeps | None = None,
+    refresh_deps: RefreshDeps | None = None,
 ) -> None:
     """Serve a single already-accepted connection as HTTP.
 
@@ -243,6 +263,7 @@ async def serve_http_connection(  # noqa: PLR0913 - HTTP wiring needs explicit d
         snapshot_deps=snapshot_deps,
         originals_deps=originals_deps,
         gaps_deps=gaps_deps,
+        refresh_deps=refresh_deps,
     )
 
 
@@ -254,6 +275,7 @@ async def _serve_connection(  # noqa: PLR0913 - HTTP wiring needs explicit deps.
     snapshot_deps: SnapshotDeps | None = None,
     originals_deps: OriginalsDeps | None = None,
     gaps_deps: GapsDeps | None = None,
+    refresh_deps: RefreshDeps | None = None,
 ) -> None:
     conn = h11.Connection(h11.SERVER)
     try:
@@ -267,6 +289,7 @@ async def _serve_connection(  # noqa: PLR0913 - HTTP wiring needs explicit deps.
             snapshot_deps=snapshot_deps,
             originals_deps=originals_deps,
             gaps_deps=gaps_deps,
+            refresh_deps=refresh_deps,
         )
         await _send_response(conn, stream, response)
     except h11.RemoteProtocolError:
@@ -279,6 +302,7 @@ async def _serve_connection(  # noqa: PLR0913 - HTTP wiring needs explicit deps.
 async def _read_request(conn: h11.Connection, stream: trio.abc.Stream) -> HttpRequest | None:
     method: str | None = None
     target: str | None = None
+    headers: tuple[tuple[bytes, bytes], ...] = ()
     body = bytearray()
     while True:
         event = conn.next_event()
@@ -289,6 +313,10 @@ async def _read_request(conn: h11.Connection, stream: trio.abc.Stream) -> HttpRe
         if isinstance(event, h11.Request):
             method = event.method.decode("ascii").upper()
             target = event.target.decode("ascii")
+            # Capture headers — used by the mutating /refresh-channels route
+            # for shared-secret auth. Cheap to always carry; the read-only
+            # routes just ignore the field.
+            headers = tuple((bytes(name), bytes(value)) for name, value in event.headers)
             continue
         if isinstance(event, h11.Data):
             body.extend(bytes(event.data))
@@ -296,7 +324,7 @@ async def _read_request(conn: h11.Connection, stream: trio.abc.Stream) -> HttpRe
         if isinstance(event, h11.EndOfMessage):
             if method is None or target is None:
                 return None
-            return HttpRequest(method=method, target=target, body=bytes(body))
+            return HttpRequest(method=method, target=target, body=bytes(body), headers=headers)
         if isinstance(event, h11.ConnectionClosed):
             return None
 

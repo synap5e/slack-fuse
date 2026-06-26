@@ -190,3 +190,46 @@ def _maybe_write_refresh_sync(
 async def refresh_channels_once(writer: OffsetWriter, client: SlackClient) -> None:
     """One full pass; intended for a one-shot CLI or initial backfill."""
     await _refresh_all_once(writer, client)
+
+
+# ===================================================================
+# HTTP-triggered refresh: consumer + trigger
+# ===================================================================
+
+
+class RefreshTrigger:
+    """Rendezvous-channel trigger used by the ``POST /refresh-channels``
+    endpoint to ask the in-process consumer for a sweep.
+
+    Rendezvous mode (``max_buffer_size=0``) gives "one in flight at a
+    time" for free: ``send_nowait`` only succeeds if the consumer is
+    currently parked in ``recv.receive()`` — if a sweep is already
+    running, the call returns False and the endpoint responds 409.
+    """
+
+    def __init__(self) -> None:
+        self._send, self._recv = trio.open_memory_channel[None](max_buffer_size=0)
+
+    def request(self) -> bool:
+        try:
+            self._send.send_nowait(None)
+        except trio.WouldBlock:
+            return False
+        return True
+
+    async def __aexit__(self, *_args: object) -> None:
+        await self._send.aclose()
+        await self._recv.aclose()
+
+    async def consume(self, writer: OffsetWriter, client: SlackClient) -> None:
+        """Trio task: drain refresh requests one at a time.
+
+        Spawned in the main nursery alongside the periodic task. The two
+        coexist cleanly — periodic ticks at 6h, HTTP triggers fire ad
+        hoc; both call ``_refresh_all_once``.
+        """
+        async for _ in self._recv:
+            try:
+                await _refresh_all_once(writer, client)
+            except Exception:
+                log.exception("refresh: HTTP-triggered run failed")

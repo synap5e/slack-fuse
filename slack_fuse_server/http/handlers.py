@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -69,6 +70,32 @@ class GapsDeps:
     database_url: str
 
 
+class RefreshTrigger(Protocol):
+    """``POST /refresh-channels`` hands the request off to a long-lived
+    background consumer via this trigger. The HTTP request returns 202
+    immediately; the actual ``conversations.info`` sweep runs in the
+    main nursery."""
+
+    def request(self) -> bool:
+        """Queue a refresh. Returns True if accepted (consumer was idle),
+        False if one is already in progress (caller should treat as 409)."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class RefreshDeps:
+    """Dependencies required by ``POST /refresh-channels``.
+
+    Mutating endpoint, so it carries a shared-secret check independent
+    from the read-only endpoints. ``trigger.request()`` hands off to a
+    long-lived task in the main nursery; the request returns 202 without
+    waiting for the sweep to finish.
+    """
+
+    shared_secret: str | None
+    trigger: RefreshTrigger
+
+
 def handle_health() -> HealthResponse:
     """`GET /health` liveness probe."""
     return HealthResponse(ok=True)
@@ -131,6 +158,55 @@ def handle_workspace_gaps(*, deps: GapsDeps) -> bytes:
 
     with psycopg.connect(deps.database_url, autocommit=True) as conn:
         return render_workspace_gaps(conn)
+
+
+def handle_refresh_channels(
+    headers: Sequence[tuple[bytes, bytes]],
+    *,
+    deps: RefreshDeps,
+) -> tuple[int, str]:
+    """``POST /refresh-channels`` — queue a one-shot refresh cycle.
+
+    Returns ``(status_code, message)``:
+      * 202 — accepted, refresh queued
+      * 401 — missing or wrong shared secret
+      * 409 — refresh already in progress; try again later
+
+    The actual sweep runs in a background task (the long-lived consumer
+    spawned by the main nursery) and logs its summary on completion.
+    """
+    if not is_http_authorized(headers, deps.shared_secret):
+        return 401, "unauthorized"
+    if deps.trigger.request():
+        return 202, "refresh queued"
+    return 409, "refresh already in progress"
+
+
+# === auth helper (shared with WS) ===
+
+
+_SHARED_SECRET_HEADER = b"x-slack-fuse-secret"
+_AUTHORIZATION_HEADER = b"authorization"
+
+
+def is_http_authorized(
+    headers: Sequence[tuple[bytes, bytes]],
+    shared_secret: str | None,
+) -> bool:
+    """True if the request carries the shared secret (or no secret is
+    configured). Accepts both ``X-Slack-Fuse-Secret: <secret>`` and
+    ``Authorization: Bearer <secret>`` — same shape the WS endpoint uses."""
+    if not shared_secret:
+        return True
+    expected_direct = shared_secret.encode()
+    expected_bearer = f"Bearer {shared_secret}".encode()
+    for name, value in headers:
+        lowered = name.lower()
+        if lowered == _SHARED_SECRET_HEADER and value == expected_direct:
+            return True
+        if lowered == _AUTHORIZATION_HEADER and value == expected_bearer:
+            return True
+    return False
 
 
 def handle_originals(

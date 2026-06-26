@@ -41,13 +41,19 @@ from slack_fuse_server.backfill.legacy import LegacyCacheBackfiller
 from slack_fuse_server.backfill.types import Backfiller
 from slack_fuse_server.config import ServerConfig, load_server_config
 from slack_fuse_server.dispatch import serve_dispatch
-from slack_fuse_server.http.handlers import GapsDeps, OriginalsDeps, ResolvePermalinkDeps, SnapshotDeps
+from slack_fuse_server.http.handlers import (
+    GapsDeps,
+    OriginalsDeps,
+    RefreshDeps,
+    ResolvePermalinkDeps,
+    SnapshotDeps,
+)
 from slack_fuse_server.http.metrics import MetricsAggregator, SubscriberSnapshot
 from slack_fuse_server.slurper.api import ChannelNotFoundError, SlackAPIError, SlackClient
 from slack_fuse_server.slurper.channels import ensure_channel_added, populate_channels_once
 from slack_fuse_server.slurper.health import HealthEmitter
 from slack_fuse_server.slurper.offsets import OffsetWriter
-from slack_fuse_server.slurper.refresh import refresh_channels_periodically
+from slack_fuse_server.slurper.refresh import RefreshTrigger, refresh_channels_periodically
 from slack_fuse_server.slurper.socket import SocketModeOptions, SocketModeStatus
 from slack_fuse_server.slurper.users import populate_users_once, run_socket_mode_with_users
 from slack_fuse_server.snapshot import SnapshotScheduler
@@ -206,6 +212,11 @@ async def _serve(config: ServerConfig) -> None:
     snapshot_deps = SnapshotDeps(database_url=config.database_url)
     originals_deps = OriginalsDeps(database_url=config.database_url)
     gaps_deps = GapsDeps(database_url=config.database_url)
+    # Trigger for ``POST /refresh-channels`` — request() rendezvous against
+    # the consumer task spawned below. Auth lives at the HTTP layer (shared
+    # secret); the trigger itself is just a one-in-flight dispatcher.
+    refresh_trigger = RefreshTrigger()
+    refresh_deps = RefreshDeps(shared_secret=config.shared_secret, trigger=refresh_trigger)
     limiter = trio.CapacityLimiter(1)
     writer = OffsetWriter(conn, limiter)
     health = HealthEmitter(writer)
@@ -240,12 +251,18 @@ async def _serve(config: ServerConfig) -> None:
                 snapshot_deps,
                 originals_deps,
                 gaps_deps,
+                refresh_deps,
             )
             nursery.start_soon(snapshot_scheduler.run)
             # Periodic ``conversations.info`` refresh: backfills lossy
             # legacy channel_added payloads (pre raw-persistence) and
             # catches drift the webhook flow doesn't surface.
             nursery.start_soon(refresh_channels_periodically, writer, client)
+            # Long-lived consumer for HTTP-triggered refresh requests
+            # (POST /refresh-channels). Same job as the periodic task,
+            # fires only on demand. Rendezvous channel means a second
+            # POST while one is running gets 409, not a queued cycle.
+            nursery.start_soon(refresh_trigger.consume, writer, client)
             if auto_backfill:
                 nursery.start_soon(_auto_backfill, config, writer, health, client, limiter)
             log.info("slack-fuse-server listening on %s (HTTP /health, /metrics + WS /ws)", config.listen_addr)
@@ -277,6 +294,7 @@ async def _serve_dispatch_task(  # noqa: PLR0913, PLR0917 - dispatch wiring need
     snapshot_deps: SnapshotDeps,
     originals_deps: OriginalsDeps,
     gaps_deps: GapsDeps,
+    refresh_deps: RefreshDeps,
 ) -> None:
     await serve_dispatch(
         listen_addr=listen_addr,
@@ -286,6 +304,7 @@ async def _serve_dispatch_task(  # noqa: PLR0913, PLR0917 - dispatch wiring need
         snapshot_deps=snapshot_deps,
         originals_deps=originals_deps,
         gaps_deps=gaps_deps,
+        refresh_deps=refresh_deps,
     )
 
 

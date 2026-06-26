@@ -29,7 +29,7 @@ from slack_fuse.migrations.runner import apply_migrations
 from slack_fuse_server._json import JsonObject
 from slack_fuse_server.dispatch import serve_dispatch_on_listeners
 from slack_fuse_server.http.dto import MetricsResponse
-from slack_fuse_server.http.handlers import GapsDeps, OriginalsDeps
+from slack_fuse_server.http.handlers import GapsDeps, OriginalsDeps, RefreshDeps
 from slack_fuse_server.http.metrics import MetricsAggregator, SubscriberSnapshot
 from slack_fuse_server.wire.frames import CaughtUpFrame, EventFrame, Frame, FrameAdapter, SubscribeFrame
 from slack_fuse_server.wire.server import WireServer, WireServerOptions
@@ -88,6 +88,7 @@ async def _running_dispatch(
     *,
     gaps_deps: GapsDeps | None = None,
     originals_deps: OriginalsDeps | None = None,
+    refresh_deps: RefreshDeps | None = None,
 ) -> AsyncIterator[tuple[int, WireServer]]:
     wire_server = WireServer(
         database_url,
@@ -103,6 +104,7 @@ async def _running_dispatch(
         metrics_source=metrics,
         gaps_deps=gaps_deps,
         originals_deps=originals_deps,
+        refresh_deps=refresh_deps,
     )
     async with trio.open_nursery() as nursery:
         nursery.start_soon(handler)
@@ -111,6 +113,20 @@ async def _running_dispatch(
             yield port, wire_server
         finally:
             nursery.cancel_scope.cancel()
+
+
+class _FakeRefreshTrigger:
+    """Test stub mirroring :class:`RefreshTrigger` without the trio
+    rendezvous channel. ``ready=False`` simulates "consumer is busy" so
+    the next request gets 409."""
+
+    def __init__(self, *, ready: bool = True) -> None:
+        self.ready = ready
+        self.calls = 0
+
+    def request(self) -> bool:
+        self.calls += 1
+        return self.ready
 
 
 async def _recv_frame(ws: WebSocketConnection, *, timeout_s: float = 1.0) -> Frame:
@@ -199,6 +215,150 @@ async def test_gaps_endpoint_503_without_deps_proves_503_is_the_failure_mode(
     ):
         response = await client.get("/gaps")
     assert response.status_code == 503
+
+
+async def test_refresh_endpoint_returns_202_when_accepted(
+    pg_conn: psycopg.Connection[TupleRow],
+) -> None:
+    """``POST /refresh-channels`` with the correct shared secret returns
+    202 and bumps the trigger's call counter — the actual sweep runs
+    in a background consumer in production; here the fake just records
+    that the dispatch chain forwarded the request."""
+    database_url = _prepare_database(pg_conn)
+    trigger = _FakeRefreshTrigger(ready=True)
+    deps = RefreshDeps(shared_secret="test-secret", trigger=trigger)
+    async with (
+        _running_dispatch(database_url, refresh_deps=deps) as (port, _wire),
+        httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client,
+    ):
+        response = await client.post(
+            "/refresh-channels",
+            headers={"Authorization": "Bearer test-secret"},
+        )
+    assert response.status_code == 202
+    assert response.json() == {"status": "refresh queued"}
+    assert trigger.calls == 1
+
+
+async def test_refresh_endpoint_returns_409_when_busy(
+    pg_conn: psycopg.Connection[TupleRow],
+) -> None:
+    """``ready=False`` simulates "consumer already running a sweep". The
+    endpoint must return 409, not queue a second one — keeps the API
+    cost bounded under bursty hammering."""
+    database_url = _prepare_database(pg_conn)
+    trigger = _FakeRefreshTrigger(ready=False)
+    deps = RefreshDeps(shared_secret="test-secret", trigger=trigger)
+    async with (
+        _running_dispatch(database_url, refresh_deps=deps) as (port, _wire),
+        httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client,
+    ):
+        response = await client.post(
+            "/refresh-channels",
+            headers={"Authorization": "Bearer test-secret"},
+        )
+    assert response.status_code == 409
+    assert response.json() == {"status": "refresh already in progress"}
+
+
+async def test_refresh_endpoint_rejects_missing_secret(
+    pg_conn: psycopg.Connection[TupleRow],
+) -> None:
+    database_url = _prepare_database(pg_conn)
+    trigger = _FakeRefreshTrigger()
+    deps = RefreshDeps(shared_secret="test-secret", trigger=trigger)
+    async with (
+        _running_dispatch(database_url, refresh_deps=deps) as (port, _wire),
+        httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client,
+    ):
+        response = await client.post("/refresh-channels")
+    assert response.status_code == 401
+    # The auth check fires BEFORE the trigger — trigger.request() must
+    # NOT have been called.
+    assert trigger.calls == 0
+
+
+async def test_refresh_endpoint_rejects_wrong_secret(
+    pg_conn: psycopg.Connection[TupleRow],
+) -> None:
+    database_url = _prepare_database(pg_conn)
+    trigger = _FakeRefreshTrigger()
+    deps = RefreshDeps(shared_secret="test-secret", trigger=trigger)
+    async with (
+        _running_dispatch(database_url, refresh_deps=deps) as (port, _wire),
+        httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client,
+    ):
+        response = await client.post(
+            "/refresh-channels",
+            headers={"Authorization": "Bearer wrong"},
+        )
+    assert response.status_code == 401
+    assert trigger.calls == 0
+
+
+async def test_refresh_endpoint_accepts_x_slack_fuse_secret_header(
+    pg_conn: psycopg.Connection[TupleRow],
+) -> None:
+    """Backwards-compat with the WS auth shape — both header forms work."""
+    database_url = _prepare_database(pg_conn)
+    trigger = _FakeRefreshTrigger()
+    deps = RefreshDeps(shared_secret="test-secret", trigger=trigger)
+    async with (
+        _running_dispatch(database_url, refresh_deps=deps) as (port, _wire),
+        httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client,
+    ):
+        response = await client.post(
+            "/refresh-channels",
+            headers={"X-Slack-Fuse-Secret": "test-secret"},
+        )
+    assert response.status_code == 202
+
+
+async def test_refresh_endpoint_unauthenticated_when_no_secret_configured(
+    pg_conn: psycopg.Connection[TupleRow],
+) -> None:
+    """If the server isn't configured with a shared secret, the endpoint
+    accepts any request. Matches the WS auth's shape — and matches the
+    fact that on a no-secret deploy, the WS is also wide open."""
+    database_url = _prepare_database(pg_conn)
+    trigger = _FakeRefreshTrigger()
+    deps = RefreshDeps(shared_secret=None, trigger=trigger)
+    async with (
+        _running_dispatch(database_url, refresh_deps=deps) as (port, _wire),
+        httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client,
+    ):
+        response = await client.post("/refresh-channels")
+    assert response.status_code == 202
+
+
+async def test_refresh_endpoint_returns_503_without_deps(
+    pg_conn: psycopg.Connection[TupleRow],
+) -> None:
+    """No deps wired → 503 (the standard dispatch-missing failure mode),
+    NOT 404. Same shape as the existing gaps endpoint regression test."""
+    database_url = _prepare_database(pg_conn)
+    async with (
+        _running_dispatch(database_url, refresh_deps=None) as (port, _wire),
+        httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client,
+    ):
+        response = await client.post("/refresh-channels")
+    assert response.status_code == 503
+
+
+async def test_refresh_endpoint_rejects_non_post(
+    pg_conn: psycopg.Connection[TupleRow],
+) -> None:
+    """GET /refresh-channels is 405 — explicitly verbs the contract.
+    Mutating endpoints don't accept idempotent verbs."""
+    database_url = _prepare_database(pg_conn)
+    trigger = _FakeRefreshTrigger()
+    deps = RefreshDeps(shared_secret=None, trigger=trigger)
+    async with (
+        _running_dispatch(database_url, refresh_deps=deps) as (port, _wire),
+        httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client,
+    ):
+        response = await client.get("/refresh-channels")
+    assert response.status_code == 405
 
 
 async def test_websocket_served_on_shared_port(pg_conn: psycopg.Connection[TupleRow]) -> None:
