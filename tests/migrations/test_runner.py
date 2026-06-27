@@ -17,7 +17,7 @@ _SERVER_DIR = Path(server_migrations.__file__).parent
 
 def test_discover_client_migrations() -> None:
     found = discover_migrations(_CLIENT_DIR)
-    assert [name for _, name, _ in found] == ["0001_init.sql"]
+    assert [name for _, name, _ in found] == ["0001_init.sql", "0002_block_sync.sql"]
     assert found[0][0] == 1
 
 
@@ -29,6 +29,7 @@ def test_discover_server_migrations() -> None:
         "0003_channels_dedup.sql",
         "0004_channels_view.sql",
         "0005_health_log_view.sql",
+        "0006_blocked_channels.sql",
     ]
 
 
@@ -56,10 +57,12 @@ def test_apply_server_migrations_idempotent(pg_conn: psycopg.Connection[TupleRow
         "0003_channels_dedup.sql",
         "0004_channels_view.sql",
         "0005_health_log_view.sql",
+        "0006_blocked_channels.sql",
     ]
     assert _table_exists(pg_conn, "events")
     assert _table_exists(pg_conn, "snapshots")
     assert _table_exists(pg_conn, "backfill_overrides")
+    assert _table_exists(pg_conn, "blocked_channels")
     # 0004 / 0005 replaced the empty `channels` / `health_log` tables with
     # VIEWs over the events log (ES-clean: one source of truth, no dual write).
     assert _relkind(pg_conn, "channels") == "v"
@@ -75,10 +78,11 @@ def test_apply_server_migrations_idempotent(pg_conn: psycopg.Connection[TupleRow
 
 
 def test_apply_client_migrations_idempotent(pg_conn: psycopg.Connection[TupleRow]) -> None:
-    assert apply_migrations(pg_conn, _CLIENT_DIR) == ["0001_init.sql"]
+    assert apply_migrations(pg_conn, _CLIENT_DIR) == ["0001_init.sql", "0002_block_sync.sql"]
     assert _table_exists(pg_conn, "chunks")
     assert _table_exists(pg_conn, "thread_chunks")
     assert _table_exists(pg_conn, "chunk_mentions")
+    assert _table_exists(pg_conn, "server_block_sync")
     # connection_state is seeded with its single row.
     with pg_conn.cursor() as cur:
         cur.execute("SELECT count(*) FROM connection_state")

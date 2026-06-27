@@ -49,6 +49,10 @@ Follows `~/docs/dev/python/` (uv, basedpyright strict, ruff preview, Pydantic at
 - **No business logic in `fuse_ops.py`** beyond path parsing and dispatch — anything that touches Slack data goes through `SlackStore`.
 - **Renderers are pure**: `renderer.py` takes models + a user resolver, returns bytes. No I/O.
 
+## Events vs operator policy
+
+The server `events` table is reserved for facts that happened upstream in Slack: messages, edits/deletes, channel metadata changes, membership, and health observations. Operator intent is mutable policy and does **not** belong in replayable Slack event streams. Channel blocks live in the server-side `blocked_channels` table (`channel_id`, `blocked_at`, `reason`) and are propagated to clients by periodic block sync, not by `channel_blocked` / `channel_unblocked` events.
+
 ## Dev commands
 
 ```bash
@@ -93,16 +97,18 @@ Push liveness for today's data, alongside the polling TTLs (which stay as the co
 
 ## Control surface (`_control/`, split mode only)
 
-A Plan-9-style ctl/status surface at the mount root, wired only in `cmd_mount_split` (`SlackFuseOpsV2`). `slack_fuse/control.py` holds the thread-safe in-memory `ControlState` (last workspace/channel refresh outcome) + the HTTP-status→verb map (`result_for_status`: 202→`queued`, 409→`busy`, 401/403→`unauthorised`, 503/`0`→`server_unavailable`, else `http_<code>`). `slack_fuse/projector/refresh_fetch.py` is the sync httpx POST (mirrors `gaps_fetch.py`), pointed at the server's `POST /refresh-channels[/{id}]` endpoints, sub-second timeout, `0` sentinel on transport error.
+A Plan-9-style ctl/status surface at the mount root, wired only in `cmd_mount_split` (`SlackFuseOpsV2`). `slack_fuse/control.py` holds the thread-safe in-memory `ControlState` (last refresh/block/unblock/backfill/rerender outcome) + the HTTP-status→verb map (`result_for_status`: 202→`queued`, 409→`busy`, 401/403→`unauthorised`, 503/`0`→`server_unavailable`, else `http_<code>`). `slack_fuse/projector/refresh_fetch.py` and `slack_fuse/projector/block_fetch.py` are sync httpx helpers (mirroring `gaps_fetch.py`), pointed at the server's mutating endpoints with sub-second timeouts and `0` sentinel on transport error.
 
 - `_control/refresh_channels` (0o644) — write any non-empty bytes → workspace sweep.
 - `_control/refresh_channel` (0o644) — write a channel id or slug → single-channel refresh (slug→id resolved locally against the `channels` table, hidden allowed, before the POST).
+- `_control/blocked_channels` (0o644) — read → fresh JSON from server `GET /blocked-channels`; write a channel id or slug plus optional reason → toggle server block policy (`POST /blocked-channels` if currently unblocked, `DELETE /blocked-channels/{id}` if currently blocked). Literal Slack ids are accepted even if the channel is not in the local `channels` table yet.
+- `_control/backfill_channel` (0o644) — write a channel id or slug → server `POST /backfill-channel/{id}`. A server-side block records `blocked` in status instead of queueing.
 - `_control/rerender_channel` (0o644) — write a channel id or slug → re-render that channel's `chunks`/`thread_chunks` with the **current** renderer code. Unlike the refresh triggers (server-side, sub-second), this is heavy client-side work, so it does NOT run inline: `_fire_rerender` resolves slug→id (worker thread) then enqueues the id on a bounded `trio` memory channel (event loop), records `queued`/`busy`/`unknown_channel`, and the `_run_rerender_consumer` task (one rerender at a time, on dedicated apply + sink conns off the FUSE/projector pools) does the work and overwrites `status` with the final verb (`rerendered`/`no_snapshot`/`server_unavailable`/`failed`).
-- `_control/status` (0o444) — read JSON of the last outcomes (`last_workspace_refresh`, `last_channel_refresh`, `last_rerender`).
+- `_control/status` (0o444) — read JSON of the last outcomes (`last_workspace_refresh`, `last_channel_refresh`, `last_block`, `last_unblock`, `last_backfill`, `last_rerender`).
 
 Rerender mechanics (`slack_fuse/projector/rerender.py`, sync, shared by the control consumer and the `slack-fuse rerender` CLI): GET the server's latest snapshot for the channel (`/streams/channel:<id>/snapshot?at=<applied_offset>`), then re-apply every row through `apply_snapshot_row` → `render_message_structural` with the renderer compiled into this build. It is **upsert-only** — deliberately NOT `snapshot_fetch.fetch_and_apply_snapshot`: no delete-absent (the snapshot lags the live head, so deleting "absent" rows would wipe the live `(snapshot, head]` tail) and no cursor advance (so the live applier's offset can't be corrupted — criterion #5). Source-data caveat: rerender only refreshes what the server persisted. Messages whose events lack `attachments` (e.g. recovered by an old-code backfill, before the slurper carried the field) stay empty until the server re-ingests them — rerender can't synthesise data the snapshot doesn't carry. The CLI passes a `NullInvalidationSink` (separate process — can't drop the mount's kernel page cache), so prefer the control file when the mount is up and you want the change visible immediately.
 
-FUSE write plumbing: writes accumulate per-fh in `_control_write_buffers` (keyed by handles allocated from `_CONTROL_FH_BASE = 1<<48`, disjoint from real inodes); `release` drains + fires the action via `_run_sync` (bounded by the per-callback budget; a timeout records `server_unavailable` and never propagates — the write already succeeded at the kernel level). State is in-process; a restart resets it.
+FUSE write plumbing: writes accumulate per-fh in `_control_write_buffers` (keyed by handles allocated from `_CONTROL_FH_BASE = 1<<48`, disjoint from real inodes); `release` drains + fires the action via `_run_sync` (bounded by the per-callback budget; a timeout records `server_unavailable` and never propagates — the write already succeeded at the kernel level). `blocked_channels` is the exception on the read path: it performs a short sync HTTP GET per read so operators see server state rather than stale local state. Status state is in-process; a restart resets it.
 
 ## Things not to do
 
@@ -112,7 +118,7 @@ FUSE write plumbing: writes accumulate per-fh in `_control_write_buffers` (keyed
 - Don't replace `cached_only_mode()`'s ContextVar with a plain instance attribute. The ContextVar ensures per-task isolation so archive's long-running pass doesn't leak to FUSE callbacks.
 - Don't remove the `pyright: ignore` comments on pyfuse3 attribute assignments — they're load-bearing because pyfuse3's stubs are incomplete.
 - Don't drop the `store.set_invalidator(InodeInvalidator(...))` wiring in `__main__.py`. Without it, `fi.keep_cache=True` in `fuse_ops.open()` lets the kernel serve stale buffered bytes after socket-mode events, so live messages won't appear in `cat` until the polling TTL expires.
-- Don't re-add the `ro` mount option to `cmd_mount_split` (it's intentionally only `{"fsname=slack-fuse"}`). `ro` makes the kernel reject every write before it reaches the daemon, killing the `_control/` triggers. Read-only is enforced in-daemon instead: `SlackFuseOpsV2.open` returns `EROFS` for any write-mode open outside the two `_control` trigger files. The legacy v1 `cmd_mount` keeps `ro` (no control surface there).
+- Don't re-add the `ro` mount option to `cmd_mount_split` (it's intentionally only `{"fsname=slack-fuse"}`). `ro` makes the kernel reject every write before it reaches the daemon, killing the `_control/` triggers. Read-only is enforced in-daemon instead: `SlackFuseOpsV2.open` returns `EROFS` for any write-mode open outside `_control` writable files. The legacy v1 `cmd_mount` keeps `ro` (no control surface there).
 
 ## Related docs
 

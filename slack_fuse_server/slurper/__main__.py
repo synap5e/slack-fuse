@@ -21,8 +21,10 @@ Sprint-0 config contract is untouched.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
+import sys
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -38,10 +40,20 @@ from slack_fuse.user_cache import UserCache
 from slack_fuse_render import ChannelId
 from slack_fuse_server.backfill.api import BackfillContext, SlackApiBackfiller, SleepBounds, backfill_channel
 from slack_fuse_server.backfill.legacy import LegacyCacheBackfiller
-from slack_fuse_server.backfill.types import Backfiller
+from slack_fuse_server.backfill.types import BackfillAbortReason, Backfiller
+from slack_fuse_server.blocked_channels import (
+    BlockedChannelError,
+    block_channel,
+    blocked_channel_ids,
+    is_channel_blocked,
+    list_blocked_channels,
+    unblock_channel,
+)
 from slack_fuse_server.config import ServerConfig, load_server_config
 from slack_fuse_server.dispatch import serve_dispatch
 from slack_fuse_server.http.handlers import (
+    BackfillDeps,
+    BlockedChannelsDeps,
     GapsDeps,
     OriginalsDeps,
     RefreshDeps,
@@ -57,7 +69,7 @@ from slack_fuse_server.slurper.catchup import (
     should_catchup,
 )
 from slack_fuse_server.slurper.channels import ensure_channel_added, populate_channels_once
-from slack_fuse_server.slurper.health import HealthEmitter
+from slack_fuse_server.slurper.health import HealthEmitter, HealthKind
 from slack_fuse_server.slurper.offsets import OffsetWriter
 from slack_fuse_server.slurper.refresh import RefreshTrigger, refresh_channels_periodically
 from slack_fuse_server.slurper.socket import SocketModeOptions, SocketModeStatus
@@ -105,6 +117,7 @@ def _make_api_backfiller(
     client: SlackClient,
     limiter: trio.CapacityLimiter,
     config: ServerConfig,
+    conn: psycopg.Connection[TupleRow] | None = None,
 ) -> SlackApiBackfiller:
     sleeps = SleepBounds(
         page_min_s=config.backfill_page_sleep_min_s,
@@ -112,7 +125,8 @@ def _make_api_backfiller(
         thread_min_s=config.backfill_thread_sleep_min_s,
         thread_max_s=config.backfill_thread_sleep_max_s,
     )
-    return SlackApiBackfiller(client, limiter, sleeps)
+    blocked = None if conn is None else lambda: blocked_channel_ids(conn)
+    return SlackApiBackfiller(client, limiter, sleeps, blocked_channel_ids=blocked)
 
 
 def _make_catchup_deps(
@@ -133,7 +147,12 @@ def _make_catchup_deps(
         thread_min_s=config.catchup_thread_sleep_min_s,
         thread_max_s=config.catchup_thread_sleep_max_s,
     )
-    backfiller = SlackApiBackfiller(client, writer.limiter, sleeps)
+    backfiller = SlackApiBackfiller(
+        client,
+        writer.limiter,
+        sleeps,
+        blocked_channel_ids=lambda: blocked_channel_ids(writer.conn),
+    )
     catchup_config = CatchupConfig(
         gap_threshold_s=config.catchup_gap_threshold_s,
         max_lookback_s=config.catchup_max_lookback_s,
@@ -149,6 +168,7 @@ def _make_backfiller(
     client: SlackClient | None,
     limiter: trio.CapacityLimiter,
     config: ServerConfig,
+    conn: psycopg.Connection[TupleRow] | None = None,
 ) -> Backfiller:
     if source == "legacy-cache":
         return LegacyCacheBackfiller(limiter=limiter)
@@ -156,7 +176,7 @@ def _make_backfiller(
         if client is None:  # pragma: no cover - guarded by _run_backfill source wiring
             msg = "slack-api backfill source requires a SlackClient"
             raise ValueError(msg)
-        return _make_api_backfiller(client, limiter, config)
+        return _make_api_backfiller(client, limiter, config, conn=conn)
     msg = f"unsupported backfill source {source!r}"
     raise ValueError(msg)
 
@@ -250,7 +270,21 @@ async def _serve(config: ServerConfig) -> None:
     # the consumer task spawned below. Auth lives at the HTTP layer (shared
     # secret); the trigger itself is just a one-in-flight dispatcher.
     refresh_trigger = RefreshTrigger()
-    refresh_deps = RefreshDeps(shared_secret=config.shared_secret, trigger=refresh_trigger)
+    refresh_deps = RefreshDeps(
+        shared_secret=config.shared_secret,
+        trigger=refresh_trigger,
+        database_url=config.database_url,
+    )
+    blocked_channels_deps = BlockedChannelsDeps(
+        shared_secret=config.shared_secret,
+        database_url=config.database_url,
+    )
+    backfill_trigger = ManualBackfillTrigger()
+    backfill_deps = BackfillDeps(
+        shared_secret=config.shared_secret,
+        database_url=config.database_url,
+        trigger=backfill_trigger,
+    )
     limiter = trio.CapacityLimiter(1)
     writer = OffsetWriter(conn, limiter)
     health = HealthEmitter(writer)
@@ -293,6 +327,8 @@ async def _serve(config: ServerConfig) -> None:
                 originals_deps,
                 gaps_deps,
                 refresh_deps,
+                blocked_channels_deps,
+                backfill_deps,
             )
             nursery.start_soon(snapshot_scheduler.run)
             # Periodic ``conversations.info`` refresh: backfills lossy
@@ -304,6 +340,7 @@ async def _serve(config: ServerConfig) -> None:
             # fires only on demand. Rendezvous channel means a second
             # POST while one is running gets 409, not a queued cycle.
             nursery.start_soon(refresh_trigger.consume, writer, client)
+            nursery.start_soon(backfill_trigger.consume, config)
             # Reconnect/restart catchup consumer: runs one bounded gap-fill at
             # startup (the restart case) and one per gap-reconnect the socket
             # runner signals via catchup_trigger.
@@ -362,6 +399,8 @@ async def _serve_dispatch_task(  # noqa: PLR0913, PLR0917 - dispatch wiring need
     originals_deps: OriginalsDeps,
     gaps_deps: GapsDeps,
     refresh_deps: RefreshDeps,
+    blocked_channels_deps: BlockedChannelsDeps,
+    backfill_deps: BackfillDeps,
 ) -> None:
     await serve_dispatch(
         listen_addr=listen_addr,
@@ -372,6 +411,8 @@ async def _serve_dispatch_task(  # noqa: PLR0913, PLR0917 - dispatch wiring need
         originals_deps=originals_deps,
         gaps_deps=gaps_deps,
         refresh_deps=refresh_deps,
+        blocked_channels_deps=blocked_channels_deps,
+        backfill_deps=backfill_deps,
     )
 
 
@@ -384,7 +425,7 @@ async def _auto_backfill(
 ) -> None:
     """Automatic first-bootup pass: backfill every member channel, throttled."""
     await trio.sleep(30)  # let startup settle before hitting the API hard
-    backfiller = _make_backfiller("slack-api", client=client, limiter=limiter, config=config)
+    backfiller = _make_backfiller("slack-api", client=client, limiter=limiter, config=config, conn=writer.conn)
     first = True
     async for channel_id in backfiller.channels_to_backfill():
         if not first:
@@ -437,6 +478,13 @@ async def _run_backfill(  # noqa: PLR0913 — thin CLI thunk; bundling into opti
     limiter = trio.CapacityLimiter(1)
     writer = OffsetWriter(conn, limiter)
     health = HealthEmitter(writer)
+    if is_channel_blocked(conn, channel_id):
+        await health.emit(
+            HealthKind.BACKFILL_SKIPPED,
+            {"channel_id": channel_id, "reason": str(BackfillAbortReason.OPERATOR_BLOCKED)},
+        )
+        conn.close()
+        raise BlockedChannelError(channel_id)
     # The SlackClient is required for `slack-api` source (history fetch) AND for
     # every source so we can call `conversations.info` to emit a synthetic
     # `channel_added` event before any per-channel writes. Without this, a
@@ -445,7 +493,7 @@ async def _run_backfill(  # noqa: PLR0913 — thin CLI thunk; bundling into opti
     # down") writes events on a `channel:<id>` stream the client projector has
     # no row for in its `channels` table, never subscribes, and orphans them.
     client = SlackClient(config.slack_user_token)
-    backfiller = _make_backfiller(source, client=client, limiter=limiter, config=config)
+    backfiller = _make_backfiller(source, client=client, limiter=limiter, config=config, conn=conn)
 
     abort_at = _resolve_abort_at(conn, channel_id, config, allow_large=allow_large, max_messages=max_messages)
     ctx = BackfillContext(writer=writer, health=health, warn_at=config.backfill_warn_at, abort_at=abort_at)
@@ -474,6 +522,9 @@ async def _run_backfill(  # noqa: PLR0913 — thin CLI thunk; bundling into opti
         client.close()
         conn.close()
 
+    if result.abort_reason == BackfillAbortReason.OPERATOR_BLOCKED:
+        raise BlockedChannelError(channel_id)
+
     status = "ABORTED" if result.aborted else "completed"
     log.info(
         "backfill %s: channel=%s messages=%d events_written=%d elapsed=%.1fs",
@@ -486,6 +537,62 @@ async def _run_backfill(  # noqa: PLR0913 — thin CLI thunk; bundling into opti
 
 
 # === CLI ===
+
+
+class ManualBackfillTrigger:
+    """Rendezvous trigger for HTTP-requested manual channel backfills."""
+
+    def __init__(self) -> None:
+        self._send, self._recv = trio.open_memory_channel[str](max_buffer_size=0)
+
+    def request_channel(self, channel_id: str) -> bool:
+        try:
+            self._send.send_nowait(channel_id)
+        except trio.WouldBlock:
+            return False
+        return True
+
+    async def consume(self, config: ServerConfig) -> None:
+        async for channel_id in self._recv:
+            try:
+                await _run_backfill(
+                    config,
+                    channel_id,
+                    allow_large=False,
+                    max_messages=None,
+                    source="slack-api",
+                )
+            except BlockedChannelError:
+                log.info("backfill: HTTP-triggered run for %s rejected: blocked", channel_id)
+            except Exception:
+                log.exception("backfill: HTTP-triggered run for %s failed", channel_id)
+
+
+def _run_block_command(config: ServerConfig, channel_id: str, reason: str | None) -> None:
+    conn = _connect_and_migrate(config.database_url)
+    try:
+        row = block_channel(conn, channel_id, reason=reason)
+    finally:
+        conn.close()
+    print(json.dumps(row, separators=(",", ":")))
+
+
+def _run_unblock_command(config: ServerConfig, channel_id: str) -> None:
+    conn = _connect_and_migrate(config.database_url)
+    try:
+        unblock_channel(conn, channel_id)
+    finally:
+        conn.close()
+    print(json.dumps({"status": "unblocked", "channel_id": channel_id}, separators=(",", ":")))
+
+
+def _run_list_blocked_command(config: ServerConfig) -> None:
+    conn = _connect_and_migrate(config.database_url)
+    try:
+        rows = list_blocked_channels(conn)
+    finally:
+        conn.close()
+    print(json.dumps({"blocked": rows}, separators=(",", ":")))
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -518,6 +625,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "Bounds pagination at the source; combined with the events_message_dedup index "
         "this makes per-channel gap-fills cheap and idempotent.",
     )
+    block = sub.add_parser("block", help="block a channel from refresh/backfill")
+    block.add_argument("channel_id", help="Slack channel id, e.g. C0AKQ5DS0FQ")
+    block.add_argument("--reason", default=None, help="optional operator reason")
+    unblock = sub.add_parser("unblock", help="remove a channel block")
+    unblock.add_argument("channel_id", help="Slack channel id, e.g. C0AKQ5DS0FQ")
+    sub.add_parser("list-blocked", help="dump blocked_channels as JSON")
     return parser
 
 
@@ -546,7 +659,20 @@ def main() -> None:
                 since_ts=since_ts,
             )
 
-        trio.run(_thunk)
+        try:
+            trio.run(_thunk)
+        except BlockedChannelError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
+        return
+    if args.command == "block":
+        _run_block_command(config, args.channel_id, args.reason)
+        return
+    if args.command == "unblock":
+        _run_unblock_command(config, args.channel_id)
+        return
+    if args.command == "list-blocked":
+        _run_list_blocked_command(config)
         return
     trio.run(_serve, config)
 

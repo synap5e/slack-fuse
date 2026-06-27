@@ -135,3 +135,11 @@ CREATE TABLE stream_caught_up (
     caught_up_at TIMESTAMPTZ NOT NULL,
     at_offset BIGINT NOT NULL
 );
+
+-- Channels this client pinned because they appeared in the server-side
+-- blocked_channels table. This is local sync bookkeeping, not operator policy;
+-- the server table remains the SSOT.
+CREATE TABLE server_block_sync (
+    channel_id TEXT PRIMARY KEY,
+    synced_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);

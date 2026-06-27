@@ -89,6 +89,8 @@ WORKSPACE_DIR: Final = "_workspace"
 CONTROL_DIR: Final = "_control"
 CONTROL_REFRESH_CHANNELS: Final = "refresh_channels"
 CONTROL_REFRESH_CHANNEL: Final = "refresh_channel"
+CONTROL_BLOCKED_CHANNELS: Final = "blocked_channels"
+CONTROL_BACKFILL_CHANNEL: Final = "backfill_channel"
 #: Write a channel slug or id → re-render that channel's chunks with the current
 #: renderer (re-derives from the server's latest snapshot). Use after a renderer
 #: change ships to refresh historical chunks rendered by the old code.
@@ -97,7 +99,13 @@ CONTROL_STATUS: Final = "status"
 #: The write-to-trigger control files (everything else under ``_control`` is
 #: read-only).
 CONTROL_WRITABLE: Final[frozenset[str]] = frozenset(
-    {CONTROL_REFRESH_CHANNELS, CONTROL_REFRESH_CHANNEL, CONTROL_RERENDER_CHANNEL}
+    {
+        CONTROL_REFRESH_CHANNELS,
+        CONTROL_REFRESH_CHANNEL,
+        CONTROL_BLOCKED_CHANNELS,
+        CONTROL_BACKFILL_CHANNEL,
+        CONTROL_RERENDER_CHANNEL,
+    }
 )
 
 # The `channel-list` stream is the staleness stream for channel-metadata

@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 import random
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import cast
 
@@ -29,15 +29,21 @@ from slack_fuse.models import ConversationsHistoryResponse, Message
 from slack_fuse_render import ChannelId
 from slack_fuse_server._json import JsonObject
 from slack_fuse_server.backfill.types import BackfillAbortReason, Backfiller, BackfillResult
+from slack_fuse_server.blocked_channels import is_channel_blocked
 from slack_fuse_server.slurper.api import FatalAPIError, RateLimitedError, SlackClient, Validated
 from slack_fuse_server.slurper.health import HealthEmitter, HealthKind
 from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter
 
 log = logging.getLogger(__name__)
 
-# RFC §Backfill → Throttling parameters.
-_DEFAULT_PAGE_SLEEP_MIN = 30.0
-_DEFAULT_PAGE_SLEEP_MAX = 180.0
+# RFC §Backfill → Throttling parameters. Tightened 2026-06-27 from 30-180s to
+# 15-90s — the original conservative defaults predated the 429 / Retry-After
+# handling, which already sleeps the Slack-mandated wait + jitter on rate-limit.
+# 15-90s keeps us well under Slack's tier 3 ceiling (50 conversations.history
+# calls/min ≈ one per 1.2s) while compressing workspace-wipe wall-clock time by
+# roughly half.
+_DEFAULT_PAGE_SLEEP_MIN = 15.0
+_DEFAULT_PAGE_SLEEP_MAX = 90.0
 _DEFAULT_THREAD_SLEEP_MIN = 2.0
 _DEFAULT_THREAD_SLEEP_MAX = 8.0
 
@@ -105,10 +111,12 @@ class SlackApiBackfiller:
         client: SlackClient,
         limiter: trio.CapacityLimiter,
         sleeps: SleepBounds | None = None,
+        blocked_channel_ids: Callable[[], set[str]] | None = None,
     ) -> None:
         self._client = client
         self._limiter = limiter
         self._sleeps = sleeps if sleeps is not None else SleepBounds()
+        self._blocked_channel_ids = blocked_channel_ids
 
     @property
     def name(self) -> str:
@@ -116,9 +124,17 @@ class SlackApiBackfiller:
 
     async def channels_to_backfill(self) -> AsyncIterator[ChannelId]:
         """Yield every member channel (non-archived) the user can see."""
+        blocked: set[str]
+        blocked = (
+            await trio.to_thread.run_sync(self._blocked_channel_ids, limiter=self._limiter)
+            if self._blocked_channel_ids is not None
+            else set()
+        )
         channels = await trio.to_thread.run_sync(self._client.list_conversations, limiter=self._limiter)
         for validated in channels:
             channel = validated.model
+            if channel.id in blocked:
+                continue
             # DMs / group DMs are always accessible; public/private need membership.
             if channel.is_member or channel.is_im or channel.is_mpim:
                 yield ChannelId(channel.id)
@@ -255,6 +271,19 @@ async def backfill_channel(
     """
     cid = channel_id.value
     stream = f"channel:{cid}"
+    if await trio.to_thread.run_sync(lambda: is_channel_blocked(ctx.writer.conn, cid), limiter=ctx.writer.limiter):
+        await ctx.health.emit(
+            HealthKind.BACKFILL_SKIPPED,
+            {"channel_id": cid, "reason": str(BackfillAbortReason.OPERATOR_BLOCKED)},
+        )
+        return BackfillResult(
+            channel_id=channel_id,
+            messages=0,
+            events_written=0,
+            elapsed_s=0.0,
+            aborted=True,
+            abort_reason=BackfillAbortReason.OPERATOR_BLOCKED,
+        )
     await ctx.health.emit(HealthKind.BACKFILL_STARTED, {"channel_id": cid})
     start = trio.current_time()
 
