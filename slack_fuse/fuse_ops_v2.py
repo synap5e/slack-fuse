@@ -41,10 +41,16 @@ import psycopg
 import pyfuse3
 import trio
 
+from slack_fuse.control import ControlState, result_for_status
 from slack_fuse.fuse_v2_helpers import (
     CHANNEL_LIST_STREAM,
     CHANNEL_MD,
     CHANNEL_ORIGINAL_MD,
+    CONTROL_DIR,
+    CONTROL_REFRESH_CHANNEL,
+    CONTROL_REFRESH_CHANNELS,
+    CONTROL_STATUS,
+    CONTROL_WRITABLE,
     CONV_ROOTS,
     GAPS_MD,
     THREAD_MD,
@@ -133,6 +139,22 @@ ChannelGapsFetchFn = Callable[[str], bytes]
 # ``WorkspaceGapsFetchFn() -> markdown body``.
 # ``/_workspace/gaps.md`` workspace-wide summary fetcher.
 WorkspaceGapsFetchFn = Callable[[], bytes]
+
+# ``_control/`` refresh triggers. Both return an HTTP status code (or the ``0``
+# transport-error sentinel). Production wires these to sync httpx POSTs against
+# the slurper server (see projector/refresh_fetch.py); tests pass a fake.
+ControlRefreshWorkspaceFn = Callable[[], int]
+ControlRefreshChannelFn = Callable[[str], int]
+
+# Write-handle file numbers for ``_control/`` writes live in a high, disjoint
+# range so they can never collide with a real persistent inode (those come from
+# a Postgres sequence that will not reach 2**48). ``open`` allocates from this
+# base; ``write`` / ``release`` look the handle up in ``_control_write_buffers``.
+_CONTROL_FH_BASE: Final = 1 << 48
+# Hard cap on a single control write — these carry a channel id or slug, never
+# more than a few dozen bytes. The cap turns a runaway ``cat huge > ctl`` into
+# EFBIG instead of unbounded memory growth.
+_CONTROL_WRITE_MAX: Final = 65536
 
 ROOT_INODE: Final = 1
 
@@ -261,10 +283,16 @@ def _make_dir_attr(inode: int) -> pyfuse3.EntryAttributes:
     return entry
 
 
-def _make_file_attr(inode: int, size: int, *, timeout_s: float = _MUTABLE_FILE_TIMEOUT_S) -> pyfuse3.EntryAttributes:
+def _make_file_attr(
+    inode: int,
+    size: int,
+    *,
+    timeout_s: float = _MUTABLE_FILE_TIMEOUT_S,
+    mode: int = stat.S_IFREG | 0o444,
+) -> pyfuse3.EntryAttributes:
     entry = pyfuse3.EntryAttributes()
     entry.st_ino = inode  # pyright: ignore[reportAttributeAccessIssue]
-    entry.st_mode = stat.S_IFREG | 0o444
+    entry.st_mode = mode
     entry.st_nlink = 1
     entry.st_size = size
     entry.st_atime_ns = entry.st_mtime_ns = entry.st_ctime_ns = int(time.time() * 1e9)
@@ -409,6 +437,27 @@ def _assemble_thread(
 
 
 # ============================================================================
+# Control-surface helpers
+# ============================================================================
+
+
+@dataclass(slots=True)
+class _ControlWrite:
+    """Per-open accumulation buffer for a ``_control/`` write handle."""
+
+    path: str
+    buffer: bytearray
+
+
+@dataclass(frozen=True, slots=True)
+class _ControlResult:
+    """Outcome of firing a control action — drives the ``status`` record."""
+
+    result: str
+    channel: str | None = None
+
+
+# ============================================================================
 # Operations
 # ============================================================================
 
@@ -442,6 +491,9 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         originals_fetch: OriginalsFetchFn | None = None,
         channel_gaps_fetch: ChannelGapsFetchFn | None = None,
         workspace_gaps_fetch: WorkspaceGapsFetchFn | None = None,
+        control_state: ControlState | None = None,
+        control_refresh_workspace: ControlRefreshWorkspaceFn | None = None,
+        control_refresh_channel: ControlRefreshChannelFn | None = None,
     ) -> None:
         super().__init__()
         # ``conn`` is the inode-map's dedicated connection. In pool mode (``pool``
@@ -507,6 +559,17 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         self._workspace_gaps_cache: _BytesCache | None = (
             _BytesCache(max_entries=1, ttl_s=600.0) if workspace_gaps_fetch is not None else None
         )
+        # ``_control/`` write surface. The directory is visible (and writes
+        # accepted) only when ``control_state`` is wired — the two refresh
+        # fetchers may be None in tests that exercise listing/attrs without
+        # firing. Write handles accumulate in ``_control_write_buffers`` keyed
+        # by the high-range fh ``open`` assigns; ``release`` drains + fires.
+        self._control_state = control_state
+        self._control_refresh_workspace = control_refresh_workspace
+        self._control_refresh_channel = control_refresh_channel
+        self._control_write_buffers: dict[int, _ControlWrite] = {}
+        self._control_write_lock = threading.Lock()
+        self._control_fh_seq = 0
 
     # ------------------------------------------------------------------
     # Public surface used by the health subscriber + tests
@@ -721,6 +784,19 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         """Test-only accessor for the directory classifier."""
         return self._is_dir(path)
 
+    def control_file_attr_for_test(self, path: str, inode: int) -> pyfuse3.EntryAttributes | None:
+        """Test-only accessor for control-file attrs."""
+        return self._control_file_attr(path, inode)
+
+    def control_read_for_test(self, path: str) -> bytes | None:
+        """Test-only accessor for the control read-path bytes."""
+        return self._control_read_bytes(path)
+
+    def control_write_buffer_count(self) -> int:
+        """Test-only: number of live per-fh control write buffers (leak check)."""
+        with self._control_write_lock:
+            return len(self._control_write_buffers)
+
     def invalidate_all_primed(self) -> int:
         """Drop every primed inode from the kernel page cache.
 
@@ -740,6 +816,142 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             self._primed_inodes.add(inode)
 
     # ------------------------------------------------------------------
+    # Control surface (`_control/`)
+    # ------------------------------------------------------------------
+
+    @property
+    def _control_enabled(self) -> bool:
+        return self._control_state is not None
+
+    def _control_file_attr(self, path: str, inode: int) -> pyfuse3.EntryAttributes | None:
+        """Attrs for a ``_control/<name>`` file, or ``None`` if not one.
+
+        ``status`` is read-only JSON sized to its current body; the refresh
+        triggers are write-to-fire (0o644) and read back empty (size 0,
+        Plan-9 ctl style). Control attrs are never cached (timeout 0) so the
+        kernel always re-checks ``status``'s changing size.
+        """
+        parts = parse_path(path)
+        if len(parts) != 2 or parts[0] != CONTROL_DIR:
+            return None
+        name = parts[1]
+        if name == CONTROL_STATUS:
+            return _make_file_attr(inode, len(self._control_status_bytes()), mode=stat.S_IFREG | 0o444)
+        if name in CONTROL_WRITABLE:
+            return _make_file_attr(inode, 0, mode=stat.S_IFREG | 0o644)
+        return None
+
+    def _control_status_bytes(self) -> bytes:
+        return self._control_state.render() if self._control_state is not None else b""
+
+    def _control_read_bytes(self, path: str) -> bytes | None:
+        """Read-side bytes for a ``_control/<name>`` file, or ``None``."""
+        parts = parse_path(path)
+        if len(parts) != 2 or parts[0] != CONTROL_DIR:
+            return None
+        name = parts[1]
+        if name == CONTROL_STATUS:
+            return self._control_status_bytes()
+        if name in CONTROL_WRITABLE:
+            return b""
+        return None
+
+    def _alloc_control_write(self, path: str) -> int:
+        with self._control_write_lock:
+            self._control_fh_seq += 1
+            fh = _CONTROL_FH_BASE + self._control_fh_seq
+            self._control_write_buffers[fh] = _ControlWrite(path=path, buffer=bytearray())
+        return fh
+
+    def _open_control(self, path: str, flags: int, inode: int) -> pyfuse3.FileInfo:
+        """Open dispatch for a ``_control/<name>`` file.
+
+        Write-mode opens of the two refresh triggers allocate a write handle;
+        write-mode opens of ``status`` (or any other control name) are EROFS.
+        Reads use ``direct_io`` so ``status`` is never served from a stale
+        kernel page cache.
+        """
+        parts = parse_path(path)
+        name = parts[1] if len(parts) == 2 else ""
+        writing = (flags & os.O_ACCMODE) != os.O_RDONLY
+        if writing:
+            if name not in CONTROL_WRITABLE:
+                raise pyfuse3.FUSEError(errno.EROFS)
+            fh = self._alloc_control_write(path)
+            fi = pyfuse3.FileInfo()
+            fi.fh = fh  # pyright: ignore[reportAttributeAccessIssue]
+            fi.direct_io = True  # pyright: ignore[reportAttributeAccessIssue]
+            fi.keep_cache = False  # pyright: ignore[reportAttributeAccessIssue]
+            return fi
+        fi = pyfuse3.FileInfo()
+        fi.fh = inode  # pyright: ignore[reportAttributeAccessIssue]
+        fi.direct_io = True  # pyright: ignore[reportAttributeAccessIssue]
+        fi.keep_cache = False  # pyright: ignore[reportAttributeAccessIssue]
+        return fi
+
+    async def _fire_control(self, entry: _ControlWrite) -> None:
+        """Drain a finished control write and trigger the matching action.
+
+        The action (slug resolution + HTTP POST) runs in a worker thread via
+        ``_run_sync`` so the FUSE event loop stays responsive and the call is
+        bounded by the per-callback budget. A timeout/EIO from ``_run_sync`` is
+        recorded as ``server_unavailable`` — the write already succeeded at the
+        kernel level, so we never propagate the failure back to ``release``.
+        """
+        if self._control_state is None:
+            return
+        name = parse_path(entry.path)[1] if len(parse_path(entry.path)) == 2 else ""
+        data = bytes(entry.buffer)
+        if name == CONTROL_REFRESH_CHANNELS:
+            if not data.strip():
+                return
+            result = await self._control_action_or_unavailable(self._do_workspace_refresh)
+            self._control_state.record_workspace(result.result)
+        elif name == CONTROL_REFRESH_CHANNEL:
+            token = data.decode("utf-8", errors="replace").strip()
+            if not token:
+                return
+            result = await self._control_action_or_unavailable(lambda: self._do_channel_refresh(token))
+            self._control_state.record_channel(result.channel or token, result.result)
+
+    async def _control_action_or_unavailable(self, fn: Callable[[], _ControlResult]) -> _ControlResult:
+        try:
+            return await self._run_sync(fn)
+        except pyfuse3.FUSEError:
+            return _ControlResult(result="server_unavailable")
+
+    def _do_workspace_refresh(self) -> _ControlResult:
+        if self._control_refresh_workspace is None:
+            return _ControlResult(result="server_unavailable")
+        return _ControlResult(result=result_for_status(self._control_refresh_workspace()))
+
+    def _do_channel_refresh(self, token: str) -> _ControlResult:
+        channel_id = self._resolve_control_channel(token)
+        if channel_id is None:
+            return _ControlResult(result="unknown_channel", channel=token)
+        if self._control_refresh_channel is None:
+            return _ControlResult(result="server_unavailable", channel=channel_id)
+        return _ControlResult(result=result_for_status(self._control_refresh_channel(channel_id)), channel=channel_id)
+
+    def _resolve_control_channel(self, token: str) -> str | None:
+        """Resolve a written token (channel id or slug) to a channel id.
+
+        A literal channel id wins (exact match in ``channels``); otherwise the
+        token is tried as a slug across every conv-root (hidden allowed, so a
+        hidden channel can still be force-refreshed by its known slug).
+        """
+        conn = self._conn
+        with conn.cursor() as cur:
+            _ = cur.execute("SELECT 1 FROM channels WHERE channel_id = %s", (token,))
+            if cur.fetchone() is not None:
+                return token
+        for conv_root in CONV_ROOTS:
+            row = fetch_channel_by_slug(conn, conv_root, token, allow_hidden=True)
+            if row is not None:
+                return row.channel_id
+        return None
+
+    # ------------------------------------------------------------------
     # Path classification and dispatch
     # ------------------------------------------------------------------
 
@@ -753,6 +965,8 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             roots: list[tuple[str, bool]] = [(d, True) for d in CONV_ROOTS]
             if self._workspace_gaps_fetch is not None:
                 roots.append((WORKSPACE_DIR, True))
+            if self._control_enabled:
+                roots.append((CONTROL_DIR, True))
             return roots
 
         # Top-level ``_workspace/`` namespace. Currently contains only
@@ -760,6 +974,16 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         if parts[0] == WORKSPACE_DIR:
             if depth == 1 and self._workspace_gaps_fetch is not None:
                 return [(GAPS_MD, False)]
+            return []
+
+        # Top-level ``_control/`` write surface (Plan-9 ctl/status).
+        if parts[0] == CONTROL_DIR:
+            if depth == 1 and self._control_enabled:
+                return [
+                    (CONTROL_REFRESH_CHANNELS, False),
+                    (CONTROL_REFRESH_CHANNEL, False),
+                    (CONTROL_STATUS, False),
+                ]
             return []
 
         if parts[0] not in CONV_ROOTS:
@@ -835,6 +1059,8 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             return True
         if parts[0] == WORKSPACE_DIR:
             return depth == 1
+        if parts[0] == CONTROL_DIR:
+            return depth == 1 and self._control_enabled
         if parts[0] not in CONV_ROOTS:
             return False
         if depth == 1:
@@ -1097,6 +1323,10 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             def _sync() -> pyfuse3.EntryAttributes | None:
                 if self._is_dir(path):
                     return _make_dir_attr(inode)
+                if self._control_enabled:
+                    ctl = self._control_file_attr(path, inode)
+                    if ctl is not None:
+                        return ctl
                 resolved = self._resolve_content(path)
                 if resolved is None:
                     return None
@@ -1145,20 +1375,33 @@ class SlackFuseOpsV2(pyfuse3.Operations):
                 entries = self._list_dir(parent_path, for_lookup=True)
                 for entry_name, entry_is_dir in entries:
                     if entry_name == child_name:
-                        inode = self._inodes.get_or_create(child_path)
-                        if entry_is_dir:
-                            return _make_dir_attr(inode)
-                        resolved = self._resolve_content(child_path)
-                        if resolved is None:
-                            return None
-                        content, _trailer, _fallback = resolved
-                        return _make_file_attr(inode, len(content), timeout_s=_file_attr_timeout(child_path, self._tz))
+                        return self._child_entry_attr(child_path, is_dir=entry_is_dir)
                 return None
 
             result = await self._run_sync(_sync)
             if result is None:
                 raise pyfuse3.FUSEError(errno.ENOENT)
             return result
+
+    def _child_entry_attr(self, child_path: str, *, is_dir: bool) -> pyfuse3.EntryAttributes | None:
+        """Resolve attrs for a directory child (shared by lookup + opendir).
+
+        Materializes the inode, then returns dir attrs, control-file attrs, or
+        rendered-file attrs (sized to the assembled bytes) — or ``None`` when
+        the path renders empty (ENOENT-like).
+        """
+        inode = self._inodes.get_or_create(child_path)
+        if is_dir:
+            return _make_dir_attr(inode)
+        if self._control_enabled:
+            ctl = self._control_file_attr(child_path, inode)
+            if ctl is not None:
+                return ctl
+        resolved = self._resolve_content(child_path)
+        if resolved is None:
+            return None
+        content, _trailer, _fallback = resolved
+        return _make_file_attr(inode, len(content), timeout_s=_file_attr_timeout(child_path, self._tz))
 
     def _snapshot_dir(self, path: str) -> list[tuple[str, pyfuse3.EntryAttributes, int]]:
         """Materialize a directory listing with stable pagination tokens.
@@ -1192,9 +1435,13 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             if is_dir:
                 attr = _make_dir_attr(child_inode)
             else:
-                resolved = self._resolve_content(child_path)
-                size = len(resolved[0]) if resolved is not None else 0
-                attr = _make_file_attr(child_inode, size, timeout_s=_file_attr_timeout(child_path, self._tz))
+                ctl = self._control_file_attr(child_path, child_inode) if self._control_enabled else None
+                if ctl is not None:
+                    attr = ctl
+                else:
+                    resolved = self._resolve_content(child_path)
+                    size = len(resolved[0]) if resolved is not None else 0
+                    attr = _make_file_attr(child_inode, size, timeout_s=_file_attr_timeout(child_path, self._tz))
             result.append((name, attr, idx + 1))
         return result
 
@@ -1264,6 +1511,17 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             if path is None:
                 raise pyfuse3.FUSEError(errno.ENOENT)
             set_path(path)
+            # ``_control/`` files have their own open semantics (write handles
+            # for the refresh triggers, direct-io reads for status).
+            if self._control_enabled and parse_path(path)[:1] == [CONTROL_DIR]:
+                return self._open_control(path, flags, inode)
+            # Everything else is read-only: reject any write-mode open with
+            # EROFS so the daemon stays read-only now that the kernel no longer
+            # blocks writes for us (the ``ro`` mount option is dropped to let
+            # the control writes through). This is the single enforcement point
+            # — ``echo > channel.md`` fails here before any write callback.
+            if (flags & os.O_ACCMODE) != os.O_RDONLY:
+                raise pyfuse3.FUSEError(errno.EROFS)
             fi = pyfuse3.FileInfo()
             fi.fh = inode  # pyright: ignore[reportAttributeAccessIssue]
             # Kernel page-cache caching is gated by the trailer + fallback rules
@@ -1285,6 +1543,14 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             if path is None:
                 raise pyfuse3.FUSEError(errno.EIO)
             set_path(path)
+
+            # ``_control/`` reads are pure in-memory (status JSON / empty ctl
+            # files) — no DB, no worker thread, no kernel priming.
+            if self._control_enabled and parse_path(path)[:1] == [CONTROL_DIR]:
+                data = self._control_read_bytes(path)
+                if data is None:
+                    raise pyfuse3.FUSEError(errno.EIO)
+                return data[off : off + size]
 
             def _sync() -> tuple[bytes, bool, bool, TrailerDecision, str] | None:
                 resolved = self._resolve_decision(path)
@@ -1351,6 +1617,67 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             self._trailer_log.write(replace(decision, inode=inode))
         except OSError as exc:  # pragma: no cover - log fd failures are rare
             log.warning("trailer_log write failed (inode=%d): %s", inode, exc)
+
+    async def write(self, fh: int, off: int, buf: bytes) -> int:
+        with self._callback_guard("write", inode=fh):
+            with self._control_write_lock:
+                entry = self._control_write_buffers.get(fh)
+            if entry is None:
+                # Only ``_control/`` write handles are writeable; anything else
+                # never got past ``open`` (EROFS), so a write here is a bug or a
+                # stale handle. Surface read-only either way.
+                raise pyfuse3.FUSEError(errno.EROFS)
+            end = off + len(buf)
+            if end > _CONTROL_WRITE_MAX:
+                raise pyfuse3.FUSEError(errno.EFBIG)
+            with self._control_write_lock:
+                if len(entry.buffer) < end:
+                    entry.buffer.extend(b"\x00" * (end - len(entry.buffer)))
+                entry.buffer[off:end] = buf
+            return len(buf)
+
+    async def setattr(  # pyright: ignore[reportIncompatibleMethodOverride]
+        self,
+        inode: int,
+        attr: pyfuse3.EntryAttributes,
+        fields: pyfuse3.SetattrFields,
+        fh: int | None,
+        ctx: pyfuse3.RequestContext,
+    ) -> pyfuse3.EntryAttributes:
+        with self._callback_guard("setattr", inode=inode):
+            path = self._inodes.get_path(inode)
+            if path is None:
+                raise pyfuse3.FUSEError(errno.ENOENT)
+            set_path(path)
+            # The only legal setattr is the implicit truncate-to-zero an
+            # ``O_TRUNC`` open performs on a writeable control trigger (kernels
+            # without atomic_o_trunc issue it as a separate SETATTR). Accept it
+            # as a no-op and report the file's steady-state attrs. Everything
+            # else (chmod/utimes/truncate on read-only files) is EROFS.
+            parts = parse_path(path)
+            if self._control_enabled and len(parts) == 2 and parts[0] == CONTROL_DIR and parts[1] in CONTROL_WRITABLE:
+                return _make_file_attr(inode, 0, mode=stat.S_IFREG | 0o644)
+            raise pyfuse3.FUSEError(errno.EROFS)
+
+    async def flush(self, fh: int) -> None:
+        # Read-only FS: flush is a no-op. The actual control trigger fires on
+        # ``release`` (after the final write), not here — flush can be called
+        # multiple times for one open.
+        return None
+
+    async def release(self, fh: int) -> None:
+        with self._control_write_lock:
+            entry = self._control_write_buffers.pop(fh, None)
+        if entry is None:
+            # A normal read-side release (fh == inode) — nothing to clean up.
+            return
+        # Fire the control action. Any failure is recorded as
+        # ``server_unavailable`` inside ``_fire_control``; a release must never
+        # raise (the write already succeeded at the kernel level).
+        try:
+            await self._fire_control(entry)
+        except Exception:
+            log.exception("control action failed on release for %s", entry.path)
 
     async def statfs(
         self,

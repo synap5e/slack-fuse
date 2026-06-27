@@ -399,6 +399,24 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
     def _workspace_gaps_fetch_sync() -> bytes:
         return fetch_workspace_gaps(ghost_http_client, ghost_base_http_url)
 
+    # ``_control/`` write surface: trigger server-side refreshes over HTTP and
+    # read the last outcomes back from ``status``. Shares the ghost-file httpx
+    # client + server origin. The state is in-process (resets on restart).
+    from slack_fuse.control import ControlState
+    from slack_fuse.projector.refresh_fetch import post_refresh_channel, post_refresh_channels
+
+    control_state = ControlState()
+
+    def _control_refresh_workspace() -> int:
+        return post_refresh_channels(
+            ghost_http_client, ghost_base_http_url, shared_secret=config.shared_secret
+        )
+
+    def _control_refresh_channel(channel_id: str) -> int:
+        return post_refresh_channel(
+            ghost_http_client, ghost_base_http_url, channel_id, shared_secret=config.shared_secret
+        )
+
     ops = SlackFuseOpsV2(
         fuse_conn,
         tz,
@@ -411,6 +429,9 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
         originals_fetch=_originals_fetch_sync,
         channel_gaps_fetch=_channel_gaps_fetch_sync,
         workspace_gaps_fetch=_workspace_gaps_fetch_sync,
+        control_state=control_state,
+        control_refresh_workspace=_control_refresh_workspace,
+        control_refresh_channel=_control_refresh_channel,
     )
 
     # The projector's post-commit sink: maps ChunkRef / ThreadChunkRef /
@@ -427,7 +448,11 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
     if always_blocked:
         log.info("always-blocked channels: %s", sorted(always_blocked))
 
-    fuse_options: set[str] = {"fsname=slack-fuse", "ro"}
+    # NB: NOT mounted ``ro`` — the kernel would reject every write before it
+    # reached the daemon, including the ``_control/`` triggers. Read-only is
+    # enforced in-daemon instead: ``open`` returns EROFS for any write-mode open
+    # outside the two ``_control`` trigger files (see ``SlackFuseOpsV2.open``).
+    fuse_options: set[str] = {"fsname=slack-fuse"}
     if args.debug:
         fuse_options.add("debug")
     pyfuse3.init(ops, str(mountpoint), fuse_options)

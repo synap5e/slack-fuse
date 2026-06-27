@@ -80,6 +80,20 @@ GAPS_MD: Final = "gaps.md"
 # inside.
 WORKSPACE_DIR: Final = "_workspace"
 
+# Top-level writeable control surface (Plan-9-style ctl/status). Sibling of the
+# conv-roots and ``_workspace``. ``refresh_channels`` / ``refresh_channel`` are
+# write-to-trigger (mode 0o644); ``status`` is read-only JSON of the last
+# outcomes (mode 0o444). The whole subtree is gated on the control wiring being
+# present — without it the directory is invisible and the daemon stays
+# effectively read-only. See ``fuse_ops_v2.SlackFuseOpsV2`` for the dispatch.
+CONTROL_DIR: Final = "_control"
+CONTROL_REFRESH_CHANNELS: Final = "refresh_channels"
+CONTROL_REFRESH_CHANNEL: Final = "refresh_channel"
+CONTROL_STATUS: Final = "status"
+#: The two write-to-trigger control files (everything else under ``_control`` is
+#: read-only).
+CONTROL_WRITABLE: Final[frozenset[str]] = frozenset({CONTROL_REFRESH_CHANNELS, CONTROL_REFRESH_CHANNEL})
+
 # The `channel-list` stream is the staleness stream for channel-metadata
 # (``channel.md``) reads — channel inventory/rename/archive flow over it.
 CHANNEL_LIST_STREAM: Final = "channel-list"
