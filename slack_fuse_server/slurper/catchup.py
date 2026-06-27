@@ -175,7 +175,7 @@ async def catchup_channel(
     events = 0
     async for wrapped in backfiller.messages_for_channel(channel_id, since_ts):
         record = EventRecord(stream=stream, kind="message", ts=wrapped.model.ts, payload=wrapped.raw, dedup=True)
-        offset = await writer.write_event(record)
+        offset = await writer.write_message_or_corrective(record)
         if offset is not None:
             events += 1
     return events

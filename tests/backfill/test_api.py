@@ -23,7 +23,7 @@ from slack_fuse_server._json import JsonObject
 from slack_fuse_server.backfill.api import BackfillContext, SlackApiBackfiller, SleepBounds, backfill_channel
 from slack_fuse_server.slurper.api import SlackClient, Validated
 from slack_fuse_server.slurper.health import HealthEmitter
-from slack_fuse_server.slurper.offsets import OffsetWriter
+from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter, write_event
 
 _NO_SLEEP = SleepBounds(page_min_s=0.0, page_max_s=0.0, thread_min_s=0.0, thread_max_s=0.0)
 
@@ -185,12 +185,46 @@ class _StubBackfiller:
             yield Validated(raw=cast(JsonObject, msg.model_dump(mode="json")), model=msg)
 
 
+class _OneMessageBackfiller:
+    """Yields one message with caller-controlled raw payload."""
+
+    def __init__(self, raw: JsonObject) -> None:
+        self._raw = raw
+
+    @property
+    def name(self) -> str:
+        return "one-message"
+
+    async def channels_to_backfill(self) -> AsyncIterator[ChannelId]:
+        return
+        yield  # pragma: no cover — present only to make this an async generator
+
+    async def messages_for_channel(
+        self,
+        channel_id: ChannelId,
+        since_ts: float | None = None,
+    ) -> AsyncIterator[Validated[Message]]:
+        msg = Message.model_validate(self._raw)
+        yield Validated(raw=self._raw, model=msg)
+
+
 def _events_count(conn: psycopg.Connection[TupleRow], stream: str) -> int:
     with conn.cursor() as cur:
         cur.execute("SELECT count(*) FROM events WHERE stream = %s", (stream,))
         row = cur.fetchone()
     assert row is not None
     return int(row[0])
+
+
+def _channel_events(conn: psycopg.Connection[TupleRow], stream: str) -> list[tuple[str, JsonObject]]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT kind, payload FROM events WHERE stream = %s ORDER BY id", (stream,))
+        rows = cur.fetchall()
+    out: list[tuple[str, JsonObject]] = []
+    for kind, payload in rows:
+        assert isinstance(payload, dict)
+        out.append((str(kind), cast(JsonObject, payload)))
+    return out
 
 
 def _health_kinds(conn: psycopg.Connection[TupleRow]) -> list[str]:
@@ -233,6 +267,83 @@ def _health_rows(conn: psycopg.Connection[TupleRow]) -> list[tuple[str, object]]
     with conn.cursor() as cur:
         cur.execute("SELECT kind, payload FROM health_log ORDER BY id")
         return [(str(r[0]), r[1]) for r in cur.fetchall()]
+
+
+def test_backfill_writes_message_when_no_prior_event(server_conn: psycopg.Connection[TupleRow]) -> None:
+    writer = OffsetWriter(server_conn, trio.CapacityLimiter(1))
+    health = HealthEmitter(writer)
+    ctx = BackfillContext(writer=writer, health=health, warn_at=1000, abort_at=20000)
+    raw: JsonObject = {"ts": "2000.000001", "user": "U1", "text": "fresh"}
+
+    result = trio.run(backfill_channel, _OneMessageBackfiller(raw), ChannelId("CFRESH"), ctx)
+
+    assert result.events_written == 1
+    assert _channel_events(server_conn, "channel:CFRESH") == [("message", raw)]
+
+
+def test_backfill_writes_message_changed_when_ts_already_has_message(
+    server_conn: psycopg.Connection[TupleRow],
+) -> None:
+    stream = "channel:CCORR"
+    legacy: JsonObject = {"ts": "2000.000002", "user": "U1", "text": ""}
+    fresh: JsonObject = {
+        "ts": "2000.000002",
+        "user": "U1",
+        "text": "",
+        "attachments": [{"fallback": "FE-740", "text": "Linear unfurl body"}],
+    }
+    assert (
+        write_event(
+            server_conn,
+            EventRecord(stream=stream, kind="message", ts="2000.000002", payload=legacy, dedup=True),
+        )
+        == 1
+    )
+    writer = OffsetWriter(server_conn, trio.CapacityLimiter(1))
+    health = HealthEmitter(writer)
+    ctx = BackfillContext(writer=writer, health=health, warn_at=1000, abort_at=20000)
+
+    result = trio.run(backfill_channel, _OneMessageBackfiller(fresh), ChannelId("CCORR"), ctx)
+
+    assert result.events_written == 1
+    assert _channel_events(server_conn, stream) == [
+        ("message", legacy),
+        ("message_changed", {"message": fresh, "previous_ts": "2000.000002"}),
+    ]
+
+
+def test_backfill_is_still_idempotent_against_message_changed(
+    server_conn: psycopg.Connection[TupleRow],
+) -> None:
+    stream = "channel:CIDEM"
+    legacy: JsonObject = {"ts": "2000.000003", "user": "U1", "text": ""}
+    fresh: JsonObject = {
+        "ts": "2000.000003",
+        "user": "U1",
+        "text": "",
+        "attachments": [{"fallback": "FE-814", "text": "Another Linear unfurl"}],
+    }
+    assert (
+        write_event(
+            server_conn,
+            EventRecord(stream=stream, kind="message", ts="2000.000003", payload=legacy, dedup=True),
+        )
+        == 1
+    )
+    writer = OffsetWriter(server_conn, trio.CapacityLimiter(1))
+    health = HealthEmitter(writer)
+    ctx = BackfillContext(writer=writer, health=health, warn_at=1000, abort_at=20000)
+    backfiller = _OneMessageBackfiller(fresh)
+
+    first = trio.run(backfill_channel, backfiller, ChannelId("CIDEM"), ctx)
+    second = trio.run(backfill_channel, backfiller, ChannelId("CIDEM"), ctx)
+
+    assert first.events_written == 1
+    assert second.events_written == 0
+    assert _channel_events(server_conn, stream) == [
+        ("message", legacy),
+        ("message_changed", {"message": fresh, "previous_ts": "2000.000003"}),
+    ]
 
 
 def test_backfill_channel_emits_progress_every_n_messages(server_conn: psycopg.Connection[TupleRow]) -> None:

@@ -23,13 +23,11 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
 
 import psycopg
-from psycopg.rows import TupleRow
 
 # =============================================================================
 # Config
@@ -179,34 +177,33 @@ def fetch_cluster_channel_names() -> dict[str, str]:
 
 def fetch_v2_per_channel() -> dict[str, tuple[int, int, float | None, float | None]]:
     """{channel_id: (top_chunks, thread_replies, first_ts, last_ts)}."""
-    with psycopg.connect(LOCAL_PG_URL) as conn:
-        with conn.cursor() as cur:
-            _ = cur.execute(
-                """
-                SELECT channel_id,
-                       count(*)::bigint AS top_chunks,
-                       min(message_ts)::float AS first_ts,
-                       max(message_ts)::float AS last_ts
-                FROM chunks
-                GROUP BY channel_id
-                """
+    with psycopg.connect(LOCAL_PG_URL) as conn, conn.cursor() as cur:
+        _ = cur.execute(
+            """
+            SELECT channel_id,
+                   count(*)::bigint AS top_chunks,
+                   min(message_ts)::float AS first_ts,
+                   max(message_ts)::float AS last_ts
+            FROM chunks
+            GROUP BY channel_id
+            """
+        )
+        chunks: dict[str, tuple[int, float | None, float | None]] = {}
+        for chid, n, first_ts, last_ts in cur.fetchall():
+            chunks[str(chid)] = (
+                int(n),
+                float(first_ts) if first_ts is not None else None,
+                float(last_ts) if last_ts is not None else None,
             )
-            chunks: dict[str, tuple[int, float | None, float | None]] = {}
-            for chid, n, first_ts, last_ts in cur.fetchall():
-                chunks[str(chid)] = (
-                    int(n),
-                    float(first_ts) if first_ts is not None else None,
-                    float(last_ts) if last_ts is not None else None,
-                )
-            _ = cur.execute(
-                """
-                SELECT channel_id, count(*)::bigint
-                FROM thread_chunks
-                WHERE role = 'reply'
-                GROUP BY channel_id
-                """
-            )
-            threads: dict[str, int] = {str(c): int(n) for c, n in cur.fetchall()}
+        _ = cur.execute(
+            """
+            SELECT channel_id, count(*)::bigint
+            FROM thread_chunks
+            WHERE role = 'reply'
+            GROUP BY channel_id
+            """
+        )
+        threads: dict[str, int] = {str(c): int(n) for c, n in cur.fetchall()}
     out: dict[str, tuple[int, int, float | None, float | None]] = {}
     for chid, (top, first_ts, last_ts) in chunks.items():
         out[chid] = (top, threads.get(chid, 0), first_ts, last_ts)
@@ -233,7 +230,7 @@ def scan_v1_cache() -> dict[str, tuple[int, str | None, str | None, int]]:
         if not chan_dir.is_dir():
             continue
         chid = chan_dir.name
-        if not chid or not chid[0] in "CDG":
+        if not chid or chid[0] not in "CDG":
             continue
         day_files = sorted(p for p in chan_dir.iterdir() if p.name.endswith(".json") and not p.name.endswith(".done"))
         # Filter to actual YYYY-MM-DD.json files.

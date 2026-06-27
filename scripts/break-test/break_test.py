@@ -41,13 +41,10 @@ import dataclasses
 import datetime as dt
 import json
 import os
-import shutil
 import signal
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
 from pathlib import Path
 
 # =============================================================================
@@ -251,7 +248,7 @@ class Scenario:
     def setup(self) -> None:
         pass
 
-    def run(self, ctx: "RunContext") -> None:  # pragma: no cover — overridden
+    def run(self, ctx: RunContext) -> None:  # pragma: no cover — overridden
         raise NotImplementedError
 
     def teardown(self) -> None:
@@ -583,11 +580,7 @@ def main(argv: list[str] | None = None) -> int:
 
     chosen: list[Scenario] = []
     for s in SCENARIOS:
-        if args.all:
-            chosen.append(s)
-        elif args.only and s.name in args.only:
-            chosen.append(s)
-        elif args.group and s.group in args.group:
+        if args.all or (args.only and s.name in args.only) or (args.group and s.group in args.group):
             chosen.append(s)
     if not chosen:
         parser.error("no scenarios matched")

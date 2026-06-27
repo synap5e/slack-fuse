@@ -21,6 +21,13 @@ write is a no-op that consumes *no* offset — the transaction aborts before
 committing the `stream_heads` bump, so offsets stay gap-free and re-running a
 backfill is idempotent.
 
+Backfill/catchup can opt into "corrective" duplicate handling with
+`write_message_or_corrective()`: when the fresh historical payload differs from
+the existing `message` row for that Slack ts, it appends a `message_changed`
+event instead of widening or bypassing the `message` dedup invariant. Socket
+Mode continues to use plain `write_event()`, so live duplicate `message` writes
+stay no-ops.
+
 Every successful insert also fires `NOTIFY new_event, '<stream-id>'` in the
 same transaction (delivered on COMMIT). The WS server's tail loop LISTENs on
 `new_event` to push real-time events to subscribers; a deduped no-op insert
@@ -30,6 +37,7 @@ fires no NOTIFY because its transaction never commits.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import cast
 
 import trio
 from psycopg import Connection, Cursor
@@ -108,6 +116,50 @@ def insert_event(cur: Cursor[TupleRow], offset: int, record: EventRecord) -> boo
     return True
 
 
+def _fetch_message_payload(cur: Cursor[TupleRow], stream: str, ts: str) -> JsonObject | None:
+    cur.execute(
+        """
+        SELECT payload
+        FROM events
+        WHERE stream = %s
+          AND kind = 'message'
+          AND payload->>'ts' = %s
+        ORDER BY id
+        LIMIT 1
+        """,
+        (stream, ts),
+    )
+    row = cur.fetchone()
+    if row is None or not isinstance(row[0], dict):
+        return None
+    return cast(JsonObject, row[0])
+
+
+def _has_matching_message_changed(cur: Cursor[TupleRow], stream: str, ts: str, payload: JsonObject) -> bool:
+    cur.execute(
+        """
+        SELECT 1
+        FROM events
+        WHERE stream = %s
+          AND kind = 'message_changed'
+          AND ts = %s
+          AND payload->'message' = %s::jsonb
+        LIMIT 1
+        """,
+        (stream, ts, Jsonb(payload)),
+    )
+    return cur.fetchone() is not None
+
+
+def _corrective_record(record: EventRecord, ts: str) -> EventRecord:
+    return EventRecord(
+        stream=record.stream,
+        kind="message_changed",
+        ts=ts,
+        payload={"message": record.payload, "previous_ts": ts},
+    )
+
+
 def write_event(conn: Connection[TupleRow], record: EventRecord) -> int | None:
     """Assign an offset and append one event, in a single transaction.
 
@@ -119,6 +171,47 @@ def write_event(conn: Connection[TupleRow], record: EventRecord) -> int | None:
             offset = assign_offset(cur, record.stream)
             if not insert_event(cur, offset, record):
                 raise _DuplicateSkip
+    except _DuplicateSkip:
+        return None
+    return offset
+
+
+def write_message_or_corrective(conn: Connection[TupleRow], record: EventRecord) -> int | None:
+    """Append a backfill message, or a corrective edit when a message exists.
+
+    Backfill and catchup use this instead of plain `write_event()` so re-running
+    with a richer historical payload can repair an older lossy `message` row
+    without deleting events or weakening the `message` dedup index. If the fresh
+    payload is already represented by the original message or by an earlier
+    corrective `message_changed`, this remains a no-op and consumes no offset.
+    """
+    if record.kind != "message" or not record.dedup:
+        msg = "write_message_or_corrective requires a deduped message EventRecord"
+        raise ValueError(msg)
+    if record.ts is None:
+        msg = "write_message_or_corrective requires record.ts"
+        raise ValueError(msg)
+    payload_ts = record.payload.get("ts")
+    if payload_ts != record.ts:
+        msg = "write_message_or_corrective requires record.payload['ts'] to match record.ts"
+        raise ValueError(msg)
+
+    try:
+        with conn.transaction(), conn.cursor() as cur:
+            offset = assign_offset(cur, record.stream)
+            if insert_event(cur, offset, record):
+                return offset
+
+            existing = _fetch_message_payload(cur, record.stream, record.ts)
+            if existing == record.payload or _has_matching_message_changed(
+                cur, record.stream, record.ts, record.payload
+            ):
+                raise _DuplicateSkip
+
+            corrective = _corrective_record(record, record.ts)
+            if not insert_event(cur, offset, corrective):  # pragma: no cover - message_changed is not deduped
+                msg = f"failed to insert corrective event for {record.stream} ts={record.ts}"
+                raise RuntimeError(msg)
     except _DuplicateSkip:
         return None
     return offset
@@ -171,5 +264,13 @@ class OffsetWriter:
 
         def _run() -> int | None:
             return write_event(self._conn, record)
+
+        return await trio.to_thread.run_sync(_run, limiter=self._limiter)
+
+    async def write_message_or_corrective(self, record: EventRecord) -> int | None:
+        """Async: append a backfill message or corrective edit."""
+
+        def _run() -> int | None:
+            return write_message_or_corrective(self._conn, record)
 
         return await trio.to_thread.run_sync(_run, limiter=self._limiter)

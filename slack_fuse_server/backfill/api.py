@@ -211,9 +211,7 @@ class SlackApiBackfiller:
             await _sleep_rate_limited(exc.retry_after)
             return None
 
-    async def _replies(
-        self, channel_id: str, thread_ts: str
-    ) -> list[Validated[Message]] | None:
+    async def _replies(self, channel_id: str, thread_ts: str) -> list[Validated[Message]] | None:
         try:
             return await trio.to_thread.run_sync(
                 lambda: self._client.get_replies(channel_id, thread_ts), limiter=self._limiter
@@ -284,10 +282,8 @@ async def backfill_channel(
             # Persist the RAW message dict, not model_dump (see Validated
             # docstring). The events log stays lossless; future projections
             # can read fields the Message model doesn't declare today.
-            record = EventRecord(
-                stream=stream, kind="message", ts=msg.ts, payload=wrapped.raw, dedup=True
-            )
-            offset = await ctx.writer.write_event(record)
+            record = EventRecord(stream=stream, kind="message", ts=msg.ts, payload=wrapped.raw, dedup=True)
+            offset = await ctx.writer.write_message_or_corrective(record)
             if offset is not None:
                 events_written += 1
     except FatalAPIError:
