@@ -38,12 +38,13 @@ if TYPE_CHECKING:
 # ============================================================================
 
 
-def _make_control_ops(
+def _make_control_ops(  # noqa: PLR0913 — test-injection knobs for each control trigger.
     conn: Connection[TupleRow],
     tz: ZoneInfo,
     *,
     workspace_fn: Callable[[], int] | None = None,
     channel_fn: Callable[[str], int] | None = None,
+    rerender_fn: Callable[[str], bool] | None = None,
     state: ControlState | None = None,
 ) -> tuple[SlackFuseOpsV2, ControlState]:
     control_state = state if state is not None else ControlState()
@@ -54,6 +55,7 @@ def _make_control_ops(
         control_state=control_state,
         control_refresh_workspace=workspace_fn,
         control_refresh_channel=channel_fn,
+        control_rerender_channel=rerender_fn,
     )
     return ops, control_state
 
@@ -78,15 +80,21 @@ def test_control_state_render_empty_and_recorded() -> None:
     state = ControlState(now_fn=lambda: fixed)
 
     empty = json.loads(state.render())
-    assert empty == {"last_workspace_refresh": None, "last_channel_refresh": None}
+    assert empty == {"last_workspace_refresh": None, "last_channel_refresh": None, "last_rerender": None}
 
     state.record_workspace("queued")
     state.record_channel("C0ALLT6Q3SQ", "busy")
+    state.record_rerender("C0ALLT6Q3SQ", "rerendered")
     payload = json.loads(state.render())
     assert payload["last_workspace_refresh"] == {"at": "2026-06-27T11:00:00Z", "result": "queued"}
     assert payload["last_channel_refresh"] == {
         "at": "2026-06-27T11:00:00Z",
         "result": "busy",
+        "channel": "C0ALLT6Q3SQ",
+    }
+    assert payload["last_rerender"] == {
+        "at": "2026-06-27T11:00:00Z",
+        "result": "rerendered",
         "channel": "C0ALLT6Q3SQ",
     }
 
@@ -100,7 +108,7 @@ def test_control_dir_listed_when_enabled(client_conn: Connection[TupleRow], utc_
     ops, _ = _make_control_ops(client_conn, utc_tz)
     assert ("_control", True) in ops.list_dir_for_test("/")
     contents = dict(ops.list_dir_for_test("/_control"))
-    assert set(contents) == {"refresh_channels", "refresh_channel", "status"}
+    assert set(contents) == {"refresh_channels", "refresh_channel", "rerender_channel", "status"}
     assert all(is_dir is False for is_dir in contents.values())
 
 
@@ -124,7 +132,7 @@ def test_control_file_modes(client_conn: Connection[TupleRow], utc_tz: ZoneInfo)
     assert status_attr is not None
     assert stat.S_IMODE(status_attr.st_mode) == 0o444
 
-    for name in ("refresh_channels", "refresh_channel"):
+    for name in ("refresh_channels", "refresh_channel", "rerender_channel"):
         attr = ops.control_file_attr_for_test(f"/_control/{name}", 11)
         assert attr is not None
         assert stat.S_IMODE(attr.st_mode) == 0o644
@@ -141,9 +149,11 @@ def test_control_read_bytes(client_conn: Connection[TupleRow], utc_tz: ZoneInfo)
     # ctl trigger files read back empty (Plan-9 style).
     assert ops.control_read_for_test("/_control/refresh_channels") == b""
     assert ops.control_read_for_test("/_control/refresh_channel") == b""
+    # ctl trigger files read back empty (Plan-9 style).
+    assert ops.control_read_for_test("/_control/rerender_channel") == b""
     # status is the JSON body.
     status = json.loads(ops.control_read_for_test("/_control/status") or b"{}")
-    assert status == {"last_workspace_refresh": None, "last_channel_refresh": None}
+    assert status == {"last_workspace_refresh": None, "last_channel_refresh": None, "last_rerender": None}
     # not a control file.
     assert ops.control_read_for_test("/channels/general/channel.md") is None
 
@@ -154,7 +164,11 @@ async def test_cat_status_via_read_callback(client_conn: Connection[TupleRow], u
     inode = ops.inodes.get_or_create("/_control/status")
     fi = await ops.open(inode, os.O_RDONLY, pyfuse3.RequestContext())
     data = await ops.read(fi.fh, 0, 65536)
-    assert json.loads(data) == {"last_workspace_refresh": None, "last_channel_refresh": None}
+    assert json.loads(data) == {
+        "last_workspace_refresh": None,
+        "last_channel_refresh": None,
+        "last_rerender": None,
+    }
 
 
 @pytest.mark.trio
@@ -306,6 +320,101 @@ async def test_write_buffers_isolated_between_handles(
 
     assert seen == ["C1", "C2"]
     assert ops.control_write_buffer_count() == 0
+
+
+# ============================================================================
+# rerender_channel trigger
+# ============================================================================
+
+
+@pytest.mark.trio
+async def test_write_rerender_channel_enqueues_resolved_id(
+    client_conn: Connection[TupleRow], utc_tz: ZoneInfo
+) -> None:
+    """A slug write resolves to the channel id and is handed to the consumer;
+    the status records ``queued`` (the consumer overwrites it when it finishes)."""
+    seed_channel(client_conn, "C0ALLT6Q3SQ", "proj-cloud")
+    enqueued: list[str] = []
+
+    def rerender_fn(channel_id: str) -> bool:
+        enqueued.append(channel_id)
+        return True
+
+    ops, _ = _make_control_ops(client_conn, utc_tz, rerender_fn=rerender_fn)
+    inode = ops.inodes.get_or_create("/_control/rerender_channel")
+    fi = await ops.open(inode, os.O_WRONLY, pyfuse3.RequestContext())
+    await ops.write(fi.fh, 0, b"proj-cloud\n")
+    await ops.release(fi.fh)
+
+    assert enqueued == ["C0ALLT6Q3SQ"]
+    status = json.loads(ops.control_read_for_test("/_control/status") or b"{}")
+    assert status["last_rerender"] == {**status["last_rerender"], "result": "queued", "channel": "C0ALLT6Q3SQ"}
+    assert ops.control_write_buffer_count() == 0
+
+
+@pytest.mark.trio
+async def test_write_rerender_channel_by_id(client_conn: Connection[TupleRow], utc_tz: ZoneInfo) -> None:
+    seed_channel(client_conn, "C0ALLT6Q3SQ", "proj-cloud")
+    enqueued: list[str] = []
+
+    ops, _ = _make_control_ops(
+        client_conn, utc_tz, rerender_fn=lambda cid: bool(enqueued.append(cid)) or True
+    )
+    inode = ops.inodes.get_or_create("/_control/rerender_channel")
+    fi = await ops.open(inode, os.O_WRONLY, pyfuse3.RequestContext())
+    await ops.write(fi.fh, 0, b"C0ALLT6Q3SQ\n")
+    await ops.release(fi.fh)
+
+    assert enqueued == ["C0ALLT6Q3SQ"]
+
+
+@pytest.mark.trio
+async def test_write_rerender_channel_unknown_slug_does_not_enqueue(
+    client_conn: Connection[TupleRow], utc_tz: ZoneInfo
+) -> None:
+    enqueued: list[str] = []
+
+    def rerender_fn(channel_id: str) -> bool:
+        enqueued.append(channel_id)
+        return True
+
+    ops, _ = _make_control_ops(client_conn, utc_tz, rerender_fn=rerender_fn)
+    inode = ops.inodes.get_or_create("/_control/rerender_channel")
+    fi = await ops.open(inode, os.O_WRONLY, pyfuse3.RequestContext())
+    await ops.write(fi.fh, 0, b"does-not-exist\n")
+    await ops.release(fi.fh)
+
+    assert enqueued == []
+    status = json.loads(ops.control_read_for_test("/_control/status") or b"{}")
+    assert status["last_rerender"]["result"] == "unknown_channel"
+    assert status["last_rerender"]["channel"] == "does-not-exist"
+
+
+@pytest.mark.trio
+async def test_write_rerender_channel_full_queue_is_busy(
+    client_conn: Connection[TupleRow], utc_tz: ZoneInfo
+) -> None:
+    seed_channel(client_conn, "C0ALLT6Q3SQ", "proj-cloud")
+
+    # The consumer's queue is full → enqueue rejects → status is ``busy``.
+    ops, _ = _make_control_ops(client_conn, utc_tz, rerender_fn=lambda _cid: False)
+    inode = ops.inodes.get_or_create("/_control/rerender_channel")
+    fi = await ops.open(inode, os.O_WRONLY, pyfuse3.RequestContext())
+    await ops.write(fi.fh, 0, b"proj-cloud\n")
+    await ops.release(fi.fh)
+
+    status = json.loads(ops.control_read_for_test("/_control/status") or b"{}")
+    assert status["last_rerender"]["result"] == "busy"
+
+
+@pytest.mark.trio
+async def test_rerender_open_write_allocates_handle(client_conn: Connection[TupleRow], utc_tz: ZoneInfo) -> None:
+    """``rerender_channel`` is a writable trigger (0o644), not EROFS."""
+    ops, _ = _make_control_ops(client_conn, utc_tz, rerender_fn=lambda _cid: True)
+    inode = ops.inodes.get_or_create("/_control/rerender_channel")
+    fi = await ops.open(inode, os.O_WRONLY, pyfuse3.RequestContext())
+    assert fi.fh >= (1 << 48)
+    await ops.release(fi.fh)
 
 
 # ============================================================================

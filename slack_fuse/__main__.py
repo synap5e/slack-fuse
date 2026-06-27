@@ -417,6 +417,22 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
             ghost_http_client, ghost_base_http_url, channel_id, shared_secret=config.shared_secret
         )
 
+    # ``_control/rerender_channel`` hands resolved channel ids to a background
+    # consumer (``_run_rerender_consumer``) rather than running inline: a
+    # snapshot fetch + re-apply is far heavier than the sub-second per-callback
+    # budget. The bounded channel turns a flood of writes into ``busy`` rather
+    # than unbounded memory growth. The enqueue runs on the trio event loop
+    # (called from ``_fire_rerender``), so ``send_nowait`` on the non-thread-safe
+    # channel is safe.
+    rerender_send, rerender_recv = trio.open_memory_channel[str](64)
+
+    def _control_rerender_channel(channel_id: str) -> bool:
+        try:
+            rerender_send.send_nowait(channel_id)
+        except trio.WouldBlock:
+            return False
+        return True
+
     ops = SlackFuseOpsV2(
         fuse_conn,
         tz,
@@ -432,6 +448,7 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
         control_state=control_state,
         control_refresh_workspace=_control_refresh_workspace,
         control_refresh_channel=_control_refresh_channel,
+        control_rerender_channel=_control_rerender_channel,
     )
 
     # The projector's post-commit sink: maps ChunkRef / ThreadChunkRef /
@@ -552,6 +569,46 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
         except Exception as exc:  # noqa: BLE001 — supervisor must outlive any warmer error
             log.warning("gaps warmer exited (%s); not restarting (gaps will fall back to ENOENT)", exc)
 
+    async def _run_rerender_consumer() -> None:
+        """Drain ``_control/rerender_channel`` requests and re-render off-budget.
+
+        One channel at a time on dedicated connections (own apply conn + own
+        invalidation-sink conn) so the heavy snapshot apply never contends with
+        the FUSE read pool, the projector's applier pool, or the live sink's
+        connection. ``rerender_channel`` is sync, so it runs in a worker thread;
+        the ``async for`` is serial, so only one rerender runs at a time.
+        """
+        from slack_fuse.projector.rerender import rerender_channel
+
+        rerender_conn = _open_conn()
+        rerender_sink_conn = _open_conn()
+        rerender_sink = V2InvalidationSink(rerender_sink_conn, tz)
+
+        def _rerender_one(channel_id: str) -> str:
+            return rerender_channel(
+                ghost_http_client,
+                ghost_base_http_url,
+                rerender_conn,
+                channel_id,
+                shared_secret=config.shared_secret,
+                sink=rerender_sink,
+            ).status
+
+        try:
+            async for channel_id in rerender_recv:
+                control_state.record_rerender(channel_id, "in_progress")
+                try:
+                    status = await trio.to_thread.run_sync(_rerender_one, channel_id)
+                except Exception as exc:  # noqa: BLE001 — consumer must outlive any one failed rerender
+                    log.warning("rerender consumer: channel %s failed (%s)", channel_id, exc)
+                    status = "failed"
+                control_state.record_rerender(channel_id, status)
+        finally:
+            with contextlib.suppress(Exception):
+                rerender_conn.close()
+            with contextlib.suppress(Exception):
+                rerender_sink_conn.close()
+
     async def _run() -> None:
         try:
             async with trio.open_nursery() as nursery:
@@ -559,6 +616,7 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
                 nursery.start_soon(_run_projector)
                 nursery.start_soon(pg_health.run)
                 nursery.start_soon(_run_gaps_warmer)
+                nursery.start_soon(_run_rerender_consumer)
                 await pyfuse3.main()
                 nursery.cancel_scope.cancel()
         finally:
@@ -685,7 +743,7 @@ def cmd_permalink(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     """Build the CLI parser. Exposed so tests can assert argument wiring (e.g.
     the split-mount mountpoint default) without invoking the command handlers."""
-    from .cli import register_tier_subcommand
+    from .cli import register_rerender_subcommand, register_tier_subcommand
 
     parser = argparse.ArgumentParser(
         prog="slack-fuse",
@@ -754,6 +812,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     permalink_parser.set_defaults(func=cmd_permalink)
     register_tier_subcommand(sub)
+    register_rerender_subcommand(sub)
     return parser
 
 
