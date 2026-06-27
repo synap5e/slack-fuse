@@ -19,7 +19,7 @@ from __future__ import annotations
 import re
 from datetime import UTC, datetime
 
-from slack_fuse.models import Message
+from slack_fuse.models import Attachment, Message
 from slack_fuse_render.mrkdwn import CHANNEL_MENTION, USER_MENTION, convert_structural
 from slack_fuse_render.resolvers import (
     ChannelId,
@@ -56,6 +56,15 @@ def render_message_structural(msg: Message) -> str:
     if msg.text:
         lines.append(convert_structural(msg.text))
         lines.append("")
+
+    # Attachments (app unfurls + bot/webhook posts). Bot integrations like
+    # Linear / GitHub / JIRA / Datadog put their content here rather than
+    # in ``text``, so dropping these silently leaves messages with no body.
+    for att in msg.attachments:
+        rendered = _render_attachment(att)
+        if rendered:
+            lines.append(rendered)
+            lines.append("")
 
     if msg.reactions:
         reaction_parts = [f":{r.name}: {r.count}" for r in msg.reactions]
@@ -151,6 +160,44 @@ def extract_mention_channel_ids(structural_md: str) -> set[ChannelId]:
     (mention_kind='channel') when the projector writes a chunk.
     """
     return {ChannelId(m.group(1)) for m in CHANNEL_MENTION.finditer(structural_md)}
+
+
+def _render_attachment(att: Attachment) -> str:
+    """Render one Slack ``Attachment`` to markdown.
+
+    Slack only guarantees ``fallback`` is set on every attachment; the
+    richer fields are optional. Prefer the richer ones when available:
+
+      * ``title`` + ``title_link`` -> linked markdown heading
+      * ``text`` / ``pretext`` -> structural mrkdwn body
+      * ``from_url`` -> bare link (for app unfurls that don't include a title)
+      * ``fallback`` -> last resort plain text
+
+    Output is a single block of markdown (no trailing newline — the
+    caller wraps with a blank line). Empty when every field is empty
+    (defensive; shouldn't happen for real Slack payloads).
+    """
+    parts: list[str] = []
+    if att.pretext:
+        parts.append(convert_structural(att.pretext))
+    if att.title:
+        if att.title_link:
+            parts.append(f"**[{att.title}]({att.title_link})**")
+        else:
+            parts.append(f"**{att.title}**")
+    if att.text:
+        parts.append(convert_structural(att.text))
+    # Bare source link, useful when none of title/text/pretext are set —
+    # e.g. minimal Linear unfurls where the title lives in ``fallback``.
+    if att.from_url and not att.title_link:
+        parts.append(f"<{att.from_url}>")
+    # ``fallback`` is the guaranteed-present field. Only emit it when the
+    # richer fields didn't yield anything; otherwise we'd render the same
+    # content twice (fallback is typically a flattened version of title +
+    # text).
+    if not parts and att.fallback:
+        parts.append(att.fallback)
+    return "\n\n".join(p for p in parts if p)
 
 
 def _ts_to_time(ts: str) -> str:

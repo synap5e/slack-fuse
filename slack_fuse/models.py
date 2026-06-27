@@ -73,6 +73,27 @@ class Edited(_FrozenModel):
     ts: str
 
 
+class Attachment(_FrozenModel):
+    """Slack message attachment — covers app unfurls (Linear, GitHub, JIRA,
+    Datadog), webhook posts, and legacy bot integrations.
+
+    The shape on the wire is wildly variant — these are the four fields we
+    actually surface in markdown. ``fallback`` is the only field Slack
+    guarantees to be present and human-readable (Slack-side spec: clients
+    that can't render the rich attachment must use this), so it's the
+    final-resort body. ``title`` / ``text`` carry the rich content when
+    populated; ``from_url`` is the canonical source link for unfurls.
+    """
+
+    fallback: str = ""
+    title: str = ""
+    title_link: str = ""
+    text: str = ""
+    pretext: str = ""
+    from_url: str = ""
+    is_app_unfurl: bool = False
+
+
 class Message(_FrozenModel):
     ts: str
     user: str = "unknown"
@@ -82,6 +103,7 @@ class Message(_FrozenModel):
     latest_reply: str | None = None
     reactions: tuple[Reaction, ...] = ()
     files: tuple[FileAttachment, ...] = ()
+    attachments: tuple[Attachment, ...] = ()
     edited: Edited | None = None
     subtype: str | None = None
 
