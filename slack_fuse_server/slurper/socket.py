@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import cast
 
@@ -103,10 +104,16 @@ class SocketModeOptions:
     Bundled so the runner constructor and entry points stay within the
     argument-count budget. `status` is shared with the metrics layer when the
     integrated server wires `/metrics`; left `None` (a fresh holder) in tests.
+
+    `on_reconnect` is invoked from the trio loop with the downtime in seconds
+    each time a connection re-establishes after a disconnect (never on the
+    first connect). The slurper wires it to the reconnect-catchup trigger; left
+    `None` in tests and when catchup is disabled.
     """
 
     degraded_min_duration_s: float = DEFAULT_DEGRADED_MIN_DURATION_S
     status: SocketModeStatus | None = None
+    on_reconnect: Callable[[float], None] | None = None
 
 
 def _classify_open_failure(exc: BaseException) -> str:
@@ -230,6 +237,7 @@ class SocketModeRunner:
         self._disconnected_at: float | None = None
         self._degraded = SlackDegradedTracker(health, options.degraded_min_duration_s)
         self._status = options.status if options.status is not None else SocketModeStatus()
+        self._on_reconnect = options.on_reconnect
 
     async def run(self) -> None:
         """Keep a Socket Mode connection open for the lifetime of the nursery."""
@@ -300,6 +308,11 @@ class SocketModeRunner:
             gap = max(0.0, trio.current_time() - self._disconnected_at)
             await self._health.emit(HealthKind.SOCKET_MODE_RECONNECTED, {"gap_seconds": round(gap, 3)})
             self._disconnected_at = None
+            # Hand the downtime to the catchup trigger (if wired). The handler
+            # decides whether the gap is long enough to warrant a gap-fill;
+            # it never blocks the socket loop (a non-blocking nudge).
+            if self._on_reconnect is not None:
+                self._on_reconnect(gap)
 
     async def _message_loop(self, ws: WebSocketConnection) -> bool:
         """Pump frames off the socket until a disconnect (or the peer closes)."""
