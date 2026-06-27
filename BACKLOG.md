@@ -541,3 +541,50 @@ queried stream.
 **Impact**: ergonomic — operators see the warning and don't know if
 it's real or noise. Doesn't affect data correctness, but every
 warning the user has to mentally filter erodes trust in the trailer.
+
+---
+
+### FUSE getattr returns `st_blocks=0` — du/dust show everything as 0B
+
+**Discovered**: 2026-06-27 while inspecting `/views/slack-split/channels/general` with `dust`.
+
+**Symptom**: every file in the mount shows up as 0B in `dust` and
+default-mode `du`, even though `stat` returns the correct `Size` and
+`cat`/`wc -c` return the real bytes.
+
+```
+$ stat -c "size=%s blocks=%b" channel.md
+size=4035 blocks=0
+
+$ dust .                           # 0B everywhere
+$ dust --apparent-size .           # real sizes
+$ du -b channel.md                 # 4035
+```
+
+**Root cause**: `_make_file_attr` (and friends in
+`slack_fuse/fuse_ops_v2.py`) set `st_size` correctly but leave
+`st_blocks` at 0. There's no real disk block allocation behind these
+files — content is rendered on read from the projector's `chunks` /
+`thread_chunks` tables — so 0 is technically accurate. But `du`/`dust`
+default to `st_blocks * 512` as "disk usage", which produces zeros
+across the board.
+
+**Current behaviour**: users have to know to pass `--apparent-size`
+(or `du -b`, or `du --apparent-size`) to get usable output. First-time
+users find it confusing — "the mount is empty?"
+
+**Fix candidates**:
+1. **Set `st_blocks = ceil(st_size / 512)`** in `_make_file_attr` (and
+   the originals + control-surface attr factories). 5-line change,
+   purely additive, no test risk. Every disk-usage tool Just Works.
+2. **Document the workaround in `README.md` / `CLAUDE.md`** — tell
+   users to pass `--apparent-size`. Cheaper, less ergonomic.
+
+**Recommendation**: option 1. It's tiny, the value is genuinely
+meaningful (`ceil(st_size / 512)` is what a tmpfs / overlayfs returns
+for content of size N — same shape), and disk-usage tooling is a
+common enough operation that "works by default" is the right default.
+
+**Impact**: ergonomic only. Doesn't affect correctness or data. Worth
+fixing because the alternative is "every user discovers it the first
+time they run `dust` and gets confused."
