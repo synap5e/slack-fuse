@@ -49,6 +49,7 @@ from slack_fuse.fuse_v2_helpers import (
     CONTROL_DIR,
     CONTROL_REFRESH_CHANNEL,
     CONTROL_REFRESH_CHANNELS,
+    CONTROL_RERENDER_CHANNEL,
     CONTROL_STATUS,
     CONTROL_WRITABLE,
     CONV_ROOTS,
@@ -145,6 +146,13 @@ WorkspaceGapsFetchFn = Callable[[], bytes]
 # the slurper server (see projector/refresh_fetch.py); tests pass a fake.
 ControlRefreshWorkspaceFn = Callable[[], int]
 ControlRefreshChannelFn = Callable[[str], int]
+# ``_control/rerender_channel`` hands a resolved channel id off to a background
+# consumer (the rerender is too heavy for the per-callback budget). Returns True
+# if the request was accepted (queued), False if the queue is full / busy. Wired
+# in ``__main__.cmd_mount_split`` to a trio memory-channel ``send_nowait``;
+# called from the trio event loop in ``_fire_control`` (never a worker thread,
+# so the non-thread-safe channel send is safe).
+ControlRerenderChannelFn = Callable[[str], bool]
 
 # Write-handle file numbers for ``_control/`` writes live in a high, disjoint
 # range so they can never collide with a real persistent inode (those come from
@@ -494,6 +502,7 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         control_state: ControlState | None = None,
         control_refresh_workspace: ControlRefreshWorkspaceFn | None = None,
         control_refresh_channel: ControlRefreshChannelFn | None = None,
+        control_rerender_channel: ControlRerenderChannelFn | None = None,
     ) -> None:
         super().__init__()
         # ``conn`` is the inode-map's dedicated connection. In pool mode (``pool``
@@ -567,6 +576,7 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         self._control_state = control_state
         self._control_refresh_workspace = control_refresh_workspace
         self._control_refresh_channel = control_refresh_channel
+        self._control_rerender_channel = control_rerender_channel
         self._control_write_buffers: dict[int, _ControlWrite] = {}
         self._control_write_lock = threading.Lock()
         self._control_fh_seq = 0
@@ -913,6 +923,12 @@ class SlackFuseOpsV2(pyfuse3.Operations):
                 return
             result = await self._control_action_or_unavailable(lambda: self._do_channel_refresh(token))
             self._control_state.record_channel(result.channel or token, result.result)
+        elif name == CONTROL_RERENDER_CHANNEL:
+            token = data.decode("utf-8", errors="replace").strip()
+            if not token:
+                return
+            result = await self._fire_rerender(token)
+            self._control_state.record_rerender(result.channel or token, result.result)
 
     async def _control_action_or_unavailable(self, fn: Callable[[], _ControlResult]) -> _ControlResult:
         try:
@@ -932,6 +948,28 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         if self._control_refresh_channel is None:
             return _ControlResult(result="server_unavailable", channel=channel_id)
         return _ControlResult(result=result_for_status(self._control_refresh_channel(channel_id)), channel=channel_id)
+
+    async def _fire_rerender(self, token: str) -> _ControlResult:
+        """Resolve a rerender token and hand it to the background consumer.
+
+        Resolution (a DB read) runs in a worker thread under the callback
+        budget; the enqueue itself runs here on the trio event loop because the
+        injected ``control_rerender_channel`` is a trio memory-channel send that
+        is not thread-safe. The actual rerender is heavy (snapshot fetch + apply)
+        and runs off-budget in the consumer, so this only ever records ``queued``
+        / ``busy`` / ``unknown_channel`` — the consumer overwrites ``status``
+        with the final verb when it finishes.
+        """
+        if self._control_rerender_channel is None:
+            return _ControlResult(result="server_unavailable")
+        try:
+            channel_id = await self._run_sync(lambda: self._resolve_control_channel(token))
+        except pyfuse3.FUSEError:
+            return _ControlResult(result="server_unavailable")
+        if channel_id is None:
+            return _ControlResult(result="unknown_channel", channel=token)
+        accepted = self._control_rerender_channel(channel_id)
+        return _ControlResult(result="queued" if accepted else "busy", channel=channel_id)
 
     def _resolve_control_channel(self, token: str) -> str | None:
         """Resolve a written token (channel id or slug) to a channel id.
@@ -982,6 +1020,7 @@ class SlackFuseOpsV2(pyfuse3.Operations):
                 return [
                     (CONTROL_REFRESH_CHANNELS, False),
                     (CONTROL_REFRESH_CHANNEL, False),
+                    (CONTROL_RERENDER_CHANNEL, False),
                     (CONTROL_STATUS, False),
                 ]
             return []

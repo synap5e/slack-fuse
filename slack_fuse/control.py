@@ -65,6 +65,7 @@ class ControlState:
         self._lock = threading.Lock()
         self._workspace: RefreshOutcome | None = None
         self._channel: RefreshOutcome | None = None
+        self._rerender: RefreshOutcome | None = None
 
     def _stamp(self) -> str:
         return self._now_fn().astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -77,14 +78,20 @@ class ControlState:
         with self._lock:
             self._channel = RefreshOutcome(at=self._stamp(), result=result, channel=channel)
 
+    def record_rerender(self, channel: str, result: str) -> None:
+        with self._lock:
+            self._rerender = RefreshOutcome(at=self._stamp(), result=result, channel=channel)
+
     def render(self) -> bytes:
         """Serialize the current state to the ``status`` file body."""
         with self._lock:
             workspace = self._workspace
             channel = self._channel
+            rerender = self._rerender
         payload: dict[str, dict[str, str] | None] = {
             "last_workspace_refresh": workspace.to_json() if workspace is not None else None,
             "last_channel_refresh": channel.to_json() if channel is not None else None,
+            "last_rerender": rerender.to_json() if rerender is not None else None,
         }
         return (json.dumps(payload, indent=2) + "\n").encode()
 

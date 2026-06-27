@@ -83,6 +83,9 @@ ignore = [
 # CLI entrypoint defers heavy imports (pyfuse3, trio) until the mount subcommand
 # actually runs — see ~/docs/dev/python/README.md "Lazy imports" section.
 "slack_fuse/__main__.py" = ["PLC0415"]
+# `rerender` subcommand defers config/ws_client/rerender imports until it runs,
+# so building the parser (every CLI invocation) stays cheap.
+"slack_fuse/cli/rerender.py" = ["PLC0415"]
 
 [tool.ruff.lint.isort]
 force-single-line = false
