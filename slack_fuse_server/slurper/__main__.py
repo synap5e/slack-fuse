@@ -23,7 +23,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
@@ -50,6 +50,12 @@ from slack_fuse_server.http.handlers import (
 )
 from slack_fuse_server.http.metrics import MetricsAggregator, SubscriberSnapshot
 from slack_fuse_server.slurper.api import ChannelNotFoundError, SlackAPIError, SlackClient
+from slack_fuse_server.slurper.catchup import (
+    CatchupConfig,
+    CatchupDeps,
+    CatchupTrigger,
+    should_catchup,
+)
 from slack_fuse_server.slurper.channels import ensure_channel_added, populate_channels_once
 from slack_fuse_server.slurper.health import HealthEmitter
 from slack_fuse_server.slurper.offsets import OffsetWriter
@@ -107,6 +113,34 @@ def _make_api_backfiller(
         thread_max_s=config.backfill_thread_sleep_max_s,
     )
     return SlackApiBackfiller(client, limiter, sleeps)
+
+
+def _make_catchup_deps(
+    client: SlackClient,
+    writer: OffsetWriter,
+    config: ServerConfig,
+) -> CatchupDeps:
+    """Build the reconnect/restart catchup sweep's dependencies.
+
+    Uses its own backfiller with tight sleep bounds (the gap-fill is bounded by
+    ``oldest``, so pages are few; the 30-180s backfill page throttle would make
+    a multi-page busy channel needlessly slow). Shares the writer's limiter so
+    every catchup API/DB call serializes with the rest of the slurper.
+    """
+    sleeps = SleepBounds(
+        page_min_s=config.catchup_page_sleep_min_s,
+        page_max_s=config.catchup_page_sleep_max_s,
+        thread_min_s=config.catchup_thread_sleep_min_s,
+        thread_max_s=config.catchup_thread_sleep_max_s,
+    )
+    backfiller = SlackApiBackfiller(client, writer.limiter, sleeps)
+    catchup_config = CatchupConfig(
+        gap_threshold_s=config.catchup_gap_threshold_s,
+        max_lookback_s=config.catchup_max_lookback_s,
+        channel_gap_s=config.catchup_channel_gap_s,
+        startup_delay_s=config.catchup_startup_delay_s,
+    )
+    return CatchupDeps(writer=writer, backfiller=backfiller, config=catchup_config)
 
 
 def _make_backfiller(
@@ -221,6 +255,11 @@ async def _serve(config: ServerConfig) -> None:
     writer = OffsetWriter(conn, limiter)
     health = HealthEmitter(writer)
 
+    # Reconnect/restart catchup: a startup gap-fill plus an on-demand one fired
+    # by the socket runner when a reconnect's downtime drained Slack's buffer.
+    catchup_trigger = CatchupTrigger() if config.catchup_enabled else None
+    catchup_deps = _make_catchup_deps(client, writer, config) if catchup_trigger is not None else None
+
     # The snapshot scheduler runs on its own connection + limiter so generating
     # a large snapshot never blocks live event writes (its REPEATABLE READ reads
     # don't contend with the writer's autocommit inserts on a separate backend).
@@ -239,7 +278,9 @@ async def _serve(config: ServerConfig) -> None:
     auto_backfill = os.environ.get(_AUTO_BACKFILL_ENV, "").lower() in ("1", "true", "yes")
     try:
         async with trio.open_nursery() as nursery:
-            nursery.start_soon(_run_socket_mode_with_users_task, writer, health, client, config, status)
+            nursery.start_soon(
+                _run_socket_mode_with_users_task, writer, health, client, config, status, catchup_trigger
+            )
             nursery.start_soon(populate_users_once, writer, client)
             nursery.start_soon(populate_channels_once, writer, client)
             nursery.start_soon(
@@ -263,6 +304,11 @@ async def _serve(config: ServerConfig) -> None:
             # fires only on demand. Rendezvous channel means a second
             # POST while one is running gets 409, not a queued cycle.
             nursery.start_soon(refresh_trigger.consume, writer, client)
+            # Reconnect/restart catchup consumer: runs one bounded gap-fill at
+            # startup (the restart case) and one per gap-reconnect the socket
+            # runner signals via catchup_trigger.
+            if catchup_trigger is not None and catchup_deps is not None:
+                nursery.start_soon(catchup_trigger.consume, catchup_deps)
             if auto_backfill:
                 nursery.start_soon(_auto_backfill, config, writer, health, client, limiter)
             log.info("slack-fuse-server listening on %s (HTTP /health, /metrics + WS /ws)", config.listen_addr)
@@ -272,18 +318,39 @@ async def _serve(config: ServerConfig) -> None:
         snapshot_conn.close()
 
 
-async def _run_socket_mode_with_users_task(
+async def _run_socket_mode_with_users_task(  # noqa: PLR0913, PLR0917 - socket task needs its full dep set
     writer: OffsetWriter,
     health: HealthEmitter,
     client: SlackClient,
     config: ServerConfig,
     status: SocketModeStatus,
+    catchup_trigger: CatchupTrigger | None,
 ) -> None:
     options = SocketModeOptions(
         degraded_min_duration_s=config.slack_degraded_min_duration_s,
         status=status,
+        on_reconnect=_make_on_reconnect(catchup_trigger, config.catchup_gap_threshold_s),
     )
     await run_socket_mode_with_users(writer, health, client, config.slack_app_token, options=options)
+
+
+def _make_on_reconnect(
+    catchup_trigger: CatchupTrigger | None,
+    gap_threshold_s: float,
+) -> Callable[[float], None] | None:
+    """Build the socket runner's reconnect hook: nudge the catchup trigger when
+    the downtime exceeded the buffer-drain threshold. ``None`` when catchup is
+    disabled, so the runner skips the call entirely."""
+    if catchup_trigger is None:
+        return None
+
+    def _on_reconnect(gap_seconds: float) -> None:
+        if not should_catchup(gap_seconds, threshold_s=gap_threshold_s):
+            return
+        if not catchup_trigger.request(gap_seconds):
+            log.info("catchup: reconnect gap=%.0fs but a catchup is already queued; skipping", gap_seconds)
+
+    return _on_reconnect
 
 
 async def _serve_dispatch_task(  # noqa: PLR0913, PLR0917 - dispatch wiring needs explicit deps.

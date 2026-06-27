@@ -58,6 +58,20 @@ class ServerConfig(BaseSettings):
     # Health-stream debouncing.
     slack_degraded_min_duration_s: float = 30.0
 
+    # Reconnect / restart catchup (slurper/catchup.py). A bounded gap-fill that
+    # recovers messages Slack dropped while the slurper was down longer than its
+    # ~5min event buffer — runs once at startup (the restart case) and on any
+    # in-process reconnect whose downtime exceeds the gap threshold.
+    catchup_enabled: bool = True
+    catchup_gap_threshold_s: float = 300.0
+    catchup_max_lookback_s: float = 3600.0
+    catchup_channel_gap_s: float = 1.5
+    catchup_startup_delay_s: float = 30.0
+    catchup_page_sleep_min_s: float = 1.0
+    catchup_page_sleep_max_s: float = 3.0
+    catchup_thread_sleep_min_s: float = 1.0
+    catchup_thread_sleep_max_s: float = 3.0
+
     @classmethod
     def settings_customise_sources(
         cls,

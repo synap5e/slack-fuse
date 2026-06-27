@@ -21,7 +21,12 @@ from slack_fuse.models import JsonObject, Message, SocketEventPayload
 from slack_fuse_server.slurper.api import SlackClient
 from slack_fuse_server.slurper.health import HealthEmitter
 from slack_fuse_server.slurper.offsets import OffsetWriter
-from slack_fuse_server.slurper.socket import SocketModeRunner, _parse_envelope, translate_message_event
+from slack_fuse_server.slurper.socket import (
+    SocketModeOptions,
+    SocketModeRunner,
+    _parse_envelope,
+    translate_message_event,
+)
 from tests._fake_slack import load_fixtures
 
 # === Pure translation ===
@@ -185,3 +190,30 @@ def test_handle_structural_event_enriches_via_conversations_info(
     assert kind == "channel_renamed"
     assert isinstance(payload, dict)
     assert payload == {"channel_id": "C0001", "new_name": "general"}
+
+
+def test_on_hello_fires_reconnect_hook_only_after_a_disconnect(
+    server_conn: psycopg.Connection[TupleRow],
+    fake_slack_http: httpx.Client,
+) -> None:
+    """The reconnect hook (catchup trigger in prod) fires with the downtime on a
+    reconnect, but never on the first connect of a fresh process — a startup has
+    no prior connection whose gap to fill via this path."""
+    fired: list[float] = []
+    client = SlackClient("xoxp-test")
+    client._http = fake_slack_http
+    writer = OffsetWriter(server_conn, trio.CapacityLimiter(1))
+    options = SocketModeOptions(on_reconnect=fired.append)
+    runner = SocketModeRunner(writer, HealthEmitter(writer), client, "xapp-test", options=options)
+
+    async def go() -> None:
+        # First hello = fresh connect (disconnected_at is None) → no hook.
+        await runner._on_hello()
+        # Simulate a disconnect 42s ago, then reconnect.
+        runner._disconnected_at = trio.current_time() - 42.0
+        await runner._on_hello()
+
+    trio.run(go)
+
+    assert len(fired) == 1
+    assert fired[0] >= 41.0
