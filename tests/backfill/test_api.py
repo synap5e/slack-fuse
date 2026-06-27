@@ -52,6 +52,111 @@ def test_messages_for_channel_yields_history_and_thread_replies(fake_slack_http:
     assert by_ts == {"1700000000.000100", "1700000100.000200", "1700000200.000300"}
 
 
+def test_thread_reply_raw_is_lossless_not_model_dump(fake_slack_http: httpx.Client) -> None:
+    """Pin the 2026-06-27 promotion: thread replies must persist the
+    actual wire dict (with all fields, including ones the ``Message``
+    model doesn't declare), not a ``Message.model_dump`` round-trip
+    that drops anything not declared on the model.
+
+    Before the promotion, ``_expand_threads`` bridged via
+    ``Validated(raw=msg.model_dump(...), model=msg)`` — so any field
+    the model lacked (notably ``attachments`` for bot/app-unfurl posts)
+    was silently dropped at persist time. This test exercises the fake
+    transport's ``conversations.replies`` fixture which carries the
+    real Slack reply shape; the raw should include the wire ``type``
+    field even though the ``Message`` model doesn't declare it.
+    """
+    backfiller = SlackApiBackfiller(_fake_client(fake_slack_http), trio.CapacityLimiter(1), _NO_SLEEP)
+
+    async def collect_thread_reply() -> Validated[Message] | None:
+        async for wrapped in backfiller.messages_for_channel(ChannelId("C0001")):
+            if wrapped.model.ts == "1700000200.000300":
+                return wrapped
+        return None
+
+    reply = trio.run(collect_thread_reply)
+    assert reply is not None
+    # The wire response includes ``type: "message"`` which the ``Message``
+    # model doesn't declare. A ``model_dump`` bridge would drop it; raw
+    # preserves it.
+    assert reply.raw.get("type") == "message"
+    # Model fields still round-trip correctly.
+    assert reply.model.user == "U0001"
+    assert reply.model.text == "You're most welcome."
+
+
+def test_get_replies_preserves_attachments_lossless() -> None:
+    """The motivating production shape: a thread-reply whose content lives
+    in ``attachments`` (Linear unfurls, GitHub alerts, Datadog events…).
+    ``SlackClient.get_replies`` must preserve the raw wire dict so the
+    backfill persistence site captures attachment data — including fields
+    the ``Attachment`` model doesn't declare.
+
+    Drives the client directly against a stubbed ``httpx.Client`` so we
+    control the exact response shape; the wider fake transport's static
+    fixture doesn't carry attachments.
+    """
+    bot_reply: dict[str, object] = {
+        "type": "message",
+        "ts": "1700000300.000400",
+        "user": "U_BOT",
+        "bot_id": "B_LINEAR",
+        "text": "",
+        "thread_ts": "1700000100.000200",
+        "attachments": [
+            {
+                "fallback": "FE-740 Bug: …",
+                "from_url": "https://linear.app/comfyorg/issue/FE-740",
+                "is_app_unfurl": True,
+                # Fields the ``Attachment`` model does NOT declare —
+                # a ``model_dump`` bridge would silently drop these.
+                "footer_icon": "https://example/footer.png",
+                "color": "#5E6AD2",
+            },
+        ],
+    }
+    response_body: dict[str, object] = {
+        "ok": True,
+        "messages": [
+            {
+                "type": "message",
+                "ts": "1700000100.000200",
+                "user": "U0001",
+                "text": "parent",
+                "thread_ts": "1700000100.000200",
+                "reply_count": 1,
+            },
+            bot_reply,
+        ],
+        "has_more": False,
+        "response_metadata": {"next_cursor": ""},
+    }
+
+    def _handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=response_body)
+
+    client = SlackClient("xoxp-test")
+    client._http = httpx.Client(transport=httpx.MockTransport(_handler))  # pyright: ignore[reportPrivateUsage]
+
+    replies = client.get_replies("C0001", "1700000100.000200")
+    # [parent, bot_reply]
+    assert len(replies) == 2
+    bot = replies[1]
+
+    raw_atts = bot.raw.get("attachments")
+    assert isinstance(raw_atts, list) and len(raw_atts) == 1
+    raw_att = raw_atts[0]
+    assert isinstance(raw_att, dict)
+    # Fields the ``Attachment`` model declares survive…
+    assert raw_att.get("fallback") == "FE-740 Bug: …"
+    assert raw_att.get("from_url") == "https://linear.app/comfyorg/issue/FE-740"
+    # …and so do fields it doesn't declare. This is the whole point of
+    # raw-persistence — projections can read these later without
+    # re-ingesting.
+    assert raw_att.get("footer_icon") == "https://example/footer.png"
+    assert raw_att.get("color") == "#5E6AD2"
+
+
 # === Driver: backfill_channel against a stub Backfiller ===
 
 

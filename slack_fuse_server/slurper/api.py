@@ -35,7 +35,6 @@ from slack_fuse.models import (
     SearchFile,
     SearchFilesResponse,
     SlackFile,
-    Thread,
 )
 
 log = logging.getLogger(__name__)
@@ -322,9 +321,23 @@ class SlackClient:
             params["oldest"] = f"{oldest:.6f}"
         return self._get_validated("conversations.history", params, ConversationsHistoryResponse)
 
-    def get_replies(self, channel_id: str, thread_ts: str) -> Thread:
-        """Fetch all replies in a thread."""
-        messages: list[Message] = []
+    def get_replies(self, channel_id: str, thread_ts: str) -> list[Validated[Message]]:
+        """Fetch all messages in a thread (parent + replies), lossless.
+
+        Returns a ``Validated[Message]`` per row so callers that persist to
+        the events table can write the raw wire dict — preserving fields
+        the ``Message`` model doesn't declare (notably ``attachments`` for
+        bot/app-unfurl posts). Order is parent first, then replies in
+        Slack's returned order.
+
+        The previous shape (``Thread`` with ``parent`` + ``replies``) was a
+        convenience for in-process consumers, but the only production
+        caller (backfill thread-walk) iterates linearly anyway — and the
+        ``Thread`` shape forced a lossy ``model_dump`` bridge that dropped
+        attachment payloads on bot messages. See 2026-06-27 incident notes
+        for the Linear thread that motivated this promotion.
+        """
+        out: list[Validated[Message]] = []
         cursor = ""
         while True:
             params: dict[str, str] = {
@@ -334,24 +347,26 @@ class SlackClient:
             }
             if cursor:
                 params["cursor"] = cursor
-            resp = self._get(
+            page = self._get_validated(
                 "conversations.replies",
                 params,
                 ConversationsRepliesResponse,
             )
-            messages.extend(resp.messages)
-            if not resp.has_more:
+            raw_msgs = page.raw.get("messages")
+            raw_list: list[object] = list(raw_msgs) if isinstance(raw_msgs, list) else []
+            # Pair each validated model with its raw dict by index — same
+            # invariant as ``list_conversations`` / ``_paginate_history``:
+            # both come from the same wire payload, indices line up.
+            for raw_msg, model_msg in zip(raw_list, page.model.messages, strict=False):
+                if isinstance(raw_msg, dict):
+                    out.append(Validated(raw=cast(JsonObject, raw_msg), model=model_msg))
+            if not page.model.has_more:
                 break
-            cursor = resp.response_metadata.next_cursor
+            cursor = page.model.response_metadata.next_cursor
             if not cursor:
                 break
             time.sleep(_PAGE_DELAY)
-
-        if not messages:
-            parent = Message(ts=thread_ts, user="unknown", text="")
-            return Thread(parent=parent)
-
-        return Thread(parent=messages[0], replies=tuple(messages[1:]))
+        return out
 
     def get_permalink(self, channel_id: str, message_ts: str) -> str:
         """Fetch Slack's canonical permalink for a message."""

@@ -25,7 +25,7 @@ from typing import cast
 
 import trio
 
-from slack_fuse.models import ConversationsHistoryResponse, Message, Thread
+from slack_fuse.models import ConversationsHistoryResponse, Message
 from slack_fuse_render import ChannelId
 from slack_fuse_server._json import JsonObject
 from slack_fuse_server.backfill.types import BackfillAbortReason, Backfiller, BackfillResult
@@ -184,16 +184,17 @@ class SlackApiBackfiller:
         for i, thread_ts in enumerate(thread_parents):
             if i > 0:
                 await trio.sleep(random.uniform(self._sleeps.thread_min_s, self._sleeps.thread_max_s))
-            thread = await self._replies(channel_id, thread_ts)
-            if thread is None:
+            thread_msgs = await self._replies(channel_id, thread_ts)
+            if thread_msgs is None:
                 continue
-            # ``get_replies`` doesn't expose raw today — bridge by re-dumping
-            # the validated model. ``get_replies`` is the smaller surface
-            # (per-thread, not per-channel); follow-up commit can promote it
-            # to Validated[Thread] for full losslessness.
-            for reply in thread.replies:
-                if _passes_since(reply.ts, since_ts):
-                    yield Validated(raw=cast(JsonObject, reply.model_dump(mode="json")), model=reply)
+            # ``get_replies`` returns ``[parent, *replies]`` lossless. Skip
+            # the parent — the top-level history pass already yielded it —
+            # and pass the genuine raw dicts through (no model_dump bridge).
+            # This is what lets attachment-carrying bot replies (Linear,
+            # GitHub, Datadog) actually persist their content.
+            for reply in thread_msgs[1:]:
+                if _passes_since(reply.model.ts, since_ts):
+                    yield reply
 
     async def _history_page(
         self,
@@ -210,7 +211,9 @@ class SlackApiBackfiller:
             await _sleep_rate_limited(exc.retry_after)
             return None
 
-    async def _replies(self, channel_id: str, thread_ts: str) -> Thread | None:
+    async def _replies(
+        self, channel_id: str, thread_ts: str
+    ) -> list[Validated[Message]] | None:
         try:
             return await trio.to_thread.run_sync(
                 lambda: self._client.get_replies(channel_id, thread_ts), limiter=self._limiter
