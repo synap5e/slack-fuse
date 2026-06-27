@@ -123,9 +123,11 @@ def _list_known_channel_ids(conn: psycopg.Connection[TupleRow]) -> list[str]:
             """
             SELECT DISTINCT payload->>'id'
             FROM events
+            LEFT JOIN blocked_channels ON blocked_channels.channel_id = payload->>'id'
             WHERE stream = %s
               AND kind IN ('channel_added', 'channel_info_refreshed')
               AND payload ? 'id'
+              AND blocked_channels.channel_id IS NULL
             ORDER BY payload->>'id'
             """,
             (_CHANNEL_LIST_STREAM,),

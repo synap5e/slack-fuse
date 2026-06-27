@@ -136,6 +136,35 @@ def _resolve_local_zoneinfo() -> ZoneInfo:
     return ZoneInfo("UTC")
 
 
+def _migrate_legacy_always_blocked(
+    http_client: httpx.Client,
+    base_http_url: str,
+    channel_ids: frozenset[str],
+    *,
+    shared_secret: str | None,
+    log: logging.Logger,
+) -> None:
+    """Idempotently copy legacy client config blocks into the server SSOT."""
+    if not channel_ids:
+        return
+    from slack_fuse.projector.block_fetch import post_block_channel
+
+    log.warning(
+        "ClientConfig.always_blocked_channel_ids is deprecated; migrating %d id(s) to server blocked_channels",
+        len(channel_ids),
+    )
+    for channel_id in sorted(channel_ids):
+        status = post_block_channel(
+            http_client,
+            base_http_url,
+            channel_id,
+            reason="migrated from always_blocked_channel_ids config",
+            shared_secret=shared_secret,
+        )
+        if status != 200:
+            log.warning("legacy block migration for %s returned HTTP %s", channel_id, status)
+
+
 def _mount_mode(args: argparse.Namespace) -> str:
     """Mount mode: CLI ``--mode`` wins, else ``SLACK_FUSE_MODE`` env, else legacy."""
     cli = getattr(args, "mode", None)
@@ -399,13 +428,29 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
     def _workspace_gaps_fetch_sync() -> bytes:
         return fetch_workspace_gaps(ghost_http_client, ghost_base_http_url)
 
-    # ``_control/`` write surface: trigger server-side refreshes over HTTP and
-    # read the last outcomes back from ``status``. Shares the ghost-file httpx
+    # ``_control/`` write surface: trigger server-side refreshes/backfills and
+    # mutate server-side block policy over HTTP. Shares the ghost-file httpx
     # client + server origin. The state is in-process (resets on restart).
     from slack_fuse.control import ControlState
+    from slack_fuse.projector.block_fetch import (
+        blocked_channel_ids_from_payload,
+        delete_block_channel,
+        get_blocked_channels,
+        get_blocked_channels_bytes,
+        post_backfill_channel,
+        post_block_channel,
+    )
     from slack_fuse.projector.refresh_fetch import post_refresh_channel, post_refresh_channels
 
     control_state = ControlState()
+
+    _migrate_legacy_always_blocked(
+        ghost_http_client,
+        ghost_base_http_url,
+        frozenset(config.always_blocked_channel_ids),
+        shared_secret=config.shared_secret,
+        log=log,
+    )
 
     def _control_refresh_workspace() -> int:
         return post_refresh_channels(
@@ -415,6 +460,49 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
     def _control_refresh_channel(channel_id: str) -> int:
         return post_refresh_channel(
             ghost_http_client, ghost_base_http_url, channel_id, shared_secret=config.shared_secret
+        )
+
+    def _control_blocked_channels_read() -> bytes:
+        return get_blocked_channels_bytes(
+            ghost_http_client,
+            ghost_base_http_url,
+            shared_secret=config.shared_secret,
+        )
+
+    def _control_blocked_channels_list() -> set[str]:
+        status, payload = get_blocked_channels(
+            ghost_http_client,
+            ghost_base_http_url,
+            shared_secret=config.shared_secret,
+        )
+        if status != 200:
+            msg = f"GET /blocked-channels returned HTTP {status}"
+            raise RuntimeError(msg)
+        return blocked_channel_ids_from_payload(payload)
+
+    def _control_block_channel(channel_id: str, reason: str | None) -> int:
+        return post_block_channel(
+            ghost_http_client,
+            ghost_base_http_url,
+            channel_id,
+            reason=reason,
+            shared_secret=config.shared_secret,
+        )
+
+    def _control_unblock_channel(channel_id: str) -> int:
+        return delete_block_channel(
+            ghost_http_client,
+            ghost_base_http_url,
+            channel_id,
+            shared_secret=config.shared_secret,
+        )
+
+    def _control_backfill_channel(channel_id: str) -> tuple[int, str | None]:
+        return post_backfill_channel(
+            ghost_http_client,
+            ghost_base_http_url,
+            channel_id,
+            shared_secret=config.shared_secret,
         )
 
     # ``_control/rerender_channel`` hands resolved channel ids to a background
@@ -448,6 +536,11 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
         control_state=control_state,
         control_refresh_workspace=_control_refresh_workspace,
         control_refresh_channel=_control_refresh_channel,
+        control_blocked_channels_read=_control_blocked_channels_read,
+        control_blocked_channels_list=_control_blocked_channels_list,
+        control_block_channel=_control_block_channel,
+        control_unblock_channel=_control_unblock_channel,
+        control_backfill_channel=_control_backfill_channel,
         control_rerender_channel=_control_rerender_channel,
     )
 
@@ -459,12 +552,6 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
         shared_secret=config.shared_secret,
         pool_size=config.projector_pool_size,
     )
-    # Operator-maintained ignore list — every event that could re-tier a
-    # listed channel is forced back to blocked-manual by the projector.
-    always_blocked = frozenset(config.always_blocked_channel_ids)
-    if always_blocked:
-        log.info("always-blocked channels: %s", sorted(always_blocked))
-
     # NB: NOT mounted ``ro`` — the kernel would reject every write before it
     # reached the daemon, including the ``_control/`` triggers. Read-only is
     # enforced in-daemon instead: ``open`` returns EROFS for any write-mode open
@@ -487,7 +574,7 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
         backoff = 2.0
         max_backoff = 300.0
         while True:
-            client = WSClient(ws_options, _open_conn, state_conn, sink=sink, always_blocked=always_blocked)
+            client = WSClient(ws_options, _open_conn, state_conn, sink=sink)
             try:
                 with state_conn.cursor() as cur:
                     cur.execute("SELECT channel_id FROM channels WHERE subscribed = TRUE")
@@ -609,6 +696,21 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
             with contextlib.suppress(Exception):
                 rerender_sink_conn.close()
 
+    async def _run_block_sync() -> None:
+        from slack_fuse.projector.block_sync import sync_blocked_channels_periodically
+
+        def _make_http_client() -> httpx.Client:
+            return httpx.Client(timeout=httpx.Timeout(connect=2.0, read=5.0, write=2.0, pool=5.0))
+
+        await sync_blocked_channels_periodically(
+            _make_http_client,
+            ghost_base_http_url,
+            _open_conn,
+            shared_secret=config.shared_secret,
+            interval_s=config.block_sync_interval_s,
+            limiter=store_limiter,
+        )
+
     async def _run() -> None:
         try:
             async with trio.open_nursery() as nursery:
@@ -617,6 +719,7 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
                 nursery.start_soon(pg_health.run)
                 nursery.start_soon(_run_gaps_warmer)
                 nursery.start_soon(_run_rerender_consumer)
+                nursery.start_soon(_run_block_sync)
                 await pyfuse3.main()
                 nursery.cancel_scope.cancel()
         finally:

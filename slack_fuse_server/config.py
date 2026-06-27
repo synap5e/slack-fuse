@@ -50,8 +50,8 @@ class ServerConfig(BaseSettings):
     # Backfill thresholds.
     backfill_warn_at: int = 5000
     backfill_abort_at: int = 20000
-    backfill_page_sleep_min_s: float = 30.0
-    backfill_page_sleep_max_s: float = 180.0
+    backfill_page_sleep_min_s: float = 15.0
+    backfill_page_sleep_max_s: float = 90.0
     backfill_thread_sleep_min_s: float = 2.0
     backfill_thread_sleep_max_s: float = 8.0
 

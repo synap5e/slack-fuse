@@ -46,6 +46,8 @@ from slack_fuse.fuse_v2_helpers import (
     CHANNEL_LIST_STREAM,
     CHANNEL_MD,
     CHANNEL_ORIGINAL_MD,
+    CONTROL_BACKFILL_CHANNEL,
+    CONTROL_BLOCKED_CHANNELS,
     CONTROL_DIR,
     CONTROL_REFRESH_CHANNEL,
     CONTROL_REFRESH_CHANNELS,
@@ -146,6 +148,11 @@ WorkspaceGapsFetchFn = Callable[[], bytes]
 # the slurper server (see projector/refresh_fetch.py); tests pass a fake.
 ControlRefreshWorkspaceFn = Callable[[], int]
 ControlRefreshChannelFn = Callable[[str], int]
+ControlBlockedChannelsReadFn = Callable[[], bytes]
+ControlBlockedChannelsListFn = Callable[[], set[str]]
+ControlBlockChannelFn = Callable[[str, str | None], int]
+ControlUnblockChannelFn = Callable[[str], int]
+ControlBackfillChannelFn = Callable[[str], tuple[int, str | None]]
 # ``_control/rerender_channel`` hands a resolved channel id off to a background
 # consumer (the rerender is too heavy for the per-callback budget). Returns True
 # if the request was accepted (queued), False if the queue is full / busy. Wired
@@ -502,6 +509,11 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         control_state: ControlState | None = None,
         control_refresh_workspace: ControlRefreshWorkspaceFn | None = None,
         control_refresh_channel: ControlRefreshChannelFn | None = None,
+        control_blocked_channels_read: ControlBlockedChannelsReadFn | None = None,
+        control_blocked_channels_list: ControlBlockedChannelsListFn | None = None,
+        control_block_channel: ControlBlockChannelFn | None = None,
+        control_unblock_channel: ControlUnblockChannelFn | None = None,
+        control_backfill_channel: ControlBackfillChannelFn | None = None,
         control_rerender_channel: ControlRerenderChannelFn | None = None,
     ) -> None:
         super().__init__()
@@ -576,6 +588,11 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         self._control_state = control_state
         self._control_refresh_workspace = control_refresh_workspace
         self._control_refresh_channel = control_refresh_channel
+        self._control_blocked_channels_read = control_blocked_channels_read
+        self._control_blocked_channels_list = control_blocked_channels_list
+        self._control_block_channel = control_block_channel
+        self._control_unblock_channel = control_unblock_channel
+        self._control_backfill_channel = control_backfill_channel
         self._control_rerender_channel = control_rerender_channel
         self._control_write_buffers: dict[int, _ControlWrite] = {}
         self._control_write_lock = threading.Lock()
@@ -847,12 +864,23 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         name = parts[1]
         if name == CONTROL_STATUS:
             return _make_file_attr(inode, len(self._control_status_bytes()), mode=stat.S_IFREG | 0o444)
+        if name == CONTROL_BLOCKED_CHANNELS:
+            return _make_file_attr(
+                inode,
+                len(self._control_blocked_channels_bytes()),
+                mode=stat.S_IFREG | 0o644,
+            )
         if name in CONTROL_WRITABLE:
             return _make_file_attr(inode, 0, mode=stat.S_IFREG | 0o644)
         return None
 
     def _control_status_bytes(self) -> bytes:
         return self._control_state.render() if self._control_state is not None else b""
+
+    def _control_blocked_channels_bytes(self) -> bytes:
+        if self._control_blocked_channels_read is None:
+            return b'{"error":"server_unavailable"}\n'
+        return self._control_blocked_channels_read()
 
     def _control_read_bytes(self, path: str) -> bytes | None:
         """Read-side bytes for a ``_control/<name>`` file, or ``None``."""
@@ -862,6 +890,8 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         name = parts[1]
         if name == CONTROL_STATUS:
             return self._control_status_bytes()
+        if name == CONTROL_BLOCKED_CHANNELS:
+            return self._control_blocked_channels_bytes()
         if name in CONTROL_WRITABLE:
             return b""
         return None
@@ -918,17 +948,44 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             result = await self._control_action_or_unavailable(self._do_workspace_refresh)
             self._control_state.record_workspace(result.result)
         elif name == CONTROL_REFRESH_CHANNEL:
-            token = data.decode("utf-8", errors="replace").strip()
-            if not token:
-                return
-            result = await self._control_action_or_unavailable(lambda: self._do_channel_refresh(token))
-            self._control_state.record_channel(result.channel or token, result.result)
+            await self._fire_refresh_channel(data)
+        elif name == CONTROL_BLOCKED_CHANNELS:
+            await self._fire_block_toggle(data)
+        elif name == CONTROL_BACKFILL_CHANNEL:
+            await self._fire_backfill(data)
         elif name == CONTROL_RERENDER_CHANNEL:
             token = data.decode("utf-8", errors="replace").strip()
             if not token:
                 return
             result = await self._fire_rerender(token)
             self._control_state.record_rerender(result.channel or token, result.result)
+
+    async def _fire_refresh_channel(self, data: bytes) -> None:
+        assert self._control_state is not None
+        token = data.decode("utf-8", errors="replace").strip()
+        if not token:
+            return
+        result = await self._control_action_or_unavailable(lambda: self._do_channel_refresh(token))
+        self._control_state.record_channel(result.channel or token, result.result)
+
+    async def _fire_block_toggle(self, data: bytes) -> None:
+        assert self._control_state is not None
+        token, reason = self._parse_control_channel_reason(data)
+        if not token:
+            return
+        result = await self._control_action_or_unavailable(lambda: self._do_block_toggle(token, reason))
+        if result.result == "unblocked":
+            self._control_state.record_unblock(result.channel or token, result.result)
+        else:
+            self._control_state.record_block(result.channel or token, result.result)
+
+    async def _fire_backfill(self, data: bytes) -> None:
+        assert self._control_state is not None
+        token = data.decode("utf-8", errors="replace").strip()
+        if not token:
+            return
+        result = await self._control_action_or_unavailable(lambda: self._do_backfill(token))
+        self._control_state.record_backfill(result.channel or token, result.result)
 
     async def _control_action_or_unavailable(self, fn: Callable[[], _ControlResult]) -> _ControlResult:
         try:
@@ -948,6 +1005,39 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         if self._control_refresh_channel is None:
             return _ControlResult(result="server_unavailable", channel=channel_id)
         return _ControlResult(result=result_for_status(self._control_refresh_channel(channel_id)), channel=channel_id)
+
+    def _do_block_toggle(self, token: str, reason: str | None) -> _ControlResult:
+        channel_id = self._resolve_control_channel_or_literal_id(token)
+        if channel_id is None:
+            return _ControlResult(result="unknown_channel", channel=token)
+        if (
+            self._control_blocked_channels_list is None
+            or self._control_block_channel is None
+            or self._control_unblock_channel is None
+        ):
+            return _ControlResult(result="server_unavailable", channel=channel_id)
+        blocked = self._control_blocked_channels_list()
+        if channel_id in blocked:
+            code = self._control_unblock_channel(channel_id)
+            return _ControlResult(
+                result="unblocked" if code == 200 else result_for_status(code),
+                channel=channel_id,
+            )
+        code = self._control_block_channel(channel_id, reason)
+        return _ControlResult(result="blocked" if code == 200 else result_for_status(code), channel=channel_id)
+
+    def _do_backfill(self, token: str) -> _ControlResult:
+        channel_id = self._resolve_control_channel_or_literal_id(token)
+        if channel_id is None:
+            return _ControlResult(result="unknown_channel", channel=token)
+        if self._control_backfill_channel is None:
+            return _ControlResult(result="server_unavailable", channel=channel_id)
+        code, message = self._control_backfill_channel(channel_id)
+        if code == 202:
+            return _ControlResult(result="queued", channel=channel_id)
+        if code == 409 and message == "blocked":
+            return _ControlResult(result="blocked", channel=channel_id)
+        return _ControlResult(result=result_for_status(code), channel=channel_id)
 
     async def _fire_rerender(self, token: str) -> _ControlResult:
         """Resolve a rerender token and hand it to the background consumer.
@@ -989,6 +1079,23 @@ class SlackFuseOpsV2(pyfuse3.Operations):
                 return row.channel_id
         return None
 
+    def _resolve_control_channel_or_literal_id(self, token: str) -> str | None:
+        resolved = self._resolve_control_channel(token)
+        if resolved is not None:
+            return resolved
+        clean = token.strip()
+        if len(clean) >= 2 and clean[0] in {"C", "D", "G"} and clean.isalnum():
+            return clean
+        return None
+
+    def _parse_control_channel_reason(self, data: bytes) -> tuple[str, str | None]:
+        text = data.decode("utf-8", errors="replace").strip()
+        if not text:
+            return "", None
+        parts = text.split(None, 1)
+        reason = parts[1].strip() if len(parts) == 2 and parts[1].strip() else None
+        return parts[0], reason
+
     # ------------------------------------------------------------------
     # Path classification and dispatch
     # ------------------------------------------------------------------
@@ -1020,6 +1127,8 @@ class SlackFuseOpsV2(pyfuse3.Operations):
                 return [
                     (CONTROL_REFRESH_CHANNELS, False),
                     (CONTROL_REFRESH_CHANNEL, False),
+                    (CONTROL_BLOCKED_CHANNELS, False),
+                    (CONTROL_BACKFILL_CHANNEL, False),
                     (CONTROL_RERENDER_CHANNEL, False),
                     (CONTROL_STATUS, False),
                 ]
@@ -1584,12 +1693,9 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             set_path(path)
 
             # ``_control/`` reads are pure in-memory (status JSON / empty ctl
-            # files) — no DB, no worker thread, no kernel priming.
+            # files) or short HTTP fetches (blocked_channels) — no kernel priming.
             if self._control_enabled and parse_path(path)[:1] == [CONTROL_DIR]:
-                data = self._control_read_bytes(path)
-                if data is None:
-                    raise pyfuse3.FUSEError(errno.EIO)
-                return data[off : off + size]
+                return await self._read_control_file(path, off, size)
 
             def _sync() -> tuple[bytes, bool, bool, TrailerDecision, str] | None:
                 resolved = self._resolve_decision(path)
@@ -1642,6 +1748,16 @@ class SlackFuseOpsV2(pyfuse3.Operations):
                 self._track_primed(fh)
 
             return content[off : off + size]
+
+    async def _read_control_file(self, path: str, off: int, size: int) -> bytes:
+        parts = parse_path(path)
+        if len(parts) == 2 and parts[1] == CONTROL_BLOCKED_CHANNELS:
+            data = await self._run_sync(lambda: self._control_read_bytes(path))
+        else:
+            data = self._control_read_bytes(path)
+        if data is None:
+            raise pyfuse3.FUSEError(errno.EIO)
+        return data[off : off + size]
 
     def _record_trailer_decision(self, decision: TrailerDecision, inode: int) -> None:
         """Append one trailer decision to the JSONL log, if logging is enabled.

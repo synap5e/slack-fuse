@@ -120,6 +120,15 @@ CREATE TABLE backfill_overrides (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Mutable operator policy. These rows are NOT Slack facts and do not belong in
+-- `events`; they are the current operator-maintained block list used by
+-- refresh/backfill/clients.
+CREATE TABLE blocked_channels (
+    channel_id TEXT PRIMARY KEY,
+    blocked_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    reason TEXT
+);
+
 -- Offset-assignment pattern (RFC §Schemas → Offset assignment pattern).
 -- Concurrent writers to the same stream serialize via the stream_heads row
 -- lock; writers to different streams are independent. Canonical write TX:

@@ -126,3 +126,28 @@ def test_refresh_is_idempotent_when_payload_unchanged(
     events = _channel_list_events(server_conn)
     refreshed = [(k, p) for k, p in events if k == "channel_info_refreshed"]
     assert refreshed == []
+
+
+def test_refresh_skips_blocked_channels(
+    server_conn: psycopg.Connection[TupleRow],
+    fake_slack_http: httpx.Client,
+) -> None:
+    fixture_channel = _conversations_info_fixture()
+    channel_id = str(fixture_channel["id"])
+    _seed_channel_added(
+        server_conn,
+        payload={
+            "id": channel_id,
+            "name": str(fixture_channel.get("name", "")),
+            "is_member": True,
+        },
+    )
+    with server_conn.cursor() as cur:
+        cur.execute("INSERT INTO blocked_channels (channel_id) VALUES (%s)", (channel_id,))
+
+    writer = OffsetWriter(server_conn, trio.CapacityLimiter(1))
+    client = _fake_client(fake_slack_http)
+    trio.run(refresh_channels_once, writer, client)
+
+    events = _channel_list_events(server_conn)
+    assert [kind for kind, _payload in events] == ["channel_added"]

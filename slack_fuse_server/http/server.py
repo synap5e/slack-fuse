@@ -19,13 +19,18 @@ from slack_fuse_server.http.dto import (
     ResolveRequest,
 )
 from slack_fuse_server.http.handlers import (
+    BackfillDeps,
+    BlockedChannelsDeps,
     GapsDeps,
     OriginalsDeps,
     RefreshDeps,
     ResolvePermalinkDeps,
     SnapshotDeps,
+    handle_backfill_channel,
+    handle_block_channel,
     handle_channel_gaps,
     handle_health,
+    handle_list_blocked_channels,
     handle_metrics,
     handle_originals,
     handle_permalink,
@@ -33,6 +38,7 @@ from slack_fuse_server.http.handlers import (
     handle_refresh_channels,
     handle_resolve,
     handle_snapshot,
+    handle_unblock_channel,
     handle_workspace_gaps,
 )
 from slack_fuse_server.http.metrics import MetricsSource
@@ -64,6 +70,11 @@ class HttpRequest:
         return path
 
 
+class BlockChannelRequest(BaseModel):
+    channel_id: str
+    reason: str | None = None
+
+
 def parse_listen_addr(listen_addr: str) -> tuple[str, int]:
     """Parse `host:port` or `[ipv6]:port` listen addresses."""
     if listen_addr.startswith("["):
@@ -92,6 +103,8 @@ def route_request(  # noqa: C901, PLR0913 - endpoint routing dispatch hub.
     originals_deps: OriginalsDeps | None = None,
     gaps_deps: GapsDeps | None = None,
     refresh_deps: RefreshDeps | None = None,
+    blocked_channels_deps: BlockedChannelsDeps | None = None,
+    backfill_deps: BackfillDeps | None = None,
 ) -> HttpResponse:
     """Pure routing table for supported HTTP endpoints."""
     if request.path == "/health":
@@ -160,6 +173,31 @@ def route_request(  # noqa: C901, PLR0913 - endpoint routing dispatch hub.
         body = json.dumps({"status": message}, separators=(",", ":")).encode("utf-8")
         return HttpResponse(status_code=status_code, body=body)
 
+    if request.path == "/blocked-channels":
+        if request.method == "GET":
+            if blocked_channels_deps is None:
+                return _error_response(status_code=503, code="service_unavailable")
+            status_code, payload = handle_list_blocked_channels(
+                request.headers, deps=blocked_channels_deps
+            )
+            return _json_response(status_code=status_code, payload=payload)
+        if request.method == "POST":
+            if blocked_channels_deps is None:
+                return _error_response(status_code=503, code="service_unavailable")
+            return _handle_blocked_channels_post(request, blocked_channels_deps)
+        return _error_response(status_code=405, code="method_not_allowed")
+
+    blocked_channel_delete = _blocked_channel_from_path(request.path)
+    if blocked_channel_delete is not None:
+        if request.method != "DELETE":
+            return _error_response(status_code=405, code="method_not_allowed")
+        if blocked_channels_deps is None:
+            return _error_response(status_code=503, code="service_unavailable")
+        status_code, payload = handle_unblock_channel(
+            blocked_channel_delete, request.headers, deps=blocked_channels_deps
+        )
+        return _json_response(status_code=status_code, payload=payload)
+
     refresh_channel_id = _refresh_channel_from_path(request.path)
     if refresh_channel_id is not None:
         if request.method != "POST":
@@ -168,6 +206,18 @@ def route_request(  # noqa: C901, PLR0913 - endpoint routing dispatch hub.
             return _error_response(status_code=503, code="service_unavailable")
         status_code, message = handle_refresh_channel(
             refresh_channel_id, request.headers, deps=refresh_deps
+        )
+        body = json.dumps({"status": message}, separators=(",", ":")).encode("utf-8")
+        return HttpResponse(status_code=status_code, body=body)
+
+    backfill_channel_id = _backfill_channel_from_path(request.path)
+    if backfill_channel_id is not None:
+        if request.method != "POST":
+            return _error_response(status_code=405, code="method_not_allowed")
+        if backfill_deps is None:
+            return _error_response(status_code=503, code="service_unavailable")
+        status_code, message = handle_backfill_channel(
+            backfill_channel_id, request.headers, deps=backfill_deps
         )
         body = json.dumps({"status": message}, separators=(",", ":")).encode("utf-8")
         return HttpResponse(status_code=status_code, body=body)
@@ -193,6 +243,8 @@ async def serve_http(  # noqa: PLR0913 - HTTP wiring needs explicit deps.
     originals_deps: OriginalsDeps | None = None,
     gaps_deps: GapsDeps | None = None,
     refresh_deps: RefreshDeps | None = None,
+    blocked_channels_deps: BlockedChannelsDeps | None = None,
+    backfill_deps: BackfillDeps | None = None,
 ) -> None:
     """Serve HTTP endpoints on the given host/port."""
     handler = partial(
@@ -203,6 +255,8 @@ async def serve_http(  # noqa: PLR0913 - HTTP wiring needs explicit deps.
         originals_deps=originals_deps,
         gaps_deps=gaps_deps,
         refresh_deps=refresh_deps,
+        blocked_channels_deps=blocked_channels_deps,
+        backfill_deps=backfill_deps,
     )
     await trio.serve_tcp(handler, port=port, host=host)
 
@@ -215,6 +269,8 @@ async def serve_http_on_listeners(  # noqa: PLR0913, PLR0917 - HTTP wiring needs
     originals_deps: OriginalsDeps | None = None,
     gaps_deps: GapsDeps | None = None,
     refresh_deps: RefreshDeps | None = None,
+    blocked_channels_deps: BlockedChannelsDeps | None = None,
+    backfill_deps: BackfillDeps | None = None,
 ) -> None:
     """Serve on already-open listeners (useful for tests and shared-port setups)."""
     handler = partial(
@@ -225,6 +281,8 @@ async def serve_http_on_listeners(  # noqa: PLR0913, PLR0917 - HTTP wiring needs
         originals_deps=originals_deps,
         gaps_deps=gaps_deps,
         refresh_deps=refresh_deps,
+        blocked_channels_deps=blocked_channels_deps,
+        backfill_deps=backfill_deps,
     )
     await trio.serve_listeners(handler, listeners)
 
@@ -238,6 +296,8 @@ async def serve_http_from_listen_addr(  # noqa: PLR0913 - HTTP wiring needs expl
     originals_deps: OriginalsDeps | None = None,
     gaps_deps: GapsDeps | None = None,
     refresh_deps: RefreshDeps | None = None,
+    blocked_channels_deps: BlockedChannelsDeps | None = None,
+    backfill_deps: BackfillDeps | None = None,
 ) -> None:
     """Serve HTTP endpoints using an RFC-style `listen_addr` string."""
     host, port = parse_listen_addr(listen_addr)
@@ -250,6 +310,8 @@ async def serve_http_from_listen_addr(  # noqa: PLR0913 - HTTP wiring needs expl
         originals_deps=originals_deps,
         gaps_deps=gaps_deps,
         refresh_deps=refresh_deps,
+        blocked_channels_deps=blocked_channels_deps,
+        backfill_deps=backfill_deps,
     )
 
 
@@ -262,6 +324,8 @@ async def serve_http_connection(  # noqa: PLR0913 - HTTP wiring needs explicit d
     originals_deps: OriginalsDeps | None = None,
     gaps_deps: GapsDeps | None = None,
     refresh_deps: RefreshDeps | None = None,
+    blocked_channels_deps: BlockedChannelsDeps | None = None,
+    backfill_deps: BackfillDeps | None = None,
 ) -> None:
     """Serve a single already-accepted connection as HTTP.
 
@@ -277,6 +341,8 @@ async def serve_http_connection(  # noqa: PLR0913 - HTTP wiring needs explicit d
         originals_deps=originals_deps,
         gaps_deps=gaps_deps,
         refresh_deps=refresh_deps,
+        blocked_channels_deps=blocked_channels_deps,
+        backfill_deps=backfill_deps,
     )
 
 
@@ -289,6 +355,8 @@ async def _serve_connection(  # noqa: PLR0913 - HTTP wiring needs explicit deps.
     originals_deps: OriginalsDeps | None = None,
     gaps_deps: GapsDeps | None = None,
     refresh_deps: RefreshDeps | None = None,
+    blocked_channels_deps: BlockedChannelsDeps | None = None,
+    backfill_deps: BackfillDeps | None = None,
 ) -> None:
     conn = h11.Connection(h11.SERVER)
     try:
@@ -303,6 +371,8 @@ async def _serve_connection(  # noqa: PLR0913 - HTTP wiring needs explicit deps.
             originals_deps=originals_deps,
             gaps_deps=gaps_deps,
             refresh_deps=refresh_deps,
+            blocked_channels_deps=blocked_channels_deps,
+            backfill_deps=backfill_deps,
         )
         await _send_response(conn, stream, response)
     except h11.RemoteProtocolError:
@@ -361,6 +431,13 @@ def _dto_response(*, status_code: int, payload: BaseModel) -> HttpResponse:
     return HttpResponse(status_code=status_code, body=payload.model_dump_json().encode("utf-8"))
 
 
+def _json_response(*, status_code: int, payload: dict[str, object]) -> HttpResponse:
+    return HttpResponse(
+        status_code=status_code,
+        body=json.dumps(payload, separators=(",", ":"), default=str).encode("utf-8"),
+    )
+
+
 def _error_response(*, status_code: int, code: str) -> HttpResponse:
     body = json.dumps({"error": code}, separators=(",", ":")).encode("utf-8")
     return HttpResponse(status_code=status_code, body=body)
@@ -398,6 +475,22 @@ def _handle_permalink(request: HttpRequest, deps: ResolvePermalinkDeps) -> HttpR
     except SlackAPIError:
         return _error_response(status_code=502, code="slack_api_error")
     return _dto_response(status_code=200, payload=response)
+
+
+def _handle_blocked_channels_post(request: HttpRequest, deps: BlockedChannelsDeps) -> HttpResponse:
+    try:
+        payload = BlockChannelRequest.model_validate_json(request.body)
+    except ValidationError:
+        return _error_response(status_code=400, code="bad_request")
+    if not payload.channel_id.strip():
+        return _error_response(status_code=400, code="bad_request")
+    status_code, response = handle_block_channel(
+        payload.channel_id.strip(),
+        payload.reason,
+        request.headers,
+        deps=deps,
+    )
+    return _json_response(status_code=status_code, payload=response)
 
 
 def _handle_snapshot(stream: str, *, at: int, since: int | None, deps: SnapshotDeps) -> HttpResponse:
@@ -513,6 +606,26 @@ def _refresh_channel_from_path(path: str) -> str | None:
     the path doesn't match."""
     parts = path.split("/")
     if len(parts) != 3 or parts[1] != "refresh-channels":
+        return None
+    encoded = parts[2]
+    if not encoded:
+        return None
+    return unquote(encoded) or None
+
+
+def _blocked_channel_from_path(path: str) -> str | None:
+    parts = path.split("/")
+    if len(parts) != 3 or parts[1] != "blocked-channels":
+        return None
+    encoded = parts[2]
+    if not encoded:
+        return None
+    return unquote(encoded) or None
+
+
+def _backfill_channel_from_path(path: str) -> str | None:
+    parts = path.split("/")
+    if len(parts) != 3 or parts[1] != "backfill-channel":
         return None
     encoded = parts[2]
     if not encoded:

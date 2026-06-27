@@ -6,6 +6,15 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
+import psycopg
+
+from slack_fuse_server.blocked_channels import (
+    block_channel,
+    get_blocked_channel,
+    is_channel_blocked,
+    list_blocked_channels,
+    unblock_channel,
+)
 from slack_fuse_server.http.dto import (
     HealthResponse,
     MetricsResponse,
@@ -100,6 +109,33 @@ class RefreshDeps:
 
     shared_secret: str | None
     trigger: RefreshTrigger
+    database_url: str | None = None
+
+
+class BackfillTrigger(Protocol):
+    """``POST /backfill-channel/{channel_id}`` hands a manual backfill to
+    the long-lived slurper process and returns immediately."""
+
+    def request_channel(self, channel_id: str) -> bool:
+        """Queue a manual backfill. False means one is already in progress."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class BlockedChannelsDeps:
+    """Dependencies for the mutable channel-block policy endpoints."""
+
+    shared_secret: str | None
+    database_url: str
+
+
+@dataclass(frozen=True, slots=True)
+class BackfillDeps:
+    """Dependencies for ``POST /backfill-channel/{channel_id}``."""
+
+    shared_secret: str | None
+    database_url: str
+    trigger: BackfillTrigger
 
 
 def handle_health() -> HealthResponse:
@@ -202,9 +238,66 @@ def handle_refresh_channel(
     """
     if not is_http_authorized(headers, deps.shared_secret):
         return 401, "unauthorized"
+    if deps.database_url is not None:
+        with psycopg.connect(deps.database_url, autocommit=True) as conn:
+            if is_channel_blocked(conn, channel_id):
+                return 409, "channel blocked"
     if deps.trigger.request_channel(channel_id):
         return 202, f"refresh queued for {channel_id}"
     return 409, "refresh already in progress"
+
+
+def handle_list_blocked_channels(
+    headers: Sequence[tuple[bytes, bytes]],
+    *,
+    deps: BlockedChannelsDeps,
+) -> tuple[int, dict[str, object]]:
+    if not is_http_authorized(headers, deps.shared_secret):
+        return 401, {"error": "unauthorized"}
+    with psycopg.connect(deps.database_url, autocommit=True) as conn:
+        return 200, {"blocked": list_blocked_channels(conn)}
+
+
+def handle_block_channel(
+    channel_id: str,
+    reason: str | None,
+    headers: Sequence[tuple[bytes, bytes]],
+    *,
+    deps: BlockedChannelsDeps,
+) -> tuple[int, dict[str, object]]:
+    if not is_http_authorized(headers, deps.shared_secret):
+        return 401, {"error": "unauthorized"}
+    with psycopg.connect(deps.database_url, autocommit=True) as conn:
+        return 200, dict(block_channel(conn, channel_id, reason=reason))
+
+
+def handle_unblock_channel(
+    channel_id: str,
+    headers: Sequence[tuple[bytes, bytes]],
+    *,
+    deps: BlockedChannelsDeps,
+) -> tuple[int, dict[str, object]]:
+    if not is_http_authorized(headers, deps.shared_secret):
+        return 401, {"error": "unauthorized"}
+    with psycopg.connect(deps.database_url, autocommit=True) as conn:
+        unblock_channel(conn, channel_id)
+    return 200, {"status": "unblocked", "channel_id": channel_id}
+
+
+def handle_backfill_channel(
+    channel_id: str,
+    headers: Sequence[tuple[bytes, bytes]],
+    *,
+    deps: BackfillDeps,
+) -> tuple[int, str]:
+    if not is_http_authorized(headers, deps.shared_secret):
+        return 401, "unauthorized"
+    with psycopg.connect(deps.database_url, autocommit=True) as conn:
+        if get_blocked_channel(conn, channel_id) is not None:
+            return 409, "blocked"
+    if deps.trigger.request_channel(channel_id):
+        return 202, f"backfill queued for {channel_id}"
+    return 409, "backfill already in progress"
 
 
 # === auth helper (shared with WS) ===

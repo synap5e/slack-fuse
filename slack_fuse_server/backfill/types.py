@@ -29,6 +29,7 @@ class BackfillAbortReason(StrEnum):
     """Why a per-channel backfill stopped early (drives `backfill_aborted`)."""
 
     EXCEEDED_DEFAULT_LIMIT = "exceeded_default_limit"
+    OPERATOR_BLOCKED = "operator_blocked"
 
 
 @dataclass(frozen=True, slots=True)

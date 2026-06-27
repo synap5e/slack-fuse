@@ -61,6 +61,9 @@ class ClientConfig(BaseSettings):
     # operator's responsibility (logrotate / cron) — the writer only appends.
     trailer_log_path: Path | None = None
 
+    # Server blocked_channels SSOT sync interval.
+    block_sync_interval_s: float = 30.0
+
     # Channel IDs the operator never wants surfaced in split mode. The projector
     # forces ``tier='blocked'``, ``tier_source='manual'``, ``subscribed=FALSE``
     # on every ``channel_added`` (and re-evaluation) for any id in this list,
@@ -69,8 +72,9 @@ class ClientConfig(BaseSettings):
     # for a config-blocked channel re-blocks it. To un-block, remove the id
     # from this list and restart the mount.
     #
-    # Use this for "planned ignore" lists that should survive DB resets,
-    # populate re-runs, and backfill discoveries.
+    # DEPRECATED 2026-06-27: use the server-side blocked_channels table via
+    # POST /blocked-channels. Split-mode startup still migrates this legacy list
+    # idempotently for one release cycle.
     always_blocked_channel_ids: list[str] = []
 
     @classmethod

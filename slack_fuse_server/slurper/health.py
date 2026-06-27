@@ -42,7 +42,7 @@ class HealthKind(StrEnum):
     state, because one channel hitting a backfill size cap is not a workspace
     ingestion-health concern):
     ``BACKFILL_STARTED``, ``BACKFILL_PROGRESS``, ``BACKFILL_COMPLETED``,
-    ``BACKFILL_ABORTED``, ``BACKFILL_WARN_LARGE``.
+    ``BACKFILL_ABORTED``, ``BACKFILL_SKIPPED``, ``BACKFILL_WARN_LARGE``.
     """
 
     SLACK_HEALTHY = "slack_healthy"
@@ -54,6 +54,7 @@ class HealthKind(StrEnum):
     BACKFILL_PROGRESS = "backfill_progress"
     BACKFILL_COMPLETED = "backfill_completed"
     BACKFILL_ABORTED = "backfill_aborted"
+    BACKFILL_SKIPPED = "backfill_skipped"
     BACKFILL_WARN_LARGE = "backfill_warn_large"
 
 

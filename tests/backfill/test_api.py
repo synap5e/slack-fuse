@@ -21,6 +21,7 @@ from slack_fuse.models import Message
 from slack_fuse_render import ChannelId
 from slack_fuse_server._json import JsonObject
 from slack_fuse_server.backfill.api import BackfillContext, SlackApiBackfiller, SleepBounds, backfill_channel
+from slack_fuse_server.backfill.types import BackfillAbortReason
 from slack_fuse_server.slurper.api import SlackClient, Validated
 from slack_fuse_server.slurper.health import HealthEmitter
 from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter, write_event
@@ -83,6 +84,23 @@ def test_thread_reply_raw_is_lossless_not_model_dump(fake_slack_http: httpx.Clie
     # Model fields still round-trip correctly.
     assert reply.model.user == "U0001"
     assert reply.model.text == "You're most welcome."
+
+
+def test_channels_to_backfill_skips_blocked_ids(fake_slack_http: httpx.Client) -> None:
+    backfiller = SlackApiBackfiller(
+        _fake_client(fake_slack_http),
+        trio.CapacityLimiter(1),
+        _NO_SLEEP,
+        blocked_channel_ids=lambda: {"C0001"},
+    )
+
+    async def collect() -> list[str]:
+        out: list[str] = []
+        async for channel_id in backfiller.channels_to_backfill():
+            out.append(channel_id.value)
+        return out
+
+    assert trio.run(collect) == ["D0001"]
 
 
 def test_get_replies_preserves_attachments_lossless() -> None:
@@ -261,6 +279,22 @@ def test_backfill_channel_aborts_at_threshold(server_conn: psycopg.Connection[Tu
     # one channel hitting its size cap is observability, not a global
     # ingestion-health signal; see BACKLOG entry on health hysteresis).
     assert _health_kinds(server_conn) == ["backfill_started", "backfill_warn_large", "backfill_aborted"]
+
+
+def test_backfill_channel_skips_blocked_channel(server_conn: psycopg.Connection[TupleRow]) -> None:
+    with server_conn.cursor() as cur:
+        cur.execute("INSERT INTO blocked_channels (channel_id, reason) VALUES ('CBLOCK', 'noisy')")
+    writer = OffsetWriter(server_conn, trio.CapacityLimiter(1))
+    health = HealthEmitter(writer)
+    ctx = BackfillContext(writer=writer, health=health, warn_at=1000, abort_at=20000)
+
+    result = trio.run(backfill_channel, _StubBackfiller(5), ChannelId("CBLOCK"), ctx)
+
+    assert result.aborted is True
+    assert result.abort_reason == BackfillAbortReason.OPERATOR_BLOCKED
+    assert result.messages == 0
+    assert _events_count(server_conn, "channel:CBLOCK") == 0
+    assert _health_kinds(server_conn) == ["backfill_skipped"]
 
 
 def _health_rows(conn: psycopg.Connection[TupleRow]) -> list[tuple[str, object]]:
