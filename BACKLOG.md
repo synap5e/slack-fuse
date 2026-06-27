@@ -366,3 +366,119 @@ the observed run).
 **Impact**: silent data divergence between cluster and client until the
 operator notices. Worth fixing relatively soon; for now monitoring is
 "is `applied_offset` advancing?"
+
+
+---
+
+### Projector psycopg pool needs pre-ping (recycle dead handles across PG restarts)
+
+**Discovered**: 2026-06-27 during workspace dump-and-reingest, after local
+postgres restarted out-of-band (system reboot, OOM, anything that bounces
+the PG process).
+
+**Symptom**: the daemon's psycopg connection pool kept handing out
+pre-restart connections to every consumer. `block-sync` task logged
+`psycopg.OperationalError: the connection is lost` every 30s for
+several minutes; FUSE callbacks that picked the same pool entry
+returned `EIO`, so `ls` / `dust` hit "Input/output error (os error 5)"
+on a fully-mounted, otherwise healthy daemon. Retrying a read often
+landed on a different (good) pool entry and succeeded — making the
+failure transient + confusing.
+
+**Current behaviour**: pool returns dead handles until each consumer
+hits the lost-connection exception, then surfaces it. No retry or
+handle recycling at the pool layer. The user's FUSE read is what
+notices the dead PG — not the projector framework.
+
+**Workaround**: `systemctl --user restart slack-fuse-split.service`
+flushes the pool and rebuilds connections against current PG.
+Mount becomes clean immediately.
+
+**Fix candidates**:
+1. Enable psycopg's pool pre-ping semantics — issue a cheap `SELECT 1`
+   before handing a pooled connection to a consumer, recycle on
+   failure. Costs an extra round-trip per acquire.
+2. Catch `OperationalError` at every pool consumer and explicitly
+   discard + retry on a fresh connection (per-site, harder to keep
+   complete coverage).
+3. Make pool acquire honor a `validate=True` knob via a
+   `setup`/`reset` hook that pings on lend.
+
+**Recommendation**: option 1 — narrow change, single place, predictable
+overhead. ~20 LoC enhancement in the pool wiring (look at
+`slack_fuse/__main__.py` or wherever the projector pool is constructed).
+Probably worth pairing with a small test using a stub PG that disconnects
+mid-pool.
+
+**Impact**: rare in normal operation (PG doesn't restart often), but the
+failure mode is misleading enough to warrant fixing — the user thought
+the mount was wedging when it was actually a stale-pool symptom.
+
+---
+
+### Workspace channel inventory view (`_workspace/channels.md`)
+
+**Discovered**: 2026-06-27 during the dump-and-reingest while wanting
+a real-time progress denominator. Slack's `search.messages` API exposes
+a per-channel total message count (with `query=in:#<name>`, `count=1`,
+read `messages.total`), giving authoritative size data we don't have
+elsewhere.
+
+**Symptom / motivation**: backfill progress, channel sizing for
+manual-backfill decisions, block-list candidates, workspace overview
+— all rely on knowing "how many messages does this channel have?"
+Currently the only path is ad-hoc SQL + a one-off `search.messages`
+sweep, which:
+
+- requires kubectl exec into the slurper pod
+- has no UI surface
+- has no caching — every check pays Tier 2 rate budget
+- doesn't expose non-joined channels' sizes (which we'd want before
+  deciding whether to manually backfill them)
+
+**Proposed shape**: `_workspace/channels.md` ghost file rendering a
+per-channel inventory table:
+
+| Name | Messages | Ingested | Status | Member | Created |
+
+Status column maps `done` / `in_progress` / `blocked` / `not_started` /
+`not_joined` / `unavailable`. Sorted by total messages desc.
+
+**Server side**:
+- New `channel_message_totals` table (channel_id PK, total BIGINT,
+  refreshed_at TIMESTAMPTZ, refresh_status TEXT)
+- Periodic refresh task (6h cadence) — Tier 2 throttle, 3.5s between
+  calls, ~24 min per cycle for ~418 visible channels
+- HTTP `GET /channel-stats` joining the totals + blocked_channels +
+  latest channel-list payload + live events count
+- CLI `slack-fuse-server refresh-channel-totals` for one-shot
+
+**Client side**:
+- `_workspace/channels.md` ghost file
+- Background-warmed cache (same shape as `_workspace/gaps.md` warmer)
+  so FUSE callbacks never block on server fetch
+- Markdown renderer
+
+**Architectural note**: the search-derived count is a fact about Slack
+but it's *query-derived* (we asked, Slack told us), not pushed via
+the events stream. It belongs in a refreshed table, not an event kind.
+Same shape as `backfill_overrides` and `blocked_channels` — distinct
+from both the events log (immutable upstream facts) and operator-policy
+tables (mutable operator intent).
+
+**Pitfalls** (for the eventual implementor):
+- Search API requires user token, not bot token
+- `is_im` channels can't be queried via `in:#<name>` — handle/skip
+- Slack's total has approximation caveats above ~10K (mark
+  `refresh_status='approximate'`)
+- Don't truncate the totals table on refresh — preserve last-known
+  on error so the view stays useful
+
+**Estimated scope**: ~200-250 LoC + tests. Self-contained handoff;
+prompt already drafted at
+`/home/simon/.agent-handoff/2026-06-27/workspace-channels-view/prompt.md`
+(queued for after the current backfill cycle settles).
+
+**Impact**: changes the operational story from "ad-hoc SQL via kubectl"
+to "cat the file". Reusable for every future "how big is X / how
+complete are we" question.
