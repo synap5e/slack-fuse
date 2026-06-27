@@ -482,3 +482,62 @@ prompt already drafted at
 **Impact**: changes the operational story from "ad-hoc SQL via kubectl"
 to "cat the file". Reusable for every future "how big is X / how
 complete are we" question.
+
+---
+
+### Trailer false-positives "server unreachable" on quiet streams
+
+**Discovered**: 2026-06-27 during dump-and-reingest. User read
+`/views/slack-split/channels/general/channel.md` (top-level metadata
+view); rendered fine in 21ms but appended:
+
+```
+> ⚠ Content may be stale. Last successful sync: never. Reason: server unreachable.
+```
+
+**Symptom**: false positive. The mount + server + WS connection are
+all healthy. `slurper-health` stream had a frame 1 minute ago; the
+projector's cursors are advancing actively across many channels; the
+HTTP server returns 200 in milliseconds.
+
+**Root cause**: `slack_fuse/projector/trailer.py::staleness_reason`
+uses **per-stream** ``last_frame_at`` as the WS-liveness signal:
+
+```python
+if state.last_frame_at is None or (now_real - state.last_frame_at) > timedelta(seconds=stale_after_s):
+    if not caught_up:
+        return "catching up after reconnect"
+    return "server unreachable"
+```
+
+For a stream that's naturally quiet — `channel-list` when no channel
+metadata is drifting, or a per-channel stream that's been backfilled
+and has no live messages — no frames arrive for >5min and the trailer
+fires. The threshold's intent was "WS disconnect", but it conflates
+"no traffic on this stream" with "no connectivity".
+
+**Current behaviour**: every read of a top-level `channel.md` (or any
+read whose freshness derives from `channel-list`) on a stable
+workspace appends a misleading "server unreachable" trailer with
+"Last successful sync: never". Users see the warning and reasonably
+conclude the daemon is broken.
+
+**Fix candidates**:
+1. **Use workspace-wide liveness signal**: track the last frame across
+   ANY stream and use that as the WS-disconnect proxy. `slurper-health`
+   is the natural heartbeat — it emits regularly for various reasons.
+2. **Explicit WS-state tracking**: tie staleness to the actual WS
+   connection state (e.g. `connection_state` table or socket
+   reconnect events) instead of inferring from data flow.
+3. **Per-stream threshold tuning**: bump `stale_after_s` for streams
+   that are known to be quiet (channel-list, users). Brittle.
+
+**Recommendation**: option 1. Cheapest fix, doesn't change the
+overall trailer architecture, and aligns with what `slurper-health`
+was designed for. The current `last_frame_at` parameter shape stays;
+it just gets sourced from a workspace-wide MAX instead of the
+queried stream.
+
+**Impact**: ergonomic — operators see the warning and don't know if
+it's real or noise. Doesn't affect data correctness, but every
+warning the user has to mentally filter erodes trust in the trailer.
