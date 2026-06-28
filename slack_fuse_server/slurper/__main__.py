@@ -62,6 +62,7 @@ from slack_fuse_server.http.handlers import (
 )
 from slack_fuse_server.http.metrics import MetricsAggregator, SubscriberSnapshot
 from slack_fuse_server.slurper.api import ChannelNotFoundError, SlackAPIError, SlackClient
+from slack_fuse_server.slurper.backfill_state import async_find_last_backfill_completion
 from slack_fuse_server.slurper.catchup import (
     CatchupConfig,
     CatchupDeps,
@@ -426,11 +427,21 @@ async def _auto_backfill(
     """Automatic first-bootup pass: backfill every member channel, throttled."""
     await trio.sleep(30)  # let startup settle before hitting the API hard
     backfiller = _make_backfiller("slack-api", client=client, limiter=limiter, config=config, conn=writer.conn)
-    first = True
+    first_backfill = True
     async for channel_id in backfiller.channels_to_backfill():
-        if not first:
+        if config.auto_backfill_skip_if_completed:
+            completion = await async_find_last_backfill_completion(writer, channel_id.value)
+            if completion is not None:
+                log.info(
+                    "auto-backfill: skipping %s — completed at %s, events_written=%d",
+                    channel_id.value,
+                    completion.at.isoformat(),
+                    completion.events_written,
+                )
+                continue
+        if not first_backfill:
             await trio.sleep(_AUTO_BACKFILL_CHANNEL_GAP_S)
-        first = False
+        first_backfill = False
         log.info("auto-backfill: %s", channel_id.value)
         ctx = BackfillContext(
             writer=writer, health=health, warn_at=config.backfill_warn_at, abort_at=config.backfill_abort_at

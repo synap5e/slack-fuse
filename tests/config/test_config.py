@@ -58,6 +58,7 @@ def test_server_config_from_toml(tmp_path: Path) -> None:
     assert abs(cfg.backfill_page_sleep_min_s - 12.5) < 1e-9
     # Untouched keys fall back to RFC defaults.
     assert cfg.backfill_warn_at == 5000
+    assert cfg.auto_backfill_skip_if_completed is True
     assert cfg.snapshot_max_age_hours == 24
 
 
