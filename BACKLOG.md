@@ -363,19 +363,20 @@ A **probe event** is a third shape: slurper-initiated, periodic,
 captures authoritative Slack API state regardless of drift, immutable
 in the events log. The latest probe wins; older ones are history.
 
-Candidate probes to evaluate together rather than one-at-a-time:
+Candidate probes — picked specifically because Slack EITHER lacks a
+push event for them OR we don't subscribe today. (Thread replies are
+covered by existing `message.*` subscriptions regardless of the
+parent's age, so they don't fit this pattern.)
 
 1. **`channel_message_count_probed`** — the asked-for one. Backfill %
    visibility. Tier 2.
-2. **`thread_reply_count_probed`** — covers a real coverage gap. Old
-   thread parents don't get new replies absent socket-mode events (and
-   replies on threads in non-member channels never surface). Tier 3.
-3. **`channel_pin_count_probed`** — pinned messages are anchors of
-   context. Today we don't capture pin state at all.
-4. **`workspace_emoji_probed`** — `emoji.list` for custom emoji.
-   Useful for rendering markdown output. Cheap.
-5. **`channel_bookmark_probed`** — some teams use bookmarks as canvas
-   pointers.
+2. **`channel_pin_count_probed`** — `pin_added`/`pin_removed` socket
+   events exist but we don't subscribe. `pins.list` is cheap.
+3. **`workspace_emoji_probed`** — `emoji.list` for custom emoji.
+   `emoji_changed` socket event exists but we don't subscribe.
+   Useful for rendering markdown output.
+4. **`channel_bookmark_probed`** — no socket event exists. Some teams
+   use bookmarks as canvas pointers.
 
 Design points to settle BEFORE writing any of them:
 
