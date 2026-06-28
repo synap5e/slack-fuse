@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 import random
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import cast
 
@@ -32,6 +32,7 @@ from slack_fuse_server.backfill.types import BackfillAbortReason, Backfiller, Ba
 from slack_fuse_server.blocked_channels import is_channel_blocked
 from slack_fuse_server.slurper.api import FatalAPIError, RateLimitedError, SlackClient, Validated
 from slack_fuse_server.slurper.health import HealthEmitter, HealthKind
+from slack_fuse_server.slurper.limiters import SlurperLimiters
 from slack_fuse_server.slurper.offsets import PG_TIMEOUT_EXCEPTIONS, EventRecord, OffsetWriter
 
 log = logging.getLogger(__name__)
@@ -86,6 +87,7 @@ class BackfillContext:
 
     writer: OffsetWriter
     health: HealthEmitter
+    limiters: SlurperLimiters
     warn_at: int
     abort_at: int | None
     progress_every: int = _DEFAULT_PROGRESS_EVERY
@@ -114,7 +116,7 @@ class SlackApiBackfiller:
         client: SlackClient,
         limiter: trio.CapacityLimiter,
         sleeps: SleepBounds | None = None,
-        blocked_channel_ids: Callable[[], set[str]] | None = None,
+        blocked_channel_ids: Callable[[], Awaitable[set[str]]] | None = None,
     ) -> None:
         self._client = client
         self._limiter = limiter
@@ -128,11 +130,7 @@ class SlackApiBackfiller:
     async def channels_to_backfill(self) -> AsyncIterator[ChannelId]:
         """Yield every member channel (non-archived) the user can see."""
         blocked: set[str]
-        blocked = (
-            await trio.to_thread.run_sync(self._blocked_channel_ids, limiter=self._limiter)
-            if self._blocked_channel_ids is not None
-            else set()
-        )
+        blocked = await self._blocked_channel_ids() if self._blocked_channel_ids is not None else set()
         channels = await trio.to_thread.run_sync(self._client.list_conversations, limiter=self._limiter)
         for validated in channels:
             channel = validated.model
@@ -290,7 +288,7 @@ async def backfill_channel(
     """
     cid = channel_id.value
     stream = f"channel:{cid}"
-    if await trio.to_thread.run_sync(lambda: is_channel_blocked(ctx.writer.conn, cid), limiter=ctx.writer.limiter):
+    if await ctx.writer.run_read(lambda conn: is_channel_blocked(conn, cid), limiter=ctx.limiters.admin_read):
         await ctx.health.emit(
             HealthKind.BACKFILL_SKIPPED,
             {"channel_id": cid, "reason": str(BackfillAbortReason.OPERATOR_BLOCKED)},

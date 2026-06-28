@@ -22,9 +22,10 @@ import trio
 
 from slack_fuse_server._json import JsonObject
 from slack_fuse_server.slurper.api import SlackClient
-from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter, write_event
+from slack_fuse_server.slurper.offsets import EventRecord, write_event
 from slack_fuse_server.slurper.refresh import refresh_channels_once
 from tests._fake_slack import load_fixtures
+from tests.conftest import make_test_limiters, make_test_writer
 
 if TYPE_CHECKING:
     import psycopg
@@ -42,18 +43,15 @@ def _seed_channel_added(
     *,
     payload: JsonObject,
 ) -> None:
-    writer = OffsetWriter(conn, trio.CapacityLimiter(1))
     record = EventRecord(stream="channel-list", kind="channel_added", ts=None, payload=payload)
-    write_event(writer.conn, record)
+    write_event(conn, record)
 
 
 def _channel_list_events(
     conn: psycopg.Connection[TupleRow],
 ) -> list[tuple[str, dict[str, object]]]:
     with conn.cursor() as cur:
-        cur.execute(
-            "SELECT kind, payload FROM events WHERE stream='channel-list' ORDER BY offset_in_stream"
-        )
+        cur.execute("SELECT kind, payload FROM events WHERE stream='channel-list' ORDER BY offset_in_stream")
         return [(str(r[0]), cast("dict[str, object]", r[1])) for r in cur.fetchall()]
 
 
@@ -91,9 +89,9 @@ def test_refresh_emits_channel_info_refreshed_when_legacy_payload_differs(
     }
     _seed_channel_added(server_conn, payload=lossy)
 
-    writer = OffsetWriter(server_conn, trio.CapacityLimiter(1))
+    writer = make_test_writer(server_conn)
     client = _fake_client(fake_slack_http)
-    trio.run(refresh_channels_once, writer, client)
+    trio.run(refresh_channels_once, writer, client, make_test_limiters())
 
     events = _channel_list_events(server_conn)
     refreshed = [(k, p) for k, p in events if k == "channel_info_refreshed"]
@@ -113,15 +111,15 @@ def test_refresh_is_idempotent_when_payload_unchanged(
     """Steady-state case: if the most recent payload already matches the
     fresh fetch, no new event is emitted. Two consecutive cycles produce
     one event total (the first), not two."""
-    writer = OffsetWriter(server_conn, trio.CapacityLimiter(1))
+    writer = make_test_writer(server_conn)
     client = _fake_client(fake_slack_http)
     # Seed the events table with the EXACT raw payload Slack will return,
     # so the first refresh sees no diff.
     fixture_channel = _conversations_info_fixture()
     _seed_channel_added(server_conn, payload=fixture_channel)
 
-    trio.run(refresh_channels_once, writer, client)
-    trio.run(refresh_channels_once, writer, client)
+    trio.run(refresh_channels_once, writer, client, make_test_limiters())
+    trio.run(refresh_channels_once, writer, client, make_test_limiters())
 
     events = _channel_list_events(server_conn)
     refreshed = [(k, p) for k, p in events if k == "channel_info_refreshed"]
@@ -145,9 +143,9 @@ def test_refresh_skips_blocked_channels(
     with server_conn.cursor() as cur:
         cur.execute("INSERT INTO blocked_channels (channel_id) VALUES (%s)", (channel_id,))
 
-    writer = OffsetWriter(server_conn, trio.CapacityLimiter(1))
+    writer = make_test_writer(server_conn)
     client = _fake_client(fake_slack_http)
-    trio.run(refresh_channels_once, writer, client)
+    trio.run(refresh_channels_once, writer, client, make_test_limiters())
 
     events = _channel_list_events(server_conn)
     assert [kind for kind, _payload in events] == ["channel_added"]

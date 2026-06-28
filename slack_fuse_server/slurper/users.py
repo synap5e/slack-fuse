@@ -16,7 +16,7 @@ from typing import cast
 
 import httpx
 import trio
-from psycopg import Cursor
+from psycopg import Connection, Cursor
 from psycopg.rows import TupleRow
 from pydantic import ValidationError
 from trio_websocket import ConnectionClosed, WebSocketConnection
@@ -32,6 +32,7 @@ from slack_fuse.models import (
 from slack_fuse_server._json import JsonObject
 from slack_fuse_server.slurper.api import SlackAPIError, SlackClient, Validated
 from slack_fuse_server.slurper.health import HealthEmitter
+from slack_fuse_server.slurper.limiters import SlurperLimiters
 from slack_fuse_server.slurper.offsets import (
     PG_TIMEOUT_EXCEPTIONS,
     EventRecord,
@@ -131,10 +132,12 @@ def _insert_user_added(cur: Cursor[TupleRow], user_raw: JsonObject) -> int:
     return offset
 
 
-def _populate_users_once_sync(writer: OffsetWriter, client: SlackClient) -> tuple[int, int]:
-    users = _fetch_workspace_users(client)
+def _populate_users_once_sync(
+    conn: Connection[TupleRow],
+    users: list[Validated[SlackUser]],
+) -> tuple[int, int]:
     inserted = 0
-    with writer.conn.transaction(), writer.conn.cursor() as cur:
+    with conn.cursor() as cur:
         _lock_users_stream(cur)
         existing = _existing_user_added_ids(cur)
         for validated in users:
@@ -147,14 +150,12 @@ def _populate_users_once_sync(writer: OffsetWriter, client: SlackClient) -> tupl
     return (len(users), inserted)
 
 
-async def populate_users_once(writer: OffsetWriter, client: SlackClient) -> None:
+async def populate_users_once(writer: OffsetWriter, client: SlackClient, limiters: SlurperLimiters) -> None:
     """One-shot startup users.list import (`user_added` events)."""
     try:
-        total, inserted = await trio.to_thread.run_sync(
-            lambda: _populate_users_once_sync(writer, client),
-            limiter=writer.limiter,
-        )
-    except (httpx.HTTPError, SlackAPIError, ValueError):
+        users = await trio.to_thread.run_sync(lambda: _fetch_workspace_users(client), limiter=limiters.slack_api)
+        total, inserted = await writer.run_transaction(lambda conn: _populate_users_once_sync(conn, users))
+    except (*PG_TIMEOUT_EXCEPTIONS, httpx.HTTPError, SlackAPIError, ValueError):
         log.warning("users: startup populate failed", exc_info=True)
         return
     log.info("users: startup populate complete users=%d inserted=%d skipped=%d", total, inserted, total - inserted)
@@ -199,8 +200,11 @@ def _load_user_state(cur: Cursor[TupleRow], user_id: str) -> _UserState | None:
     return _UserState(display_name=display_name, profile_fields=profile_fields)
 
 
-def _apply_user_change_sync(writer: OffsetWriter, client: SlackClient, user_id: str) -> tuple[bool, bool, bool]:
-    validated = _fetch_user(client, user_id)
+def _apply_user_change_sync(
+    conn: Connection[TupleRow],
+    validated: Validated[SlackUser],
+    user_id: str,
+) -> tuple[bool, bool, bool]:
     member = validated.model
     new_display_name = member.display()
     # ``profile_fields`` for diff stays model-derived: it's the in-process
@@ -212,7 +216,7 @@ def _apply_user_change_sync(writer: OffsetWriter, client: SlackClient, user_id: 
     wrote_user_added = False
     wrote_renamed = False
     wrote_profile_changed = False
-    with writer.conn.transaction(), writer.conn.cursor() as cur:
+    with conn.cursor() as cur:
         _lock_users_stream(cur)
         previous = _load_user_state(cur, user_id)
         if previous is None:
@@ -240,7 +244,12 @@ def _apply_user_change_sync(writer: OffsetWriter, client: SlackClient, user_id: 
     return (wrote_user_added, wrote_renamed, wrote_profile_changed)
 
 
-async def apply_user_change_event(writer: OffsetWriter, client: SlackClient, event: SocketEventPayload) -> None:
+async def apply_user_change_event(
+    writer: OffsetWriter,
+    client: SlackClient,
+    event: SocketEventPayload,
+    limiters: SlurperLimiters,
+) -> None:
     """Translate one `user_change` socket event to `users` stream writes."""
     if event.type != "user_change":
         return
@@ -249,9 +258,9 @@ async def apply_user_change_event(writer: OffsetWriter, client: SlackClient, eve
         log.debug("users: ignoring user_change without user id")
         return
     try:
-        added, renamed, profile_changed = await trio.to_thread.run_sync(
-            lambda: _apply_user_change_sync(writer, client, user_id),
-            limiter=writer.limiter,
+        validated = await trio.to_thread.run_sync(lambda: _fetch_user(client, user_id), limiter=limiters.slack_api)
+        added, renamed, profile_changed = await writer.run_transaction(
+            lambda conn: _apply_user_change_sync(conn, validated, user_id)
         )
     except PG_TIMEOUT_EXCEPTIONS:
         log.warning("users: dropped user_change after PostgreSQL timeout for %s", user_id, exc_info=True)
@@ -341,22 +350,24 @@ def _ack(envelope_id: str) -> str:
 class UsersSocketModeRunner(SocketModeRunner):
     """Socket-mode runner that adds `user_change` handling to Sprint-1A logic."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 - mirrors SocketModeRunner plus user-change dependencies.
         self,
         writer: OffsetWriter,
         health: HealthEmitter,
         client: SlackClient,
         app_token: str,
         *,
+        limiters: SlurperLimiters,
         options: SocketModeOptions | None = None,
     ) -> None:
-        super().__init__(writer, health, client, app_token, options=options)
+        super().__init__(writer, health, client, app_token, limiters=limiters, options=options)
         self._users_writer = writer
         self._users_client = client
+        self._users_limiters = limiters
 
     async def _handle_event(self, event: SocketEventPayload, raw_event: JsonObject) -> None:
         if event.type == "user_change":
-            await apply_user_change_event(self._users_writer, self._users_client, event)
+            await apply_user_change_event(self._users_writer, self._users_client, event, self._users_limiters)
             return
         await super()._handle_event(event, raw_event)
 
@@ -385,13 +396,14 @@ class UsersSocketModeRunner(SocketModeRunner):
             return False
 
 
-async def run_socket_mode_with_users(
+async def run_socket_mode_with_users(  # noqa: PLR0913 - public wrapper mirrors runner dependencies.
     writer: OffsetWriter,
     health: HealthEmitter,
     client: SlackClient,
     app_token: str,
     *,
+    limiters: SlurperLimiters,
     options: SocketModeOptions | None = None,
 ) -> None:
     """Entry point: Socket Mode with message/channel + user-change writes."""
-    await UsersSocketModeRunner(writer, health, client, app_token, options=options).run()
+    await UsersSocketModeRunner(writer, health, client, app_token, limiters=limiters, options=options).run()

@@ -13,13 +13,13 @@ from psycopg.rows import TupleRow
 
 from slack_fuse.models import JsonObject, SocketEventPayload
 from slack_fuse_server.slurper.api import SlackClient
-from slack_fuse_server.slurper.offsets import OffsetWriter
 from slack_fuse_server.slurper.users import (
     _parse_envelope_allow_user_change,
     apply_user_change_event,
     populate_users_once,
 )
 from tests._fake_slack import make_fake_slack_transport
+from tests.conftest import make_test_limiters, make_test_writer
 
 
 def _make_client(http: httpx.Client) -> SlackClient:
@@ -48,8 +48,8 @@ def test_populate_users_once_writes_user_added_events(
     server_conn: psycopg.Connection[TupleRow],
     fake_slack_http: httpx.Client,
 ) -> None:
-    writer = OffsetWriter(server_conn, trio.CapacityLimiter(1))
-    trio.run(populate_users_once, writer, _make_client(fake_slack_http))
+    writer = make_test_writer(server_conn)
+    trio.run(populate_users_once, writer, _make_client(fake_slack_http), make_test_limiters())
 
     rows = _user_rows(server_conn)
     assert [kind for _, kind, _ in rows] == ["user_added", "user_added"]
@@ -68,11 +68,11 @@ def test_populate_users_once_is_idempotent_on_restart(
     server_conn: psycopg.Connection[TupleRow],
     fake_slack_http: httpx.Client,
 ) -> None:
-    writer = OffsetWriter(server_conn, trio.CapacityLimiter(1))
+    writer = make_test_writer(server_conn)
     client = _make_client(fake_slack_http)
 
-    trio.run(populate_users_once, writer, client)
-    trio.run(populate_users_once, writer, client)
+    trio.run(populate_users_once, writer, client, make_test_limiters())
+    trio.run(populate_users_once, writer, client, make_test_limiters())
 
     rows = _user_rows(server_conn)
     assert len(rows) == 2
@@ -83,8 +83,8 @@ def test_apply_user_change_event_emits_user_renamed(
     server_conn: psycopg.Connection[TupleRow],
     fake_slack_http: httpx.Client,
 ) -> None:
-    writer = OffsetWriter(server_conn, trio.CapacityLimiter(1))
-    trio.run(populate_users_once, writer, _make_client(fake_slack_http))
+    writer = make_test_writer(server_conn)
+    trio.run(populate_users_once, writer, _make_client(fake_slack_http), make_test_limiters())
 
     users_info_override = cast(
         JsonObject,
@@ -101,7 +101,7 @@ def test_apply_user_change_event_emits_user_renamed(
     with httpx.Client(base_url="https://slack.com/api", transport=transport) as renamed_http:
         renamed_client = _make_client(renamed_http)
         event = SocketEventPayload(type="user_change", user="U0001")
-        trio.run(apply_user_change_event, writer, renamed_client, event)
+        trio.run(apply_user_change_event, writer, renamed_client, event, make_test_limiters())
 
     rows = _user_rows(server_conn)
     renamed_payloads = [payload for _, kind, payload in rows if kind == "user_renamed"]

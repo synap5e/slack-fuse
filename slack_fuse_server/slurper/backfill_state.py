@@ -16,9 +16,9 @@ from dataclasses import dataclass
 from datetime import datetime
 
 import psycopg
-import trio
 from psycopg.rows import TupleRow
 
+from slack_fuse_server.slurper.limiters import SlurperLimiters
 from slack_fuse_server.slurper.offsets import OffsetWriter
 
 
@@ -59,9 +59,10 @@ def find_last_backfill_completion(
 async def async_find_last_backfill_completion(
     writer: OffsetWriter,
     channel_id: str,
+    limiters: SlurperLimiters,
 ) -> BackfillCompletion | None:
-    """Async wrapper for ``find_last_backfill_completion`` using the writer limiter."""
-    return await trio.to_thread.run_sync(
-        lambda: find_last_backfill_completion(writer.conn, channel_id),
-        limiter=writer.limiter,
+    """Async wrapper for ``find_last_backfill_completion`` using the admin-read limiter."""
+    return await writer.run_read(
+        lambda conn: find_last_backfill_completion(conn, channel_id),
+        limiter=limiters.admin_read,
     )

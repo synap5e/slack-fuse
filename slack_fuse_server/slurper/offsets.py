@@ -12,8 +12,9 @@ Two layers:
   inside a caller-managed transaction. `health.py` reuses them to write the
   event and its `health_log` mirror atomically.
 - `write_event` / `OffsetWriter` — the sync transaction and its trio-friendly
-  async wrapper. Sync psycopg is run via `trio.to_thread.run_sync` behind a
-  shared `CapacityLimiter`, mirroring how the client serializes store/API work.
+  async wrapper. Sync psycopg is run via `trio.to_thread.run_sync` behind the
+  writer `CapacityLimiter`, while each operation borrows one connection from a
+  bounded pool.
 
 Message events are deduped on `(stream, kind, payload->>'ts')` via the
 `events_message_dedup` partial unique index (RFC §Backfill). A duplicate
@@ -36,8 +37,10 @@ fires no NOTIFY because its transaction never commits.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator, Callable, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import cast
+from typing import TypeVar, cast
 
 import psycopg
 import trio
@@ -47,9 +50,17 @@ from psycopg.types.json import Jsonb
 
 from slack_fuse_server._json import JsonObject
 
+T = TypeVar("T")
+
+
+class WriterPoolExhausted(RuntimeError):
+    """All writer pool connections are in use beyond the acquire timeout."""
+
+
 PG_TIMEOUT_EXCEPTIONS: tuple[type[BaseException], ...] = (
     psycopg.errors.LockNotAvailable,
     psycopg.errors.QueryCanceled,
+    WriterPoolExhausted,
 )
 
 
@@ -224,59 +235,144 @@ def write_message_or_corrective(conn: Connection[TupleRow], record: EventRecord)
 
 
 class OffsetWriter:
-    """Trio-friendly wrapper around the sync `write_event` transaction.
+    """Trio-friendly wrapper around pooled sync event-write transactions.
 
-    Holds one psycopg connection and runs every write on a worker thread behind
-    a shared `CapacityLimiter`, so all DB writes for the process serialize
-    through one connection (single-process slurper). The underlying SQL still
-    survives true concurrency — see `tests/slurper/test_offsets.py`.
+    Holds a bounded pool of psycopg connections and runs each operation on a
+    worker thread behind the writer `CapacityLimiter`. Per-stream monotonicity
+    comes from the `stream_heads ... FOR UPDATE` row lock in `assign_offset`,
+    not from an application-level mutex.
 
-    The connection MUST be in autocommit mode: each `write_event` brackets its
-    work in `with conn.transaction()`, which only durably commits when no outer
+    Every connection MUST be in autocommit mode: each write brackets its work
+    in `with conn.transaction()`, which only durably commits when no outer
     transaction is open. A non-autocommit connection on which a bare read ran
     first would make these transactions savepoints that vanish on close.
     """
 
-    def __init__(self, conn: Connection[TupleRow], limiter: trio.CapacityLimiter) -> None:
+    def __init__(
+        self,
+        connections: Sequence[Connection[TupleRow]],
+        *,
+        limiter: trio.CapacityLimiter,
+        acquire_timeout_s: float,
+    ) -> None:
+        if not connections:
+            raise ValueError("OffsetWriter requires at least one pooled connection")
+        if acquire_timeout_s <= 0:
+            raise ValueError("OffsetWriter acquire timeout must be positive")
+        if limiter.total_tokens != len(connections):
+            msg = (
+                "OffsetWriter limiter size must match the connection pool size "
+                f"(limiter={limiter.total_tokens}, pool={len(connections)})"
+            )
+            raise ValueError(msg)
+        for conn in connections:
+            self._check_autocommit(conn)
+
+        self._connections = tuple(connections)
+        self._limiter = limiter
+        self._acquire_timeout_s = acquire_timeout_s
+        self._send, self._receive = trio.open_memory_channel[Connection[TupleRow]](len(self._connections))
+        for conn in self._connections:
+            self._send.send_nowait(conn)
+
+    @staticmethod
+    def _check_autocommit(conn: Connection[TupleRow]) -> None:
         # Fail fast rather than rely on callers remembering the docstring
         # contract. The bug this guards against is silent: writes appear to
-        # succeed, then disappear when the connection closes because they
-        # were nested savepoints inside an implicit outer transaction
-        # opened by an earlier bare SELECT.
+        # succeed, then disappear when the connection closes because they were
+        # nested savepoints inside an implicit outer transaction opened by an
+        # earlier bare SELECT.
         if not conn.autocommit:
             msg = (
-                "OffsetWriter requires conn.autocommit=True. "
+                "OffsetWriter requires every pooled connection to have conn.autocommit=True. "
                 "Without it, write_event()'s `with conn.transaction()` becomes "
                 "a savepoint inside an implicit outer transaction and rolls "
                 "back when the connection closes. Set conn.autocommit=True "
-                "BEFORE constructing the writer."
+                "BEFORE constructing the writer pool."
             )
             raise ValueError(msg)
-        self._conn = conn
-        self._limiter = limiter
 
-    @property
-    def conn(self) -> Connection[TupleRow]:
-        """The underlying connection, for callers that compose their own TX
-        (e.g. `health.py` writing the event + `health_log` mirror atomically)."""
-        return self._conn
+    @asynccontextmanager
+    async def _borrow_connection(self) -> AsyncIterator[Connection[TupleRow]]:
+        conn: Connection[TupleRow] | None = None
+        with trio.move_on_after(self._acquire_timeout_s) as scope:
+            conn = await self._receive.receive()
+        if scope.cancelled_caught or conn is None:
+            msg = f"all {len(self._connections)} writer connection(s) busy for {self._acquire_timeout_s:.3f}s"
+            raise WriterPoolExhausted(msg)
+        try:
+            yield conn
+        finally:
+            self._send.send_nowait(conn)
 
-    @property
-    def limiter(self) -> trio.CapacityLimiter:
-        return self._limiter
+    @asynccontextmanager
+    async def acquire_read(self) -> AsyncIterator[Connection[TupleRow]]:
+        """Acquire a pooled connection for read-only work.
+
+        Use `run_read()` when possible so the synchronous psycopg body runs on
+        a worker thread under the caller-selected resource limiter.
+        """
+        async with self._borrow_connection() as conn:
+            yield conn
+
+    @asynccontextmanager
+    async def acquire_transaction(self) -> AsyncIterator[Connection[TupleRow]]:
+        """Acquire a pooled connection inside an open transaction.
+
+        The transaction commits on normal exit and rolls back when the body
+        raises. Use `run_transaction()` when possible so the synchronous body
+        runs on a worker thread under the writer limiter.
+        """
+        async with self._borrow_connection() as conn:
+            tx = conn.transaction()
+            await trio.to_thread.run_sync(tx.__enter__, limiter=self._limiter)
+            try:
+                yield conn
+            except BaseException as exc:
+                exc_type = type(exc)
+                exc_value = exc
+                exc_traceback = exc.__traceback__
+
+                def _rollback() -> bool | None:
+                    return tx.__exit__(exc_type, exc_value, exc_traceback)
+
+                await trio.to_thread.run_sync(_rollback, limiter=self._limiter)
+                raise
+            else:
+
+                def _commit() -> bool | None:
+                    return tx.__exit__(None, None, None)
+
+                await trio.to_thread.run_sync(_commit, limiter=self._limiter)
+
+    async def run_read(
+        self,
+        func: Callable[[Connection[TupleRow]], T],
+        *,
+        limiter: trio.CapacityLimiter,
+    ) -> T:
+        """Run a read-only synchronous DB body against one pooled connection."""
+        async with self.acquire_read() as conn:
+            return await trio.to_thread.run_sync(lambda: func(conn), limiter=limiter)
+
+    async def run_transaction(self, func: Callable[[Connection[TupleRow]], T]) -> T:
+        """Run a synchronous DB body inside one pooled transaction."""
+        async with self.acquire_transaction() as conn:
+            return await trio.to_thread.run_sync(lambda: func(conn), limiter=self._limiter)
+
+    async def _run_pooled_write(self, func: Callable[[Connection[TupleRow]], T]) -> T:
+        async with self._borrow_connection() as conn:
+            return await trio.to_thread.run_sync(lambda: func(conn), limiter=self._limiter)
+
+    def close(self) -> None:
+        """Close every connection owned by the writer pool."""
+        for conn in self._connections:
+            conn.close()
 
     async def write_event(self, record: EventRecord) -> int | None:
         """Async: assign an offset and append one event. See `write_event`."""
-
-        def _run() -> int | None:
-            return write_event(self._conn, record)
-
-        return await trio.to_thread.run_sync(_run, limiter=self._limiter)
+        return await self._run_pooled_write(lambda conn: write_event(conn, record))
 
     async def write_message_or_corrective(self, record: EventRecord) -> int | None:
         """Async: append a backfill message or corrective edit."""
-
-        def _run() -> int | None:
-            return write_message_or_corrective(self._conn, record)
-
-        return await trio.to_thread.run_sync(_run, limiter=self._limiter)
+        return await self._run_pooled_write(lambda conn: write_message_or_corrective(conn, record))

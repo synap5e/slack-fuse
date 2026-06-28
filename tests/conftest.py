@@ -23,11 +23,14 @@ from pathlib import Path
 import httpx
 import psycopg
 import pytest
+import trio
 from psycopg import sql
 from psycopg.rows import TupleRow
 
 import slack_fuse_server.migrations as server_migrations
 from slack_fuse.migrations.runner import apply_migrations
+from slack_fuse_server.slurper.limiters import SlurperLimiters
+from slack_fuse_server.slurper.offsets import OffsetWriter
 from tests._fake_slack import make_fake_slack_transport
 
 _SERVER_MIGRATIONS_DIR = Path(server_migrations.__file__).parent
@@ -39,6 +42,30 @@ ServerConnFactory = Callable[[], psycopg.Connection[TupleRow]]
 
 class _EphemeralPostgresUnavailable(RuntimeError):
     """Raised when a temporary Postgres cannot be started for the test session."""
+
+
+def make_test_limiters(*, writer_pool_size: int = 1) -> SlurperLimiters:
+    """Small limiter bundle for slurper unit tests."""
+    return SlurperLimiters(
+        slack_api=trio.CapacityLimiter(1),
+        writer=trio.CapacityLimiter(writer_pool_size),
+        snapshot=trio.CapacityLimiter(1),
+        admin_read=trio.CapacityLimiter(1),
+    )
+
+
+def make_test_writer(
+    *connections: psycopg.Connection[TupleRow],
+    acquire_timeout_s: float = 1.0,
+) -> OffsetWriter:
+    """Build an OffsetWriter whose limiter size matches the supplied pool."""
+    if not connections:
+        raise ValueError("make_test_writer requires at least one connection")
+    return OffsetWriter(
+        list(connections),
+        limiter=trio.CapacityLimiter(len(connections)),
+        acquire_timeout_s=acquire_timeout_s,
+    )
 
 
 def _pick_unused_tcp_port() -> int:
@@ -122,8 +149,7 @@ def database_url() -> Iterator[str]:
 
     if os.environ.get(_DISABLE_AUTO_POSTGRES_ENV) == "1":
         pytest.skip(
-            "DATABASE_URL not set and temporary Postgres auto-provision disabled "
-            f"({_DISABLE_AUTO_POSTGRES_ENV}=1)"
+            f"DATABASE_URL not set and temporary Postgres auto-provision disabled ({_DISABLE_AUTO_POSTGRES_ENV}=1)"
         )
     try:
         with _temporary_postgres_dsn() as dsn:

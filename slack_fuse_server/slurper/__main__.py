@@ -71,6 +71,7 @@ from slack_fuse_server.slurper.catchup import (
 )
 from slack_fuse_server.slurper.channels import ensure_channel_added, populate_channels_once
 from slack_fuse_server.slurper.health import HealthEmitter, HealthKind
+from slack_fuse_server.slurper.limiters import SlurperLimiters
 from slack_fuse_server.slurper.offsets import OffsetWriter
 from slack_fuse_server.slurper.refresh import RefreshTrigger, refresh_channels_periodically
 from slack_fuse_server.slurper.socket import SocketModeOptions, SocketModeStatus
@@ -90,15 +91,25 @@ type BackfillSource = Literal["slack-api", "legacy-cache"]
 
 
 def _connect_and_migrate(config: ServerConfig) -> psycopg.Connection[TupleRow]:
+    conn = _connect_server_connection(config)
+    applied = apply_migrations(conn, _MIGRATIONS_DIR)
+    if applied:
+        log.info("applied server migrations: %s", ", ".join(applied))
+    _set_runtime_timeouts(conn, config)
+    return conn
+
+
+def _connect_server_connection(config: ServerConfig) -> psycopg.Connection[TupleRow]:
     conn: psycopg.Connection[TupleRow] = psycopg.connect(config.database_url)
     # Autocommit so each `with conn.transaction()` is a real BEGIN/COMMIT. Without
     # it, a bare read (e.g. the backfill-override lookup) opens an implicit
     # transaction, turning every later transaction() into a savepoint that never
     # durably commits — and conn.close() then rolls the whole thing back.
     conn.autocommit = True
-    applied = apply_migrations(conn, _MIGRATIONS_DIR)
-    if applied:
-        log.info("applied server migrations: %s", ", ".join(applied))
+    return conn
+
+
+def _set_runtime_timeouts(conn: psycopg.Connection[TupleRow], config: ServerConfig) -> None:
     lock_timeout_ms = int(config.slurper_lock_timeout_s * 1000)
     statement_timeout_ms = int(config.slurper_statement_timeout_s * 1000)
     with conn.cursor() as cur:
@@ -106,7 +117,33 @@ def _connect_and_migrate(config: ServerConfig) -> psycopg.Connection[TupleRow]:
             "SELECT set_config('lock_timeout', %s, false), set_config('statement_timeout', %s, false)",
             (f"{lock_timeout_ms}ms", f"{statement_timeout_ms}ms"),
         )
-    return conn
+
+
+def _connect_writer_pool(config: ServerConfig) -> list[psycopg.Connection[TupleRow]]:
+    conns = [_connect_and_migrate(config)]
+    try:
+        for _ in range(config.slurper_writer_pool_size - 1):
+            conn = _connect_server_connection(config)
+            _set_runtime_timeouts(conn, config)
+            conns.append(conn)
+    except Exception:
+        for conn in conns:
+            conn.close()
+        raise
+    return conns
+
+
+def _make_limiters(config: ServerConfig) -> SlurperLimiters:
+    slack_api_limiter = trio.CapacityLimiter(2)
+    writer_limiter = trio.CapacityLimiter(config.slurper_writer_pool_size)
+    snapshot_limiter = trio.CapacityLimiter(1)
+    admin_read_limiter = trio.CapacityLimiter(4)
+    return SlurperLimiters(
+        slack_api=slack_api_limiter,
+        writer=writer_limiter,
+        snapshot=snapshot_limiter,
+        admin_read=admin_read_limiter,
+    )
 
 
 def _connect_snapshot(database_url: str) -> psycopg.Connection[TupleRow]:
@@ -123,9 +160,9 @@ def _connect_snapshot(database_url: str) -> psycopg.Connection[TupleRow]:
 
 def _make_api_backfiller(
     client: SlackClient,
-    limiter: trio.CapacityLimiter,
+    limiters: SlurperLimiters,
     config: ServerConfig,
-    conn: psycopg.Connection[TupleRow] | None = None,
+    writer: OffsetWriter | None = None,
 ) -> SlackApiBackfiller:
     sleeps = SleepBounds(
         page_min_s=config.backfill_page_sleep_min_s,
@@ -133,21 +170,23 @@ def _make_api_backfiller(
         thread_min_s=config.backfill_thread_sleep_min_s,
         thread_max_s=config.backfill_thread_sleep_max_s,
     )
-    blocked = None if conn is None else lambda: blocked_channel_ids(conn)
-    return SlackApiBackfiller(client, limiter, sleeps, blocked_channel_ids=blocked)
+    blocked = None if writer is None else lambda: writer.run_read(blocked_channel_ids, limiter=limiters.admin_read)
+    return SlackApiBackfiller(client, limiters.slack_api, sleeps, blocked_channel_ids=blocked)
 
 
 def _make_catchup_deps(
     client: SlackClient,
     writer: OffsetWriter,
     config: ServerConfig,
+    limiters: SlurperLimiters,
 ) -> CatchupDeps:
     """Build the reconnect/restart catchup sweep's dependencies.
 
     Uses its own backfiller with tight sleep bounds (the gap-fill is bounded by
     ``oldest``, so pages are few; the 30-180s backfill page throttle would make
-    a multi-page busy channel needlessly slow). Shares the writer's limiter so
-    every catchup API/DB call serializes with the rest of the slurper.
+    a multi-page busy channel needlessly slow). Slack HTTP uses the slack_api
+    gate; blocked-list and resume-point SQL use admin_read; event writes go
+    through the writer pool.
     """
     sleeps = SleepBounds(
         page_min_s=config.catchup_page_sleep_min_s,
@@ -157,9 +196,9 @@ def _make_catchup_deps(
     )
     backfiller = SlackApiBackfiller(
         client,
-        writer.limiter,
+        limiters.slack_api,
         sleeps,
-        blocked_channel_ids=lambda: blocked_channel_ids(writer.conn),
+        blocked_channel_ids=lambda: writer.run_read(blocked_channel_ids, limiter=limiters.admin_read),
     )
     catchup_config = CatchupConfig(
         gap_threshold_s=config.catchup_gap_threshold_s,
@@ -167,24 +206,24 @@ def _make_catchup_deps(
         channel_gap_s=config.catchup_channel_gap_s,
         startup_delay_s=config.catchup_startup_delay_s,
     )
-    return CatchupDeps(writer=writer, backfiller=backfiller, config=catchup_config)
+    return CatchupDeps(writer=writer, backfiller=backfiller, config=catchup_config, limiters=limiters)
 
 
 def _make_backfiller(
     source: BackfillSource,
     *,
     client: SlackClient | None,
-    limiter: trio.CapacityLimiter,
+    limiters: SlurperLimiters,
     config: ServerConfig,
-    conn: psycopg.Connection[TupleRow] | None = None,
+    writer: OffsetWriter | None = None,
 ) -> Backfiller:
     if source == "legacy-cache":
-        return LegacyCacheBackfiller(limiter=limiter)
+        return LegacyCacheBackfiller(limiter=limiters.writer)
     if source == "slack-api":
         if client is None:  # pragma: no cover - guarded by _run_backfill source wiring
             msg = "slack-api backfill source requires a SlackClient"
             raise ValueError(msg)
-        return _make_api_backfiller(client, limiter, config, conn=conn)
+        return _make_api_backfiller(client, limiters, config, writer=writer)
     msg = f"unsupported backfill source {source!r}"
     raise ValueError(msg)
 
@@ -272,7 +311,22 @@ def _log_slurper_started() -> None:
 
 
 async def _serve(config: ServerConfig) -> None:
-    conn = _connect_and_migrate(config)
+    slack_api_limiter = trio.CapacityLimiter(2)
+    writer_limiter = trio.CapacityLimiter(config.slurper_writer_pool_size)
+    snapshot_limiter = trio.CapacityLimiter(1)
+    admin_read_limiter = trio.CapacityLimiter(4)
+    limiters = SlurperLimiters(
+        slack_api=slack_api_limiter,
+        writer=writer_limiter,
+        snapshot=snapshot_limiter,
+        admin_read=admin_read_limiter,
+    )
+    writer_conns = _connect_writer_pool(config)
+    writer = OffsetWriter(
+        writer_conns,
+        limiter=limiters.writer,
+        acquire_timeout_s=config.slurper_writer_pool_acquire_timeout_s,
+    )
     client = SlackClient(config.slack_user_token)
     users = UserCache(client.http)
     users.populate()
@@ -303,14 +357,12 @@ async def _serve(config: ServerConfig) -> None:
         database_url=config.database_url,
         trigger=backfill_trigger,
     )
-    limiter = trio.CapacityLimiter(1)
-    writer = OffsetWriter(conn, limiter)
     health = HealthEmitter(writer)
 
     # Reconnect/restart catchup: a startup gap-fill plus an on-demand one fired
     # by the socket runner when a reconnect's downtime drained Slack's buffer.
     catchup_trigger = CatchupTrigger() if config.catchup_enabled else None
-    catchup_deps = _make_catchup_deps(client, writer, config) if catchup_trigger is not None else None
+    catchup_deps = _make_catchup_deps(client, writer, config, limiters) if catchup_trigger is not None else None
 
     # The snapshot scheduler runs on its own connection + limiter so generating
     # a large snapshot never blocks live event writes (its REPEATABLE READ reads
@@ -320,7 +372,7 @@ async def _serve(config: ServerConfig) -> None:
         snapshot_conn,
         every_n_events=config.snapshot_every_n_events,
         max_age_seconds=config.snapshot_max_age_hours * 3600,
-        limiter=trio.CapacityLimiter(1),
+        limiter=limiters.snapshot,
     )
 
     status = SocketModeStatus()
@@ -332,10 +384,10 @@ async def _serve(config: ServerConfig) -> None:
         async with trio.open_nursery() as nursery:
             _log_slurper_started()
             nursery.start_soon(
-                _run_socket_mode_with_users_task, writer, health, client, config, status, catchup_trigger
+                _run_socket_mode_with_users_task, writer, health, client, config, status, catchup_trigger, limiters
             )
-            nursery.start_soon(populate_users_once, writer, client)
-            nursery.start_soon(populate_channels_once, writer, client)
+            nursery.start_soon(populate_users_once, writer, client, limiters)
+            nursery.start_soon(populate_channels_once, writer, client, limiters)
             nursery.start_soon(
                 _serve_dispatch_task,
                 config.listen_addr,
@@ -353,12 +405,12 @@ async def _serve(config: ServerConfig) -> None:
             # Periodic ``conversations.info`` refresh: backfills lossy
             # legacy channel_added payloads (pre raw-persistence) and
             # catches drift the webhook flow doesn't surface.
-            nursery.start_soon(refresh_channels_periodically, writer, client)
+            nursery.start_soon(refresh_channels_periodically, writer, client, limiters)
             # Long-lived consumer for HTTP-triggered refresh requests
             # (POST /refresh-channels). Same job as the periodic task,
             # fires only on demand. Rendezvous channel means a second
             # POST while one is running gets 409, not a queued cycle.
-            nursery.start_soon(refresh_trigger.consume, writer, client)
+            nursery.start_soon(refresh_trigger.consume, writer, client, limiters)
             nursery.start_soon(backfill_trigger.consume, config)
             # Reconnect/restart catchup consumer: runs one bounded gap-fill at
             # startup (the restart case) and one per gap-reconnect the socket
@@ -366,11 +418,11 @@ async def _serve(config: ServerConfig) -> None:
             if catchup_trigger is not None and catchup_deps is not None:
                 nursery.start_soon(catchup_trigger.consume, catchup_deps)
             if auto_backfill:
-                nursery.start_soon(_auto_backfill, config, writer, health, client, limiter)
+                nursery.start_soon(_auto_backfill, config, writer, health, client, limiters)
             log.info("slack-fuse-server listening on %s (HTTP /health, /metrics + WS /ws)", config.listen_addr)
     finally:
         client.close()
-        conn.close()
+        writer.close()
         snapshot_conn.close()
 
 
@@ -381,13 +433,14 @@ async def _run_socket_mode_with_users_task(  # noqa: PLR0913, PLR0917 - socket t
     config: ServerConfig,
     status: SocketModeStatus,
     catchup_trigger: CatchupTrigger | None,
+    limiters: SlurperLimiters,
 ) -> None:
     options = SocketModeOptions(
         degraded_min_duration_s=config.slack_degraded_min_duration_s,
         status=status,
         on_reconnect=_make_on_reconnect(catchup_trigger, config.catchup_gap_threshold_s),
     )
-    await run_socket_mode_with_users(writer, health, client, config.slack_app_token, options=options)
+    await run_socket_mode_with_users(writer, health, client, config.slack_app_token, limiters=limiters, options=options)
 
 
 def _make_on_reconnect(
@@ -440,15 +493,15 @@ async def _auto_backfill(
     writer: OffsetWriter,
     health: HealthEmitter,
     client: SlackClient,
-    limiter: trio.CapacityLimiter,
+    limiters: SlurperLimiters,
 ) -> None:
     """Automatic first-bootup pass: backfill every member channel, throttled."""
     await trio.sleep(30)  # let startup settle before hitting the API hard
-    backfiller = _make_backfiller("slack-api", client=client, limiter=limiter, config=config, conn=writer.conn)
+    backfiller = _make_backfiller("slack-api", client=client, limiters=limiters, config=config, writer=writer)
     first_backfill = True
     async for channel_id in backfiller.channels_to_backfill():
         if config.auto_backfill_skip_if_completed:
-            completion = await async_find_last_backfill_completion(writer, channel_id.value)
+            completion = await async_find_last_backfill_completion(writer, channel_id.value, limiters)
             if completion is not None:
                 log.info(
                     "auto-backfill: skipping %s — completed at %s, events_written=%d",
@@ -462,7 +515,11 @@ async def _auto_backfill(
         first_backfill = False
         log.info("auto-backfill: %s", channel_id.value)
         ctx = BackfillContext(
-            writer=writer, health=health, warn_at=config.backfill_warn_at, abort_at=config.backfill_abort_at
+            writer=writer,
+            health=health,
+            limiters=limiters,
+            warn_at=config.backfill_warn_at,
+            abort_at=config.backfill_abort_at,
         )
         await backfill_channel(backfiller, channel_id, ctx)
     log.info("auto-backfill: complete")
@@ -480,15 +537,18 @@ async def _run_refresh_channels_once(config: ServerConfig) -> None:
     """
     from slack_fuse_server.slurper.refresh import refresh_channels_once  # noqa: PLC0415
 
-    conn = _connect_and_migrate(config)
-    limiter = trio.CapacityLimiter(1)
-    writer = OffsetWriter(conn, limiter)
+    limiters = _make_limiters(config)
+    writer = OffsetWriter(
+        _connect_writer_pool(config),
+        limiter=limiters.writer,
+        acquire_timeout_s=config.slurper_writer_pool_acquire_timeout_s,
+    )
     client = SlackClient(config.slack_user_token)
     try:
-        await refresh_channels_once(writer, client)
+        await refresh_channels_once(writer, client, limiters)
     finally:
         client.close()
-        conn.close()
+        writer.close()
 
 
 # === Backfill (admin) mode ===
@@ -503,37 +563,54 @@ async def _run_backfill(  # noqa: PLR0913 — thin CLI thunk; bundling into opti
     source: BackfillSource,
     since_ts: float | None = None,
 ) -> None:
-    conn = _connect_and_migrate(config)
-    limiter = trio.CapacityLimiter(1)
-    writer = OffsetWriter(conn, limiter)
+    limiters = _make_limiters(config)
+    writer = OffsetWriter(
+        _connect_writer_pool(config),
+        limiter=limiters.writer,
+        acquire_timeout_s=config.slurper_writer_pool_acquire_timeout_s,
+    )
     health = HealthEmitter(writer)
-    if is_channel_blocked(conn, channel_id):
-        await health.emit(
-            HealthKind.BACKFILL_SKIPPED,
-            {"channel_id": channel_id, "reason": str(BackfillAbortReason.OPERATOR_BLOCKED)},
-        )
-        conn.close()
-        raise BlockedChannelError(channel_id)
-    # The SlackClient is required for `slack-api` source (history fetch) AND for
-    # every source so we can call `conversations.info` to emit a synthetic
-    # `channel_added` event before any per-channel writes. Without this, a
-    # backfill on a channel the slurper's startup populate never saw (e.g.
-    # archived → excluded by populate; or "channel I joined while server was
-    # down") writes events on a `channel:<id>` stream the client projector has
-    # no row for in its `channels` table, never subscribes, and orphans them.
-    client = SlackClient(config.slack_user_token)
-    backfiller = _make_backfiller(source, client=client, limiter=limiter, config=config, conn=conn)
-
-    abort_at = _resolve_abort_at(conn, channel_id, config, allow_large=allow_large, max_messages=max_messages)
-    ctx = BackfillContext(writer=writer, health=health, warn_at=config.backfill_warn_at, abort_at=abort_at)
+    client: SlackClient | None = None
     try:
+        if await writer.run_read(lambda conn: is_channel_blocked(conn, channel_id), limiter=limiters.admin_read):
+            await health.emit(
+                HealthKind.BACKFILL_SKIPPED,
+                {"channel_id": channel_id, "reason": str(BackfillAbortReason.OPERATOR_BLOCKED)},
+            )
+            raise BlockedChannelError(channel_id)
+        # The SlackClient is required for `slack-api` source (history fetch) AND for
+        # every source so we can call `conversations.info` to emit a synthetic
+        # `channel_added` event before any per-channel writes. Without this, a
+        # backfill on a channel the slurper's startup populate never saw (e.g.
+        # archived → excluded by populate; or "channel I joined while server was
+        # down") writes events on a `channel:<id>` stream the client projector has
+        # no row for in its `channels` table, never subscribes, and orphans them.
+        client = SlackClient(config.slack_user_token)
+        backfiller = _make_backfiller(source, client=client, limiters=limiters, config=config, writer=writer)
+
+        abort_at = await writer.run_transaction(
+            lambda conn: _resolve_abort_at(
+                conn,
+                channel_id,
+                config,
+                allow_large=allow_large,
+                max_messages=max_messages,
+            )
+        )
+        ctx = BackfillContext(
+            writer=writer,
+            health=health,
+            limiters=limiters,
+            warn_at=config.backfill_warn_at,
+            abort_at=abort_at,
+        )
         # Bring the channel under the projector's normal model BEFORE we write
         # any per-channel events. A channel the user token can't describe
         # (left/closed DMs, archived-then-purged) gets skipped cleanly so the
         # admin Job exits 0; any other API failure still fails loud because it
         # would orphan events otherwise.
         try:
-            emitted = await ensure_channel_added(writer, client, channel_id)
+            emitted = await ensure_channel_added(writer, client, channel_id, limiters)
         except ChannelNotFoundError:
             log.warning(
                 "backfill: channel %s not accessible (channel_not_found); skipping cleanly. "
@@ -548,8 +625,9 @@ async def _run_backfill(  # noqa: PLR0913 — thin CLI thunk; bundling into opti
             log.info("backfill: emitted synthetic channel_added for %s", channel_id)
         result = await backfill_channel(backfiller, ChannelId(channel_id), ctx, since_ts=since_ts)
     finally:
-        client.close()
-        conn.close()
+        if client is not None:
+            client.close()
+        writer.close()
 
     if result.abort_reason == BackfillAbortReason.OPERATOR_BLOCKED:
         raise BlockedChannelError(channel_id)

@@ -9,7 +9,7 @@ needing the API at all.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import cast
 
 import httpx
@@ -26,6 +26,7 @@ from slack_fuse_server.backfill.types import BackfillAbortReason
 from slack_fuse_server.slurper.api import SlackClient, Validated
 from slack_fuse_server.slurper.health import HealthEmitter, HealthKind
 from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter, write_event
+from tests.conftest import make_test_limiters, make_test_writer
 
 _NO_SLEEP = SleepBounds(page_min_s=0.0, page_max_s=0.0, thread_min_s=0.0, thread_max_s=0.0)
 
@@ -88,11 +89,15 @@ def test_thread_reply_raw_is_lossless_not_model_dump(fake_slack_http: httpx.Clie
 
 
 def test_channels_to_backfill_skips_blocked_ids(fake_slack_http: httpx.Client) -> None:
+    async def _blocked_channel_ids() -> set[str]:
+        await trio.lowlevel.checkpoint()
+        return {"C0001"}
+
     backfiller = SlackApiBackfiller(
         _fake_client(fake_slack_http),
         trio.CapacityLimiter(1),
         _NO_SLEEP,
-        blocked_channel_ids=lambda: {"C0001"},
+        blocked_channel_ids=_blocked_channel_ids,
     )
 
     async def collect() -> list[str]:
@@ -239,9 +244,16 @@ class _NullHealth:
 class _FlakyWriter:
     def __init__(self, conn: psycopg.Connection[TupleRow], *, failures: int) -> None:
         self.conn = conn
-        self.limiter = trio.CapacityLimiter(1)
         self.failures_remaining = failures
         self.calls = 0
+
+    async def run_read(
+        self,
+        func: Callable[[psycopg.Connection[TupleRow]], object],
+        *,
+        limiter: trio.CapacityLimiter,
+    ) -> object:
+        return func(self.conn)
 
     async def write_message_or_corrective(self, _record: EventRecord) -> int | None:
         self.calls += 1
@@ -284,9 +296,9 @@ def _health_kinds(conn: psycopg.Connection[TupleRow]) -> list[str]:
 
 
 def test_backfill_channel_writes_events_and_emits_health(server_conn: psycopg.Connection[TupleRow]) -> None:
-    writer = OffsetWriter(server_conn, trio.CapacityLimiter(1))
+    writer = make_test_writer(server_conn)
     health = HealthEmitter(writer)
-    ctx = BackfillContext(writer=writer, health=health, warn_at=1000, abort_at=20000)
+    ctx = BackfillContext(writer=writer, health=health, limiters=make_test_limiters(), warn_at=1000, abort_at=20000)
 
     result = trio.run(backfill_channel, _StubBackfiller(5), ChannelId("CX"), ctx)
 
@@ -305,6 +317,7 @@ def test_backfill_channel_retries_pg_timeout_once_then_continues(
     ctx = BackfillContext(
         writer=cast(OffsetWriter, writer),
         health=cast(HealthEmitter, health),
+        limiters=make_test_limiters(),
         warn_at=1000,
         abort_at=20000,
     )
@@ -326,6 +339,7 @@ def test_backfill_channel_propagates_second_pg_timeout(
     ctx = BackfillContext(
         writer=cast(OffsetWriter, writer),
         health=cast(HealthEmitter, _NullHealth()),
+        limiters=make_test_limiters(),
         warn_at=1000,
         abort_at=20000,
     )
@@ -337,9 +351,9 @@ def test_backfill_channel_propagates_second_pg_timeout(
 
 
 def test_backfill_channel_aborts_at_threshold(server_conn: psycopg.Connection[TupleRow]) -> None:
-    writer = OffsetWriter(server_conn, trio.CapacityLimiter(1))
+    writer = make_test_writer(server_conn)
     health = HealthEmitter(writer)
-    ctx = BackfillContext(writer=writer, health=health, warn_at=2, abort_at=3)
+    ctx = BackfillContext(writer=writer, health=health, limiters=make_test_limiters(), warn_at=2, abort_at=3)
 
     result = trio.run(backfill_channel, _StubBackfiller(100), ChannelId("CBIG"), ctx)
 
@@ -357,9 +371,9 @@ def test_backfill_channel_aborts_at_threshold(server_conn: psycopg.Connection[Tu
 def test_backfill_channel_skips_blocked_channel(server_conn: psycopg.Connection[TupleRow]) -> None:
     with server_conn.cursor() as cur:
         cur.execute("INSERT INTO blocked_channels (channel_id, reason) VALUES ('CBLOCK', 'noisy')")
-    writer = OffsetWriter(server_conn, trio.CapacityLimiter(1))
+    writer = make_test_writer(server_conn)
     health = HealthEmitter(writer)
-    ctx = BackfillContext(writer=writer, health=health, warn_at=1000, abort_at=20000)
+    ctx = BackfillContext(writer=writer, health=health, limiters=make_test_limiters(), warn_at=1000, abort_at=20000)
 
     result = trio.run(backfill_channel, _StubBackfiller(5), ChannelId("CBLOCK"), ctx)
 
@@ -377,9 +391,9 @@ def _health_rows(conn: psycopg.Connection[TupleRow]) -> list[tuple[str, object]]
 
 
 def test_backfill_writes_message_when_no_prior_event(server_conn: psycopg.Connection[TupleRow]) -> None:
-    writer = OffsetWriter(server_conn, trio.CapacityLimiter(1))
+    writer = make_test_writer(server_conn)
     health = HealthEmitter(writer)
-    ctx = BackfillContext(writer=writer, health=health, warn_at=1000, abort_at=20000)
+    ctx = BackfillContext(writer=writer, health=health, limiters=make_test_limiters(), warn_at=1000, abort_at=20000)
     raw: JsonObject = {"ts": "2000.000001", "user": "U1", "text": "fresh"}
 
     result = trio.run(backfill_channel, _OneMessageBackfiller(raw), ChannelId("CFRESH"), ctx)
@@ -406,9 +420,9 @@ def test_backfill_writes_message_changed_when_ts_already_has_message(
         )
         == 1
     )
-    writer = OffsetWriter(server_conn, trio.CapacityLimiter(1))
+    writer = make_test_writer(server_conn)
     health = HealthEmitter(writer)
-    ctx = BackfillContext(writer=writer, health=health, warn_at=1000, abort_at=20000)
+    ctx = BackfillContext(writer=writer, health=health, limiters=make_test_limiters(), warn_at=1000, abort_at=20000)
 
     result = trio.run(backfill_channel, _OneMessageBackfiller(fresh), ChannelId("CCORR"), ctx)
 
@@ -437,9 +451,9 @@ def test_backfill_is_still_idempotent_against_message_changed(
         )
         == 1
     )
-    writer = OffsetWriter(server_conn, trio.CapacityLimiter(1))
+    writer = make_test_writer(server_conn)
     health = HealthEmitter(writer)
-    ctx = BackfillContext(writer=writer, health=health, warn_at=1000, abort_at=20000)
+    ctx = BackfillContext(writer=writer, health=health, limiters=make_test_limiters(), warn_at=1000, abort_at=20000)
     backfiller = _OneMessageBackfiller(fresh)
 
     first = trio.run(backfill_channel, backfiller, ChannelId("CIDEM"), ctx)
@@ -454,9 +468,16 @@ def test_backfill_is_still_idempotent_against_message_changed(
 
 
 def test_backfill_channel_emits_progress_every_n_messages(server_conn: psycopg.Connection[TupleRow]) -> None:
-    writer = OffsetWriter(server_conn, trio.CapacityLimiter(1))
+    writer = make_test_writer(server_conn)
     health = HealthEmitter(writer)
-    ctx = BackfillContext(writer=writer, health=health, warn_at=1000, abort_at=20000, progress_every=2)
+    ctx = BackfillContext(
+        writer=writer,
+        health=health,
+        limiters=make_test_limiters(),
+        warn_at=1000,
+        abort_at=20000,
+        progress_every=2,
+    )
 
     result = trio.run(backfill_channel, _StubBackfiller(5), ChannelId("CP"), ctx)
 
@@ -477,9 +498,9 @@ def test_backfill_channel_emits_progress_every_n_messages(server_conn: psycopg.C
 
 
 def test_backfill_channel_is_idempotent_on_rerun(server_conn: psycopg.Connection[TupleRow]) -> None:
-    writer = OffsetWriter(server_conn, trio.CapacityLimiter(1))
+    writer = make_test_writer(server_conn)
     health = HealthEmitter(writer)
-    ctx = BackfillContext(writer=writer, health=health, warn_at=1000, abort_at=20000)
+    ctx = BackfillContext(writer=writer, health=health, limiters=make_test_limiters(), warn_at=1000, abort_at=20000)
 
     first = trio.run(backfill_channel, _StubBackfiller(4), ChannelId("CY"), ctx)
     second = trio.run(backfill_channel, _StubBackfiller(4), ChannelId("CY"), ctx)

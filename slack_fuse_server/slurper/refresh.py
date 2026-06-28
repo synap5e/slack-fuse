@@ -32,9 +32,11 @@ from typing import TYPE_CHECKING
 
 import httpx
 import trio
+from psycopg import Connection
 
 from slack_fuse_server._json import JsonObject
 from slack_fuse_server.slurper.api import ChannelNotFoundError, SlackAPIError, SlackClient
+from slack_fuse_server.slurper.limiters import SlurperLimiters
 from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter, assign_offset, insert_event
 
 if TYPE_CHECKING:
@@ -59,6 +61,7 @@ _CHANNEL_LIST_STREAM = "channel-list"
 async def refresh_channels_periodically(
     writer: OffsetWriter,
     client: SlackClient,
+    limiters: SlurperLimiters,
     *,
     interval_s: float = DEFAULT_INTERVAL_S,
 ) -> None:
@@ -71,17 +74,15 @@ async def refresh_channels_periodically(
     """
     while True:
         try:
-            await _refresh_all_once(writer, client)
+            await _refresh_all_once(writer, client, limiters)
         except Exception:
             log.exception("refresh: cycle failed; retrying after interval")
         await trio.sleep(interval_s)
 
 
-async def _refresh_all_once(writer: OffsetWriter, client: SlackClient) -> None:
+async def _refresh_all_once(writer: OffsetWriter, client: SlackClient, limiters: SlurperLimiters) -> None:
     """One full pass: walk known channels, refresh each."""
-    channel_ids = await trio.to_thread.run_sync(
-        _list_known_channel_ids, writer.conn, limiter=writer.limiter
-    )
+    channel_ids = await writer.run_read(_list_known_channel_ids, limiter=limiters.admin_read)
     log.info("refresh: starting cycle for %d channel(s)", len(channel_ids))
     refreshed = 0
     unchanged = 0
@@ -89,7 +90,7 @@ async def _refresh_all_once(writer: OffsetWriter, client: SlackClient) -> None:
     errors = 0
     for channel_id in channel_ids:
         try:
-            changed = await _refresh_one(writer, client, channel_id)
+            changed = await _refresh_one(writer, client, channel_id, limiters)
         except ChannelNotFoundError:
             # Channel left / archived-and-purged — skip cleanly.
             not_found += 1
@@ -139,28 +140,24 @@ async def _refresh_one(
     writer: OffsetWriter,
     client: SlackClient,
     channel_id: str,
+    limiters: SlurperLimiters,
 ) -> bool:
     """Refresh one channel. Returns True iff a ``channel_info_refreshed``
     event was written (i.e. the new payload differed from the latest
     known one)."""
-    fresh = await trio.to_thread.run_sync(
-        lambda: client.get_channel_info(channel_id), limiter=writer.limiter
-    )
-    return await trio.to_thread.run_sync(
-        lambda: _maybe_write_refresh_sync(writer, channel_id, fresh.raw),
-        limiter=writer.limiter,
-    )
+    fresh = await trio.to_thread.run_sync(lambda: client.get_channel_info(channel_id), limiter=limiters.slack_api)
+    return await writer.run_transaction(lambda conn: _maybe_write_refresh_sync(conn, channel_id, fresh.raw))
 
 
 def _maybe_write_refresh_sync(
-    writer: OffsetWriter,
+    conn: Connection[TupleRow],
     channel_id: str,
     fresh_raw: JsonObject,
 ) -> bool:
     """Compare ``fresh_raw`` to the most recent ``channel_added`` /
     ``channel_info_refreshed`` payload for this channel. Emit if they
     differ; no-op otherwise."""
-    with writer.conn.transaction(), writer.conn.cursor() as cur:
+    with conn.cursor() as cur:
         cur.execute(
             """
             SELECT payload FROM events
@@ -189,9 +186,9 @@ def _maybe_write_refresh_sync(
 
 # Public so external callers (one-shot CLI, tests) can run a single
 # cycle without spawning the periodic loop.
-async def refresh_channels_once(writer: OffsetWriter, client: SlackClient) -> None:
+async def refresh_channels_once(writer: OffsetWriter, client: SlackClient, limiters: SlurperLimiters) -> None:
     """One full pass; intended for a one-shot CLI or initial backfill."""
-    await _refresh_all_once(writer, client)
+    await _refresh_all_once(writer, client, limiters)
 
 
 # ===================================================================
@@ -239,7 +236,7 @@ class RefreshTrigger:
         await self._send.aclose()
         await self._recv.aclose()
 
-    async def consume(self, writer: OffsetWriter, client: SlackClient) -> None:
+    async def consume(self, writer: OffsetWriter, client: SlackClient, limiters: SlurperLimiters) -> None:
         """Trio task: drain refresh requests one at a time.
 
         Spawned in the main nursery alongside the periodic task. The two
@@ -249,9 +246,9 @@ class RefreshTrigger:
         async for item in self._recv:
             try:
                 if item is None:
-                    await _refresh_all_once(writer, client)
+                    await _refresh_all_once(writer, client, limiters)
                 else:
-                    await _refresh_one(writer, client, item)
+                    await _refresh_one(writer, client, item, limiters)
             except ChannelNotFoundError:
                 log.info("refresh: HTTP-triggered run for %s: channel not found", item)
             except Exception:

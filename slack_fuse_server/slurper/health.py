@@ -21,6 +21,8 @@ from collections.abc import Callable
 from enum import StrEnum
 
 import trio
+from psycopg import Connection
+from psycopg.rows import TupleRow
 
 from slack_fuse_server._json import JsonObject
 from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter, assign_offset, insert_event
@@ -68,15 +70,14 @@ class HealthEmitter:
     def __init__(self, writer: OffsetWriter) -> None:
         self._writer = writer
 
-    def _emit_sync(self, kind: HealthKind, payload: JsonObject) -> int:
+    def _emit_sync(self, conn: Connection[TupleRow], kind: HealthKind, payload: JsonObject) -> int:
         # Single write to `events` (stream='slurper-health'). The old
         # `health_log` table was a dual-write of the same data for operator
         # convenience; migration 0005 replaces it with a VIEW over `events`,
         # so operators can still `SELECT … FROM health_log …` without the
         # dual-write anti-pattern. See BACKLOG / ES audit findings.
-        conn = self._writer.conn
         record = EventRecord(stream=_HEALTH_STREAM, kind=str(kind), ts=None, payload=payload)
-        with conn.transaction(), conn.cursor() as cur:
+        with conn.cursor() as cur:
             offset = assign_offset(cur, _HEALTH_STREAM)
             insert_event(cur, offset, record)
         return offset
@@ -84,10 +85,7 @@ class HealthEmitter:
     async def emit(self, kind: HealthKind, payload: JsonObject | None = None) -> int:
         """Emit one health transition. Returns the assigned `slurper-health` offset."""
         body: JsonObject = payload if payload is not None else {}
-        offset = await trio.to_thread.run_sync(
-            lambda: self._emit_sync(kind, body),
-            limiter=self._writer.limiter,
-        )
+        offset = await self._writer.run_transaction(lambda conn: self._emit_sync(conn, kind, body))
         log.info("slurper-health: %s %s (offset=%d)", kind, body, offset)
         return offset
 

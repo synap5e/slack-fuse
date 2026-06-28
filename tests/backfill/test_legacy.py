@@ -21,8 +21,8 @@ from slack_fuse_server.backfill.api import BackfillContext, backfill_channel
 from slack_fuse_server.backfill.legacy import LegacyCacheBackfiller
 from slack_fuse_server.slurper.__main__ import _build_parser
 from slack_fuse_server.slurper.health import HealthEmitter
-from slack_fuse_server.slurper.offsets import OffsetWriter
 from slack_fuse_server.wire.frames import EventFrame
+from tests.conftest import make_test_limiters, make_test_writer
 
 
 def _write_day(cache_dir: Path, channel_id: str, day: str, messages: list[Message]) -> None:
@@ -149,9 +149,9 @@ def test_legacy_backfill_channel_is_idempotent_and_payloads_validate(
     )
 
     backfiller = LegacyCacheBackfiller(cache_dir, limiter=trio.CapacityLimiter(1))
-    writer = OffsetWriter(server_conn, trio.CapacityLimiter(1))
+    writer = make_test_writer(server_conn)
     health = HealthEmitter(writer)
-    ctx = BackfillContext(writer=writer, health=health, warn_at=1000, abort_at=20000)
+    ctx = BackfillContext(writer=writer, health=health, limiters=make_test_limiters(), warn_at=1000, abort_at=20000)
 
     first = trio.run(backfill_channel, backfiller, ChannelId("CLEG"), ctx)
     second = trio.run(backfill_channel, backfiller, ChannelId("CLEG"), ctx)

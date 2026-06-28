@@ -42,6 +42,7 @@ from slack_fuse_server.slurper.catchup import (
     should_catchup,
 )
 from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter, write_event
+from tests.conftest import make_test_limiters, make_test_writer
 
 if TYPE_CHECKING:
     import psycopg
@@ -127,7 +128,7 @@ def test_catchup_channel_writes_history_and_thread_events(
     fake_slack_http: httpx.Client,
 ) -> None:
     limiter = trio.CapacityLimiter(1)
-    writer = OffsetWriter(server_conn, limiter)
+    writer = make_test_writer(server_conn)
     backfiller = SlackApiBackfiller(_fake_client(fake_slack_http), limiter, _NO_SLEEP)
 
     async def go() -> int:
@@ -145,7 +146,7 @@ def test_catchup_channel_is_idempotent_on_rerun(
     fake_slack_http: httpx.Client,
 ) -> None:
     limiter = trio.CapacityLimiter(1)
-    writer = OffsetWriter(server_conn, limiter)
+    writer = make_test_writer(server_conn)
     backfiller = SlackApiBackfiller(_fake_client(fake_slack_http), limiter, _NO_SLEEP)
 
     async def go() -> int:
@@ -165,7 +166,7 @@ def test_catchup_channel_since_ts_filters_old_messages(
     fake_slack_http: httpx.Client,
 ) -> None:
     limiter = trio.CapacityLimiter(1)
-    writer = OffsetWriter(server_conn, limiter)
+    writer = make_test_writer(server_conn)
     backfiller = SlackApiBackfiller(_fake_client(fake_slack_http), limiter, _NO_SLEEP)
 
     async def go() -> int:
@@ -256,9 +257,9 @@ def test_run_catchup_once_sweeps_every_channel_with_resolved_resume_points(
 ) -> None:
     # C1 has a tip in the events table → resume from it. CNEW has none → floor.
     _seed_message(server_conn, "channel:C1", "1700000000.000000")
-    writer = OffsetWriter(server_conn, trio.CapacityLimiter(1))
+    writer = make_test_writer(server_conn)
     backfiller = _RecordingBackfiller(["C1", "CNEW"])
-    deps = CatchupDeps(writer=writer, backfiller=backfiller, config=_FAST)
+    deps = CatchupDeps(writer=writer, backfiller=backfiller, config=_FAST, limiters=make_test_limiters())
 
     async def go() -> CatchupResult:
         return await run_catchup_once(deps, now_epoch=1700100000.0)
@@ -296,9 +297,9 @@ class _FlakyBackfiller(_RecordingBackfiller):
 def test_run_catchup_once_isolates_per_channel_errors(
     server_conn: psycopg.Connection[TupleRow],
 ) -> None:
-    writer = OffsetWriter(server_conn, trio.CapacityLimiter(1))
+    writer = make_test_writer(server_conn)
     backfiller = _FlakyBackfiller(["CA", "CBAD", "CC"], failing="CBAD")
-    deps = CatchupDeps(writer=writer, backfiller=backfiller, config=_FAST)
+    deps = CatchupDeps(writer=writer, backfiller=backfiller, config=_FAST, limiters=make_test_limiters())
 
     async def go() -> CatchupResult:
         return await run_catchup_once(deps, now_epoch=1700100000.0)
@@ -316,9 +317,9 @@ def test_run_catchup_once_integration_over_fake_transport(
     fake_slack_http: httpx.Client,
 ) -> None:
     limiter = trio.CapacityLimiter(1)
-    writer = OffsetWriter(server_conn, limiter)
+    writer = make_test_writer(server_conn)
     backfiller = SlackApiBackfiller(_fake_client(fake_slack_http), limiter, _NO_SLEEP)
-    deps = CatchupDeps(writer=writer, backfiller=backfiller, config=_FAST)
+    deps = CatchupDeps(writer=writer, backfiller=backfiller, config=_FAST, limiters=make_test_limiters())
 
     async def go() -> CatchupResult:
         # now close to the fixture timestamps so the lookback floor (now - 1h)
@@ -351,9 +352,9 @@ def test_catchup_trigger_coalesces_requests() -> None:
 def test_catchup_trigger_runs_startup_catchup(
     server_conn: psycopg.Connection[TupleRow],
 ) -> None:
-    writer = OffsetWriter(server_conn, trio.CapacityLimiter(1))
+    writer = make_test_writer(server_conn)
     backfiller = _RecordingBackfiller(["CS1", "CS2"])
-    deps = CatchupDeps(writer=writer, backfiller=backfiller, config=_FAST)
+    deps = CatchupDeps(writer=writer, backfiller=backfiller, config=_FAST, limiters=make_test_limiters())
     trigger = CatchupTrigger()
 
     async def go() -> None:

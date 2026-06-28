@@ -29,6 +29,7 @@ from slack_fuse_server.slurper.socket import (
     translate_message_event,
 )
 from tests._fake_slack import load_fixtures
+from tests.conftest import make_test_limiters, make_test_writer
 
 # === Pure translation ===
 
@@ -144,8 +145,8 @@ def test_translate_message_payload_matches_backfill_shape() -> None:
 def _make_runner(conn: psycopg.Connection[TupleRow], http: httpx.Client) -> SocketModeRunner:
     client = SlackClient("xoxp-test")
     client._http = http  # swap in the fake transport
-    writer = OffsetWriter(conn, trio.CapacityLimiter(1))
-    return SocketModeRunner(writer, HealthEmitter(writer), client, "xapp-test")
+    writer = make_test_writer(conn)
+    return SocketModeRunner(writer, HealthEmitter(writer), client, "xapp-test", limiters=make_test_limiters())
 
 
 class _NullHealth:
@@ -155,7 +156,6 @@ class _NullHealth:
 
 class _TimeoutWriter:
     def __init__(self) -> None:
-        self.limiter = trio.CapacityLimiter(1)
         self.records: list[EventRecord] = []
 
     async def write_event(self, record: EventRecord) -> int | None:
@@ -196,7 +196,13 @@ def test_handle_message_event_drops_pg_timeout_with_warning(
     client = SlackClient("xoxp-test")
     client._http = fake_slack_http
     writer = _TimeoutWriter()
-    runner = SocketModeRunner(cast(OffsetWriter, writer), cast(HealthEmitter, _NullHealth()), client, "xapp-test")
+    runner = SocketModeRunner(
+        cast(OffsetWriter, writer),
+        cast(HealthEmitter, _NullHealth()),
+        client,
+        "xapp-test",
+        limiters=make_test_limiters(),
+    )
     event = SocketEventPayload(type="message", channel="C1", ts="100.0001", user="U1", text="hi")
     caplog.set_level("WARNING", logger="slack_fuse_server.slurper.socket")
 
@@ -238,9 +244,16 @@ def test_on_hello_fires_reconnect_hook_only_after_a_disconnect(
     fired: list[float] = []
     client = SlackClient("xoxp-test")
     client._http = fake_slack_http
-    writer = OffsetWriter(server_conn, trio.CapacityLimiter(1))
+    writer = make_test_writer(server_conn)
     options = SocketModeOptions(on_reconnect=fired.append)
-    runner = SocketModeRunner(writer, HealthEmitter(writer), client, "xapp-test", options=options)
+    runner = SocketModeRunner(
+        writer,
+        HealthEmitter(writer),
+        client,
+        "xapp-test",
+        limiters=make_test_limiters(),
+        options=options,
+    )
 
     async def go() -> None:
         # First hello = fresh connect (disconnected_at is None) → no hook.

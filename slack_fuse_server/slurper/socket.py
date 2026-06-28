@@ -56,6 +56,7 @@ from slack_fuse.models import (
 from slack_fuse_server._json import JsonObject
 from slack_fuse_server.slurper.api import SlackAPIError, SlackClient, Validated
 from slack_fuse_server.slurper.health import HealthEmitter, HealthKind, SlackDegradedTracker
+from slack_fuse_server.slurper.limiters import SlurperLimiters
 from slack_fuse_server.slurper.offsets import PG_TIMEOUT_EXCEPTIONS, EventRecord, OffsetWriter
 
 log = logging.getLogger(__name__)
@@ -224,13 +225,14 @@ def _record_channel_id(record: EventRecord) -> str | None:
 class SocketModeRunner:
     """Owns the Socket Mode connection lifecycle and its health transitions."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 - runner dependencies are explicit and shared with tests.
         self,
         writer: OffsetWriter,
         health: HealthEmitter,
         client: SlackClient,
         app_token: str,
         *,
+        limiters: SlurperLimiters,
         options: SocketModeOptions | None = None,
     ) -> None:
         options = options or SocketModeOptions()
@@ -238,7 +240,7 @@ class SocketModeRunner:
         self._health = health
         self._client = client
         self._app_token = app_token
-        self._limiter = writer.limiter
+        self._limiters = limiters
         # trio clock time of the most recent disconnect; None while connected
         # for the first time (initial connect emits slack_healthy, not reconnected).
         self._disconnected_at: float | None = None
@@ -252,7 +254,7 @@ class SocketModeRunner:
         while True:
             self._status.state = "connecting"
             try:
-                ws_url = await trio.to_thread.run_sync(self._open_socket, limiter=self._limiter)
+                ws_url = await trio.to_thread.run_sync(self._open_socket, limiter=self._limiters.slack_api)
             except _AuthFailed:
                 self._status.state = "auth_failed"
                 await self._health.emit(HealthKind.AUTH_TOKEN_INVALID)
@@ -417,7 +419,7 @@ class SocketModeRunner:
     async def _fetch_channel(self, channel_id: str) -> Validated[Channel] | None:
         try:
             return await trio.to_thread.run_sync(
-                lambda: self._client.get_channel_info(channel_id), limiter=self._limiter
+                lambda: self._client.get_channel_info(channel_id), limiter=self._limiters.slack_api
             )
         except (SlackAPIError, httpx.HTTPError):
             log.warning("socket-mode: conversations.info failed for %s", channel_id, exc_info=True)
@@ -479,13 +481,14 @@ def _ack(envelope_id: str) -> str:
     return json.dumps({"envelope_id": envelope_id})
 
 
-async def run_socket_mode(
+async def run_socket_mode(  # noqa: PLR0913 - public wrapper mirrors runner dependencies.
     writer: OffsetWriter,
     health: HealthEmitter,
     client: SlackClient,
     app_token: str,
     *,
+    limiters: SlurperLimiters,
     options: SocketModeOptions | None = None,
 ) -> None:
     """Entry point: build a `SocketModeRunner` and run it forever."""
-    await SocketModeRunner(writer, health, client, app_token, options=options).run()
+    await SocketModeRunner(writer, health, client, app_token, limiters=limiters, options=options).run()

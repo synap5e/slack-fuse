@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -40,6 +41,8 @@ class ServerConfig(BaseSettings):
     database_url: str = "postgresql:///slack_fuse_server"
     slurper_lock_timeout_s: float = 10.0
     slurper_statement_timeout_s: float = 30.0
+    slurper_writer_pool_size: int = Field(default=4, ge=1)
+    slurper_writer_pool_acquire_timeout_s: float = Field(default=30.0, gt=0.0)
 
     # WebSocket server.
     listen_addr: str = "127.0.0.1:8765"

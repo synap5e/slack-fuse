@@ -15,9 +15,9 @@ from psycopg.rows import TupleRow
 import slack_fuse_server.slurper.channels as channels_module
 from slack_fuse_server.slurper.api import ChannelNotFoundError, SlackAPIError, SlackClient
 from slack_fuse_server.slurper.channels import ensure_channel_added, populate_channels_once
-from slack_fuse_server.slurper.offsets import OffsetWriter
 from slack_fuse_server.slurper.socket import _channel_added_write
 from tests._fake_slack import load_fixtures, make_fake_slack_transport
+from tests.conftest import make_test_limiters, make_test_writer
 
 
 def _make_client(http: httpx.Client) -> SlackClient:
@@ -47,8 +47,8 @@ def test_populate_channels_once_writes_channel_added_events(
     server_conn: psycopg.Connection[TupleRow],
     fake_slack_http: httpx.Client,
 ) -> None:
-    writer = OffsetWriter(server_conn, trio.CapacityLimiter(1))
-    trio.run(populate_channels_once, writer, _make_client(fake_slack_http))
+    writer = make_test_writer(server_conn)
+    trio.run(populate_channels_once, writer, _make_client(fake_slack_http), make_test_limiters())
 
     rows = _channel_rows(server_conn)
     assert [kind for _, kind, _ in rows] == ["channel_added", "channel_added"]
@@ -69,11 +69,11 @@ def test_populate_channels_once_is_idempotent_on_restart(
     server_conn: psycopg.Connection[TupleRow],
     fake_slack_http: httpx.Client,
 ) -> None:
-    writer = OffsetWriter(server_conn, trio.CapacityLimiter(1))
+    writer = make_test_writer(server_conn)
     client = _make_client(fake_slack_http)
 
-    trio.run(populate_channels_once, writer, client)
-    trio.run(populate_channels_once, writer, client)
+    trio.run(populate_channels_once, writer, client, make_test_limiters())
+    trio.run(populate_channels_once, writer, client, make_test_limiters())
 
     rows = _channel_rows(server_conn)
     assert len(rows) == 2
@@ -91,8 +91,8 @@ def test_populate_payload_matches_live_socket_mode_shape(
     identically to a live socket-mode `channel_created` / `im_created`.
     """
     client = _make_client(fake_slack_http)
-    writer = OffsetWriter(server_conn, trio.CapacityLimiter(1))
-    trio.run(populate_channels_once, writer, client)
+    writer = make_test_writer(server_conn)
+    trio.run(populate_channels_once, writer, client, make_test_limiters())
 
     populated: dict[str, dict[str, object]] = {}
     for _, kind, payload in _channel_rows(server_conn):
@@ -124,10 +124,10 @@ def test_ensure_channel_added_emits_when_channel_not_previously_seen(
     """Fresh server: no prior channel_added events. ensure_channel_added calls
     conversations.info, writes the synthetic event, returns True.
     """
-    writer = OffsetWriter(server_conn, trio.CapacityLimiter(1))
+    writer = make_test_writer(server_conn)
     client = _make_client(fake_slack_http)
 
-    emitted = trio.run(ensure_channel_added, writer, client, "C0001")
+    emitted = trio.run(ensure_channel_added, writer, client, "C0001", make_test_limiters())
 
     assert emitted is True
     rows = _channel_rows(server_conn)
@@ -158,9 +158,9 @@ def test_ensure_channel_added_fetches_channel_info_before_stream_lock(
         original_lock(cur)
 
     monkeypatch.setattr(channels_module, "_lock_channel_list_stream", recording_lock)
-    writer = OffsetWriter(server_conn, trio.CapacityLimiter(1))
+    writer = make_test_writer(server_conn)
     with httpx.Client(base_url="https://slack.com/api", transport=httpx.MockTransport(handler)) as http_client:
-        emitted = trio.run(ensure_channel_added, writer, _make_client(http_client), "C0001")
+        emitted = trio.run(ensure_channel_added, writer, _make_client(http_client), "C0001", make_test_limiters())
 
     assert emitted is True
     assert order == ["http", "lock"]
@@ -171,11 +171,11 @@ def test_ensure_channel_added_is_idempotent_on_repeat(
     fake_slack_http: httpx.Client,
 ) -> None:
     """Second call sees the existing event and returns False without writing."""
-    writer = OffsetWriter(server_conn, trio.CapacityLimiter(1))
+    writer = make_test_writer(server_conn)
     client = _make_client(fake_slack_http)
 
-    first = trio.run(ensure_channel_added, writer, client, "C0001")
-    second = trio.run(ensure_channel_added, writer, client, "C0001")
+    first = trio.run(ensure_channel_added, writer, client, "C0001", make_test_limiters())
+    second = trio.run(ensure_channel_added, writer, client, "C0001", make_test_limiters())
 
     assert first is True
     assert second is False
@@ -189,13 +189,13 @@ def test_ensure_channel_added_is_noop_after_populate(
     """If `populate_channels_once` has already emitted channel_added for this
     channel, ensure_channel_added detects it and skips the conversations.info
     call. (Exercises the same dedup path as repeat ensure_channel_added.)"""
-    writer = OffsetWriter(server_conn, trio.CapacityLimiter(1))
+    writer = make_test_writer(server_conn)
     client = _make_client(fake_slack_http)
 
-    trio.run(populate_channels_once, writer, client)
+    trio.run(populate_channels_once, writer, client, make_test_limiters())
     before_offset = _channel_list_next_offset(server_conn)
 
-    emitted = trio.run(ensure_channel_added, writer, client, "C0001")
+    emitted = trio.run(ensure_channel_added, writer, client, "C0001", make_test_limiters())
 
     assert emitted is False
     assert _channel_list_next_offset(server_conn) == before_offset
@@ -210,17 +210,15 @@ def test_ensure_channel_added_raises_channel_not_found_for_inaccessible(
     token no longer has access to the channel; failing the whole Job for an
     expected condition is unhelpful. The existing broad SlackAPIError catch
     still works for the same reason."""
-    transport = make_fake_slack_transport(
-        overrides={"conversations.info": {"ok": False, "error": "channel_not_found"}}
-    )
+    transport = make_fake_slack_transport(overrides={"conversations.info": {"ok": False, "error": "channel_not_found"}})
     http_client = httpx.Client(transport=transport, base_url="https://slack.com/api")
     client = SlackClient("xoxp-test")
     client._http = http_client
-    writer = OffsetWriter(server_conn, trio.CapacityLimiter(1))
+    writer = make_test_writer(server_conn)
 
     # Specific subclass for callers that want skip-not-fail semantics.
     with pytest.raises(ChannelNotFoundError):
-        _ = trio.run(ensure_channel_added, writer, client, "C-GONE")
+        _ = trio.run(ensure_channel_added, writer, client, "C-GONE", make_test_limiters())
 
     # Subclass relationship: existing broad handlers still catch it.
     assert issubclass(ChannelNotFoundError, SlackAPIError)

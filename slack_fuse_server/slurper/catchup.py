@@ -50,6 +50,7 @@ import trio
 from slack_fuse_render import ChannelId
 from slack_fuse_server.backfill.types import Backfiller
 from slack_fuse_server.slurper.api import SlackAPIError
+from slack_fuse_server.slurper.limiters import SlurperLimiters
 from slack_fuse_server.slurper.offsets import PG_TIMEOUT_EXCEPTIONS, EventRecord, OffsetWriter
 
 if TYPE_CHECKING:
@@ -106,6 +107,7 @@ class CatchupDeps:
     writer: OffsetWriter
     backfiller: Backfiller
     config: CatchupConfig
+    limiters: SlurperLimiters
 
 
 _CHANNEL_STREAM_PREFIX = "channel:"
@@ -210,9 +212,7 @@ async def run_catchup_once(deps: CatchupDeps, *, now_epoch: float | None = None)
     recovery of the rest.
     """
     now = now_epoch if now_epoch is not None else time.time()
-    last_seen = await trio.to_thread.run_sync(
-        lambda: last_seen_ts_by_stream(deps.writer.conn), limiter=deps.writer.limiter
-    )
+    last_seen = await deps.writer.run_read(last_seen_ts_by_stream, limiter=deps.limiters.admin_read)
     start = trio.current_time()
     channels = 0
     events = 0

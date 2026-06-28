@@ -20,7 +20,8 @@ from slack_fuse_server.config import ServerConfig
 from slack_fuse_server.slurper import __main__ as slurper_main
 from slack_fuse_server.slurper.api import SlackClient, Validated
 from slack_fuse_server.slurper.health import HealthEmitter
-from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter, write_event
+from slack_fuse_server.slurper.offsets import EventRecord, write_event
+from tests.conftest import make_test_limiters, make_test_writer
 
 
 class _ChannelListBackfiller:
@@ -104,7 +105,8 @@ def _run_auto_backfill(
     *,
     auto_backfill_skip_if_completed: bool = True,
 ) -> tuple[list[str], list[float]]:
-    writer = OffsetWriter(conn, trio.CapacityLimiter(1))
+    writer = make_test_writer(conn)
+    limiters = make_test_limiters()
     health = HealthEmitter(writer)
     backfiller = _ChannelListBackfiller(channel_ids)
     backfilled: list[str] = []
@@ -138,7 +140,7 @@ def _run_auto_backfill(
         writer,
         health,
         cast(SlackClient, object()),
-        writer.limiter,
+        limiters,
     )
     return backfilled, sleep_calls
 
@@ -194,7 +196,4 @@ def test_auto_backfill_skip_logs_completion_details(
     backfilled, _sleep_calls = _run_auto_backfill(server_conn, monkeypatch, ["C_LOG"])
 
     assert backfilled == []
-    assert (
-        f"auto-backfill: skipping C_LOG — completed at {completed_at.isoformat()}, events_written=23"
-        in caplog.text
-    )
+    assert f"auto-backfill: skipping C_LOG — completed at {completed_at.isoformat()}, events_written=23" in caplog.text

@@ -27,11 +27,13 @@ import logging
 
 import httpx
 import trio
-from psycopg import Cursor
+from psycopg import Connection, Cursor
 from psycopg.rows import TupleRow
 
+from slack_fuse.models import Channel
 from slack_fuse_server._json import JsonObject
-from slack_fuse_server.slurper.api import SlackAPIError, SlackClient
+from slack_fuse_server.slurper.api import SlackAPIError, SlackClient, Validated
+from slack_fuse_server.slurper.limiters import SlurperLimiters
 from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter, assign_offset, insert_event
 
 log = logging.getLogger(__name__)
@@ -88,10 +90,12 @@ def _insert_channel_added(cur: Cursor[TupleRow], channel_raw: JsonObject) -> int
     return offset
 
 
-def _populate_channels_once_sync(writer: OffsetWriter, client: SlackClient) -> tuple[int, int]:
-    channels = client.list_conversations()
+def _populate_channels_once_sync(
+    conn: Connection[TupleRow],
+    channels: list[Validated[Channel]],
+) -> tuple[int, int]:
     inserted = 0
-    with writer.conn.transaction(), writer.conn.cursor() as cur:
+    with conn.cursor() as cur:
         _lock_channel_list_stream(cur)
         existing = _existing_channel_added_ids(cur)
         for validated in channels:
@@ -104,13 +108,11 @@ def _populate_channels_once_sync(writer: OffsetWriter, client: SlackClient) -> t
     return (len(channels), inserted)
 
 
-async def populate_channels_once(writer: OffsetWriter, client: SlackClient) -> None:
+async def populate_channels_once(writer: OffsetWriter, client: SlackClient, limiters: SlurperLimiters) -> None:
     """One-shot startup conversations.list import (`channel_added` events)."""
     try:
-        total, inserted = await trio.to_thread.run_sync(
-            lambda: _populate_channels_once_sync(writer, client),
-            limiter=writer.limiter,
-        )
+        channels = await trio.to_thread.run_sync(client.list_conversations, limiter=limiters.slack_api)
+        total, inserted = await writer.run_transaction(lambda conn: _populate_channels_once_sync(conn, channels))
     except (httpx.HTTPError, SlackAPIError, ValueError):
         log.warning("channels: startup populate failed", exc_info=True)
         return
@@ -122,19 +124,23 @@ async def populate_channels_once(writer: OffsetWriter, client: SlackClient) -> N
     )
 
 
-def _channel_added_exists_sync(writer: OffsetWriter, channel_id: str) -> bool:
-    with writer.conn.cursor() as cur:
+def _channel_added_exists_sync(conn: Connection[TupleRow], channel_id: str) -> bool:
+    with conn.cursor() as cur:
         return _channel_added_exists(cur, channel_id)
 
 
-def _insert_channel_added_if_missing_sync(writer: OffsetWriter, channel_id: str, channel_raw: JsonObject) -> bool:
+def _insert_channel_added_if_missing_sync(
+    conn: Connection[TupleRow],
+    channel_id: str,
+    channel_raw: JsonObject,
+) -> bool:
     """Transaction-only body of :func:`ensure_channel_added`.
 
     Returns True if a new event was inserted, False if one already existed
     (idempotent re-run). The caller fetches ``channel_raw`` before entering this
     transaction; this helper must stay DB-only.
     """
-    with writer.conn.transaction(), writer.conn.cursor() as cur:
+    with conn.cursor() as cur:
         _lock_channel_list_stream(cur)
         if _channel_added_exists(cur, channel_id):
             return False
@@ -142,7 +148,12 @@ def _insert_channel_added_if_missing_sync(writer: OffsetWriter, channel_id: str,
         return True
 
 
-async def ensure_channel_added(writer: OffsetWriter, client: SlackClient, channel_id: str) -> bool:
+async def ensure_channel_added(
+    writer: OffsetWriter,
+    client: SlackClient,
+    channel_id: str,
+    limiters: SlurperLimiters,
+) -> bool:
     """Guarantee that ``channel-list`` has a ``channel_added`` event for
     ``channel_id`` before any per-channel events are written.
 
@@ -155,9 +166,9 @@ async def ensure_channel_added(writer: OffsetWriter, client: SlackClient, channe
 
     Returns True if a new event was inserted, False if one already existed.
     """
-    already_exists = await trio.to_thread.run_sync(
-        lambda: _channel_added_exists_sync(writer, channel_id),
-        limiter=writer.limiter,
+    already_exists = await writer.run_read(
+        lambda conn: _channel_added_exists_sync(conn, channel_id),
+        limiter=limiters.admin_read,
     )
     if already_exists:
         return False
@@ -167,9 +178,8 @@ async def ensure_channel_added(writer: OffsetWriter, client: SlackClient, channe
     # without holding the stream row lock during the network call.
     validated = await trio.to_thread.run_sync(
         lambda: client.get_channel_info(channel_id),
-        limiter=writer.limiter,
+        limiter=limiters.slack_api,
     )
-    return await trio.to_thread.run_sync(
-        lambda: _insert_channel_added_if_missing_sync(writer, channel_id, validated.raw),
-        limiter=writer.limiter,
+    return await writer.run_transaction(
+        lambda conn: _insert_channel_added_if_missing_sync(conn, channel_id, validated.raw)
     )
