@@ -39,6 +39,7 @@ for an ad hoc admin run, not for a 100+-channel sweep on every restart.
 from __future__ import annotations
 
 import logging
+import random
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -49,7 +50,7 @@ import trio
 from slack_fuse_render import ChannelId
 from slack_fuse_server.backfill.types import Backfiller
 from slack_fuse_server.slurper.api import SlackAPIError
-from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter
+from slack_fuse_server.slurper.offsets import PG_TIMEOUT_EXCEPTIONS, EventRecord, OffsetWriter
 
 if TYPE_CHECKING:
     import psycopg
@@ -73,6 +74,9 @@ DEFAULT_CHANNEL_GAP_S = 1.5
 #: Delay before the startup catchup, so the populate one-shots and the live
 #: socket connection settle before we add history traffic.
 DEFAULT_STARTUP_DELAY_S = 30.0
+
+_PG_TIMEOUT_RETRY_MIN_S = 0.5
+_PG_TIMEOUT_RETRY_MAX_S = 2.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,10 +179,26 @@ async def catchup_channel(
     events = 0
     async for wrapped in backfiller.messages_for_channel(channel_id, since_ts):
         record = EventRecord(stream=stream, kind="message", ts=wrapped.model.ts, payload=wrapped.raw, dedup=True)
-        offset = await writer.write_message_or_corrective(record)
+        offset = await _write_message_or_corrective_retry_once(writer, record)
         if offset is not None:
             events += 1
     return events
+
+
+async def _write_message_or_corrective_retry_once(writer: OffsetWriter, record: EventRecord) -> int | None:
+    try:
+        return await writer.write_message_or_corrective(record)
+    except PG_TIMEOUT_EXCEPTIONS:
+        wait = random.uniform(_PG_TIMEOUT_RETRY_MIN_S, _PG_TIMEOUT_RETRY_MAX_S)
+        log.warning(
+            "catchup: PostgreSQL timeout writing stream=%s kind=%s; retrying once in %.2fs",
+            record.stream,
+            record.kind,
+            wait,
+            exc_info=True,
+        )
+        await trio.sleep(wait)
+        return await writer.write_message_or_corrective(record)
 
 
 async def run_catchup_once(deps: CatchupDeps, *, now_epoch: float | None = None) -> CatchupResult:

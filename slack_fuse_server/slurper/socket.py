@@ -56,7 +56,7 @@ from slack_fuse.models import (
 from slack_fuse_server._json import JsonObject
 from slack_fuse_server.slurper.api import SlackAPIError, SlackClient, Validated
 from slack_fuse_server.slurper.health import HealthEmitter, HealthKind, SlackDegradedTracker
-from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter
+from slack_fuse_server.slurper.offsets import PG_TIMEOUT_EXCEPTIONS, EventRecord, OffsetWriter
 
 log = logging.getLogger(__name__)
 
@@ -214,6 +214,13 @@ def _channel_added_write(channel_raw: JsonObject) -> EventRecord:
     return EventRecord(stream="channel-list", kind="channel_added", ts=None, payload=channel_raw)
 
 
+def _record_channel_id(record: EventRecord) -> str | None:
+    if record.stream.startswith("channel:"):
+        return record.stream.removeprefix("channel:")
+    channel_id = record.payload.get("channel_id")
+    return channel_id if isinstance(channel_id, str) else None
+
+
 class SocketModeRunner:
     """Owns the Socket Mode connection lifecycle and its health transitions."""
 
@@ -345,12 +352,24 @@ class SocketModeRunner:
         if event.type == "message":
             write = translate_message_event(event, raw_event)
             if write is not None:
-                await self._writer.write_event(write)
+                await self._write_event_or_drop_timeout(write)
             return
         if event.type in CHANNEL_LIST_EVENT_TYPES:
             await self._handle_structural_event(event)
             return
         log.debug("socket-mode: ignoring event type %s", event.type)
+
+    async def _write_event_or_drop_timeout(self, record: EventRecord) -> None:
+        try:
+            await self._writer.write_event(record)
+        except PG_TIMEOUT_EXCEPTIONS:
+            log.warning(
+                "socket-mode: dropped event after PostgreSQL timeout stream=%s kind=%s channel_id=%s",
+                record.stream,
+                record.kind,
+                _record_channel_id(record),
+                exc_info=True,
+            )
 
     async def _handle_structural_event(self, event: SocketEventPayload) -> None:
         """Translate a channel-structure event to a `channel-list` write.
@@ -364,7 +383,7 @@ class SocketModeRunner:
             return
         write = await self._build_structural_write(event, channel_id)
         if write is not None:
-            await self._writer.write_event(write)
+            await self._write_event_or_drop_timeout(write)
 
     async def _build_structural_write(self, event: SocketEventPayload, channel_id: str) -> EventRecord | None:
         etype = event.type

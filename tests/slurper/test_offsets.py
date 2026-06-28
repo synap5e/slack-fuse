@@ -8,9 +8,11 @@ single-connection serialization the production slurper happens to use.
 
 from __future__ import annotations
 
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import psycopg
+import pytest
 from psycopg.rows import TupleRow
 
 from slack_fuse_server.slurper.offsets import EventRecord, write_event
@@ -31,6 +33,19 @@ def _next_offset(conn: psycopg.Connection[TupleRow], stream: str) -> int:
         row = cur.fetchone()
     assert row is not None
     return int(row[0])
+
+
+def _set_session_timeouts(
+    conn: psycopg.Connection[TupleRow],
+    *,
+    lock_timeout_s: float,
+    statement_timeout_s: float,
+) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT set_config('lock_timeout', %s, false), set_config('statement_timeout', %s, false)",
+            (f"{int(lock_timeout_s * 1000)}ms", f"{int(statement_timeout_s * 1000)}ms"),
+        )
 
 
 def test_sequential_offsets_start_at_one(server_conn: psycopg.Connection[TupleRow]) -> None:
@@ -105,3 +120,38 @@ def test_concurrent_writers_no_gaps_or_duplicates(server_conn_factory: ServerCon
 
     all_offsets = sorted(off for sub in results for off in sub)
     assert all_offsets == list(range(1, workers * per_worker + 1))
+
+
+def test_lock_timeout_fires_when_stream_head_row_is_locked(server_conn_factory: ServerConnFactory) -> None:
+    stream = "channel:LOCKED"
+    locker_conn = server_conn_factory()
+    writer_conn = server_conn_factory()
+    _set_session_timeouts(writer_conn, lock_timeout_s=0.1, statement_timeout_s=5.0)
+
+    assert write_event(locker_conn, EventRecord(stream=stream, kind="message", ts="1.0", payload={"ts": "1.0"})) == 1
+
+    with locker_conn.transaction(), locker_conn.cursor() as cur:
+        cur.execute("SELECT next_offset FROM stream_heads WHERE stream = %s FOR UPDATE", (stream,))
+        assert cur.fetchone() is not None
+
+        start = time.monotonic()
+        with pytest.raises(psycopg.errors.LockNotAvailable):
+            write_event(
+                writer_conn,
+                EventRecord(stream=stream, kind="message", ts="2.0", payload={"ts": "2.0"}),
+            )
+        elapsed = time.monotonic() - start
+
+    assert elapsed < 0.75
+
+
+def test_statement_timeout_fires_for_slow_query(server_conn_factory: ServerConnFactory) -> None:
+    writer_conn = server_conn_factory()
+    _set_session_timeouts(writer_conn, lock_timeout_s=5.0, statement_timeout_s=0.1)
+
+    start = time.monotonic()
+    with pytest.raises(psycopg.errors.QueryCanceled), writer_conn.cursor() as cur:
+        cur.execute("SELECT pg_sleep(0.5)")
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 0.75

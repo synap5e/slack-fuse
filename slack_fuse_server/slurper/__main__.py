@@ -89,8 +89,8 @@ _BACKFILL_SOURCES = ("slack-api", "legacy-cache")
 type BackfillSource = Literal["slack-api", "legacy-cache"]
 
 
-def _connect_and_migrate(database_url: str) -> psycopg.Connection[TupleRow]:
-    conn: psycopg.Connection[TupleRow] = psycopg.connect(database_url)
+def _connect_and_migrate(config: ServerConfig) -> psycopg.Connection[TupleRow]:
+    conn: psycopg.Connection[TupleRow] = psycopg.connect(config.database_url)
     # Autocommit so each `with conn.transaction()` is a real BEGIN/COMMIT. Without
     # it, a bare read (e.g. the backfill-override lookup) opens an implicit
     # transaction, turning every later transaction() into a savepoint that never
@@ -99,6 +99,13 @@ def _connect_and_migrate(database_url: str) -> psycopg.Connection[TupleRow]:
     applied = apply_migrations(conn, _MIGRATIONS_DIR)
     if applied:
         log.info("applied server migrations: %s", ", ".join(applied))
+    lock_timeout_ms = int(config.slurper_lock_timeout_s * 1000)
+    statement_timeout_ms = int(config.slurper_statement_timeout_s * 1000)
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT set_config('lock_timeout', %s, false), set_config('statement_timeout', %s, false)",
+            (f"{lock_timeout_ms}ms", f"{statement_timeout_ms}ms"),
+        )
     return conn
 
 
@@ -265,7 +272,7 @@ def _log_slurper_started() -> None:
 
 
 async def _serve(config: ServerConfig) -> None:
-    conn = _connect_and_migrate(config.database_url)
+    conn = _connect_and_migrate(config)
     client = SlackClient(config.slack_user_token)
     users = UserCache(client.http)
     users.populate()
@@ -473,7 +480,7 @@ async def _run_refresh_channels_once(config: ServerConfig) -> None:
     """
     from slack_fuse_server.slurper.refresh import refresh_channels_once  # noqa: PLC0415
 
-    conn = _connect_and_migrate(config.database_url)
+    conn = _connect_and_migrate(config)
     limiter = trio.CapacityLimiter(1)
     writer = OffsetWriter(conn, limiter)
     client = SlackClient(config.slack_user_token)
@@ -496,7 +503,7 @@ async def _run_backfill(  # noqa: PLR0913 — thin CLI thunk; bundling into opti
     source: BackfillSource,
     since_ts: float | None = None,
 ) -> None:
-    conn = _connect_and_migrate(config.database_url)
+    conn = _connect_and_migrate(config)
     limiter = trio.CapacityLimiter(1)
     writer = OffsetWriter(conn, limiter)
     health = HealthEmitter(writer)
@@ -591,7 +598,7 @@ class ManualBackfillTrigger:
 
 
 def _run_block_command(config: ServerConfig, channel_id: str, reason: str | None) -> None:
-    conn = _connect_and_migrate(config.database_url)
+    conn = _connect_and_migrate(config)
     try:
         row = block_channel(conn, channel_id, reason=reason)
     finally:
@@ -600,7 +607,7 @@ def _run_block_command(config: ServerConfig, channel_id: str, reason: str | None
 
 
 def _run_unblock_command(config: ServerConfig, channel_id: str) -> None:
-    conn = _connect_and_migrate(config.database_url)
+    conn = _connect_and_migrate(config)
     try:
         unblock_channel(conn, channel_id)
     finally:
@@ -609,7 +616,7 @@ def _run_unblock_command(config: ServerConfig, channel_id: str) -> None:
 
 
 def _run_list_blocked_command(config: ServerConfig) -> None:
-    conn = _connect_and_migrate(config.database_url)
+    conn = _connect_and_migrate(config)
     try:
         rows = list_blocked_channels(conn)
     finally:

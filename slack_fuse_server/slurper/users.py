@@ -32,7 +32,13 @@ from slack_fuse.models import (
 from slack_fuse_server._json import JsonObject
 from slack_fuse_server.slurper.api import SlackAPIError, SlackClient, Validated
 from slack_fuse_server.slurper.health import HealthEmitter
-from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter, assign_offset, insert_event
+from slack_fuse_server.slurper.offsets import (
+    PG_TIMEOUT_EXCEPTIONS,
+    EventRecord,
+    OffsetWriter,
+    assign_offset,
+    insert_event,
+)
 from slack_fuse_server.slurper.socket import SocketModeOptions, SocketModeRunner, extract_raw_event
 
 log = logging.getLogger(__name__)
@@ -247,6 +253,9 @@ async def apply_user_change_event(writer: OffsetWriter, client: SlackClient, eve
             lambda: _apply_user_change_sync(writer, client, user_id),
             limiter=writer.limiter,
         )
+    except PG_TIMEOUT_EXCEPTIONS:
+        log.warning("users: dropped user_change after PostgreSQL timeout for %s", user_id, exc_info=True)
+        return
     except (httpx.HTTPError, SlackAPIError, ValueError):
         log.warning("users: failed to apply user_change for %s", user_id, exc_info=True)
         return

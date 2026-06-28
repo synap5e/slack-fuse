@@ -21,6 +21,8 @@ from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, cast
 
 import httpx
+import psycopg
+import pytest
 import trio
 
 from slack_fuse.models import Message
@@ -205,6 +207,48 @@ class _RecordingBackfiller:
         ts = f"{1800000000 + hash(channel_id.value) % 1000}.000000"
         msg = Message(ts=ts, user="U1", text=f"m-{channel_id.value}")
         yield Validated(raw=cast(JsonObject, msg.model_dump(mode="json")), model=msg)
+
+
+class _FlakyCatchupWriter:
+    def __init__(self, conn: psycopg.Connection[TupleRow], *, failures: int) -> None:
+        self.conn = conn
+        self.limiter = trio.CapacityLimiter(1)
+        self.failures_remaining = failures
+        self.calls = 0
+
+    async def write_message_or_corrective(self, _record: EventRecord) -> int | None:
+        self.calls += 1
+        if self.failures_remaining > 0:
+            self.failures_remaining -= 1
+            raise psycopg.errors.QueryCanceled("test statement timeout")
+        return 1
+
+
+def _disable_catchup_pg_retry_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _zero(_minimum: float, _maximum: float) -> float:
+        return 0.0
+
+    monkeypatch.setattr("slack_fuse_server.slurper.catchup.random.uniform", _zero)
+
+
+def test_catchup_channel_retries_pg_timeout_once_then_continues(
+    server_conn: psycopg.Connection[TupleRow],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _disable_catchup_pg_retry_sleep(monkeypatch)
+    writer = _FlakyCatchupWriter(server_conn, failures=1)
+    backfiller = _RecordingBackfiller(["CRETRY"])
+
+    written = trio.run(
+        catchup_channel,
+        backfiller,
+        cast(OffsetWriter, writer),
+        ChannelId("CRETRY"),
+        0.0,
+    )
+
+    assert writer.calls == 2
+    assert written == 1
 
 
 def test_run_catchup_once_sweeps_every_channel_with_resolved_resume_points(

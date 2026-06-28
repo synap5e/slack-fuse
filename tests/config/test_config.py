@@ -21,6 +21,8 @@ listen_addr = "0.0.0.0:9999"
 snapshot_every_n_events = 1234
 backfill_abort_at = 99999
 backfill_page_sleep_min_s = 12.5
+slurper_lock_timeout_s = 1.5
+slurper_statement_timeout_s = 12.25
 """
 
 _CLIENT_TOML = """\
@@ -56,6 +58,8 @@ def test_server_config_from_toml(tmp_path: Path) -> None:
     assert cfg.snapshot_every_n_events == 1234
     assert cfg.backfill_abort_at == 99999
     assert abs(cfg.backfill_page_sleep_min_s - 12.5) < 1e-9
+    assert abs(cfg.slurper_lock_timeout_s - 1.5) < 1e-9
+    assert abs(cfg.slurper_statement_timeout_s - 12.25) < 1e-9
     # Untouched keys fall back to RFC defaults.
     assert cfg.backfill_warn_at == 5000
     assert cfg.auto_backfill_skip_if_completed is True

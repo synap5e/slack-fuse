@@ -38,6 +38,8 @@ class ServerConfig(BaseSettings):
 
     # Postgres.
     database_url: str = "postgresql:///slack_fuse_server"
+    slurper_lock_timeout_s: float = 10.0
+    slurper_statement_timeout_s: float = 30.0
 
     # WebSocket server.
     listen_addr: str = "127.0.0.1:8765"

@@ -39,12 +39,18 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import cast
 
+import psycopg
 import trio
 from psycopg import Connection, Cursor
 from psycopg.rows import TupleRow
 from psycopg.types.json import Jsonb
 
 from slack_fuse_server._json import JsonObject
+
+PG_TIMEOUT_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    psycopg.errors.LockNotAvailable,
+    psycopg.errors.QueryCanceled,
+)
 
 
 @dataclass(frozen=True, slots=True)

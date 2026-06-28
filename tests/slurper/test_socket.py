@@ -14,13 +14,14 @@ from typing import cast
 
 import httpx
 import psycopg
+import pytest
 import trio
 from psycopg.rows import TupleRow
 
 from slack_fuse.models import JsonObject, Message, SocketEventPayload
 from slack_fuse_server.slurper.api import SlackClient
 from slack_fuse_server.slurper.health import HealthEmitter
-from slack_fuse_server.slurper.offsets import OffsetWriter
+from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter
 from slack_fuse_server.slurper.socket import (
     SocketModeOptions,
     SocketModeRunner,
@@ -147,6 +148,21 @@ def _make_runner(conn: psycopg.Connection[TupleRow], http: httpx.Client) -> Sock
     return SocketModeRunner(writer, HealthEmitter(writer), client, "xapp-test")
 
 
+class _NullHealth:
+    async def emit(self, *_args: object, **_kwargs: object) -> int:
+        return 1
+
+
+class _TimeoutWriter:
+    def __init__(self) -> None:
+        self.limiter = trio.CapacityLimiter(1)
+        self.records: list[EventRecord] = []
+
+    async def write_event(self, record: EventRecord) -> int | None:
+        self.records.append(record)
+        raise psycopg.errors.QueryCanceled("test statement timeout")
+
+
 def _rows(conn: psycopg.Connection[TupleRow], stream: str) -> list[tuple[str, object]]:
     with conn.cursor() as cur:
         cur.execute(
@@ -171,6 +187,26 @@ def test_handle_message_event_writes_channel_stream(
     assert kind == "message"
     assert isinstance(payload, dict)
     assert payload["ts"] == "100.0001"
+
+
+def test_handle_message_event_drops_pg_timeout_with_warning(
+    fake_slack_http: httpx.Client,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = SlackClient("xoxp-test")
+    client._http = fake_slack_http
+    writer = _TimeoutWriter()
+    runner = SocketModeRunner(cast(OffsetWriter, writer), cast(HealthEmitter, _NullHealth()), client, "xapp-test")
+    event = SocketEventPayload(type="message", channel="C1", ts="100.0001", user="U1", text="hi")
+    caplog.set_level("WARNING", logger="slack_fuse_server.slurper.socket")
+
+    trio.run(runner._handle_event, event, _raw_for(event))
+
+    assert len(writer.records) == 1
+    assert "dropped event after PostgreSQL timeout" in caplog.text
+    assert "stream=channel:C1" in caplog.text
+    assert "kind=message" in caplog.text
+    assert "channel_id=C1" in caplog.text
 
 
 def test_handle_structural_event_enriches_via_conversations_info(

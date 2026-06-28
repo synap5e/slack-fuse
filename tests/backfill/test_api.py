@@ -14,6 +14,7 @@ from typing import cast
 
 import httpx
 import psycopg
+import pytest
 import trio
 from psycopg.rows import TupleRow
 
@@ -23,7 +24,7 @@ from slack_fuse_server._json import JsonObject
 from slack_fuse_server.backfill.api import BackfillContext, SlackApiBackfiller, SleepBounds, backfill_channel
 from slack_fuse_server.backfill.types import BackfillAbortReason
 from slack_fuse_server.slurper.api import SlackClient, Validated
-from slack_fuse_server.slurper.health import HealthEmitter
+from slack_fuse_server.slurper.health import HealthEmitter, HealthKind
 from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter, write_event
 
 _NO_SLEEP = SleepBounds(page_min_s=0.0, page_max_s=0.0, thread_min_s=0.0, thread_max_s=0.0)
@@ -226,6 +227,37 @@ class _OneMessageBackfiller:
         yield Validated(raw=self._raw, model=msg)
 
 
+class _NullHealth:
+    def __init__(self) -> None:
+        self.kinds: list[str] = []
+
+    async def emit(self, kind: HealthKind, _payload: JsonObject | None = None) -> int:
+        self.kinds.append(str(kind))
+        return len(self.kinds)
+
+
+class _FlakyWriter:
+    def __init__(self, conn: psycopg.Connection[TupleRow], *, failures: int) -> None:
+        self.conn = conn
+        self.limiter = trio.CapacityLimiter(1)
+        self.failures_remaining = failures
+        self.calls = 0
+
+    async def write_message_or_corrective(self, _record: EventRecord) -> int | None:
+        self.calls += 1
+        if self.failures_remaining > 0:
+            self.failures_remaining -= 1
+            raise psycopg.errors.LockNotAvailable("test lock timeout")
+        return 1
+
+
+def _disable_pg_retry_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _zero(_minimum: float, _maximum: float) -> float:
+        return 0.0
+
+    monkeypatch.setattr("slack_fuse_server.backfill.api.random.uniform", _zero)
+
+
 def _events_count(conn: psycopg.Connection[TupleRow], stream: str) -> int:
     with conn.cursor() as cur:
         cur.execute("SELECT count(*) FROM events WHERE stream = %s", (stream,))
@@ -261,6 +293,47 @@ def test_backfill_channel_writes_events_and_emits_health(server_conn: psycopg.Co
     assert (result.messages, result.events_written, result.aborted) == (5, 5, False)
     assert _events_count(server_conn, "channel:CX") == 5
     assert _health_kinds(server_conn) == ["backfill_started", "backfill_completed"]
+
+
+def test_backfill_channel_retries_pg_timeout_once_then_continues(
+    server_conn: psycopg.Connection[TupleRow],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _disable_pg_retry_sleep(monkeypatch)
+    writer = _FlakyWriter(server_conn, failures=1)
+    health = _NullHealth()
+    ctx = BackfillContext(
+        writer=cast(OffsetWriter, writer),
+        health=cast(HealthEmitter, health),
+        warn_at=1000,
+        abort_at=20000,
+    )
+
+    result = trio.run(backfill_channel, _StubBackfiller(1), ChannelId("CRETRY"), ctx)
+
+    assert writer.calls == 2
+    assert result.messages == 1
+    assert result.events_written == 1
+    assert health.kinds == ["backfill_started", "backfill_completed"]
+
+
+def test_backfill_channel_propagates_second_pg_timeout(
+    server_conn: psycopg.Connection[TupleRow],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _disable_pg_retry_sleep(monkeypatch)
+    writer = _FlakyWriter(server_conn, failures=2)
+    ctx = BackfillContext(
+        writer=cast(OffsetWriter, writer),
+        health=cast(HealthEmitter, _NullHealth()),
+        warn_at=1000,
+        abort_at=20000,
+    )
+
+    with pytest.raises(psycopg.errors.LockNotAvailable):
+        trio.run(backfill_channel, _StubBackfiller(1), ChannelId("CFAIL"), ctx)
+
+    assert writer.calls == 2
 
 
 def test_backfill_channel_aborts_at_threshold(server_conn: psycopg.Connection[TupleRow]) -> None:

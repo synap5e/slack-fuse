@@ -32,7 +32,7 @@ from slack_fuse_server.backfill.types import BackfillAbortReason, Backfiller, Ba
 from slack_fuse_server.blocked_channels import is_channel_blocked
 from slack_fuse_server.slurper.api import FatalAPIError, RateLimitedError, SlackClient, Validated
 from slack_fuse_server.slurper.health import HealthEmitter, HealthKind
-from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter
+from slack_fuse_server.slurper.offsets import PG_TIMEOUT_EXCEPTIONS, EventRecord, OffsetWriter
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +50,9 @@ _DEFAULT_THREAD_SLEEP_MAX = 8.0
 # Extra jitter added to a Slack-provided retry-after before resuming.
 _RATE_LIMIT_JITTER_MIN = 10.0
 _RATE_LIMIT_JITTER_MAX = 30.0
+
+_PG_TIMEOUT_RETRY_MIN_S = 0.5
+_PG_TIMEOUT_RETRY_MAX_S = 2.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,6 +255,22 @@ async def _sleep_rate_limited(retry_after: float | None) -> None:
     await trio.sleep(wait)
 
 
+async def _write_message_or_corrective_retry_once(writer: OffsetWriter, record: EventRecord) -> int | None:
+    try:
+        return await writer.write_message_or_corrective(record)
+    except PG_TIMEOUT_EXCEPTIONS:
+        wait = random.uniform(_PG_TIMEOUT_RETRY_MIN_S, _PG_TIMEOUT_RETRY_MAX_S)
+        log.warning(
+            "backfill: PostgreSQL timeout writing stream=%s kind=%s; retrying once in %.2fs",
+            record.stream,
+            record.kind,
+            wait,
+            exc_info=True,
+        )
+        await trio.sleep(wait)
+        return await writer.write_message_or_corrective(record)
+
+
 async def backfill_channel(
     backfiller: Backfiller,
     channel_id: ChannelId,
@@ -312,7 +331,7 @@ async def backfill_channel(
             # docstring). The events log stays lossless; future projections
             # can read fields the Message model doesn't declare today.
             record = EventRecord(stream=stream, kind="message", ts=msg.ts, payload=wrapped.raw, dedup=True)
-            offset = await ctx.writer.write_message_or_corrective(record)
+            offset = await _write_message_or_corrective_retry_once(ctx.writer, record)
             if offset is not None:
                 events_written += 1
     except FatalAPIError:
