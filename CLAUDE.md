@@ -60,6 +60,7 @@ The codebase has several "health" signals. They are orthogonal; never collapse t
 - `connection_state.last_slurper_health` — client projection of selected `slurper-health` kinds for trailer classification (`healthy`/`degraded`/`disconnected`/`auth_failed`).
 - Slurper task liveness — `/livez` reads the in-memory task supervisor's latest phase + deadline per long-running task; it models scheduler progress, not data flow.
 - Slurper restart frequency — stdout INFO line `slurper-started image=... commit=... pid=...`; Loki counts it. `SLACK_FUSE_SERVER_IMAGE` / `GIT_COMMIT` are optional now, useful once wired.
+- Slurper span logs — stdout lines from `slurper.spans` with `op=`, `task=`, `result=`, `duration_ms=`, `limiter_wait_ms=`, and `sync_ms=`; operation-level evidence for slow/failing/wedged sync hops.
 - Client trailer `staleness_reason` — rendered-content freshness from `connection_state.last_frame_at`, WS state, and per-stream `stream_caught_up`; known quiet-stream false positives live in `BACKLOG.md`.
 - Client `cursors.updated_at` / `applied_offset` — per-stream apply progress for reconnect resume. Distinct from server health.
 - `PgHealth` / `NO_POSTGRES` — local projector Postgres reachability. Cluster server/slurper may be fine while FUSE reads fail fast.

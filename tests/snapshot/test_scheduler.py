@@ -8,6 +8,7 @@ and back-dated event timestamps).
 from __future__ import annotations
 
 import psycopg
+import pytest
 import trio
 from psycopg.rows import TupleRow
 
@@ -110,18 +111,26 @@ def _new_scheduler(conn: psycopg.Connection[TupleRow], *, every_n_events: int) -
     )
 
 
-def test_tick_generates_due_snapshot_then_is_idempotent(server_conn: psycopg.Connection[TupleRow]) -> None:
+def test_tick_generates_due_snapshot_then_is_idempotent(
+    server_conn: psycopg.Connection[TupleRow],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     stream = "channel:C1"
     for i in range(3):
         _write_message(server_conn, stream, f"40{i}.000000")
 
     scheduler = _new_scheduler(server_conn, every_n_events=3)
+    caplog.set_level("INFO", logger="slack_fuse_server.slurper.spans")
     results = trio.run(scheduler.tick)
 
     assert len(results) == 1
     assert results[0].stream == stream
     assert results[0].at_offset == 3
     assert results[0].generation_trigger == "event_count"
+    assert "op=slurper.snapshot.generate" in caplog.text
+    assert "result=ok" in caplog.text
+    assert "stream=channel:C1" in caplog.text
+    assert "offset=3" in caplog.text
 
     # No new events → the next tick generates nothing.
     assert trio.run(scheduler.tick) == []

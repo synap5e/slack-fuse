@@ -38,11 +38,14 @@ from slack_fuse_server._json import JsonObject
 from slack_fuse_server.slurper.api import ChannelNotFoundError, SlackAPIError, SlackClient
 from slack_fuse_server.slurper.limiters import SlurperLimiters
 from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter, assign_offset, insert_event
+from slack_fuse_server.slurper.spans import run_sync_with_span, span
 from slack_fuse_server.slurper.supervisor import TaskSupervisor, phase
 
 if TYPE_CHECKING:
     import psycopg
     from psycopg.rows import TupleRow
+
+    from slack_fuse_server.slurper.spans import SpanRecorder
 
 log = logging.getLogger(__name__)
 
@@ -93,11 +96,17 @@ async def _refresh_all_once(
     task_name: str = "refresh",
 ) -> None:
     """One full pass: walk known channels, refresh each."""
-    if supervisor is None:
-        channel_ids = await writer.run_read(_list_known_channel_ids, limiter=limiters.admin_read)
-    else:
-        async with phase(supervisor, task_name, "listing_channels", deadline_s=30):
-            channel_ids = await writer.run_read(_list_known_channel_ids, limiter=limiters.admin_read)
+    async with span(op="slurper.refresh.list_known_channels", task=task_name) as list_span:
+        if supervisor is None:
+            channel_ids = await writer.run_read(_list_known_channel_ids, limiter=limiters.admin_read, span=list_span)
+        else:
+            async with phase(supervisor, task_name, "listing_channels", deadline_s=30):
+                channel_ids = await writer.run_read(
+                    _list_known_channel_ids,
+                    limiter=limiters.admin_read,
+                    span=list_span,
+                )
+        list_span.set("channels", len(channel_ids))
     log.info("refresh: starting cycle for %d channel(s)", len(channel_ids))
     refreshed = 0
     unchanged = 0
@@ -105,17 +114,14 @@ async def _refresh_all_once(
     errors = 0
     for channel_id in channel_ids:
         try:
-            if supervisor is None:
-                changed = await _refresh_one(writer, client, channel_id, limiters)
-            else:
-                async with phase(
-                    supervisor,
-                    task_name,
-                    "refreshing_channel",
-                    details={"channel_id": channel_id},
-                    deadline_s=10,
-                ):
-                    changed = await _refresh_one(writer, client, channel_id, limiters)
+            changed = await _refresh_channel_with_span(
+                writer,
+                client,
+                channel_id,
+                limiters,
+                task_name=task_name,
+                supervisor=supervisor,
+            )
         except ChannelNotFoundError:
             # Channel left / archived-and-purged — skip cleanly.
             not_found += 1
@@ -135,6 +141,35 @@ async def _refresh_all_once(
         not_found,
         errors,
     )
+
+
+async def _refresh_channel_with_span(  # noqa: PLR0913 - mirrors _refresh_one with span/phase metadata.
+    writer: OffsetWriter,
+    client: SlackClient,
+    channel_id: str,
+    limiters: SlurperLimiters,
+    *,
+    task_name: str,
+    supervisor: TaskSupervisor | None = None,
+) -> bool:
+    async with span(
+        op="slurper.refresh.refresh_channel",
+        task=task_name,
+        extra={"channel_id": channel_id},
+    ) as refresh_span:
+        if supervisor is None:
+            changed = await _refresh_one(writer, client, channel_id, limiters, span=refresh_span)
+        else:
+            async with phase(
+                supervisor,
+                task_name,
+                "refreshing_channel",
+                details={"channel_id": channel_id},
+                deadline_s=10,
+            ):
+                changed = await _refresh_one(writer, client, channel_id, limiters, span=refresh_span)
+        refresh_span.set("changed", changed)
+        return changed
 
 
 def _list_known_channel_ids(conn: psycopg.Connection[TupleRow]) -> list[str]:
@@ -166,12 +201,14 @@ async def _refresh_one(
     client: SlackClient,
     channel_id: str,
     limiters: SlurperLimiters,
+    *,
+    span: SpanRecorder | None = None,
 ) -> bool:
     """Refresh one channel. Returns True iff a ``channel_info_refreshed``
     event was written (i.e. the new payload differed from the latest
     known one)."""
-    fresh = await trio.to_thread.run_sync(lambda: client.get_channel_info(channel_id), limiter=limiters.slack_api)
-    return await writer.run_transaction(lambda conn: _maybe_write_refresh_sync(conn, channel_id, fresh.raw))
+    fresh = await run_sync_with_span(lambda: client.get_channel_info(channel_id), limiter=limiters.slack_api, span=span)
+    return await writer.run_transaction(lambda conn: _maybe_write_refresh_sync(conn, channel_id, fresh.raw), span=span)
 
 
 def _maybe_write_refresh_sync(
@@ -289,7 +326,13 @@ class RefreshTrigger:
                     if item is None:
                         await _refresh_all_once(writer, client, limiters)
                     else:
-                        await _refresh_one(writer, client, item, limiters)
+                        await _refresh_channel_with_span(
+                            writer,
+                            client,
+                            item,
+                            limiters,
+                            task_name="refresh-trigger",
+                        )
                 else:
                     async with phase(
                         supervisor,
@@ -301,7 +344,13 @@ class RefreshTrigger:
                         if item is None:
                             await _refresh_all_once(writer, client, limiters)
                         else:
-                            await _refresh_one(writer, client, item, limiters)
+                            await _refresh_channel_with_span(
+                                writer,
+                                client,
+                                item,
+                                limiters,
+                                task_name="refresh-trigger",
+                            )
             except ChannelNotFoundError:
                 log.info("refresh: HTTP-triggered run for %s: channel not found", item)
             except Exception:

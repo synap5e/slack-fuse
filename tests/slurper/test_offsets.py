@@ -19,6 +19,7 @@ from psycopg.rows import TupleRow
 
 from slack_fuse_server.slurper.limiters import SlurperLimiters
 from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter, WriterPoolExhausted, write_event
+from slack_fuse_server.slurper.spans import span
 from tests.conftest import ServerConnFactory, make_test_writer
 
 
@@ -306,3 +307,78 @@ def test_slack_api_limiter_wait_does_not_block_writer_pool(
             return offset
 
     assert trio.run(body) == 1
+
+
+def test_run_read_and_transaction_populate_span_timings(
+    server_conn: psycopg.Connection[TupleRow],
+) -> None:
+    writer = make_test_writer(server_conn)
+    limiter = trio.CapacityLimiter(1)
+
+    def _read(_conn: psycopg.Connection[TupleRow]) -> int:
+        time.sleep(0.005)
+        return 42
+
+    def _write(conn: psycopg.Connection[TupleRow]) -> int:
+        time.sleep(0.005)
+        with conn.cursor() as cur:
+            cur.execute("SELECT 7")
+            row = cur.fetchone()
+        assert row is not None
+        return int(row[0])
+
+    async def body() -> tuple[tuple[int, int], tuple[int, int]]:
+        async with span(op="slurper.test.run_read", task="unit") as read_span:
+            assert await writer.run_read(_read, limiter=limiter, span=read_span) == 42
+            read_timings = (read_span.limiter_wait_ms, read_span.sync_ms)
+        async with span(op="slurper.test.run_transaction", task="unit") as tx_span:
+            assert await writer.run_transaction(_write, span=tx_span) == 7
+            tx_timings = (tx_span.limiter_wait_ms, tx_span.sync_ms)
+        return read_timings, tx_timings
+
+    read_timings, tx_timings = trio.run(body)
+
+    assert read_timings[0] >= 0
+    assert read_timings[1] > 0
+    assert tx_timings[0] >= 0
+    assert tx_timings[1] > 0
+
+
+def test_pool_acquire_methods_accept_optional_span(
+    server_conn: psycopg.Connection[TupleRow],
+) -> None:
+    writer = make_test_writer(server_conn)
+
+    async def body() -> tuple[tuple[int, int], tuple[int, int]]:
+        async with span(op="slurper.test.acquire_read", task="unit") as read_span:
+            async with writer.acquire_read(span=read_span) as conn:
+                assert conn is server_conn
+            read_timings = (read_span.limiter_wait_ms, read_span.sync_ms)
+        async with span(op="slurper.test.acquire_transaction", task="unit") as tx_span:
+            async with writer.acquire_transaction(span=tx_span) as conn:
+                assert conn is server_conn
+            tx_timings = (tx_span.limiter_wait_ms, tx_span.sync_ms)
+        return read_timings, tx_timings
+
+    read_timings, tx_timings = trio.run(body)
+
+    assert read_timings[0] >= 0
+    assert read_timings[1] == 0
+    assert tx_timings[0] >= 0
+    assert tx_timings[1] >= 0
+
+
+def test_writer_methods_preserve_span_none_behavior(
+    server_conn: psycopg.Connection[TupleRow],
+) -> None:
+    writer = make_test_writer(server_conn)
+
+    async def body() -> tuple[int, int | None]:
+        read_value = await writer.run_read(lambda _conn: 5, limiter=trio.CapacityLimiter(1), span=None)
+        offset = await writer.write_event(
+            EventRecord(stream="channel:SPAN-NONE", kind="message", ts="1.0", payload={"ts": "1.0"}),
+            span=None,
+        )
+        return read_value, offset
+
+    assert trio.run(body) == (5, 1)

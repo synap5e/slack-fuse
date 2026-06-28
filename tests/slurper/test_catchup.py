@@ -126,7 +126,9 @@ def test_last_seen_ts_by_stream_takes_max_per_channel(server_conn: psycopg.Conne
 def test_catchup_channel_writes_history_and_thread_events(
     server_conn: psycopg.Connection[TupleRow],
     fake_slack_http: httpx.Client,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level("INFO", logger="slack_fuse_server.slurper.spans")
     limiter = trio.CapacityLimiter(1)
     writer = make_test_writer(server_conn)
     backfiller = SlackApiBackfiller(_fake_client(fake_slack_http), limiter, _NO_SLEEP)
@@ -139,6 +141,10 @@ def test_catchup_channel_writes_history_and_thread_events(
     # 2 top-level history messages + 1 thread reply (replies[1:]).
     assert written == 3
     assert _events_count(server_conn, "channel:C0001") == 3
+    assert "op=slurper.catchup.catch_up_channel" in caplog.text
+    assert "result=ok" in caplog.text
+    assert "channel_id=C0001" in caplog.text
+    assert "events_written=3" in caplog.text
 
 
 def test_catchup_channel_is_idempotent_on_rerun(
@@ -217,7 +223,7 @@ class _FlakyCatchupWriter:
         self.failures_remaining = failures
         self.calls = 0
 
-    async def write_message_or_corrective(self, _record: EventRecord) -> int | None:
+    async def write_message_or_corrective(self, _record: EventRecord, **_kwargs: object) -> int | None:
         self.calls += 1
         if self.failures_remaining > 0:
             self.failures_remaining -= 1

@@ -52,11 +52,14 @@ from slack_fuse_server.backfill.types import Backfiller
 from slack_fuse_server.slurper.api import SlackAPIError
 from slack_fuse_server.slurper.limiters import SlurperLimiters
 from slack_fuse_server.slurper.offsets import PG_TIMEOUT_EXCEPTIONS, EventRecord, OffsetWriter
+from slack_fuse_server.slurper.spans import span
 from slack_fuse_server.slurper.supervisor import TaskSupervisor, phase
 
 if TYPE_CHECKING:
     import psycopg
     from psycopg.rows import TupleRow
+
+    from slack_fuse_server.slurper.spans import SpanRecorder
 
 log = logging.getLogger(__name__)
 
@@ -178,19 +181,30 @@ async def catchup_channel(
     through the health-emitting ``backfill_channel`` driver. Already-present
     messages dedup to no-ops, so the count is genuinely-recovered events only.
     """
-    stream = f"{_CHANNEL_STREAM_PREFIX}{channel_id.value}"
-    events = 0
-    async for wrapped in backfiller.messages_for_channel(channel_id, since_ts):
-        record = EventRecord(stream=stream, kind="message", ts=wrapped.model.ts, payload=wrapped.raw, dedup=True)
-        offset = await _write_message_or_corrective_retry_once(writer, record)
-        if offset is not None:
-            events += 1
-    return events
+    async with span(
+        op="slurper.catchup.catch_up_channel",
+        task="catchup",
+        extra={"channel_id": channel_id.value},
+    ) as recorder:
+        stream = f"{_CHANNEL_STREAM_PREFIX}{channel_id.value}"
+        events = 0
+        async for wrapped in backfiller.messages_for_channel(channel_id, since_ts):
+            record = EventRecord(stream=stream, kind="message", ts=wrapped.model.ts, payload=wrapped.raw, dedup=True)
+            offset = await _write_message_or_corrective_retry_once(writer, record, span=recorder)
+            if offset is not None:
+                events += 1
+        recorder.set("events_written", events)
+        return events
 
 
-async def _write_message_or_corrective_retry_once(writer: OffsetWriter, record: EventRecord) -> int | None:
+async def _write_message_or_corrective_retry_once(
+    writer: OffsetWriter,
+    record: EventRecord,
+    *,
+    span: SpanRecorder | None = None,
+) -> int | None:
     try:
-        return await writer.write_message_or_corrective(record)
+        return await writer.write_message_or_corrective(record, span=span)
     except PG_TIMEOUT_EXCEPTIONS:
         wait = random.uniform(_PG_TIMEOUT_RETRY_MIN_S, _PG_TIMEOUT_RETRY_MAX_S)
         log.warning(
@@ -201,7 +215,7 @@ async def _write_message_or_corrective_retry_once(writer: OffsetWriter, record: 
             exc_info=True,
         )
         await trio.sleep(wait)
-        return await writer.write_message_or_corrective(record)
+        return await writer.write_message_or_corrective(record, span=span)
 
 
 async def run_catchup_once(

@@ -34,6 +34,7 @@ from slack_fuse_server.slurper.api import FatalAPIError, RateLimitedError, Slack
 from slack_fuse_server.slurper.health import HealthEmitter, HealthKind
 from slack_fuse_server.slurper.limiters import SlurperLimiters
 from slack_fuse_server.slurper.offsets import PG_TIMEOUT_EXCEPTIONS, EventRecord, OffsetWriter
+from slack_fuse_server.slurper.spans import run_sync_with_span, span
 
 log = logging.getLogger(__name__)
 
@@ -91,6 +92,7 @@ class BackfillContext:
     warn_at: int
     abort_at: int | None
     progress_every: int = _DEFAULT_PROGRESS_EVERY
+    task_name: str = "backfill"
 
 
 def _ts_float(ts: str) -> float | None:
@@ -117,11 +119,13 @@ class SlackApiBackfiller:
         limiter: trio.CapacityLimiter,
         sleeps: SleepBounds | None = None,
         blocked_channel_ids: Callable[[], Awaitable[set[str]]] | None = None,
+        task_name: str = "backfill",
     ) -> None:
         self._client = client
         self._limiter = limiter
         self._sleeps = sleeps if sleeps is not None else SleepBounds()
         self._blocked_channel_ids = blocked_channel_ids
+        self._task_name = task_name
 
     @property
     def name(self) -> str:
@@ -129,16 +133,26 @@ class SlackApiBackfiller:
 
     async def channels_to_backfill(self) -> AsyncIterator[ChannelId]:
         """Yield every member channel (non-archived) the user can see."""
-        blocked: set[str]
-        blocked = await self._blocked_channel_ids() if self._blocked_channel_ids is not None else set()
-        channels = await trio.to_thread.run_sync(self._client.list_conversations, limiter=self._limiter)
-        for validated in channels:
-            channel = validated.model
-            if channel.id in blocked:
-                continue
-            # DMs / group DMs are always accessible; public/private need membership.
-            if channel.is_member or channel.is_im or channel.is_mpim:
-                yield ChannelId(channel.id)
+        yielded: list[ChannelId] = []
+        op = (
+            "slurper.auto_backfill.list_channels"
+            if self._task_name == "auto-backfill"
+            else "slurper.backfill.list_channels"
+        )
+        async with span(op=op, task=self._task_name) as recorder:
+            blocked: set[str]
+            blocked = await self._blocked_channel_ids() if self._blocked_channel_ids is not None else set()
+            channels = await run_sync_with_span(self._client.list_conversations, limiter=self._limiter, span=recorder)
+            for validated in channels:
+                channel = validated.model
+                if channel.id in blocked:
+                    continue
+                # DMs / group DMs are always accessible; public/private need membership.
+                if channel.is_member or channel.is_im or channel.is_mpim:
+                    yielded.append(ChannelId(channel.id))
+            recorder.set("channels", len(yielded))
+        for channel_id in yielded:
+            yield channel_id
 
     async def messages_for_channel(
         self,
@@ -168,7 +182,7 @@ class SlackApiBackfiller:
         while True:
             if page > 0:
                 await trio.sleep(random.uniform(self._sleeps.page_min_s, self._sleeps.page_max_s))
-            wrapped = await self._history_page(channel_id, cursor, oldest=since_ts)
+            wrapped = await self._history_page(channel_id, cursor, oldest=since_ts, page=page)
             if wrapped is None:  # rate-limited; _history_page already slept — retry same cursor
                 continue
             resp = wrapped.model
@@ -218,24 +232,45 @@ class SlackApiBackfiller:
         channel_id: str,
         cursor: str,
         oldest: float | None = None,
+        page: int = 0,
     ) -> Validated[ConversationsHistoryResponse] | None:
-        try:
-            return await trio.to_thread.run_sync(
-                lambda: self._client.get_history_page(channel_id, cursor, oldest),
-                limiter=self._limiter,
-            )
-        except RateLimitedError as exc:
-            await _sleep_rate_limited(exc.retry_after)
-            return None
+        async with span(
+            op="slurper.backfill.history_page",
+            task=self._task_name,
+            extra={"channel_id": channel_id, "page": page},
+        ) as recorder:
+            try:
+                wrapped = await run_sync_with_span(
+                    lambda: self._client.get_history_page(channel_id, cursor, oldest),
+                    limiter=self._limiter,
+                    span=recorder,
+                )
+            except RateLimitedError as exc:
+                recorder.mark_rate_limited(exc.retry_after)
+                await _sleep_rate_limited(exc.retry_after)
+                return None
+            recorder.set("messages", len(wrapped.model.messages))
+            recorder.set("has_more", wrapped.model.has_more)
+            return wrapped
 
     async def _replies(self, channel_id: str, thread_ts: str) -> list[Validated[Message]] | None:
-        try:
-            return await trio.to_thread.run_sync(
-                lambda: self._client.get_replies(channel_id, thread_ts), limiter=self._limiter
-            )
-        except RateLimitedError as exc:
-            await _sleep_rate_limited(exc.retry_after)
-            return None
+        async with span(
+            op="slurper.backfill.thread_replies",
+            task=self._task_name,
+            extra={"channel_id": channel_id, "thread_ts": thread_ts},
+        ) as recorder:
+            try:
+                replies = await run_sync_with_span(
+                    lambda: self._client.get_replies(channel_id, thread_ts),
+                    limiter=self._limiter,
+                    span=recorder,
+                )
+            except RateLimitedError as exc:
+                recorder.mark_rate_limited(exc.retry_after)
+                await _sleep_rate_limited(exc.retry_after)
+                return None
+            recorder.set("messages", len(replies))
+            return replies
 
 
 def _passes_since(ts: str, since_ts: float | None) -> bool:
@@ -253,20 +288,35 @@ async def _sleep_rate_limited(retry_after: float | None) -> None:
     await trio.sleep(wait)
 
 
-async def _write_message_or_corrective_retry_once(writer: OffsetWriter, record: EventRecord) -> int | None:
-    try:
-        return await writer.write_message_or_corrective(record)
-    except PG_TIMEOUT_EXCEPTIONS:
-        wait = random.uniform(_PG_TIMEOUT_RETRY_MIN_S, _PG_TIMEOUT_RETRY_MAX_S)
-        log.warning(
-            "backfill: PostgreSQL timeout writing stream=%s kind=%s; retrying once in %.2fs",
-            record.stream,
-            record.kind,
-            wait,
-            exc_info=True,
-        )
-        await trio.sleep(wait)
-        return await writer.write_message_or_corrective(record)
+async def _write_message_or_corrective_retry_once(
+    writer: OffsetWriter,
+    record: EventRecord,
+    *,
+    task_name: str,
+) -> int | None:
+    channel_id = record.stream.removeprefix("channel:") if record.stream.startswith("channel:") else None
+    async with span(
+        op="slurper.backfill.write_message",
+        task=task_name,
+        extra={"stream": record.stream, "kind": record.kind, "channel_id": channel_id},
+    ) as recorder:
+        try:
+            offset = await writer.write_message_or_corrective(record, span=recorder)
+        except PG_TIMEOUT_EXCEPTIONS:
+            wait = random.uniform(_PG_TIMEOUT_RETRY_MIN_S, _PG_TIMEOUT_RETRY_MAX_S)
+            log.warning(
+                "backfill: PostgreSQL timeout writing stream=%s kind=%s; retrying once in %.2fs",
+                record.stream,
+                record.kind,
+                wait,
+                exc_info=True,
+            )
+            await trio.sleep(wait)
+            offset = await writer.write_message_or_corrective(record, span=recorder)
+        recorder.set("events_written", 1 if offset is not None else 0)
+        if offset is not None:
+            recorder.set("offset", offset)
+        return offset
 
 
 async def backfill_channel(
@@ -329,7 +379,7 @@ async def backfill_channel(
             # docstring). The events log stays lossless; future projections
             # can read fields the Message model doesn't declare today.
             record = EventRecord(stream=stream, kind="message", ts=msg.ts, payload=wrapped.raw, dedup=True)
-            offset = await _write_message_or_corrective_retry_once(ctx.writer, record)
+            offset = await _write_message_or_corrective_retry_once(ctx.writer, record, task_name=ctx.task_name)
             if offset is not None:
                 events_written += 1
     except FatalAPIError:

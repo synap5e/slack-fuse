@@ -170,6 +170,26 @@ def test_auto_backfill_backfills_channel_without_prior_completion(
     assert sleep_calls == [30]
 
 
+def test_auto_backfill_logs_one_channel_span_per_channel(
+    server_conn: psycopg.Connection[TupleRow],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="slack_fuse_server.slurper.spans")
+
+    backfilled, _sleep_calls = _run_auto_backfill(server_conn, monkeypatch, ["C_ONE", "C_TWO"])
+
+    assert backfilled == ["C_ONE", "C_TWO"]
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if "op=slurper.auto_backfill.channel" in record.getMessage()
+    ]
+    assert len(messages) == 2
+    assert any("channel_id=C_ONE" in message and "result=ok" in message for message in messages)
+    assert any("channel_id=C_TWO" in message and "result=ok" in message for message in messages)
+
+
 def test_auto_backfill_config_false_rewalks_completed_channel(
     server_conn: psycopg.Connection[TupleRow],
     monkeypatch: pytest.MonkeyPatch,
@@ -194,11 +214,16 @@ def test_auto_backfill_skip_logs_completion_details(
 ) -> None:
     completed_at = _seed_completion(server_conn, "C_LOG", events_written=23)
     caplog.set_level(logging.INFO, logger=slurper_main.log.name)
+    caplog.set_level(logging.INFO, logger="slack_fuse_server.slurper.spans")
 
     backfilled, _sleep_calls = _run_auto_backfill(server_conn, monkeypatch, ["C_LOG"])
 
     assert backfilled == []
     assert f"auto-backfill: skipping C_LOG — completed at {completed_at.isoformat()}, events_written=23" in caplog.text
+    assert "op=slurper.auto_backfill.channel" in caplog.text
+    assert "result=skipped" in caplog.text
+    assert "channel_id=C_LOG" in caplog.text
+    assert "events_written=23" in caplog.text
 
 
 def test_auto_backfill_declares_phase_sequence(

@@ -21,7 +21,7 @@ from psycopg.rows import TupleRow
 from slack_fuse.models import JsonObject, Message, SocketEventPayload
 from slack_fuse_server.slurper.api import SlackClient
 from slack_fuse_server.slurper.health import HealthEmitter
-from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter
+from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter, WriterPoolExhausted
 from slack_fuse_server.slurper.socket import (
     SocketModeOptions,
     SocketModeRunner,
@@ -158,9 +158,9 @@ class _TimeoutWriter:
     def __init__(self) -> None:
         self.records: list[EventRecord] = []
 
-    async def write_event(self, record: EventRecord) -> int | None:
+    async def write_event(self, record: EventRecord, **_kwargs: object) -> int | None:
         self.records.append(record)
-        raise psycopg.errors.QueryCanceled("test statement timeout")
+        raise WriterPoolExhausted("test writer pool exhausted")
 
 
 def _rows(conn: psycopg.Connection[TupleRow], stream: str) -> list[tuple[str, object]]:
@@ -229,7 +229,7 @@ def test_handle_message_event_drops_pg_timeout_with_warning(
         limiters=make_test_limiters(),
     )
     event = SocketEventPayload(type="message", channel="C1", ts="100.0001", user="U1", text="hi")
-    caplog.set_level("WARNING", logger="slack_fuse_server.slurper.socket")
+    caplog.set_level("INFO")
 
     trio.run(runner._handle_event, event, _raw_for(event))
 
@@ -238,6 +238,17 @@ def test_handle_message_event_drops_pg_timeout_with_warning(
     assert "stream=channel:C1" in caplog.text
     assert "kind=message" in caplog.text
     assert "channel_id=C1" in caplog.text
+    span_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "slack_fuse_server.slurper.spans"
+    ]
+    assert any(
+        "op=slurper.socket.handle_event" in message
+        and "result=timeout" in message
+        and "timeout_type=WriterPoolExhausted" in message
+        for message in span_messages
+    )
 
 
 def test_handle_structural_event_enriches_via_conversations_info(

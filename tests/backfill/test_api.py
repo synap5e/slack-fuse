@@ -23,7 +23,7 @@ from slack_fuse_render import ChannelId
 from slack_fuse_server._json import JsonObject
 from slack_fuse_server.backfill.api import BackfillContext, SlackApiBackfiller, SleepBounds, backfill_channel
 from slack_fuse_server.backfill.types import BackfillAbortReason
-from slack_fuse_server.slurper.api import SlackClient, Validated
+from slack_fuse_server.slurper.api import RateLimitedError, SlackClient, Validated
 from slack_fuse_server.slurper.health import HealthEmitter, HealthKind
 from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter, write_event
 from tests.conftest import make_test_limiters, make_test_writer
@@ -107,6 +107,31 @@ def test_channels_to_backfill_skips_blocked_ids(fake_slack_http: httpx.Client) -
         return out
 
     assert trio.run(collect) == ["D0001"]
+
+
+def test_history_page_logs_rate_limited_span(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class _RateLimitedClient:
+        def get_history_page(self, _channel_id: str, _cursor: str, _oldest: float | None) -> object:
+            raise RateLimitedError(4.0)
+
+    async def _no_sleep(_retry_after: float | None) -> None:
+        await trio.lowlevel.checkpoint()
+
+    monkeypatch.setattr("slack_fuse_server.backfill.api._sleep_rate_limited", _no_sleep)
+    caplog.set_level("INFO", logger="slack_fuse_server.slurper.spans")
+    backfiller = SlackApiBackfiller(cast(SlackClient, _RateLimitedClient()), trio.CapacityLimiter(1), _NO_SLEEP)
+
+    result = trio.run(backfiller._history_page, "C_RATE", "", None, 2)
+
+    assert result is None
+    assert "op=slurper.backfill.history_page" in caplog.text
+    assert "result=rate_limited" in caplog.text
+    assert "retry_after_s=4.0" in caplog.text
+    assert "channel_id=C_RATE" in caplog.text
+    assert "page=2" in caplog.text
 
 
 def test_get_replies_preserves_attachments_lossless() -> None:
@@ -255,7 +280,7 @@ class _FlakyWriter:
     ) -> object:
         return func(self.conn)
 
-    async def write_message_or_corrective(self, _record: EventRecord) -> int | None:
+    async def write_message_or_corrective(self, _record: EventRecord, **_kwargs: object) -> int | None:
         self.calls += 1
         if self.failures_remaining > 0:
             self.failures_remaining -= 1

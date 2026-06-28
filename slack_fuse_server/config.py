@@ -64,6 +64,12 @@ class ServerConfig(BaseSettings):
     # Health-stream debouncing.
     slack_degraded_min_duration_s: float = 30.0
 
+    # Slurper span logging slow-operation thresholds.
+    span_slow_threshold_default_ms: int = 5000
+    span_slow_threshold_backfill_channel_ms: int = 300000
+    span_slow_threshold_snapshot_ms: int = 60000
+    span_slow_threshold_socket_event_ms: int = 1000
+
     # Reconnect / restart catchup (slurper/catchup.py). A bounded gap-fill that
     # recovers messages Slack dropped while the slurper was down longer than its
     # ~5min event buffer — runs once at startup (the restart case) and on any

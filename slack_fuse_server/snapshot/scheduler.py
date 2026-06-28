@@ -30,6 +30,7 @@ import trio
 from psycopg import Connection
 from psycopg.rows import TupleRow
 
+from slack_fuse_server.slurper.spans import run_sync_with_span, span
 from slack_fuse_server.slurper.supervisor import TaskSupervisor, phase
 from slack_fuse_server.snapshot.generator import (
     GenerationTrigger,
@@ -206,23 +207,42 @@ class SnapshotScheduler:
     async def tick(self, supervisor: TaskSupervisor | None = None) -> list[SnapshotResult]:
         """Run one scheduling pass on a worker thread; return generated snapshots."""
         if supervisor is None:
-            return await trio.to_thread.run_sync(self._tick_sync, limiter=self._limiter)
-
-        async with phase(supervisor, "snapshot", "tick", deadline_s=30):
             due = await trio.to_thread.run_sync(self._due_streams_sync, limiter=self._limiter)
+        else:
+            async with phase(supervisor, "snapshot", "tick", deadline_s=30):
+                due = await trio.to_thread.run_sync(self._due_streams_sync, limiter=self._limiter)
+
         results: list[SnapshotResult] = []
         for stream, trigger in due:
-            async with phase(
-                supervisor,
-                "snapshot",
-                "generating",
-                details={"stream": stream, "trigger": trigger},
-                deadline_s=300,
-            ):
-                result = await trio.to_thread.run_sync(
-                    partial(self._generate_snapshot_sync, stream, trigger),
-                    limiter=self._limiter,
-                )
+            async with span(
+                op="slurper.snapshot.generate",
+                task="snapshot",
+                extra={"stream": stream, "trigger": trigger},
+            ) as snapshot_span:
+                if supervisor is None:
+                    result = await run_sync_with_span(
+                        partial(self._generate_snapshot_sync, stream, trigger),
+                        limiter=self._limiter,
+                        span=snapshot_span,
+                    )
+                else:
+                    async with phase(
+                        supervisor,
+                        "snapshot",
+                        "generating",
+                        details={"stream": stream, "trigger": trigger},
+                        deadline_s=300,
+                    ):
+                        result = await run_sync_with_span(
+                            partial(self._generate_snapshot_sync, stream, trigger),
+                            limiter=self._limiter,
+                            span=snapshot_span,
+                        )
+                if result is None:
+                    snapshot_span.mark_skipped()
+                else:
+                    snapshot_span.set("offset", result.at_offset)
+                    snapshot_span.set("events_covered", result.events_covered)
             if result is not None:
                 results.append(result)
         return results

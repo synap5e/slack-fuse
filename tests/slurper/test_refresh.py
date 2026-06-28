@@ -72,6 +72,7 @@ def _conversations_info_fixture() -> JsonObject:
 def test_refresh_emits_channel_info_refreshed_when_legacy_payload_differs(
     server_conn: psycopg.Connection[TupleRow],
     fake_slack_http: httpx.Client,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Legacy backfill case: existing channel_added has the old
     ``model_dump`` shape (missing fields like ``created``). The refresh
@@ -90,6 +91,7 @@ def test_refresh_emits_channel_info_refreshed_when_legacy_payload_differs(
         # shape the slurper produced pre-2026-06-27.
     }
     _seed_channel_added(server_conn, payload=lossy)
+    caplog.set_level("INFO", logger="slack_fuse_server.slurper.spans")
 
     writer = make_test_writer(server_conn)
     client = _fake_client(fake_slack_http)
@@ -104,6 +106,10 @@ def test_refresh_emits_channel_info_refreshed_when_legacy_payload_differs(
     # lossy seed.
     assert refreshed_payload != lossy
     assert refreshed_payload["id"] == channel_id
+    assert "op=slurper.refresh.refresh_channel" in caplog.text
+    assert "result=ok" in caplog.text
+    assert "changed=True" in caplog.text
+    assert f"channel_id={channel_id}" in caplog.text
 
 
 def test_refresh_is_idempotent_when_payload_unchanged(
@@ -185,6 +191,7 @@ def test_refresh_trigger_consume_declares_waiting_and_running(monkeypatch: pytes
         _client: object,
         channel_id: str,
         _limiters: object,
+        **_kwargs: object,
     ) -> bool:
         ran.append(channel_id)
         await trio.lowlevel.checkpoint()

@@ -76,6 +76,7 @@ from slack_fuse_server.slurper.limiters import SlurperLimiters
 from slack_fuse_server.slurper.offsets import OffsetWriter
 from slack_fuse_server.slurper.refresh import RefreshTrigger, refresh_channels_periodically
 from slack_fuse_server.slurper.socket import SocketModeOptions, SocketModeStatus
+from slack_fuse_server.slurper.spans import configure_span_thresholds_from_config, span
 from slack_fuse_server.slurper.supervisor import TaskSupervisor, phase
 from slack_fuse_server.slurper.users import populate_users_once, run_socket_mode_with_users
 from slack_fuse_server.snapshot import SnapshotScheduler
@@ -165,6 +166,7 @@ def _make_api_backfiller(
     limiters: SlurperLimiters,
     config: ServerConfig,
     writer: OffsetWriter | None = None,
+    task_name: str = "backfill",
 ) -> SlackApiBackfiller:
     sleeps = SleepBounds(
         page_min_s=config.backfill_page_sleep_min_s,
@@ -173,7 +175,7 @@ def _make_api_backfiller(
         thread_max_s=config.backfill_thread_sleep_max_s,
     )
     blocked = None if writer is None else lambda: writer.run_read(blocked_channel_ids, limiter=limiters.admin_read)
-    return SlackApiBackfiller(client, limiters.slack_api, sleeps, blocked_channel_ids=blocked)
+    return SlackApiBackfiller(client, limiters.slack_api, sleeps, blocked_channel_ids=blocked, task_name=task_name)
 
 
 def _make_catchup_deps(
@@ -201,6 +203,7 @@ def _make_catchup_deps(
         limiters.slack_api,
         sleeps,
         blocked_channel_ids=lambda: writer.run_read(blocked_channel_ids, limiter=limiters.admin_read),
+        task_name="catchup",
     )
     catchup_config = CatchupConfig(
         gap_threshold_s=config.catchup_gap_threshold_s,
@@ -211,13 +214,14 @@ def _make_catchup_deps(
     return CatchupDeps(writer=writer, backfiller=backfiller, config=catchup_config, limiters=limiters)
 
 
-def _make_backfiller(
+def _make_backfiller(  # noqa: PLR0913 - source wiring keeps dependencies explicit.
     source: BackfillSource,
     *,
     client: SlackClient | None,
     limiters: SlurperLimiters,
     config: ServerConfig,
     writer: OffsetWriter | None = None,
+    task_name: str = "backfill",
 ) -> Backfiller:
     if source == "legacy-cache":
         return LegacyCacheBackfiller(limiter=limiters.writer)
@@ -225,7 +229,7 @@ def _make_backfiller(
         if client is None:  # pragma: no cover - guarded by _run_backfill source wiring
             msg = "slack-api backfill source requires a SlackClient"
             raise ValueError(msg)
-        return _make_api_backfiller(client, limiters, config, writer=writer)
+        return _make_api_backfiller(client, limiters, config, writer=writer, task_name=task_name)
     msg = f"unsupported backfill source {source!r}"
     raise ValueError(msg)
 
@@ -524,7 +528,14 @@ async def _auto_backfill(  # noqa: C901, PLR0913, PLR0917 - task dependencies an
     if supervisor is not None:
         supervisor.declare("auto-backfill", "startup_sleep", deadline_s=None)
     await trio.sleep(30)  # let startup settle before hitting the API hard
-    backfiller = _make_backfiller("slack-api", client=client, limiters=limiters, config=config, writer=writer)
+    backfiller = _make_backfiller(
+        "slack-api",
+        client=client,
+        limiters=limiters,
+        config=config,
+        writer=writer,
+        task_name="auto-backfill",
+    )
     first_backfill = True
     if supervisor is not None:
         supervisor.declare("auto-backfill", "listing_channels", deadline_s=60)
@@ -542,6 +553,14 @@ async def _auto_backfill(  # noqa: C901, PLR0913, PLR0917 - task dependencies an
                 ):
                     completion = await async_find_last_backfill_completion(writer, channel_id.value, limiters)
             if completion is not None:
+                async with span(
+                    op="slurper.auto_backfill.channel",
+                    task="auto-backfill",
+                    extra={"channel_id": channel_id.value},
+                ) as channel_span:
+                    channel_span.mark_skipped()
+                    channel_span.set("completed_at", completion.at.isoformat())
+                    channel_span.set("events_written", completion.events_written)
                 log.info(
                     "auto-backfill: skipping %s — completed at %s, events_written=%d",
                     channel_id.value,
@@ -559,25 +578,36 @@ async def _auto_backfill(  # noqa: C901, PLR0913, PLR0917 - task dependencies an
                 )
             await trio.sleep(_AUTO_BACKFILL_CHANNEL_GAP_S)
         first_backfill = False
-        log.info("auto-backfill: %s", channel_id.value)
-        ctx = BackfillContext(
-            writer=writer,
-            health=health,
-            limiters=limiters,
-            warn_at=config.backfill_warn_at,
-            abort_at=config.backfill_abort_at,
-        )
-        if supervisor is None:
-            await backfill_channel(backfiller, channel_id, ctx)
-        else:
-            async with phase(
-                supervisor,
-                "auto-backfill",
-                "channel",
-                details={"channel_id": channel_id.value},
-                deadline_s=config.backfill_abort_at * 0.5,
-            ):
-                await backfill_channel(backfiller, channel_id, ctx)
+        async with span(
+            op="slurper.auto_backfill.channel",
+            task="auto-backfill",
+            extra={"channel_id": channel_id.value},
+        ) as channel_span:
+            log.info("auto-backfill: %s", channel_id.value)
+            ctx = BackfillContext(
+                writer=writer,
+                health=health,
+                limiters=limiters,
+                warn_at=config.backfill_warn_at,
+                abort_at=config.backfill_abort_at,
+                task_name="auto-backfill",
+            )
+            if supervisor is None:
+                result = await backfill_channel(backfiller, channel_id, ctx)
+            else:
+                async with phase(
+                    supervisor,
+                    "auto-backfill",
+                    "channel",
+                    details={"channel_id": channel_id.value},
+                    deadline_s=config.backfill_abort_at * 0.5,
+                ):
+                    result = await backfill_channel(backfiller, channel_id, ctx)
+            channel_span.set("messages", result.messages)
+            channel_span.set("events_written", result.events_written)
+            channel_span.set("aborted", result.aborted)
+            if result.abort_reason is not None:
+                channel_span.set("abort_reason", str(result.abort_reason))
     if supervisor is not None:
         supervisor.declare("auto-backfill", "complete", deadline_s=None)
     log.info("auto-backfill: complete")
@@ -825,6 +855,7 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     args = _build_parser().parse_args()
     config = load_server_config()
+    configure_span_thresholds_from_config(config)
 
     if args.command == "refresh-channels":
         trio.run(_run_refresh_channels_once, config)

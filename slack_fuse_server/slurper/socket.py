@@ -33,7 +33,7 @@ import json
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import httpx
 import trio
@@ -58,7 +58,11 @@ from slack_fuse_server.slurper.api import SlackAPIError, SlackClient, Validated
 from slack_fuse_server.slurper.health import HealthEmitter, HealthKind, SlackDegradedTracker
 from slack_fuse_server.slurper.limiters import SlurperLimiters
 from slack_fuse_server.slurper.offsets import PG_TIMEOUT_EXCEPTIONS, EventRecord, OffsetWriter
+from slack_fuse_server.slurper.spans import run_sync_with_span, span
 from slack_fuse_server.slurper.supervisor import TaskSupervisor, phase
+
+if TYPE_CHECKING:
+    from slack_fuse_server.slurper.spans import SpanRecorder
 
 log = logging.getLogger(__name__)
 
@@ -258,7 +262,12 @@ class SocketModeRunner:
             self._status.state = "connecting"
             self._supervisor.declare("socket", "connecting", deadline_s=15)
             try:
-                ws_url = await trio.to_thread.run_sync(self._open_socket, limiter=self._limiters.slack_api)
+                async with span(op="slurper.socket.reconnect", task="socket") as reconnect_span:
+                    ws_url = await run_sync_with_span(
+                        self._open_socket,
+                        limiter=self._limiters.slack_api,
+                        span=reconnect_span,
+                    )
             except _AuthFailed:
                 self._status.state = "auth_failed"
                 await self._health.emit(HealthKind.AUTH_TOKEN_INVALID)
@@ -359,7 +368,10 @@ class SocketModeRunner:
 
     async def _handle_event(self, event: SocketEventPayload, raw_event: JsonObject) -> None:
         """Translate one socket event and write the resulting wire events."""
-        async with phase(
+        extra: JsonObject = {"kind": event.type}
+        if event.channel:
+            extra["channel_id"] = event.channel
+        async with span(op="slurper.socket.handle_event", task="socket", extra=extra) as event_span, phase(
             self._supervisor,
             "socket",
             "handling_event",
@@ -368,41 +380,87 @@ class SocketModeRunner:
         ):
             if event.type == "message":
                 write = translate_message_event(event, raw_event)
-                if write is not None:
-                    await self._write_event_or_drop_timeout(write)
+                if write is None:
+                    event_span.mark_skipped()
+                    return
+                await self._write_event_or_drop_timeout(write, parent_span=event_span)
                 return
             if event.type in CHANNEL_LIST_EVENT_TYPES:
-                await self._handle_structural_event(event)
+                wrote = await self._handle_structural_event(event, parent_span=event_span)
+                if not wrote and event_span.result == "ok":
+                    event_span.mark_skipped()
                 return
             log.debug("socket-mode: ignoring event type %s", event.type)
+            event_span.mark_skipped()
 
-    async def _write_event_or_drop_timeout(self, record: EventRecord) -> None:
-        try:
-            await self._writer.write_event(record)
-        except PG_TIMEOUT_EXCEPTIONS:
-            log.warning(
-                "socket-mode: dropped event after PostgreSQL timeout stream=%s kind=%s channel_id=%s",
-                record.stream,
-                record.kind,
-                _record_channel_id(record),
-                exc_info=True,
-            )
+    async def _write_event_or_drop_timeout(
+        self,
+        record: EventRecord,
+        *,
+        parent_span: SpanRecorder | None = None,
+    ) -> bool:
+        channel_id = _record_channel_id(record)
+        async with span(
+            op="slurper.socket.write_event_or_drop",
+            task="socket",
+            extra={"stream": record.stream, "kind": record.kind, "channel_id": channel_id},
+        ) as write_span:
+            try:
+                offset = await self._writer.write_event(record, span=write_span)
+            except PG_TIMEOUT_EXCEPTIONS as exc:
+                timeout_type = type(exc).__name__
+                write_span.mark_timeout(timeout_type)
+                if parent_span is not None:
+                    parent_span.mark_timeout(timeout_type)
+                log.warning(
+                    "socket-mode: dropped event after PostgreSQL timeout stream=%s kind=%s channel_id=%s",
+                    record.stream,
+                    record.kind,
+                    channel_id,
+                    exc_info=True,
+                )
+                return False
+            write_span.set("events_written", 1 if offset is not None else 0)
+            if offset is not None:
+                write_span.set("offset", offset)
+            return True
 
-    async def _handle_structural_event(self, event: SocketEventPayload) -> None:
+    async def _handle_structural_event(
+        self,
+        event: SocketEventPayload,
+        *,
+        parent_span: SpanRecorder | None = None,
+    ) -> bool:
         """Translate a channel-structure event to a `channel-list` write.
 
         Enriches via `conversations.info` where the wire kind needs the channel
         object / name / membership. A failed enrichment skips the event (logged)
         rather than crashing the loop.
         """
-        channel_id = event.channel
-        if not channel_id:
-            return
-        write = await self._build_structural_write(event, channel_id)
-        if write is not None:
-            await self._write_event_or_drop_timeout(write)
+        extra: JsonObject = {"kind": event.type}
+        if event.channel:
+            extra["channel_id"] = event.channel
+        async with span(op="slurper.socket.handle_structural_event", task="socket", extra=extra) as structural_span:
+            channel_id = event.channel
+            if not channel_id:
+                structural_span.mark_skipped()
+                return False
+            write = await self._build_structural_write(event, channel_id, span=structural_span)
+            if write is None:
+                structural_span.mark_skipped()
+                return False
+            wrote = await self._write_event_or_drop_timeout(write, parent_span=parent_span)
+            if not wrote:
+                structural_span.mark_timeout()
+            return wrote
 
-    async def _build_structural_write(self, event: SocketEventPayload, channel_id: str) -> EventRecord | None:
+    async def _build_structural_write(
+        self,
+        event: SocketEventPayload,
+        channel_id: str,
+        *,
+        span: SpanRecorder | None = None,
+    ) -> EventRecord | None:
         etype = event.type
         if etype in _MEMBERSHIP_LOST_EVENTS:
             payload: JsonObject = {"channel_id": channel_id, "is_member": False}
@@ -416,7 +474,7 @@ class SocketModeRunner:
                 stream="channel-list", kind="channel_unarchived", ts=None, payload={"channel_id": channel_id}
             )
 
-        validated = await self._fetch_channel(channel_id)
+        validated = await self._fetch_channel(channel_id, span=span)
         if validated is None:
             return None
         channel = validated.model
@@ -431,10 +489,17 @@ class SocketModeRunner:
         log.debug("socket-mode: no structural translation for %s", etype)
         return None
 
-    async def _fetch_channel(self, channel_id: str) -> Validated[Channel] | None:
+    async def _fetch_channel(
+        self,
+        channel_id: str,
+        *,
+        span: SpanRecorder | None = None,
+    ) -> Validated[Channel] | None:
         try:
-            return await trio.to_thread.run_sync(
-                lambda: self._client.get_channel_info(channel_id), limiter=self._limiters.slack_api
+            return await run_sync_with_span(
+                lambda: self._client.get_channel_info(channel_id),
+                limiter=self._limiters.slack_api,
+                span=span,
             )
         except (SlackAPIError, httpx.HTTPError):
             log.warning("socket-mode: conversations.info failed for %s", channel_id, exc_info=True)

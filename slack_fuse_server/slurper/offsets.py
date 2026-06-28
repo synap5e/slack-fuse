@@ -37,10 +37,11 @@ fires no NOTIFY because its transaction never commits.
 
 from __future__ import annotations
 
+import time
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import TypeVar, cast
+from typing import TYPE_CHECKING, TypeVar, cast
 
 import psycopg
 import trio
@@ -49,6 +50,9 @@ from psycopg.rows import TupleRow
 from psycopg.types.json import Jsonb
 
 from slack_fuse_server._json import JsonObject
+
+if TYPE_CHECKING:
+    from slack_fuse_server.slurper.spans import SpanRecorder
 
 T = TypeVar("T")
 
@@ -293,10 +297,12 @@ class OffsetWriter:
             raise ValueError(msg)
 
     @asynccontextmanager
-    async def _borrow_connection(self) -> AsyncIterator[Connection[TupleRow]]:
+    async def _borrow_connection(self, *, span: SpanRecorder | None = None) -> AsyncIterator[Connection[TupleRow]]:
         conn: Connection[TupleRow] | None = None
+        started_ns = time.monotonic_ns()
         with trio.move_on_after(self._acquire_timeout_s) as scope:
             conn = await self._receive.receive()
+        _record_span_timing(span, started_ns=started_ns, sync_ns=0)
         if scope.cancelled_caught or conn is None:
             msg = f"all {len(self._connections)} writer connection(s) busy for {self._acquire_timeout_s:.3f}s"
             raise WriterPoolExhausted(msg)
@@ -306,26 +312,26 @@ class OffsetWriter:
             self._send.send_nowait(conn)
 
     @asynccontextmanager
-    async def acquire_read(self) -> AsyncIterator[Connection[TupleRow]]:
+    async def acquire_read(self, *, span: SpanRecorder | None = None) -> AsyncIterator[Connection[TupleRow]]:
         """Acquire a pooled connection for read-only work.
 
         Use `run_read()` when possible so the synchronous psycopg body runs on
         a worker thread under the caller-selected resource limiter.
         """
-        async with self._borrow_connection() as conn:
+        async with self._borrow_connection(span=span) as conn:
             yield conn
 
     @asynccontextmanager
-    async def acquire_transaction(self) -> AsyncIterator[Connection[TupleRow]]:
+    async def acquire_transaction(self, *, span: SpanRecorder | None = None) -> AsyncIterator[Connection[TupleRow]]:
         """Acquire a pooled connection inside an open transaction.
 
         The transaction commits on normal exit and rolls back when the body
         raises. Use `run_transaction()` when possible so the synchronous body
         runs on a worker thread under the writer limiter.
         """
-        async with self._borrow_connection() as conn:
+        async with self._borrow_connection(span=span) as conn:
             tx = conn.transaction()
-            await trio.to_thread.run_sync(tx.__enter__, limiter=self._limiter)
+            await _run_sync_recorded(tx.__enter__, limiter=self._limiter, span=span)
             try:
                 yield conn
             except BaseException as exc:
@@ -336,43 +342,95 @@ class OffsetWriter:
                 def _rollback() -> bool | None:
                     return tx.__exit__(exc_type, exc_value, exc_traceback)
 
-                await trio.to_thread.run_sync(_rollback, limiter=self._limiter)
+                await _run_sync_recorded(_rollback, limiter=self._limiter, span=span)
                 raise
             else:
 
                 def _commit() -> bool | None:
                     return tx.__exit__(None, None, None)
 
-                await trio.to_thread.run_sync(_commit, limiter=self._limiter)
+                await _run_sync_recorded(_commit, limiter=self._limiter, span=span)
 
     async def run_read(
         self,
         func: Callable[[Connection[TupleRow]], T],
         *,
         limiter: trio.CapacityLimiter,
+        span: SpanRecorder | None = None,
     ) -> T:
         """Run a read-only synchronous DB body against one pooled connection."""
-        async with self.acquire_read() as conn:
-            return await trio.to_thread.run_sync(lambda: func(conn), limiter=limiter)
+        async with self.acquire_read(span=span) as conn:
+            return await _run_sync_recorded(lambda: func(conn), limiter=limiter, span=span)
 
-    async def run_transaction(self, func: Callable[[Connection[TupleRow]], T]) -> T:
+    async def run_transaction(
+        self,
+        func: Callable[[Connection[TupleRow]], T],
+        *,
+        span: SpanRecorder | None = None,
+    ) -> T:
         """Run a synchronous DB body inside one pooled transaction."""
-        async with self.acquire_transaction() as conn:
-            return await trio.to_thread.run_sync(lambda: func(conn), limiter=self._limiter)
+        async with self.acquire_transaction(span=span) as conn:
+            return await _run_sync_recorded(lambda: func(conn), limiter=self._limiter, span=span)
 
-    async def _run_pooled_write(self, func: Callable[[Connection[TupleRow]], T]) -> T:
-        async with self._borrow_connection() as conn:
-            return await trio.to_thread.run_sync(lambda: func(conn), limiter=self._limiter)
+    async def _run_pooled_write(
+        self,
+        func: Callable[[Connection[TupleRow]], T],
+        *,
+        span: SpanRecorder | None = None,
+    ) -> T:
+        async with self._borrow_connection(span=span) as conn:
+            return await _run_sync_recorded(lambda: func(conn), limiter=self._limiter, span=span)
 
     def close(self) -> None:
         """Close every connection owned by the writer pool."""
         for conn in self._connections:
             conn.close()
 
-    async def write_event(self, record: EventRecord) -> int | None:
+    async def write_event(self, record: EventRecord, *, span: SpanRecorder | None = None) -> int | None:
         """Async: assign an offset and append one event. See `write_event`."""
-        return await self._run_pooled_write(lambda conn: write_event(conn, record))
+        return await self._run_pooled_write(lambda conn: write_event(conn, record), span=span)
 
-    async def write_message_or_corrective(self, record: EventRecord) -> int | None:
+    async def write_message_or_corrective(
+        self,
+        record: EventRecord,
+        *,
+        span: SpanRecorder | None = None,
+    ) -> int | None:
         """Async: append a backfill message or corrective edit."""
-        return await self._run_pooled_write(lambda conn: write_message_or_corrective(conn, record))
+        return await self._run_pooled_write(lambda conn: write_message_or_corrective(conn, record), span=span)
+
+
+async def _run_sync_recorded[U](
+    func: Callable[[], U],
+    *,
+    limiter: trio.CapacityLimiter,
+    span: SpanRecorder | None,
+) -> U:
+    started_ns = time.monotonic_ns()
+    sync_ns = 0
+
+    def _timed() -> U:
+        nonlocal sync_ns
+        sync_started_ns = time.monotonic_ns()
+        try:
+            return func()
+        finally:
+            sync_ns += time.monotonic_ns() - sync_started_ns
+
+    try:
+        return await trio.to_thread.run_sync(_timed, limiter=limiter)
+    finally:
+        _record_span_timing(span, started_ns=started_ns, sync_ns=sync_ns)
+
+
+def _record_span_timing(
+    span: SpanRecorder | None,
+    *,
+    started_ns: int,
+    sync_ns: int,
+) -> None:
+    if span is None:
+        return
+    total_ms = int((time.monotonic_ns() - started_ns) / 1_000_000)
+    sync_ms = int(sync_ns / 1_000_000)
+    span.add_timing(limiter_wait_ms=max(total_ms - sync_ms, 0), sync_ms=sync_ms)

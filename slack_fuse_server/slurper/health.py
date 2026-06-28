@@ -26,6 +26,7 @@ from psycopg.rows import TupleRow
 
 from slack_fuse_server._json import JsonObject
 from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter, assign_offset, insert_event
+from slack_fuse_server.slurper.spans import span
 
 log = logging.getLogger(__name__)
 
@@ -85,7 +86,9 @@ class HealthEmitter:
     async def emit(self, kind: HealthKind, payload: JsonObject | None = None) -> int:
         """Emit one health transition. Returns the assigned `slurper-health` offset."""
         body: JsonObject = payload if payload is not None else {}
-        offset = await self._writer.run_transaction(lambda conn: self._emit_sync(conn, kind, body))
+        async with span(op="slurper.health.emit", task="health", extra={"kind": str(kind)}) as recorder:
+            offset = await self._writer.run_transaction(lambda conn: self._emit_sync(conn, kind, body), span=recorder)
+            recorder.set("offset", offset)
         log.info("slurper-health: %s %s (offset=%d)", kind, body, offset)
         return offset
 
