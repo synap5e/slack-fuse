@@ -337,6 +337,73 @@ time they run `dust` and gets confused."
 
 ---
 
+### Probe-event pattern — channel message counts + wider pattern
+
+**Discovered**: 2026-06-28, post Wave 2 deploy. Triggered by the
+question "what's the % progress of the backfill?" — we have no
+authoritative denominator until a channel is fully backfilled.
+
+**Specific item**: add a `channel_message_count_probed` event kind.
+Slurper periodically calls `search.messages?query=in:<channel>` and
+emits one event per channel per period with the total count from the
+API. Tier 2 (`search.messages`: 60/min). Lets `/livez` (or a new
+endpoint) compute "% complete" as `sum(events_written from
+backfill_completed) / sum(latest probed count)`. Cheap to implement
+once the pattern shape is decided.
+
+**Wider pattern to think through** before building the specific item.
+Today our event kinds split cleanly into two shapes:
+
+- **Push-driven** (Socket Mode): `message`, `channel_added`,
+  `user_added`, `member_joined_channel`, `reaction_added`, etc.
+- **Diff-driven refreshes** (`channel_info_refreshed`): fire ONLY when
+  a periodic `conversations.info` sweep detects payload drift.
+
+A **probe event** is a third shape: slurper-initiated, periodic,
+captures authoritative Slack API state regardless of drift, immutable
+in the events log. The latest probe wins; older ones are history.
+
+Candidate probes to evaluate together rather than one-at-a-time:
+
+1. **`channel_message_count_probed`** — the asked-for one. Backfill %
+   visibility. Tier 2.
+2. **`thread_reply_count_probed`** — covers a real coverage gap. Old
+   thread parents don't get new replies absent socket-mode events (and
+   replies on threads in non-member channels never surface). Tier 3.
+3. **`channel_pin_count_probed`** — pinned messages are anchors of
+   context. Today we don't capture pin state at all.
+4. **`workspace_emoji_probed`** — `emoji.list` for custom emoji.
+   Useful for rendering markdown output. Cheap.
+5. **`channel_bookmark_probed`** — some teams use bookmarks as canvas
+   pointers.
+
+Design points to settle BEFORE writing any of them:
+
+- **One probe-sweep task or per-probe tasks?** One sweep is simpler
+  (one supervisor entry, one limiter; the sweep walks a registry of
+  probe kinds with their own intervals). Per-probe scales the nursery
+  + supervisor surface unnecessarily.
+- **TTL + cadence per kind.** `channel_message_count` could refresh
+  every 6h; `workspace_emoji` daily; `pins` weekly. Make this part of
+  ServerConfig.
+- **Tier budget accounting.** `search.messages` (Tier 2, 60/min) for
+  N channels at interval T must respect the ceiling. Bake into the
+  sweep.
+- **Failure handling.** API failure = no event written. Last probe
+  stays as truth. Consumers shouldn't assume any cadence.
+- **Spans wrap probes.** Each probe emits `slurper.probe.<kind>`
+  spans for cost visibility — natural follow-on from Wave 2.C.
+- **Distinct from refreshes.** `channel_info_refreshed` fires on
+  diff; probes fire on period regardless. Two different consumers;
+  don't piggyback.
+
+**Recommendation**: spec the probe-event shape (one sweep task,
+registry of probe kinds, per-kind TTL via config) as one design pass,
+then implement the first probe (`channel_message_count_probed`) as
+the proof. Other probes drop in cheaply afterward.
+
+---
+
 ### Clean up repo
 
 **Discovered**: 2026-06-28.
