@@ -588,3 +588,15 @@ common enough operation that "works by default" is the right default.
 **Impact**: ergonomic only. Doesn't affect correctness or data. Worth
 fixing because the alternative is "every user discovers it the first
 time they run `dust` and gets confused."
+
+---
+
+### Clean up repo
+
+**Discovered**: 2026-06-28.
+
+Stale paths that should be deleted from main:
+
+- **`slack_fuse_poc_b/`** — POC B for the renderer-split byte-equivalence proof from June 9. The split shipped in `slack_fuse_render/`; the POC is leftover scratch (24K, two files + __pycache__).
+- **`.wt/synap5e/poc/a-events-to-postgres`** + **`.wt/synap5e/poc/b-renderer-split`** worktrees — early development POC branches still listed in `git worktree list`. Check for unmerged history before removing.
+- Any other `poc_*` / `sprint*` worktree branches that were created during early development and have since shipped or been abandoned.
