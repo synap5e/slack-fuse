@@ -23,12 +23,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from functools import partial
 
 import psycopg
 import trio
 from psycopg import Connection
 from psycopg.rows import TupleRow
 
+from slack_fuse_server.slurper.supervisor import TaskSupervisor, phase
 from slack_fuse_server.snapshot.generator import (
     GenerationTrigger,
     SnapshotResult,
@@ -172,36 +174,66 @@ class SnapshotScheduler:
         self._poll_interval_s = poll_interval_s
 
     def _tick_sync(self) -> list[SnapshotResult]:
-        due = due_streams(
+        due = self._due_streams_sync()
+        results: list[SnapshotResult] = []
+        for stream, trigger in due:
+            result = self._generate_snapshot_sync(stream, trigger)
+            if result is not None:
+                results.append(result)
+        return results
+
+    def _due_streams_sync(self) -> list[tuple[str, GenerationTrigger]]:
+        return due_streams(
             self._conn,
             every_n_events=self._every_n_events,
             max_age_seconds=self._max_age_seconds,
         )
+
+    def _generate_snapshot_sync(self, stream: str, trigger: GenerationTrigger) -> SnapshotResult | None:
+        result = generate_snapshot(self._conn, stream, trigger=trigger)
+        if result is not None:
+            log.info(
+                "snapshot: stream=%s at_offset=%d events_covered=%d payload_bytes=%d trigger=%s (%dms)",
+                result.stream,
+                result.at_offset,
+                result.events_covered,
+                result.payload_bytes,
+                result.generation_trigger,
+                result.generation_duration_ms,
+            )
+        return result
+
+    async def tick(self, supervisor: TaskSupervisor | None = None) -> list[SnapshotResult]:
+        """Run one scheduling pass on a worker thread; return generated snapshots."""
+        if supervisor is None:
+            return await trio.to_thread.run_sync(self._tick_sync, limiter=self._limiter)
+
+        async with phase(supervisor, "snapshot", "tick", deadline_s=30):
+            due = await trio.to_thread.run_sync(self._due_streams_sync, limiter=self._limiter)
         results: list[SnapshotResult] = []
         for stream, trigger in due:
-            result = generate_snapshot(self._conn, stream, trigger=trigger)
+            async with phase(
+                supervisor,
+                "snapshot",
+                "generating",
+                details={"stream": stream, "trigger": trigger},
+                deadline_s=300,
+            ):
+                result = await trio.to_thread.run_sync(
+                    partial(self._generate_snapshot_sync, stream, trigger),
+                    limiter=self._limiter,
+                )
             if result is not None:
                 results.append(result)
-                log.info(
-                    "snapshot: stream=%s at_offset=%d events_covered=%d payload_bytes=%d trigger=%s (%dms)",
-                    result.stream,
-                    result.at_offset,
-                    result.events_covered,
-                    result.payload_bytes,
-                    result.generation_trigger,
-                    result.generation_duration_ms,
-                )
         return results
 
-    async def tick(self) -> list[SnapshotResult]:
-        """Run one scheduling pass on a worker thread; return generated snapshots."""
-        return await trio.to_thread.run_sync(self._tick_sync, limiter=self._limiter)
-
-    async def run(self) -> None:
+    async def run(self, supervisor: TaskSupervisor | None = None) -> None:
         """Loop forever: tick, then sleep one poll interval. Resilient to DB errors."""
         while True:
             try:
-                await self.tick()
+                await self.tick(supervisor)
             except psycopg.Error:
                 log.warning("snapshot: scheduling tick failed; retrying next interval", exc_info=True)
+            if supervisor is not None:
+                supervisor.declare("snapshot", "idle", deadline_s=None)
             await trio.sleep(self._poll_interval_s)

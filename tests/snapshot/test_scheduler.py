@@ -15,6 +15,7 @@ from slack_fuse.models import Message
 from slack_fuse_server._json import JsonObject
 from slack_fuse_server.slurper.offsets import EventRecord, write_event
 from slack_fuse_server.snapshot.scheduler import SnapshotScheduler, decide_trigger, due_streams
+from tests.conftest import RecordingSupervisor
 
 
 def _write_message(conn: psycopg.Connection[TupleRow], stream: str, ts: str) -> None:
@@ -141,3 +142,18 @@ def test_tick_covers_multiple_streams(server_conn: psycopg.Connection[TupleRow])
     results = trio.run(scheduler.tick)
 
     assert {r.stream for r in results} == {"channel:C1", "channel:C2"}
+
+
+def test_tick_declares_supervisor_phases(server_conn: psycopg.Connection[TupleRow]) -> None:
+    stream = "channel:C_PHASE"
+    for i in range(3):
+        _write_message(server_conn, stream, f"70{i}.000000")
+    scheduler = _new_scheduler(server_conn, every_n_events=3)
+    supervisor = RecordingSupervisor()
+
+    results = trio.run(scheduler.tick, supervisor)
+
+    assert [result.stream for result in results] == [stream]
+    phases = [(item.task_name, item.phase, item.details) for item in supervisor.declarations]
+    assert ("snapshot", "tick", None) in phases
+    assert ("snapshot", "generating", {"stream": stream, "trigger": "event_count"}) in phases

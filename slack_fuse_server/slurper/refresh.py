@@ -38,6 +38,7 @@ from slack_fuse_server._json import JsonObject
 from slack_fuse_server.slurper.api import ChannelNotFoundError, SlackAPIError, SlackClient
 from slack_fuse_server.slurper.limiters import SlurperLimiters
 from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter, assign_offset, insert_event
+from slack_fuse_server.slurper.supervisor import TaskSupervisor, phase
 
 if TYPE_CHECKING:
     import psycopg
@@ -62,6 +63,7 @@ async def refresh_channels_periodically(
     writer: OffsetWriter,
     client: SlackClient,
     limiters: SlurperLimiters,
+    supervisor: TaskSupervisor | None = None,
     *,
     interval_s: float = DEFAULT_INTERVAL_S,
 ) -> None:
@@ -74,15 +76,28 @@ async def refresh_channels_periodically(
     """
     while True:
         try:
-            await _refresh_all_once(writer, client, limiters)
+            await _refresh_all_once(writer, client, limiters, supervisor)
         except Exception:
             log.exception("refresh: cycle failed; retrying after interval")
+        if supervisor is not None:
+            supervisor.declare("refresh", "sleeping_until", deadline_s=None)
         await trio.sleep(interval_s)
 
 
-async def _refresh_all_once(writer: OffsetWriter, client: SlackClient, limiters: SlurperLimiters) -> None:
+async def _refresh_all_once(
+    writer: OffsetWriter,
+    client: SlackClient,
+    limiters: SlurperLimiters,
+    supervisor: TaskSupervisor | None = None,
+    *,
+    task_name: str = "refresh",
+) -> None:
     """One full pass: walk known channels, refresh each."""
-    channel_ids = await writer.run_read(_list_known_channel_ids, limiter=limiters.admin_read)
+    if supervisor is None:
+        channel_ids = await writer.run_read(_list_known_channel_ids, limiter=limiters.admin_read)
+    else:
+        async with phase(supervisor, task_name, "listing_channels", deadline_s=30):
+            channel_ids = await writer.run_read(_list_known_channel_ids, limiter=limiters.admin_read)
     log.info("refresh: starting cycle for %d channel(s)", len(channel_ids))
     refreshed = 0
     unchanged = 0
@@ -90,7 +105,17 @@ async def _refresh_all_once(writer: OffsetWriter, client: SlackClient, limiters:
     errors = 0
     for channel_id in channel_ids:
         try:
-            changed = await _refresh_one(writer, client, channel_id, limiters)
+            if supervisor is None:
+                changed = await _refresh_one(writer, client, channel_id, limiters)
+            else:
+                async with phase(
+                    supervisor,
+                    task_name,
+                    "refreshing_channel",
+                    details={"channel_id": channel_id},
+                    deadline_s=10,
+                ):
+                    changed = await _refresh_one(writer, client, channel_id, limiters)
         except ChannelNotFoundError:
             # Channel left / archived-and-purged — skip cleanly.
             not_found += 1
@@ -236,19 +261,47 @@ class RefreshTrigger:
         await self._send.aclose()
         await self._recv.aclose()
 
-    async def consume(self, writer: OffsetWriter, client: SlackClient, limiters: SlurperLimiters) -> None:
+    async def consume(
+        self,
+        writer: OffsetWriter,
+        client: SlackClient,
+        limiters: SlurperLimiters,
+        supervisor: TaskSupervisor | None = None,
+        *,
+        interval_s: float = DEFAULT_INTERVAL_S,
+    ) -> None:
         """Trio task: drain refresh requests one at a time.
 
         Spawned in the main nursery alongside the periodic task. The two
         coexist cleanly — periodic ticks at 6h, HTTP triggers fire ad
         hoc; both share ``_refresh_all_once`` / ``_refresh_one``.
         """
-        async for item in self._recv:
+        while True:
+            if supervisor is not None:
+                supervisor.declare("refresh-trigger", "waiting_for_trigger", deadline_s=None)
             try:
-                if item is None:
-                    await _refresh_all_once(writer, client, limiters)
+                item = await self._recv.receive()
+            except trio.EndOfChannel:
+                return
+            try:
+                details: JsonObject = {} if item is None else {"channel_id": item}
+                if supervisor is None:
+                    if item is None:
+                        await _refresh_all_once(writer, client, limiters)
+                    else:
+                        await _refresh_one(writer, client, item, limiters)
                 else:
-                    await _refresh_one(writer, client, item, limiters)
+                    async with phase(
+                        supervisor,
+                        "refresh-trigger",
+                        "running",
+                        details=details,
+                        deadline_s=interval_s * 0.5,
+                    ):
+                        if item is None:
+                            await _refresh_all_once(writer, client, limiters)
+                        else:
+                            await _refresh_one(writer, client, item, limiters)
             except ChannelNotFoundError:
                 log.info("refresh: HTTP-triggered run for %s: channel not found", item)
             except Exception:

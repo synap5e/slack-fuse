@@ -42,7 +42,7 @@ from slack_fuse_server.slurper.catchup import (
     should_catchup,
 )
 from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter, write_event
-from tests.conftest import make_test_limiters, make_test_writer
+from tests.conftest import RecordingSupervisor, make_test_limiters, make_test_writer
 
 if TYPE_CHECKING:
     import psycopg
@@ -356,10 +356,11 @@ def test_catchup_trigger_runs_startup_catchup(
     backfiller = _RecordingBackfiller(["CS1", "CS2"])
     deps = CatchupDeps(writer=writer, backfiller=backfiller, config=_FAST, limiters=make_test_limiters())
     trigger = CatchupTrigger()
+    supervisor = RecordingSupervisor()
 
     async def go() -> None:
         async with trio.open_nursery() as nursery:
-            nursery.start_soon(trigger.consume, deps)
+            nursery.start_soon(trigger.consume, deps, supervisor)
             # consume runs the startup sweep then parks on the channel forever;
             # give it room to finish the sweep, then tear the nursery down.
             await trio.sleep(0.2)
@@ -369,3 +370,9 @@ def test_catchup_trigger_runs_startup_catchup(
 
     # Startup catchup ran without any request() — both channels were swept.
     assert set(backfiller.since_by_channel) == {"CS1", "CS2"}
+    phases = [(item.task_name, item.phase, item.details) for item in supervisor.declarations]
+    assert ("catchup", "startup_delay", None) in phases
+    assert ("catchup", "listing_channels", None) in phases
+    assert ("catchup", "catching_up_channel", {"channel_id": "CS1"}) in phases
+    assert ("catchup", "catching_up_channel", {"channel_id": "CS2"}) in phases
+    assert ("catchup", "idle", None) in phases

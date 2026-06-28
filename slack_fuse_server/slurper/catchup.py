@@ -52,6 +52,7 @@ from slack_fuse_server.backfill.types import Backfiller
 from slack_fuse_server.slurper.api import SlackAPIError
 from slack_fuse_server.slurper.limiters import SlurperLimiters
 from slack_fuse_server.slurper.offsets import PG_TIMEOUT_EXCEPTIONS, EventRecord, OffsetWriter
+from slack_fuse_server.slurper.supervisor import TaskSupervisor, phase
 
 if TYPE_CHECKING:
     import psycopg
@@ -203,7 +204,12 @@ async def _write_message_or_corrective_retry_once(writer: OffsetWriter, record: 
         return await writer.write_message_or_corrective(record)
 
 
-async def run_catchup_once(deps: CatchupDeps, *, now_epoch: float | None = None) -> CatchupResult:
+async def run_catchup_once(
+    deps: CatchupDeps,
+    *,
+    now_epoch: float | None = None,
+    supervisor: TaskSupervisor | None = None,
+) -> CatchupResult:
     """One full sweep: gap-fill every member channel from its resume point.
 
     ``now_epoch`` is injectable for tests; it defaults to wall-clock time and is
@@ -212,7 +218,11 @@ async def run_catchup_once(deps: CatchupDeps, *, now_epoch: float | None = None)
     recovery of the rest.
     """
     now = now_epoch if now_epoch is not None else time.time()
-    last_seen = await deps.writer.run_read(last_seen_ts_by_stream, limiter=deps.limiters.admin_read)
+    if supervisor is None:
+        last_seen = await deps.writer.run_read(last_seen_ts_by_stream, limiter=deps.limiters.admin_read)
+    else:
+        async with phase(supervisor, "catchup", "listing_channels", deadline_s=60):
+            last_seen = await deps.writer.run_read(last_seen_ts_by_stream, limiter=deps.limiters.admin_read)
     start = trio.current_time()
     channels = 0
     events = 0
@@ -227,7 +237,17 @@ async def run_catchup_once(deps: CatchupDeps, *, now_epoch: float | None = None)
             channel_id.value, last_seen, now_epoch=now, max_lookback_s=deps.config.max_lookback_s
         )
         try:
-            events += await catchup_channel(deps.backfiller, deps.writer, channel_id, since_ts)
+            if supervisor is None:
+                events += await catchup_channel(deps.backfiller, deps.writer, channel_id, since_ts)
+            else:
+                async with phase(
+                    supervisor,
+                    "catchup",
+                    "catching_up_channel",
+                    details={"channel_id": channel_id.value},
+                    deadline_s=300,
+                ):
+                    events += await catchup_channel(deps.backfiller, deps.writer, channel_id, since_ts)
         except (SlackAPIError, httpx.HTTPError):
             log.warning("catchup: API error for %s", channel_id.value, exc_info=True)
             errors += 1
@@ -263,20 +283,28 @@ class CatchupTrigger:
             return False
         return True
 
-    async def consume(self, deps: CatchupDeps) -> None:
+    async def consume(self, deps: CatchupDeps, supervisor: TaskSupervisor | None = None) -> None:
         """Trio task: startup catchup, then one per queued reconnect request.
 
         Spawned in the main nursery. Supervisor catches inside the cycle so a
         single bad sweep doesn't take the task down.
         """
+        if supervisor is not None:
+            supervisor.declare("catchup", "startup_delay", deadline_s=None)
         await trio.sleep(deps.config.startup_delay_s)
-        await self._safe_run(deps, "startup")
-        async for gap in self._recv:
-            await self._safe_run(deps, f"reconnect gap={gap:.0f}s")
+        await self._safe_run(deps, "startup", supervisor)
+        while True:
+            if supervisor is not None:
+                supervisor.declare("catchup", "idle", deadline_s=None)
+            try:
+                gap = await self._recv.receive()
+            except trio.EndOfChannel:
+                return
+            await self._safe_run(deps, f"reconnect gap={gap:.0f}s", supervisor)
 
-    async def _safe_run(self, deps: CatchupDeps, trigger: str) -> None:
+    async def _safe_run(self, deps: CatchupDeps, trigger: str, supervisor: TaskSupervisor | None) -> None:
         log.info("catchup: starting cycle (%s)", trigger)
         try:
-            await run_catchup_once(deps)
+            await run_catchup_once(deps, supervisor=supervisor)
         except Exception:
             log.exception("catchup: cycle failed")

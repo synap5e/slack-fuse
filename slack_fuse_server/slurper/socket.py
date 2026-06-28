@@ -58,6 +58,7 @@ from slack_fuse_server.slurper.api import SlackAPIError, SlackClient, Validated
 from slack_fuse_server.slurper.health import HealthEmitter, HealthKind, SlackDegradedTracker
 from slack_fuse_server.slurper.limiters import SlurperLimiters
 from slack_fuse_server.slurper.offsets import PG_TIMEOUT_EXCEPTIONS, EventRecord, OffsetWriter
+from slack_fuse_server.slurper.supervisor import TaskSupervisor, phase
 
 log = logging.getLogger(__name__)
 
@@ -234,6 +235,7 @@ class SocketModeRunner:
         *,
         limiters: SlurperLimiters,
         options: SocketModeOptions | None = None,
+        supervisor: TaskSupervisor | None = None,
     ) -> None:
         options = options or SocketModeOptions()
         self._writer = writer
@@ -241,6 +243,7 @@ class SocketModeRunner:
         self._client = client
         self._app_token = app_token
         self._limiters = limiters
+        self._supervisor = supervisor or TaskSupervisor()
         # trio clock time of the most recent disconnect; None while connected
         # for the first time (initial connect emits slack_healthy, not reconnected).
         self._disconnected_at: float | None = None
@@ -253,11 +256,13 @@ class SocketModeRunner:
         backoff = _RECONNECT_MIN
         while True:
             self._status.state = "connecting"
+            self._supervisor.declare("socket", "connecting", deadline_s=15)
             try:
                 ws_url = await trio.to_thread.run_sync(self._open_socket, limiter=self._limiters.slack_api)
             except _AuthFailed:
                 self._status.state = "auth_failed"
                 await self._health.emit(HealthKind.AUTH_TOKEN_INVALID)
+                self._supervisor.declare("socket", "reconnecting", deadline_s=None)
                 await trio.sleep(backoff)
                 backoff = min(backoff * 2.0, _RECONNECT_MAX)
                 continue
@@ -266,6 +271,7 @@ class SocketModeRunner:
                 reason = _classify_open_failure(exc)
                 log.warning("socket-mode: apps.connections.open failed (%s): %s", reason, exc)
                 await self._degraded.record_failure(reason)
+                self._supervisor.declare("socket", "reconnecting", deadline_s=None)
                 await trio.sleep(backoff)
                 backoff = min(backoff * 2.0, _RECONNECT_MAX)
                 continue
@@ -279,6 +285,7 @@ class SocketModeRunner:
                 backoff = _RECONNECT_MIN
             else:
                 log.info("socket-mode: unclean close; backing off")
+                self._supervisor.declare("socket", "reconnecting", deadline_s=None)
                 await trio.sleep(backoff)
                 backoff = min(backoff * 2.0, _RECONNECT_MAX)
 
@@ -327,6 +334,7 @@ class SocketModeRunner:
         """Pump frames off the socket until a disconnect (or the peer closes)."""
         try:
             while True:
+                self._supervisor.declare("socket", "connected_waiting_for_frame", deadline_s=None)
                 message = await ws.get_message()
                 parsed = _parse_envelope(message)
                 if parsed is None:
@@ -351,15 +359,22 @@ class SocketModeRunner:
 
     async def _handle_event(self, event: SocketEventPayload, raw_event: JsonObject) -> None:
         """Translate one socket event and write the resulting wire events."""
-        if event.type == "message":
-            write = translate_message_event(event, raw_event)
-            if write is not None:
-                await self._write_event_or_drop_timeout(write)
-            return
-        if event.type in CHANNEL_LIST_EVENT_TYPES:
-            await self._handle_structural_event(event)
-            return
-        log.debug("socket-mode: ignoring event type %s", event.type)
+        async with phase(
+            self._supervisor,
+            "socket",
+            "handling_event",
+            details={"kind": event.type},
+            deadline_s=10,
+        ):
+            if event.type == "message":
+                write = translate_message_event(event, raw_event)
+                if write is not None:
+                    await self._write_event_or_drop_timeout(write)
+                return
+            if event.type in CHANNEL_LIST_EVENT_TYPES:
+                await self._handle_structural_event(event)
+                return
+            log.debug("socket-mode: ignoring event type %s", event.type)
 
     async def _write_event_or_drop_timeout(self, record: EventRecord) -> None:
         try:
@@ -489,6 +504,15 @@ async def run_socket_mode(  # noqa: PLR0913 - public wrapper mirrors runner depe
     *,
     limiters: SlurperLimiters,
     options: SocketModeOptions | None = None,
+    supervisor: TaskSupervisor | None = None,
 ) -> None:
     """Entry point: build a `SocketModeRunner` and run it forever."""
-    await SocketModeRunner(writer, health, client, app_token, limiters=limiters, options=options).run()
+    await SocketModeRunner(
+        writer,
+        health,
+        client,
+        app_token,
+        limiters=limiters,
+        options=options,
+        supervisor=supervisor,
+    ).run()

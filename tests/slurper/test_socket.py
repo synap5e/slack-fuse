@@ -29,7 +29,7 @@ from slack_fuse_server.slurper.socket import (
     translate_message_event,
 )
 from tests._fake_slack import load_fixtures
-from tests.conftest import make_test_limiters, make_test_writer
+from tests.conftest import RecordingSupervisor, make_test_limiters, make_test_writer
 
 # === Pure translation ===
 
@@ -187,6 +187,31 @@ def test_handle_message_event_writes_channel_stream(
     assert kind == "message"
     assert isinstance(payload, dict)
     assert payload["ts"] == "100.0001"
+
+
+def test_handle_event_declares_handling_phase(
+    server_conn: psycopg.Connection[TupleRow],
+    fake_slack_http: httpx.Client,
+) -> None:
+    client = SlackClient("xoxp-test")
+    client._http = fake_slack_http
+    writer = make_test_writer(server_conn)
+    supervisor = RecordingSupervisor()
+    runner = SocketModeRunner(
+        writer,
+        HealthEmitter(writer),
+        client,
+        "xapp-test",
+        limiters=make_test_limiters(),
+        supervisor=supervisor,
+    )
+    event = SocketEventPayload(type="message", channel="C1", ts="100.0001", user="U1", text="hi")
+
+    trio.run(runner._handle_event, event, _raw_for(event))
+
+    assert ("socket", "handling_event", {"kind": "message"}) in [
+        (item.task_name, item.phase, item.details) for item in supervisor.declarations
+    ]
 
 
 def test_handle_message_event_drops_pg_timeout_with_warning(

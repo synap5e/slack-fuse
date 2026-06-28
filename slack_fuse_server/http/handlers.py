@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol
@@ -28,6 +29,9 @@ from slack_fuse_server.http.permalink import resolve_path_to_permalink_url
 from slack_fuse_server.http.resolve import resolve_permalink_url
 from slack_fuse_server.http.snapshot import SnapshotPayload, fetch_snapshot_payload
 from slack_fuse_server.slurper.api import SlackClient
+from slack_fuse_server.slurper.supervisor import TaskPhase, TaskSupervisor
+
+log = logging.getLogger(__name__)
 
 
 class DisplayNameResolver(Protocol):
@@ -138,9 +142,53 @@ class BackfillDeps:
     trigger: BackfillTrigger
 
 
+@dataclass(frozen=True, slots=True)
+class LivezDeps:
+    """Dependencies required by ``GET /livez``."""
+
+    supervisor: TaskSupervisor
+
+
 def handle_health() -> HealthResponse:
     """`GET /health` liveness probe."""
     return HealthResponse(ok=True)
+
+
+def handle_livez(deps: LivezDeps) -> tuple[int, dict[str, object]]:
+    """``GET /livez`` task-liveness snapshot."""
+    phases = deps.supervisor.all_phases()
+    overdue = deps.supervisor.overdue()
+    serialized_phases = {task_name: _serialize_phase_for_map(phase) for task_name, phase in phases.items()}
+    if not overdue:
+        return 200, {"phases": serialized_phases}
+
+    log.warning(
+        "livez: overdue task phase(s): %s",
+        ", ".join(
+            f"{phase.task_name}:{phase.phase} deadline={phase.deadline.isoformat() if phase.deadline else None}"
+            for phase in overdue
+        ),
+    )
+    return 503, {
+        "overdue": [_serialize_phase_for_overdue(phase) for phase in overdue],
+        "phases": serialized_phases,
+    }
+
+
+def _serialize_phase_for_map(phase: TaskPhase) -> dict[str, object]:
+    return {
+        "phase": phase.phase,
+        "details": phase.details,
+        "entered_at": phase.entered_at.isoformat(),
+        "deadline": None if phase.deadline is None else phase.deadline.isoformat(),
+    }
+
+
+def _serialize_phase_for_overdue(phase: TaskPhase) -> dict[str, object]:
+    return {
+        "task_name": phase.task_name,
+        **_serialize_phase_for_map(phase),
+    }
 
 
 def handle_metrics(metrics_source: MetricsSource) -> MetricsResponse:

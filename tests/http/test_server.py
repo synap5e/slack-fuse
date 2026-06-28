@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -19,6 +20,7 @@ from slack_fuse_server.http.dto import (
     StreamMetrics,
     SubscribersMetrics,
 )
+from slack_fuse_server.http.handlers import LivezDeps
 from slack_fuse_server.http.metrics import MetricsSource
 from slack_fuse_server.http.server import (
     HttpRequest,
@@ -26,6 +28,7 @@ from slack_fuse_server.http.server import (
     route_request,
     serve_http_on_listeners,
 )
+from slack_fuse_server.slurper.supervisor import TaskSupervisor
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,12 +56,16 @@ def _sample_metrics() -> MetricsResponse:
 
 
 @asynccontextmanager
-async def _running_server(metrics_source: MetricsSource):
+async def _running_server(metrics_source: MetricsSource, livez_deps: LivezDeps | None = None):
     listeners = await trio.open_tcp_listeners(0, host="127.0.0.1")
     sockname = cast(tuple[str, int], listeners[0].socket.getsockname())
     port = sockname[1]
+
+    async def serve() -> None:
+        await serve_http_on_listeners(listeners, metrics_source, livez_deps=livez_deps)
+
     async with trio.open_nursery() as nursery:
-        nursery.start_soon(serve_http_on_listeners, listeners, metrics_source)
+        nursery.start_soon(serve)
         await trio.sleep(0.05)
         try:
             yield f"http://127.0.0.1:{port}"
@@ -87,6 +94,101 @@ def test_route_request_metrics() -> None:
     assert MetricsResponse.model_validate_json(response.body) == payload
 
 
+def test_route_request_livez_empty_registry() -> None:
+    response = route_request(
+        HttpRequest(method="GET", target="/livez"),
+        metrics_source=StaticMetricsSource(_sample_metrics()),
+        livez_deps=LivezDeps(supervisor=TaskSupervisor()),
+    )
+
+    assert response.status_code == 200
+    assert response.body == b'{"phases":{}}'
+
+
+def test_route_request_livez_all_phases_healthy() -> None:
+    now = datetime(2026, 6, 28, 3, 14, 15, 123456, tzinfo=UTC)
+    supervisor = TaskSupervisor(clock=lambda: now)
+    supervisor.declare("socket", "connected_waiting_for_frame", deadline_s=None)
+    supervisor.declare("refresh", "refreshing_channel", details={"channel_id": "C1"}, deadline_s=10)
+
+    response = route_request(
+        HttpRequest(method="GET", target="/livez"),
+        metrics_source=StaticMetricsSource(_sample_metrics()),
+        livez_deps=LivezDeps(supervisor=supervisor),
+    )
+
+    assert response.status_code == 200
+    assert json.loads(response.body) == {
+        "phases": {
+            "socket": {
+                "phase": "connected_waiting_for_frame",
+                "details": {},
+                "entered_at": "2026-06-28T03:14:15.123456+00:00",
+                "deadline": None,
+            },
+            "refresh": {
+                "phase": "refreshing_channel",
+                "details": {"channel_id": "C1"},
+                "entered_at": "2026-06-28T03:14:15.123456+00:00",
+                "deadline": "2026-06-28T03:14:25.123456+00:00",
+            },
+        }
+    }
+
+
+def test_route_request_livez_one_overdue() -> None:
+    current = datetime(2026, 6, 28, 3, 14, 15, tzinfo=UTC)
+    supervisor = TaskSupervisor(clock=lambda: current)
+    supervisor.declare("auto-backfill", "channel", details={"channel_id": "C1"}, deadline_s=5)
+    current = datetime(2026, 6, 28, 3, 14, 21, tzinfo=UTC)
+
+    response = route_request(
+        HttpRequest(method="GET", target="/livez"),
+        metrics_source=StaticMetricsSource(_sample_metrics()),
+        livez_deps=LivezDeps(supervisor=supervisor),
+    )
+
+    assert response.status_code == 503
+    assert json.loads(response.body) == {
+        "overdue": [
+            {
+                "task_name": "auto-backfill",
+                "phase": "channel",
+                "details": {"channel_id": "C1"},
+                "entered_at": "2026-06-28T03:14:15+00:00",
+                "deadline": "2026-06-28T03:14:20+00:00",
+            }
+        ],
+        "phases": {
+            "auto-backfill": {
+                "phase": "channel",
+                "details": {"channel_id": "C1"},
+                "entered_at": "2026-06-28T03:14:15+00:00",
+                "deadline": "2026-06-28T03:14:20+00:00",
+            }
+        },
+    }
+
+
+def test_route_request_livez_mix_healthy_and_overdue_degrades() -> None:
+    current = datetime(2026, 6, 28, 3, 14, 15, tzinfo=UTC)
+    supervisor = TaskSupervisor(clock=lambda: current)
+    supervisor.declare("socket", "connected_waiting_for_frame", deadline_s=None)
+    supervisor.declare("catchup", "catching_up_channel", details={"channel_id": "C2"}, deadline_s=300)
+    current = datetime(2026, 6, 28, 3, 19, 16, tzinfo=UTC)
+
+    response = route_request(
+        HttpRequest(method="GET", target="/livez"),
+        metrics_source=StaticMetricsSource(_sample_metrics()),
+        livez_deps=LivezDeps(supervisor=supervisor),
+    )
+
+    payload = json.loads(response.body)
+    assert response.status_code == 503
+    assert [item["task_name"] for item in payload["overdue"]] == ["catchup"]
+    assert set(payload["phases"]) == {"socket", "catchup"}
+
+
 def test_route_request_not_found() -> None:
     response = route_request(
         HttpRequest(method="GET", target="/nope"),
@@ -113,6 +215,19 @@ async def test_http_server_health_endpoint() -> None:
         response = await client.get("/health")
     assert response.status_code == 200
     assert response.json() == {"ok": True}
+
+
+@pytest.mark.trio
+async def test_http_server_livez_endpoint() -> None:
+    supervisor = TaskSupervisor()
+    supervisor.declare("socket", "connected_waiting_for_frame", deadline_s=None)
+    async with _running_server(
+        StaticMetricsSource(_sample_metrics()),
+        livez_deps=LivezDeps(supervisor=supervisor),
+    ) as base_url, httpx.AsyncClient(base_url=base_url) as client:
+        response = await client.get("/livez")
+    assert response.status_code == 200
+    assert response.json()["phases"]["socket"]["phase"] == "connected_waiting_for_frame"
 
 
 @pytest.mark.trio

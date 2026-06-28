@@ -35,6 +35,7 @@ from slack_fuse_server._json import JsonObject
 from slack_fuse_server.slurper.api import SlackAPIError, SlackClient, Validated
 from slack_fuse_server.slurper.limiters import SlurperLimiters
 from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter, assign_offset, insert_event
+from slack_fuse_server.slurper.supervisor import TaskSupervisor
 
 log = logging.getLogger(__name__)
 
@@ -108,13 +109,24 @@ def _populate_channels_once_sync(
     return (len(channels), inserted)
 
 
-async def populate_channels_once(writer: OffsetWriter, client: SlackClient, limiters: SlurperLimiters) -> None:
+async def populate_channels_once(
+    writer: OffsetWriter,
+    client: SlackClient,
+    limiters: SlurperLimiters,
+    supervisor: TaskSupervisor | None = None,
+) -> None:
     """One-shot startup conversations.list import (`channel_added` events)."""
     try:
+        if supervisor is not None:
+            supervisor.declare("populate-channels", "listing_channels", deadline_s=60)
         channels = await trio.to_thread.run_sync(client.list_conversations, limiter=limiters.slack_api)
+        if supervisor is not None:
+            supervisor.declare("populate-channels", "writing_channels", deadline_s=30)
         total, inserted = await writer.run_transaction(lambda conn: _populate_channels_once_sync(conn, channels))
     except (httpx.HTTPError, SlackAPIError, ValueError):
         log.warning("channels: startup populate failed", exc_info=True)
+        if supervisor is not None:
+            supervisor.declare("populate-channels", "failed", deadline_s=None)
         return
     log.info(
         "channels: startup populate complete channels=%d inserted=%d skipped=%d",
@@ -122,6 +134,8 @@ async def populate_channels_once(writer: OffsetWriter, client: SlackClient, limi
         inserted,
         total - inserted,
     )
+    if supervisor is not None:
+        supervisor.declare("populate-channels", "complete", deadline_s=None)
 
 
 def _channel_added_exists_sync(conn: Connection[TupleRow], channel_id: str) -> bool:

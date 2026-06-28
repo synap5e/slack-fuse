@@ -55,6 +55,7 @@ from slack_fuse_server.http.handlers import (
     BackfillDeps,
     BlockedChannelsDeps,
     GapsDeps,
+    LivezDeps,
     OriginalsDeps,
     RefreshDeps,
     ResolvePermalinkDeps,
@@ -75,6 +76,7 @@ from slack_fuse_server.slurper.limiters import SlurperLimiters
 from slack_fuse_server.slurper.offsets import OffsetWriter
 from slack_fuse_server.slurper.refresh import RefreshTrigger, refresh_channels_periodically
 from slack_fuse_server.slurper.socket import SocketModeOptions, SocketModeStatus
+from slack_fuse_server.slurper.supervisor import TaskSupervisor, phase
 from slack_fuse_server.slurper.users import populate_users_once, run_socket_mode_with_users
 from slack_fuse_server.snapshot import SnapshotScheduler
 from slack_fuse_server.wire.server import WireServer
@@ -321,6 +323,7 @@ async def _serve(config: ServerConfig) -> None:
         snapshot=snapshot_limiter,
         admin_read=admin_read_limiter,
     )
+    supervisor = TaskSupervisor()
     writer_conns = _connect_writer_pool(config)
     writer = OffsetWriter(
         writer_conns,
@@ -338,6 +341,7 @@ async def _serve(config: ServerConfig) -> None:
     snapshot_deps = SnapshotDeps(database_url=config.database_url)
     originals_deps = OriginalsDeps(database_url=config.database_url)
     gaps_deps = GapsDeps(database_url=config.database_url)
+    livez_deps = LivezDeps(supervisor=supervisor)
     # Trigger for ``POST /refresh-channels`` — request() rendezvous against
     # the consumer task spawned below. Auth lives at the HTTP layer (shared
     # secret); the trigger itself is just a one-in-flight dispatcher.
@@ -384,10 +388,18 @@ async def _serve(config: ServerConfig) -> None:
         async with trio.open_nursery() as nursery:
             _log_slurper_started()
             nursery.start_soon(
-                _run_socket_mode_with_users_task, writer, health, client, config, status, catchup_trigger, limiters
+                _run_socket_mode_with_users_task,
+                writer,
+                health,
+                client,
+                config,
+                status,
+                catchup_trigger,
+                limiters,
+                supervisor,
             )
-            nursery.start_soon(populate_users_once, writer, client, limiters)
-            nursery.start_soon(populate_channels_once, writer, client, limiters)
+            nursery.start_soon(populate_users_once, writer, client, limiters, supervisor)
+            nursery.start_soon(populate_channels_once, writer, client, limiters, supervisor)
             nursery.start_soon(
                 _serve_dispatch_task,
                 config.listen_addr,
@@ -400,25 +412,26 @@ async def _serve(config: ServerConfig) -> None:
                 refresh_deps,
                 blocked_channels_deps,
                 backfill_deps,
+                livez_deps,
             )
-            nursery.start_soon(snapshot_scheduler.run)
+            nursery.start_soon(snapshot_scheduler.run, supervisor)
             # Periodic ``conversations.info`` refresh: backfills lossy
             # legacy channel_added payloads (pre raw-persistence) and
             # catches drift the webhook flow doesn't surface.
-            nursery.start_soon(refresh_channels_periodically, writer, client, limiters)
+            nursery.start_soon(refresh_channels_periodically, writer, client, limiters, supervisor)
             # Long-lived consumer for HTTP-triggered refresh requests
             # (POST /refresh-channels). Same job as the periodic task,
             # fires only on demand. Rendezvous channel means a second
             # POST while one is running gets 409, not a queued cycle.
-            nursery.start_soon(refresh_trigger.consume, writer, client, limiters)
-            nursery.start_soon(backfill_trigger.consume, config)
+            nursery.start_soon(refresh_trigger.consume, writer, client, limiters, supervisor)
+            nursery.start_soon(backfill_trigger.consume, config, supervisor)
             # Reconnect/restart catchup consumer: runs one bounded gap-fill at
             # startup (the restart case) and one per gap-reconnect the socket
             # runner signals via catchup_trigger.
             if catchup_trigger is not None and catchup_deps is not None:
-                nursery.start_soon(catchup_trigger.consume, catchup_deps)
+                nursery.start_soon(catchup_trigger.consume, catchup_deps, supervisor)
             if auto_backfill:
-                nursery.start_soon(_auto_backfill, config, writer, health, client, limiters)
+                nursery.start_soon(_auto_backfill, config, writer, health, client, limiters, supervisor)
             log.info("slack-fuse-server listening on %s (HTTP /health, /metrics + WS /ws)", config.listen_addr)
     finally:
         client.close()
@@ -434,13 +447,22 @@ async def _run_socket_mode_with_users_task(  # noqa: PLR0913, PLR0917 - socket t
     status: SocketModeStatus,
     catchup_trigger: CatchupTrigger | None,
     limiters: SlurperLimiters,
+    supervisor: TaskSupervisor,
 ) -> None:
     options = SocketModeOptions(
         degraded_min_duration_s=config.slack_degraded_min_duration_s,
         status=status,
         on_reconnect=_make_on_reconnect(catchup_trigger, config.catchup_gap_threshold_s),
     )
-    await run_socket_mode_with_users(writer, health, client, config.slack_app_token, limiters=limiters, options=options)
+    await run_socket_mode_with_users(
+        writer,
+        health,
+        client,
+        config.slack_app_token,
+        limiters=limiters,
+        options=options,
+        supervisor=supervisor,
+    )
 
 
 def _make_on_reconnect(
@@ -473,6 +495,7 @@ async def _serve_dispatch_task(  # noqa: PLR0913, PLR0917 - dispatch wiring need
     refresh_deps: RefreshDeps,
     blocked_channels_deps: BlockedChannelsDeps,
     backfill_deps: BackfillDeps,
+    livez_deps: LivezDeps,
 ) -> None:
     await serve_dispatch(
         listen_addr=listen_addr,
@@ -485,23 +508,39 @@ async def _serve_dispatch_task(  # noqa: PLR0913, PLR0917 - dispatch wiring need
         refresh_deps=refresh_deps,
         blocked_channels_deps=blocked_channels_deps,
         backfill_deps=backfill_deps,
+        livez_deps=livez_deps,
     )
 
 
-async def _auto_backfill(
+async def _auto_backfill(  # noqa: C901, PLR0913, PLR0917 - task dependencies and phase boundaries are explicit.
     config: ServerConfig,
     writer: OffsetWriter,
     health: HealthEmitter,
     client: SlackClient,
     limiters: SlurperLimiters,
+    supervisor: TaskSupervisor | None = None,
 ) -> None:
     """Automatic first-bootup pass: backfill every member channel, throttled."""
+    if supervisor is not None:
+        supervisor.declare("auto-backfill", "startup_sleep", deadline_s=None)
     await trio.sleep(30)  # let startup settle before hitting the API hard
     backfiller = _make_backfiller("slack-api", client=client, limiters=limiters, config=config, writer=writer)
     first_backfill = True
+    if supervisor is not None:
+        supervisor.declare("auto-backfill", "listing_channels", deadline_s=60)
     async for channel_id in backfiller.channels_to_backfill():
         if config.auto_backfill_skip_if_completed:
-            completion = await async_find_last_backfill_completion(writer, channel_id.value, limiters)
+            if supervisor is None:
+                completion = await async_find_last_backfill_completion(writer, channel_id.value, limiters)
+            else:
+                async with phase(
+                    supervisor,
+                    "auto-backfill",
+                    "checking_skip",
+                    details={"channel_id": channel_id.value},
+                    deadline_s=5,
+                ):
+                    completion = await async_find_last_backfill_completion(writer, channel_id.value, limiters)
             if completion is not None:
                 log.info(
                     "auto-backfill: skipping %s — completed at %s, events_written=%d",
@@ -511,6 +550,13 @@ async def _auto_backfill(
                 )
                 continue
         if not first_backfill:
+            if supervisor is not None:
+                supervisor.declare(
+                    "auto-backfill",
+                    "inter_channel_sleep",
+                    details={"channel_id": channel_id.value},
+                    deadline_s=None,
+                )
             await trio.sleep(_AUTO_BACKFILL_CHANNEL_GAP_S)
         first_backfill = False
         log.info("auto-backfill: %s", channel_id.value)
@@ -521,7 +567,19 @@ async def _auto_backfill(
             warn_at=config.backfill_warn_at,
             abort_at=config.backfill_abort_at,
         )
-        await backfill_channel(backfiller, channel_id, ctx)
+        if supervisor is None:
+            await backfill_channel(backfiller, channel_id, ctx)
+        else:
+            async with phase(
+                supervisor,
+                "auto-backfill",
+                "channel",
+                details={"channel_id": channel_id.value},
+                deadline_s=config.backfill_abort_at * 0.5,
+            ):
+                await backfill_channel(backfiller, channel_id, ctx)
+    if supervisor is not None:
+        supervisor.declare("auto-backfill", "complete", deadline_s=None)
     log.info("auto-backfill: complete")
 
 
@@ -659,16 +717,38 @@ class ManualBackfillTrigger:
             return False
         return True
 
-    async def consume(self, config: ServerConfig) -> None:
-        async for channel_id in self._recv:
+    async def consume(self, config: ServerConfig, supervisor: TaskSupervisor | None = None) -> None:
+        while True:
+            if supervisor is not None:
+                supervisor.declare("backfill-trigger", "waiting_for_trigger", deadline_s=None)
             try:
-                await _run_backfill(
-                    config,
-                    channel_id,
-                    allow_large=False,
-                    max_messages=None,
-                    source="slack-api",
-                )
+                channel_id = await self._recv.receive()
+            except trio.EndOfChannel:
+                return
+            try:
+                if supervisor is None:
+                    await _run_backfill(
+                        config,
+                        channel_id,
+                        allow_large=False,
+                        max_messages=None,
+                        source="slack-api",
+                    )
+                else:
+                    async with phase(
+                        supervisor,
+                        "backfill-trigger",
+                        "running",
+                        details={"channel_id": channel_id},
+                        deadline_s=config.backfill_abort_at * 0.5,
+                    ):
+                        await _run_backfill(
+                            config,
+                            channel_id,
+                            allow_large=False,
+                            max_messages=None,
+                            source="slack-api",
+                        )
             except BlockedChannelError:
                 log.info("backfill: HTTP-triggered run for %s rejected: blocked", channel_id)
             except Exception:

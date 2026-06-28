@@ -18,6 +18,7 @@ import subprocess
 import tempfile
 import uuid
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
@@ -29,8 +30,10 @@ from psycopg.rows import TupleRow
 
 import slack_fuse_server.migrations as server_migrations
 from slack_fuse.migrations.runner import apply_migrations
+from slack_fuse_server._json import JsonObject
 from slack_fuse_server.slurper.limiters import SlurperLimiters
 from slack_fuse_server.slurper.offsets import OffsetWriter
+from slack_fuse_server.slurper.supervisor import TaskSupervisor
 from tests._fake_slack import make_fake_slack_transport
 
 _SERVER_MIGRATIONS_DIR = Path(server_migrations.__file__).parent
@@ -38,6 +41,33 @@ _DISABLE_AUTO_POSTGRES_ENV = "SLACK_FUSE_TEST_DISABLE_AUTO_POSTGRES"
 
 # A factory that opens fresh connections bound to one migrated server schema.
 ServerConnFactory = Callable[[], psycopg.Connection[TupleRow]]
+
+
+@dataclass(frozen=True, slots=True)
+class SupervisorDeclaration:
+    task_name: str
+    phase: str
+    details: JsonObject | None
+    deadline_s: float | None
+
+
+class RecordingSupervisor(TaskSupervisor):
+    """TaskSupervisor that records every declaration for phase-sequence tests."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.declarations: list[SupervisorDeclaration] = []
+
+    def declare(
+        self,
+        task_name: str,
+        phase: str,
+        *,
+        details: JsonObject | None = None,
+        deadline_s: float | None = None,
+    ) -> None:
+        self.declarations.append(SupervisorDeclaration(task_name, phase, details, deadline_s))
+        super().declare(task_name, phase, details=details, deadline_s=deadline_s)
 
 
 class _EphemeralPostgresUnavailable(RuntimeError):

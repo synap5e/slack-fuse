@@ -22,6 +22,7 @@ from slack_fuse_server.http.handlers import (
     BackfillDeps,
     BlockedChannelsDeps,
     GapsDeps,
+    LivezDeps,
     OriginalsDeps,
     RefreshDeps,
     ResolvePermalinkDeps,
@@ -31,6 +32,7 @@ from slack_fuse_server.http.handlers import (
     handle_channel_gaps,
     handle_health,
     handle_list_blocked_channels,
+    handle_livez,
     handle_metrics,
     handle_originals,
     handle_permalink,
@@ -105,12 +107,21 @@ def route_request(  # noqa: C901, PLR0913 - endpoint routing dispatch hub.
     refresh_deps: RefreshDeps | None = None,
     blocked_channels_deps: BlockedChannelsDeps | None = None,
     backfill_deps: BackfillDeps | None = None,
+    livez_deps: LivezDeps | None = None,
 ) -> HttpResponse:
     """Pure routing table for supported HTTP endpoints."""
     if request.path == "/health":
         if request.method != "GET":
             return _error_response(status_code=405, code="method_not_allowed")
         return _dto_response(status_code=200, payload=handle_health())
+
+    if request.path == "/livez":
+        if request.method != "GET":
+            return _error_response(status_code=405, code="method_not_allowed")
+        if livez_deps is None:
+            return _error_response(status_code=503, code="service_unavailable")
+        status_code, payload = handle_livez(livez_deps)
+        return _json_response(status_code=status_code, payload=payload)
 
     if request.path == "/metrics":
         if request.method != "GET":
@@ -245,6 +256,7 @@ async def serve_http(  # noqa: PLR0913 - HTTP wiring needs explicit deps.
     refresh_deps: RefreshDeps | None = None,
     blocked_channels_deps: BlockedChannelsDeps | None = None,
     backfill_deps: BackfillDeps | None = None,
+    livez_deps: LivezDeps | None = None,
 ) -> None:
     """Serve HTTP endpoints on the given host/port."""
     handler = partial(
@@ -257,6 +269,7 @@ async def serve_http(  # noqa: PLR0913 - HTTP wiring needs explicit deps.
         refresh_deps=refresh_deps,
         blocked_channels_deps=blocked_channels_deps,
         backfill_deps=backfill_deps,
+        livez_deps=livez_deps,
     )
     await trio.serve_tcp(handler, port=port, host=host)
 
@@ -271,6 +284,7 @@ async def serve_http_on_listeners(  # noqa: PLR0913, PLR0917 - HTTP wiring needs
     refresh_deps: RefreshDeps | None = None,
     blocked_channels_deps: BlockedChannelsDeps | None = None,
     backfill_deps: BackfillDeps | None = None,
+    livez_deps: LivezDeps | None = None,
 ) -> None:
     """Serve on already-open listeners (useful for tests and shared-port setups)."""
     handler = partial(
@@ -283,6 +297,7 @@ async def serve_http_on_listeners(  # noqa: PLR0913, PLR0917 - HTTP wiring needs
         refresh_deps=refresh_deps,
         blocked_channels_deps=blocked_channels_deps,
         backfill_deps=backfill_deps,
+        livez_deps=livez_deps,
     )
     await trio.serve_listeners(handler, listeners)
 
@@ -298,6 +313,7 @@ async def serve_http_from_listen_addr(  # noqa: PLR0913 - HTTP wiring needs expl
     refresh_deps: RefreshDeps | None = None,
     blocked_channels_deps: BlockedChannelsDeps | None = None,
     backfill_deps: BackfillDeps | None = None,
+    livez_deps: LivezDeps | None = None,
 ) -> None:
     """Serve HTTP endpoints using an RFC-style `listen_addr` string."""
     host, port = parse_listen_addr(listen_addr)
@@ -312,6 +328,7 @@ async def serve_http_from_listen_addr(  # noqa: PLR0913 - HTTP wiring needs expl
         refresh_deps=refresh_deps,
         blocked_channels_deps=blocked_channels_deps,
         backfill_deps=backfill_deps,
+        livez_deps=livez_deps,
     )
 
 
@@ -326,6 +343,7 @@ async def serve_http_connection(  # noqa: PLR0913 - HTTP wiring needs explicit d
     refresh_deps: RefreshDeps | None = None,
     blocked_channels_deps: BlockedChannelsDeps | None = None,
     backfill_deps: BackfillDeps | None = None,
+    livez_deps: LivezDeps | None = None,
 ) -> None:
     """Serve a single already-accepted connection as HTTP.
 
@@ -343,6 +361,7 @@ async def serve_http_connection(  # noqa: PLR0913 - HTTP wiring needs explicit d
         refresh_deps=refresh_deps,
         blocked_channels_deps=blocked_channels_deps,
         backfill_deps=backfill_deps,
+        livez_deps=livez_deps,
     )
 
 
@@ -357,6 +376,7 @@ async def _serve_connection(  # noqa: PLR0913 - HTTP wiring needs explicit deps.
     refresh_deps: RefreshDeps | None = None,
     blocked_channels_deps: BlockedChannelsDeps | None = None,
     backfill_deps: BackfillDeps | None = None,
+    livez_deps: LivezDeps | None = None,
 ) -> None:
     conn = h11.Connection(h11.SERVER)
     try:
@@ -373,6 +393,7 @@ async def _serve_connection(  # noqa: PLR0913 - HTTP wiring needs explicit deps.
             refresh_deps=refresh_deps,
             blocked_channels_deps=blocked_channels_deps,
             backfill_deps=backfill_deps,
+            livez_deps=livez_deps,
         )
         await _send_response(conn, stream, response)
     except h11.RemoteProtocolError:

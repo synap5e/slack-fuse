@@ -1,3 +1,4 @@
+# pyright: reportPrivateUsage=false
 """``conversations.info`` refresh sweep semantics.
 
 The sweep is the legacy-backfill + drift catcher for channel metadata.
@@ -18,14 +19,15 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, cast
 
 import httpx
+import pytest
 import trio
 
 from slack_fuse_server._json import JsonObject
 from slack_fuse_server.slurper.api import SlackClient
-from slack_fuse_server.slurper.offsets import EventRecord, write_event
-from slack_fuse_server.slurper.refresh import refresh_channels_once
+from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter, write_event
+from slack_fuse_server.slurper.refresh import RefreshTrigger, _refresh_all_once, refresh_channels_once
 from tests._fake_slack import load_fixtures
-from tests.conftest import make_test_limiters, make_test_writer
+from tests.conftest import RecordingSupervisor, make_test_limiters, make_test_writer
 
 if TYPE_CHECKING:
     import psycopg
@@ -149,3 +151,64 @@ def test_refresh_skips_blocked_channels(
 
     events = _channel_list_events(server_conn)
     assert [kind for kind, _payload in events] == ["channel_added"]
+
+
+def test_refresh_all_once_declares_phase_sequence(
+    server_conn: psycopg.Connection[TupleRow],
+    fake_slack_http: httpx.Client,
+) -> None:
+    fixture_channel = _conversations_info_fixture()
+    channel_id = str(fixture_channel["id"])
+    _seed_channel_added(server_conn, payload=fixture_channel)
+    supervisor = RecordingSupervisor()
+
+    trio.run(
+        _refresh_all_once,
+        make_test_writer(server_conn),
+        _fake_client(fake_slack_http),
+        make_test_limiters(),
+        supervisor,
+    )
+
+    phases = [(item.task_name, item.phase, item.details) for item in supervisor.declarations]
+    assert ("refresh", "listing_channels", None) in phases
+    assert ("refresh", "refreshing_channel", {"channel_id": channel_id}) in phases
+
+
+def test_refresh_trigger_consume_declares_waiting_and_running(monkeypatch: pytest.MonkeyPatch) -> None:
+    trigger = RefreshTrigger()
+    supervisor = RecordingSupervisor()
+    ran: list[str] = []
+
+    async def _fake_refresh_one(
+        _writer: object,
+        _client: object,
+        channel_id: str,
+        _limiters: object,
+    ) -> bool:
+        ran.append(channel_id)
+        await trio.lowlevel.checkpoint()
+        return False
+
+    monkeypatch.setattr("slack_fuse_server.slurper.refresh._refresh_one", _fake_refresh_one)
+
+    async def go() -> None:
+        async with trio.open_nursery() as nursery:
+            nursery.start_soon(
+                trigger.consume,
+                cast(OffsetWriter, object()),
+                cast(SlackClient, object()),
+                make_test_limiters(),
+                supervisor,
+            )
+            await trio.sleep(0.01)
+            assert trigger.request_channel("C_PHASE") is True
+            await trio.sleep(0.05)
+            nursery.cancel_scope.cancel()
+
+    trio.run(go)
+
+    assert ran == ["C_PHASE"]
+    phases = [(item.task_name, item.phase, item.details) for item in supervisor.declarations]
+    assert ("refresh-trigger", "waiting_for_trigger", None) in phases
+    assert ("refresh-trigger", "running", {"channel_id": "C_PHASE"}) in phases

@@ -41,6 +41,7 @@ from slack_fuse_server.slurper.offsets import (
     insert_event,
 )
 from slack_fuse_server.slurper.socket import SocketModeOptions, SocketModeRunner, extract_raw_event
+from slack_fuse_server.slurper.supervisor import TaskSupervisor, phase
 
 log = logging.getLogger(__name__)
 
@@ -150,15 +151,28 @@ def _populate_users_once_sync(
     return (len(users), inserted)
 
 
-async def populate_users_once(writer: OffsetWriter, client: SlackClient, limiters: SlurperLimiters) -> None:
+async def populate_users_once(
+    writer: OffsetWriter,
+    client: SlackClient,
+    limiters: SlurperLimiters,
+    supervisor: TaskSupervisor | None = None,
+) -> None:
     """One-shot startup users.list import (`user_added` events)."""
     try:
+        if supervisor is not None:
+            supervisor.declare("populate-users", "listing_users", deadline_s=60)
         users = await trio.to_thread.run_sync(lambda: _fetch_workspace_users(client), limiter=limiters.slack_api)
+        if supervisor is not None:
+            supervisor.declare("populate-users", "writing_users", deadline_s=30)
         total, inserted = await writer.run_transaction(lambda conn: _populate_users_once_sync(conn, users))
     except (*PG_TIMEOUT_EXCEPTIONS, httpx.HTTPError, SlackAPIError, ValueError):
         log.warning("users: startup populate failed", exc_info=True)
+        if supervisor is not None:
+            supervisor.declare("populate-users", "failed", deadline_s=None)
         return
     log.info("users: startup populate complete users=%d inserted=%d skipped=%d", total, inserted, total - inserted)
+    if supervisor is not None:
+        supervisor.declare("populate-users", "complete", deadline_s=None)
 
 
 def _load_user_state(cur: Cursor[TupleRow], user_id: str) -> _UserState | None:
@@ -359,15 +373,23 @@ class UsersSocketModeRunner(SocketModeRunner):
         *,
         limiters: SlurperLimiters,
         options: SocketModeOptions | None = None,
+        supervisor: TaskSupervisor | None = None,
     ) -> None:
-        super().__init__(writer, health, client, app_token, limiters=limiters, options=options)
+        super().__init__(writer, health, client, app_token, limiters=limiters, options=options, supervisor=supervisor)
         self._users_writer = writer
         self._users_client = client
         self._users_limiters = limiters
 
     async def _handle_event(self, event: SocketEventPayload, raw_event: JsonObject) -> None:
         if event.type == "user_change":
-            await apply_user_change_event(self._users_writer, self._users_client, event, self._users_limiters)
+            async with phase(
+                self._supervisor,
+                "socket",
+                "handling_event",
+                details={"kind": event.type},
+                deadline_s=10,
+            ):
+                await apply_user_change_event(self._users_writer, self._users_client, event, self._users_limiters)
             return
         await super()._handle_event(event, raw_event)
 
@@ -375,6 +397,7 @@ class UsersSocketModeRunner(SocketModeRunner):
         """Base loop with user-change envelope normalization."""
         try:
             while True:
+                self._supervisor.declare("socket", "connected_waiting_for_frame", deadline_s=None)
                 message = await ws.get_message()
                 parsed = _parse_envelope_allow_user_change(message)
                 if parsed is None:
@@ -404,6 +427,15 @@ async def run_socket_mode_with_users(  # noqa: PLR0913 - public wrapper mirrors 
     *,
     limiters: SlurperLimiters,
     options: SocketModeOptions | None = None,
+    supervisor: TaskSupervisor | None = None,
 ) -> None:
     """Entry point: Socket Mode with message/channel + user-change writes."""
-    await UsersSocketModeRunner(writer, health, client, app_token, limiters=limiters, options=options).run()
+    await UsersSocketModeRunner(
+        writer,
+        health,
+        client,
+        app_token,
+        limiters=limiters,
+        options=options,
+        supervisor=supervisor,
+    ).run()

@@ -58,7 +58,7 @@ The codebase has several "health" signals. They are orthogonal; never collapse t
 - `/health` HTTP endpoint — proves only that the dispatch HTTP task can answer. Kubelet readiness probe; no Slack/DB ingestion claim.
 - `slurper-health` stream — Slack-side ingestion + backfill observations (`slack_healthy`, `slack_degraded`, `socket_mode_*`, `backfill_*`). `health_log` is only the operator SQL view over this stream.
 - `connection_state.last_slurper_health` — client projection of selected `slurper-health` kinds for trailer classification (`healthy`/`degraded`/`disconnected`/`auth_failed`).
-- Slurper task liveness — does not exist yet. Future supervisor + `/livez` should model task phase + deadline, not data flow.
+- Slurper task liveness — `/livez` reads the in-memory task supervisor's latest phase + deadline per long-running task; it models scheduler progress, not data flow.
 - Slurper restart frequency — stdout INFO line `slurper-started image=... commit=... pid=...`; Loki counts it. `SLACK_FUSE_SERVER_IMAGE` / `GIT_COMMIT` are optional now, useful once wired.
 - Client trailer `staleness_reason` — rendered-content freshness from `connection_state.last_frame_at`, WS state, and per-stream `stream_caught_up`; known quiet-stream false positives live in `BACKLOG.md`.
 - Client `cursors.updated_at` / `applied_offset` — per-stream apply progress for reconnect resume. Distinct from server health.
