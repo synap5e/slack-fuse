@@ -9,13 +9,15 @@ import httpx
 import psycopg
 import pytest
 import trio
+from psycopg import Cursor
 from psycopg.rows import TupleRow
 
+import slack_fuse_server.slurper.channels as channels_module
 from slack_fuse_server.slurper.api import ChannelNotFoundError, SlackAPIError, SlackClient
 from slack_fuse_server.slurper.channels import ensure_channel_added, populate_channels_once
 from slack_fuse_server.slurper.offsets import OffsetWriter
 from slack_fuse_server.slurper.socket import _channel_added_write
-from tests._fake_slack import make_fake_slack_transport
+from tests._fake_slack import load_fixtures, make_fake_slack_transport
 
 
 def _make_client(http: httpx.Client) -> SlackClient:
@@ -135,6 +137,33 @@ def test_ensure_channel_added_emits_when_channel_not_previously_seen(
     assert isinstance(payload, dict)
     payload_dict = cast(dict[str, object], payload)
     assert payload_dict["id"] == "C0001"
+
+
+def test_ensure_channel_added_fetches_channel_info_before_stream_lock(
+    server_conn: psycopg.Connection[TupleRow],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order: list[str] = []
+    info_response = load_fixtures()["conversations.info"]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/conversations.info"
+        order.append("http")
+        return httpx.Response(200, json=info_response)
+
+    original_lock = channels_module._lock_channel_list_stream
+
+    def recording_lock(cur: Cursor[TupleRow]) -> None:
+        order.append("lock")
+        original_lock(cur)
+
+    monkeypatch.setattr(channels_module, "_lock_channel_list_stream", recording_lock)
+    writer = OffsetWriter(server_conn, trio.CapacityLimiter(1))
+    with httpx.Client(base_url="https://slack.com/api", transport=httpx.MockTransport(handler)) as http_client:
+        emitted = trio.run(ensure_channel_added, writer, _make_client(http_client), "C0001")
+
+    assert emitted is True
+    assert order == ["http", "lock"]
 
 
 def test_ensure_channel_added_is_idempotent_on_repeat(

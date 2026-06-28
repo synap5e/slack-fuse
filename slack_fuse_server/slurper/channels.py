@@ -66,6 +66,14 @@ def _existing_channel_added_ids(cur: Cursor[TupleRow]) -> set[str]:
     return existing
 
 
+def _channel_added_exists(cur: Cursor[TupleRow], channel_id: str) -> bool:
+    cur.execute(
+        "SELECT 1 FROM events WHERE stream = %s AND kind = 'channel_added' AND payload->>'id' = %s LIMIT 1",
+        (_CHANNEL_LIST_STREAM, channel_id),
+    )
+    return cur.fetchone() is not None
+
+
 def _insert_channel_added(cur: Cursor[TupleRow], channel_raw: JsonObject) -> int:
     """Persist the RAW channel dict as the payload, not ``model_dump`` output.
 
@@ -114,22 +122,23 @@ async def populate_channels_once(writer: OffsetWriter, client: SlackClient) -> N
     )
 
 
-def _ensure_channel_added_sync(writer: OffsetWriter, client: SlackClient, channel_id: str) -> bool:
-    """Synchronous body of :func:`ensure_channel_added`. Returns True if a new
-    event was inserted, False if one already existed (idempotent re-run).
+def _channel_added_exists_sync(writer: OffsetWriter, channel_id: str) -> bool:
+    with writer.conn.cursor() as cur:
+        return _channel_added_exists(cur, channel_id)
 
-    Raises ``SlackAPIError`` if ``conversations.info`` rejects the channel —
-    the caller (admin backfill flow) should refuse to proceed because there's
-    no safe way to project events for a channel the server can't even describe.
+
+def _insert_channel_added_if_missing_sync(writer: OffsetWriter, channel_id: str, channel_raw: JsonObject) -> bool:
+    """Transaction-only body of :func:`ensure_channel_added`.
+
+    Returns True if a new event was inserted, False if one already existed
+    (idempotent re-run). The caller fetches ``channel_raw`` before entering this
+    transaction; this helper must stay DB-only.
     """
     with writer.conn.transaction(), writer.conn.cursor() as cur:
         _lock_channel_list_stream(cur)
-        if channel_id in _existing_channel_added_ids(cur):
+        if _channel_added_exists(cur, channel_id):
             return False
-        # No prior channel_added event — fetch current channel metadata so the
-        # synthetic event mirrors the live socket-mode shape exactly.
-        validated = client.get_channel_info(channel_id)
-        _ = _insert_channel_added(cur, validated.raw)
+        _ = _insert_channel_added(cur, channel_raw)
         return True
 
 
@@ -146,7 +155,21 @@ async def ensure_channel_added(writer: OffsetWriter, client: SlackClient, channe
 
     Returns True if a new event was inserted, False if one already existed.
     """
+    already_exists = await trio.to_thread.run_sync(
+        lambda: _channel_added_exists_sync(writer, channel_id),
+        limiter=writer.limiter,
+    )
+    if already_exists:
+        return False
+
+    # Fetch outside the channel-list transaction. If Slack rejects the channel,
+    # no event is written, matching the old rollback-on-HTTP-failure surface
+    # without holding the stream row lock during the network call.
+    validated = await trio.to_thread.run_sync(
+        lambda: client.get_channel_info(channel_id),
+        limiter=writer.limiter,
+    )
     return await trio.to_thread.run_sync(
-        lambda: _ensure_channel_added_sync(writer, client, channel_id),
+        lambda: _insert_channel_added_if_missing_sync(writer, channel_id, validated.raw),
         limiter=writer.limiter,
     )
