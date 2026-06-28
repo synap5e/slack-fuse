@@ -254,6 +254,16 @@ def _build_metrics_aggregator(
     )
 
 
+def _log_slurper_started() -> None:
+    """Emit the canonical startup line for restart counting."""
+    log.info(
+        "slurper-started image=%s commit=%s pid=%d",
+        os.environ.get("SLACK_FUSE_SERVER_IMAGE", "unknown"),
+        os.environ.get("GIT_COMMIT", "unknown"),
+        os.getpid(),
+    )
+
+
 async def _serve(config: ServerConfig) -> None:
     conn = _connect_and_migrate(config.database_url)
     client = SlackClient(config.slack_user_token)
@@ -313,6 +323,7 @@ async def _serve(config: ServerConfig) -> None:
     auto_backfill = os.environ.get(_AUTO_BACKFILL_ENV, "").lower() in ("1", "true", "yes")
     try:
         async with trio.open_nursery() as nursery:
+            _log_slurper_started()
             nursery.start_soon(
                 _run_socket_mode_with_users_task, writer, health, client, config, status, catchup_trigger
             )

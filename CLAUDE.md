@@ -48,6 +48,23 @@ Follows `~/docs/dev/python/` (uv, basedpyright strict, ruff preview, Pydantic at
 - **`_api_call(callable)`**, not `_api_call("method_name")`. Pass a method reference or lambda; the wrapper preserves the return type via `TypeVar`. No string-based dispatch, no `# type: ignore[assignment]`.
 - **No business logic in `fuse_ops.py`** beyond path parsing and dispatch — anything that touches Slack data goes through `SlackStore`.
 - **Renderers are pure**: `renderer.py` takes models + a user resolver, returns bytes. No I/O.
+- **No external I/O inside `conn.transaction()` blocks** — no Slack HTTP, network, or file reads while holding DB locks. Fetch externally-sourced data first, store locally, then open the transaction.
+- **Slurper PG operations are bounded by session `lock_timeout` / `statement_timeout` after migrations.** Treat `psycopg.errors.LockNotAvailable` and `psycopg.errors.QueryCanceled` as recoverable: backfill/catchup retry once then propagate; Socket Mode drops the event; `HealthEmitter` propagates for callers to catch.
+
+## Health concepts (distinct, do not conflate)
+
+The codebase has several "health" signals. They are orthogonal; never collapse them into one boolean.
+
+- `/health` HTTP endpoint — proves only that the dispatch HTTP task can answer. Kubelet readiness probe; no Slack/DB ingestion claim.
+- `slurper-health` stream — Slack-side ingestion + backfill observations (`slack_healthy`, `slack_degraded`, `socket_mode_*`, `backfill_*`). `health_log` is only the operator SQL view over this stream.
+- `connection_state.last_slurper_health` — client projection of selected `slurper-health` kinds for trailer classification (`healthy`/`degraded`/`disconnected`/`auth_failed`).
+- Slurper task liveness — does not exist yet. Future supervisor + `/livez` should model task phase + deadline, not data flow.
+- Slurper restart frequency — stdout INFO line `slurper-started image=... commit=... pid=...`; Loki counts it. `SLACK_FUSE_SERVER_IMAGE` / `GIT_COMMIT` are optional now, useful once wired.
+- Client trailer `staleness_reason` — rendered-content freshness from `connection_state.last_frame_at`, WS state, and per-stream `stream_caught_up`; known quiet-stream false positives live in `BACKLOG.md`.
+- Client `cursors.updated_at` / `applied_offset` — per-stream apply progress for reconnect resume. Distinct from server health.
+- `PgHealth` / `NO_POSTGRES` — local projector Postgres reachability. Cluster server/slurper may be fine while FUSE reads fail fast.
+
+When asking "is the slurper healthy?", name the observable: serving HTTP, ingesting Slack, task scheduler not wedged, client data current, restart-looping, or local PG reachable.
 
 ## Events vs operator policy
 
