@@ -295,6 +295,161 @@ within a channel that IS being walked.
 
 ---
 
+### Switch from Socket Mode to Events API (HTTP request URL via Tailscale funnel)
+
+**Discovered**: 2026-06-30 spec review. The catchup mid-stream gap bug
+(socket disconnect → message dropped → next live message after reconnect
+advances local `MAX(ts)` past the lost window) is the most damning data
+loss surface in the current architecture. The proper architectural fix
+isn't smarter catchup — it's removing the persistent-WebSocket failure
+mode entirely.
+
+**The proposal**: switch event delivery from Socket Mode (Slack pushes
+over WebSocket we hold open) to the Events API (Slack POSTs events to a
+public HTTPS request URL we expose). Use Tailscale Funnel — already
+supported on our k8s — to expose the slurper's existing HTTP server
+publicly without putting the cluster directly on the internet.
+
+**Critical property to enable**: leave Slack's default event-retry
+semantics ON (do NOT opt out via `X-Slack-No-Retry: 1`). When the slurper
+is down or 5xx's, Slack retries up to 3 times with exponential backoff
+(immediately → ~1 min → ~5 min). This is the catchup-mid-stream-gap fix
+at the architecture layer: short slurper outages become at-least-once
+retries instead of permanent data loss.
+
+**Why this is the right architectural move:**
+
+| Failure mode | Socket Mode (today) | Events API + retries |
+|---|---|---|
+| Slurper restart (10s) | Events fired during the window are lost; catchup races with the head pointer | Slack retries; events land after restart |
+| Slurper down 1 min | Same | Retries within retry-window land cleanly |
+| Slurper down 30 min | Permanent loss past catchup max-lookback | Retries may have expired; need backfill |
+| Slurper down hours | Permanent loss; full re-backfill needed | Same |
+| Network partition (slurper-side) | Connection drops; catchup races | Same recovery path as restart |
+| Tailscale funnel down | n/a | All deliveries fail; Slack retries; recovery on funnel restore |
+| Slack-side delivery lag | None (push) | Bounded; rare in practice |
+
+The race window we hit on 2026-06-28 (and that the catchup query bug
+preserves) is **architecturally impossible** with retries — Slack itself
+becomes the durable buffer.
+
+**Infrastructure**:
+- k8s-homelab already supports Tailscale Funnel for public-HTTPS exposure
+  of cluster-internal services. Confirm with the k8s-homelab-owner whether
+  the slurper specifically can be exposed (some services are funnel-eligible,
+  others aren't, depends on the cluster config).
+- The slurper already runs an HTTP server (`/health`, `/livez`, `/metrics`,
+  the backfill triggers, etc.) so adding a `/slack-events` route is just
+  one more handler.
+- Signing-secret validation on incoming Slack POSTs is mandatory; ship the
+  `x-slack-signature` + `x-slack-request-timestamp` HMAC verification
+  before any subscription change in the Slack admin UI.
+
+**What changes in the slurper code:**
+
+- Add `/slack-events` POST handler. Validates Slack signing-secret,
+  accepts the envelope, dispatches the event to the same handler chain
+  Socket Mode currently uses.
+- The handler must respond with 200 within 3 seconds; do the actual event
+  write asynchronously (write to a bounded trio queue, background task
+  drains into events table). Otherwise high-volume bursts will hit
+  Slack's 3s ack timeout and trigger unnecessary retries.
+- Disable the `SocketModeRunner` task. Keep the code around (gated behind
+  a config flag) during migration — both can run simultaneously, dedup
+  index handles double-writes.
+- Migrate `apps.connections.open` usage out of the slurper.
+
+**What changes in the Slack app config (operator-side):**
+- Disable Socket Mode in the app admin UI.
+- Set the Events API request URL to the funnel address.
+- Confirm/re-verify URL with Slack (URL verification challenge handshake).
+- Re-confirm every event subscription stays enabled across the switch.
+
+**Trade-offs to think through:**
+
+- **At-least-once delivery vs at-most-once.** Slack retries → we may see
+  the same event multiple times. The existing dedup index handles this for
+  `message` and the new partial-unique indexes from PR `9bdf542` cover the
+  extended event kinds, but every NEW event kind we add must declare its
+  dedup contract. Document this as a permanent invariant.
+- **Public URL surface.** The funnel exposes one route publicly. Make sure
+  the handler signature-validates BEFORE doing anything else; reject
+  anything that doesn't match. No content sniffing on unsigned bodies.
+- **Tailscale Funnel availability.** It's no longer beta but still limited
+  per ts.net account / per node. Check our specific node quota and SLA.
+- **Some events are Socket-Mode-only?** Verify against Slack docs — almost
+  every event type works on either delivery mechanism, but a few interactivity
+  endpoints (shortcuts, modals) are Socket-Mode-only. We don't use those, but
+  confirm.
+- **The slurper's HTTP server response time becomes load-bearing.** Today
+  a slow `/livez` is just an observability cost; tomorrow a slow
+  `/slack-events` causes Slack retries. The async-queue pattern above must
+  be airtight.
+- **Migration ordering.** Run BOTH for a few days; compare event volumes;
+  switch over only when Events API parity is confirmed.
+
+**Risks**:
+- Funnel goes down → all deliveries fail → retries expire → permanent loss
+  of the burst. Need monitoring on the funnel itself, not just on the
+  slurper.
+- Signing-secret rotation procedures (Slack lets you rotate; we need to
+  handle gracefully without a window where neither secret works).
+- Migration churn — running both delivery paths produces duplicate event
+  writes (dedup handles, but logs and metrics double-count during the
+  overlap).
+- If our public endpoint is ever compromised or made unauthenticated, a
+  flood of spoofed events lands in our event log. Signing-secret check is
+  the only defense.
+
+**Detection / observability dependencies**:
+- Span the incoming POST handler (`slurper.events_api.handle`) with
+  Wave 2.C instrumentation — duration, result, retry-attempt header.
+- Track Slack's retry attempts via the `x-slack-retry-num` /
+  `x-slack-retry-reason` headers; emit a `events_api_retry_observed`
+  event when retry_num > 0 (signal we had a delivery problem in the
+  prior attempt).
+- Probe-sweep v1's day-presence probe (v2 scope) becomes much less
+  load-bearing — retries cover most of the gap surface. v2 probes can
+  shift toward less-frequent reconciliation rather than primary
+  detection.
+
+**Sequencing dependencies**:
+- The catchup mid-stream gap fix (separate backlog) becomes much less
+  urgent once this lands; consider whether to ship the Events API
+  switchover INSTEAD of fixing catchup. Compare implementation cost.
+- Probe-sweep v1 must be in place first to verify the migration: probes
+  detect ingestion gaps regardless of delivery mechanism, so they validate
+  the new path matches Socket Mode parity.
+- Wave 2 supervisor + spans must be in place (they are — PRs `318b33b`,
+  `1a4ef7d`) so per-event-API latency is observable.
+
+**Recommended sequence to actually do this**:
+1. Spike: prove `/slack-events` can ack a real Slack POST within 3s on
+   a single-channel test workspace. Confirm signing-secret math.
+2. Spike: confirm Tailscale Funnel exposes the slurper's HTTP port. Check
+   with k8s-homelab-owner for any gotchas.
+3. Implement the handler + async-queue + dedup invariants. Tests against
+   real Slack-shaped POST fixtures (capture from the live workspace once
+   in test mode).
+4. Deploy with Socket Mode STILL ACTIVE — run both delivery paths in
+   parallel for ~3 days. Diff the event volumes per stream/kind. Confirm
+   no Events API silent-drop.
+5. Disable Socket Mode in the app config. Watch probe-sweep + spans for
+   24h.
+6. Remove the Socket Mode code path (or keep behind a config flag for
+   recovery scenarios).
+
+**Sleeper consideration**: if Tailscale Funnel goes down for hours, we're
+worse off than Socket Mode (which would just reconnect and retry from
+its position). Worth thinking about whether to retain Socket Mode as a
+fallback delivery path — both subscribed, dedup handles overlap.
+
+**Impact**: removes the single most damning data-loss surface in the
+current architecture. Catchup mid-stream gap stops being a thing.
+Multi-minute slurper outages become recoverable for free.
+
+---
+
 ### Workspace channel inventory view (`_workspace/channels.md`)
 
 **Discovered**: 2026-06-27 during the dump-and-reingest while wanting
