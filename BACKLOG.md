@@ -116,6 +116,129 @@ slack-fuse code change. Left as a follow-up for the operator.
 
 ---
 
+### FUSE passthrough + dirty-set + coalesced disk projection
+
+**Discovered**: 2026-06-29 while benchmarking ripgrep throughput. Live
+mount serves ~18 files/sec (every file goes through FUSE round-trip);
+the archive on disk serves ~135,000 files/sec. ~7,500× gap. Kernel-push
+(`invalidate_inode`) doesn't help cold scans because each file is read
+once — no kernel cache to hit. The architectural fix is FUSE
+**passthrough**: Linux ≥ 6.9 + libfuse ≥ 3.16 (May/Sept 2024) let the
+daemon delegate `read()` directly to a backing fd. Kernel reads from
+disk; FUSE daemon is bypassed for the read path entirely.
+
+**Stack check** (already done): kernel 7.1.1 ✓, libfuse 3.18.2 ✓,
+pyfuse3 3.4.2 has NO passthrough bindings ✗. The Python binding gap
+is the only real blocker.
+
+**Why this is a natural fallout from v2 event-sourcing.** Without v2
+you'd be solving a cache-coherence problem; with v2 you're just adding
+a sink. v2 already gives:
+
+- Deterministic renders (offset + chunk row → byte-identical output)
+- Per-key chunking matching the on-disk layout
+- Idempotent re-renders (atomic temp+rename is safe)
+- Existing `InvalidationSink` plumbing (one extra line to add disk write)
+- `stream_caught_up` + `applied_offset` for "is this chunk stable?"
+- In-memory render LRU already exists in `fuse_ops_v2.py` — just move
+  the storage backend to disk
+
+**Three-component design** (sharper than "stale tolerance contract"):
+
+```
+event arrives ─→ InvalidationSink
+                 - add path to dirty_set      (in-memory hash set)
+                 - invalidate_inode           (drops kernel page cache)
+
+coalescer ─────→ every stale_threshold:
+                 for path in dirty_set:
+                   render_to_disk_atomic     (temp + rename)
+                   remove from set
+                   invalidate_inode          (kernel re-asks → daemon
+                                              now returns passthrough)
+
+read(path) ────→ open():
+                   if path in dirty_set:  no FOPEN_PASSTHROUGH; read()
+                                          renders JIT (what v2 does today)
+                   else:                  FOPEN_PASSTHROUGH + backing fd;
+                                          kernel reads disk directly
+```
+
+**Why dirty-set is right over "stale tolerance" contract**: reads are
+always *fresh*. JIT path returns bytes computed from latest
+applied_offset; passthrough path only serves files byte-identical to
+JIT output (the set is the proof). Stale threshold controls disk
+write rate, NOT read freshness. Hot channels can fire 50 msgs/sec —
+one disk write per stale_threshold per key, not per event.
+
+**stale_threshold ladder** (mirrors v1's `_date_ttl` / `_thread_ttl`):
+
+| Key | Threshold | Why |
+|---|---|---|
+| Today, busy or quiet channel feed | 1s | Feels live to humans |
+| Today, active thread (< 1h) | 1s | Same |
+| Today, idle thread (> 24h) | 30s | Long-tail; readers tolerate slack |
+| Yesterday | ∞ until invalidate | Locked-in; only edits/deletes change it |
+| Older than 7d | ∞ | Effectively immutable |
+
+**Expected throughput gain**: ripgrep over live mount goes from ~18
+files/sec to **~50,000-100,000 files/sec** cold (limited by
+`getattr`/`lookup` round-trips, which the kernel attr-cache absorbs
+after first pass), approaching the archive's ~135K/sec on warm runs.
+
+**Subtle caveat to document**: `FOPEN_PASSTHROUGH` is per-open and
+persists for the life of the fd. Long-held fds reading a path that
+later transitions clean→dirty keep reading from the cached backing
+fd until close. Same edge case as today's `keep_cache=True`: rg/cat/
+modern editors re-open and self-correct; only processes holding fds
+indefinitely see drift. Document, accept.
+
+**Implementation plan** (four pieces, smaller than it sounds):
+
+1. **Disk-backed render output**. Extend the existing render path so
+   each render also atomically writes to a known on-disk location
+   (mirror the FUSE tree under `~/.cache/slack-fuse/projection/` or
+   similar). Pure I/O; ~30 lines.
+2. **Dirty set in `fuse_ops_v2.py`**. Add `_dirty_paths: set[str]`
+   plus the sink hook + coalescer task. ~50 lines + tests.
+3. **`open()` passthrough decision**. Check dirty set; return with or
+   without `FOPEN_PASSTHROUGH` + backing fd. Trivial once (4) lands.
+4. **pyfuse3 passthrough binding gap**. Two options:
+   - **Patch pyfuse3 upstream** — Cython bindings for
+     `fuse_passthrough_open()` and `FOPEN_PASSTHROUGH`. ~150 LoC plus
+     tests. Cleanest if upstream merges; pyfuse3 is barely maintained
+     so a vendored fork is plausible.
+   - **Small native extension** — ctypes/Cython wrapper that calls
+     `fuse_passthrough_open()` and returns the backing-id to pyfuse3's
+     `open()` callback. ~50 LoC of C plus a ctypes shim. More
+     surgical, no upstream dependency.
+
+   Lean toward option B (native extension) for the spike; option A
+   later if it's worth upstreaming.
+
+**Decision points before starting**:
+
+- Where does the projection live on disk? Single tree mirroring FUSE
+  layout, separate from archive? Same as archive but extended to today?
+- Coalescer task: one per-process trio task walking the dirty set, or
+  per-key timers? Per-process simpler.
+- Disk overhead: archive is 572MB today; projection covering today
+  too is probably 1-1.5GB. Trivial.
+- Crash recovery: on startup, treat all paths as dirty until the
+  projector has caught up. Re-flush on the first coalescer tick.
+
+**Why not now**: backfill ingest still has ~2h remaining; pyfuse3
+binding work benefits from a focused session not interleaved with
+other work; current performance is workable (archive for broad scans,
+live mount for "what did Alice say" interactive queries). Big win
+when done; nothing blocked on it.
+
+**Suggested order**: spike (4) first (the binding) — that's the only
+unknown. Once a 20-line test program proves passthrough works
+end-to-end on this stack, (1)-(3) drop in mechanically.
+
+---
+
 ### Workspace channel inventory view (`_workspace/channels.md`)
 
 **Discovered**: 2026-06-27 during the dump-and-reingest while wanting
