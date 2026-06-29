@@ -30,9 +30,11 @@ loop.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from typing import Final
 
+import psycopg
 import trio
 from psycopg import Connection
 from psycopg.rows import TupleRow
@@ -84,14 +86,28 @@ class ConnectionPool:
         return self._created
 
     async def acquire(self) -> Connection[TupleRow]:
-        """Borrow a connection. Blocks until a slot is free; creates lazily."""
+        """Borrow a connection. Blocks until a slot is free; creates lazily.
+
+        Cached idle connections are pre-pinged with ``SELECT 1`` before being
+        handed back, so a Postgres restart between release and re-acquire
+        surfaces here (we discard + recreate) instead of as ``OperationalError``
+        on the borrower's first SQL. Without this, every cached connection
+        becomes a poisoned handle that the FUSE layer ``EIO``s on.
+        """
         if self._closed:
             raise ConnectionPoolClosed
         await self._slots.acquire()
         try:
+            cached: Connection[TupleRow] | None = None
             async with self._lock:
                 if self._idle:
-                    return self._idle.pop()
+                    cached = self._idle.pop()
+            if cached is not None:
+                if await trio.to_thread.run_sync(_check_alive, cached):
+                    return cached
+                # Stale (PG was restarted): close + fall through to create fresh.
+                log.info("pool: discarding stale connection after failed pre-ping")
+                await trio.to_thread.run_sync(_close_quietly, cached)
             conn = await trio.to_thread.run_sync(self._make)
             async with self._lock:
                 self._created += 1
@@ -129,3 +145,24 @@ class ConnectionPool:
             self._idle.clear()
         for conn in idle:
             await trio.to_thread.run_sync(conn.close)
+
+
+def _check_alive(conn: Connection[TupleRow]) -> bool:
+    """Cheap liveness probe. ``SELECT 1`` round-trips PG without holding a lock.
+
+    Catches ``psycopg.OperationalError`` (the family ``connection is lost`` and
+    admin-shutdown errors raise) and treats it as dead.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+            cur.fetchone()
+    except psycopg.OperationalError:
+        return False
+    return True
+
+
+def _close_quietly(conn: Connection[TupleRow]) -> None:
+    """Close a dead connection without raising further OperationalError."""
+    with contextlib.suppress(psycopg.OperationalError):
+        conn.close()

@@ -270,3 +270,41 @@ def test_applier_failure_poisons_stream_without_skipping_offset(
     # 41 applied; 42 failed; 43 never processed (stream died at 42).
     assert _cursor(verify_conn, "channel:CFAIL") == 41
     assert _count_chunks(verify_conn, "CFAIL") == 1
+
+
+def test_acquire_discards_stale_cached_connection_after_pg_restart(
+    client_conn_factory: ClientConnFactory,
+) -> None:
+    """Postgres-restart regression: a cached idle connection that PG has killed
+    must be discarded + replaced on acquire, not handed to a borrower who then
+    sees ``OperationalError: the connection is lost`` on their first SQL.
+
+    Simulates the failure mode the projector hit when local PG restarted while
+    the FUSE mount was live — every cached pool connection was poisoned and the
+    mount started returning EIO until the service was bounced.
+    """
+    pool = ConnectionPool(client_conn_factory)
+
+    async def body() -> None:
+        # 1. Acquire + release → one connection in the idle list.
+        conn = await pool.acquire()
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+            cur.fetchone()
+        await pool.release(conn)
+        # 2. Kill the cached connection out-of-band (mirrors PG restart).
+        assert len(pool._idle) == 1  # pyright: ignore[reportPrivateUsage]
+        cached = pool._idle[0]  # pyright: ignore[reportPrivateUsage]
+        cached.close()
+        # 3. Acquire again: must NOT return the dead connection.
+        fresh = await pool.acquire()
+        assert fresh is not cached, "pool handed back a dead connection"
+        # And the fresh connection actually works.
+        with fresh.cursor() as cur:
+            cur.execute("SELECT 1")
+            row = cur.fetchone()
+        assert row == (1,)
+        await pool.release(fresh)
+        await pool.aclose()
+
+    trio.run(body)
