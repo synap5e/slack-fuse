@@ -239,6 +239,62 @@ end-to-end on this stack, (1)-(3) drop in mechanically.
 
 ---
 
+### Skip thread-expansion when local thread is already caught up
+
+**Discovered**: 2026-06-30 watching proj-cloud's backfill spend ~9 hours
+in the thread-expansion phase writing rows that all dedup'd to no-ops.
+proj-cloud's history pagination finished by 17:57; the next 8+ hours
+were `conversations.replies` calls per thread parent, paying the 2-8s
+throttle per call, hitting the dedup index, inserting zero new rows.
+Socket-mode events had already filled the threads in.
+
+**Optimization**: in `backfill_channel`'s thread-expansion loop (in
+`slack_fuse_server/backfill/api.py`, where `_expand_threads` walks
+`thread_parents`), check local state before calling
+`conversations.replies`. Skip the fetch when both hold:
+
+1. We have a `message` event with `ts == parent.latest_reply`
+   (newest reply timestamp from the parent's payload), AND
+2. Count of locally-stored events with `thread_ts == parent.ts` equals
+   `parent.reply_count` (including the parent itself, or off-by-one
+   per Slack's convention — verify against `tests/_fake_slack/`).
+
+If either fails, fetch normally.
+
+**Why it's safe**:
+- False negative (we fetch unnecessarily) is the worst-case if our
+  cached `reply_count` is stale; that's the status quo.
+- False positive (we skip a real gap) requires our local thread to
+  have the exact `latest_reply` ts but be missing intermediate
+  replies — Slack doesn't insert replies in the middle of a thread's
+  timeline retroactively, so this shape doesn't occur in practice.
+- The dedup index remains the correctness backstop: if we somehow
+  miss a reply, the next backfill re-walk catches it (no
+  `latest_reply` match → fetch).
+
+**Wins**:
+- Hours of API budget reclaimed on busy channels where socket-mode
+  already filled the threads.
+- Frees Tier 3 quota for actually-new work.
+- Auto-backfill cycle completes faster after restart — when combined
+  with skip-completed-channels (Wave 1 D), the only API work that
+  actually fires is for genuinely new gaps.
+
+**Where to wire the check**: emit a `slurper.backfill.thread_skip`
+span when the skip fires, so Loki can confirm in production how many
+threads the optimization actually saves. Per-channel run that wastes
+4500 thread fetches × 5s avg = 6+ hours saved on a single big channel.
+
+**Edge case**: huddle channels' transcript "threads" are a separate
+flow (`transcript.py`); this optimization doesn't apply. The
+predicate is on `reply_count` which the huddle path doesn't touch.
+
+**Distinct from**: skip-completed-channels (Wave 1 D), which avoids
+re-walking ENTIRE channels. This is a finer-grained per-thread skip
+within a channel that IS being walked.
+
+---
+
 ### Workspace channel inventory view (`_workspace/channels.md`)
 
 **Discovered**: 2026-06-27 during the dump-and-reingest while wanting
