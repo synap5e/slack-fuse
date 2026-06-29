@@ -116,52 +116,6 @@ slack-fuse code change. Left as a follow-up for the operator.
 
 ---
 
-### Projector psycopg pool needs pre-ping (recycle dead handles across PG restarts)
-
-**Discovered**: 2026-06-27 during workspace dump-and-reingest, after local
-postgres restarted out-of-band (system reboot, OOM, anything that bounces
-the PG process).
-
-**Symptom**: the daemon's psycopg connection pool kept handing out
-pre-restart connections to every consumer. `block-sync` task logged
-`psycopg.OperationalError: the connection is lost` every 30s for
-several minutes; FUSE callbacks that picked the same pool entry
-returned `EIO`, so `ls` / `dust` hit "Input/output error (os error 5)"
-on a fully-mounted, otherwise healthy daemon. Retrying a read often
-landed on a different (good) pool entry and succeeded — making the
-failure transient + confusing.
-
-**Current behaviour**: pool returns dead handles until each consumer
-hits the lost-connection exception, then surfaces it. No retry or
-handle recycling at the pool layer. The user's FUSE read is what
-notices the dead PG — not the projector framework.
-
-**Workaround**: `systemctl --user restart slack-fuse-split.service`
-flushes the pool and rebuilds connections against current PG.
-Mount becomes clean immediately.
-
-**Fix candidates**:
-1. Enable psycopg's pool pre-ping semantics — issue a cheap `SELECT 1`
-   before handing a pooled connection to a consumer, recycle on
-   failure. Costs an extra round-trip per acquire.
-2. Catch `OperationalError` at every pool consumer and explicitly
-   discard + retry on a fresh connection (per-site, harder to keep
-   complete coverage).
-3. Make pool acquire honor a `validate=True` knob via a
-   `setup`/`reset` hook that pings on lend.
-
-**Recommendation**: option 1 — narrow change, single place, predictable
-overhead. ~20 LoC enhancement in the pool wiring (look at
-`slack_fuse/__main__.py` or wherever the projector pool is constructed).
-Probably worth pairing with a small test using a stub PG that disconnects
-mid-pool.
-
-**Impact**: rare in normal operation (PG doesn't restart often), but the
-failure mode is misleading enough to warrant fixing — the user thought
-the mount was wedging when it was actually a stale-pool symptom.
-
----
-
 ### Workspace channel inventory view (`_workspace/channels.md`)
 
 **Discovered**: 2026-06-27 during the dump-and-reingest while wanting
