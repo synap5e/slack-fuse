@@ -1,0 +1,12 @@
+{
+  "type": "events_api",
+  "envelope_id": "env-member-left-channel",
+  "payload": {
+    "event": {
+      "type": "member_left_channel",
+      "channel": "C0001",
+      "user": "UOTHER",
+      "event_ts": "1700000001.000200"
+    }
+  }
+}

@@ -437,6 +437,8 @@ CHANNEL_LIST_EVENT_TYPES: frozenset[str] = frozenset({
     "channel_archive",
     "channel_unarchive",
     "channel_deleted",
+    "channel_history_changed",
+    "channel_id_changed",
     "channel_left",
     "member_joined_channel",
     "member_left_channel",

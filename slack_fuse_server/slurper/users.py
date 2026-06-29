@@ -4,6 +4,8 @@ Closes the Sprint-1A deferral: the server now emits `users` stream events from
 both a startup one-shot users.list pass and live `user_change` socket events.
 
 - Startup: one `user_added` event per workspace user (idempotent on restart).
+- Live join: `team_join` emits the same `user_added` event from Slack's full
+  user payload (idempotent on user id).
 - Live: `user_change` emits `user_renamed` and/or `user_profile_changed`.
 """
 
@@ -124,6 +126,14 @@ def _existing_user_added_ids(cur: Cursor[TupleRow]) -> set[str]:
     return existing
 
 
+def _user_added_exists(cur: Cursor[TupleRow], user_id: str) -> bool:
+    cur.execute(
+        "SELECT 1 FROM events WHERE stream = %s AND kind = 'user_added' AND payload->>'id' = %s LIMIT 1",
+        (_USERS_STREAM, user_id),
+    )
+    return cur.fetchone() is not None
+
+
 def _insert_user_added(cur: Cursor[TupleRow], user_raw: JsonObject) -> int:
     """Persist the RAW user dict — same lossless contract as
     ``channels._insert_channel_added``."""
@@ -131,6 +141,16 @@ def _insert_user_added(cur: Cursor[TupleRow], user_raw: JsonObject) -> int:
     record = EventRecord(stream=_USERS_STREAM, kind="user_added", ts=None, payload=user_raw)
     insert_event(cur, offset, record)
     return offset
+
+
+def _apply_team_join_sync(conn: Connection[TupleRow], validated: Validated[SlackUser]) -> bool:
+    user_id = validated.model.id
+    with conn.cursor() as cur:
+        _lock_users_stream(cur)
+        if _user_added_exists(cur, user_id):
+            return False
+        _insert_user_added(cur, validated.raw)
+    return True
 
 
 def _populate_users_once_sync(
@@ -294,6 +314,32 @@ async def apply_user_change_event(
         )
 
 
+async def apply_team_join_event(
+    writer: OffsetWriter,
+    event: SocketEventPayload,
+    raw_event: JsonObject,
+) -> None:
+    """Translate one `team_join` socket event to a `user_added` stream write."""
+    if event.type != "team_join":
+        return
+    raw_user = raw_event.get("user")
+    if not isinstance(raw_user, dict):
+        log.debug("users: ignoring team_join without user payload")
+        return
+    try:
+        user_raw = cast(JsonObject, raw_user)
+        user = SlackUser.model_validate(user_raw)
+        inserted = await writer.run_transaction(lambda conn: _apply_team_join_sync(conn, Validated(user_raw, user)))
+    except ValidationError:
+        log.warning("users: rejecting malformed team_join user payload", exc_info=True)
+        return
+    except PG_TIMEOUT_EXCEPTIONS:
+        log.warning("users: dropped team_join after PostgreSQL timeout", exc_info=True)
+        return
+    if inserted:
+        log.info("users: team_join inserted user_added for %s", user.id)
+
+
 def _normalize_user_change_envelope(message: str | bytes) -> JsonObject | None:
     try:
         raw = json.loads(message)
@@ -312,7 +358,7 @@ def _normalize_user_change_envelope(message: str | bytes) -> JsonObject | None:
     if not isinstance(event_raw, dict):
         return None
     event = cast(dict[str, object], event_raw)
-    if event.get("type") != "user_change":
+    if event.get("type") not in {"team_join", "user_change"}:
         return None
     user_raw = event.get("user")
     if not isinstance(user_raw, dict):
@@ -330,7 +376,7 @@ def _normalize_user_change_envelope(message: str | bytes) -> JsonObject | None:
 def _parse_envelope_allow_user_change(
     message: str | bytes,
 ) -> tuple[SocketEnvelope, JsonObject] | None:
-    """Validate + return paired (model, raw normalized dict).
+    """Validate + return paired (possibly normalized model, original raw dict).
 
     See base ``_parse_envelope`` for the rationale on returning the raw
     dict — message persistence is lossless against the wire shape.
@@ -351,7 +397,7 @@ def _parse_envelope_allow_user_change(
             log.warning("socket-mode: envelope parse error: %s", exc)
             return None
         try:
-            return SocketEnvelope.model_validate(normalized), normalized
+            return SocketEnvelope.model_validate(normalized), raw_envelope
         except ValidationError as fallback_exc:
             log.warning("socket-mode: envelope parse error: %s", fallback_exc)
             return None
@@ -381,6 +427,16 @@ class UsersSocketModeRunner(SocketModeRunner):
         self._users_limiters = limiters
 
     async def _handle_event(self, event: SocketEventPayload, raw_event: JsonObject) -> None:
+        if event.type == "team_join":
+            async with phase(
+                self._supervisor,
+                "socket",
+                "handling_event",
+                details={"kind": event.type},
+                deadline_s=10,
+            ):
+                await apply_team_join_event(self._users_writer, event, raw_event)
+            return
         if event.type == "user_change":
             async with phase(
                 self._supervisor,

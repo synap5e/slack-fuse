@@ -1,0 +1,13 @@
+{
+  "type": "events_api",
+  "envelope_id": "env-tokens-revoked",
+  "payload": {
+    "event": {
+      "type": "tokens_revoked",
+      "tokens": {
+        "oauth": ["U0001"],
+        "bot": ["B0001"]
+      }
+    }
+  }
+}

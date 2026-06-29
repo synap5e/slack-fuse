@@ -15,6 +15,7 @@ from slack_fuse.models import JsonObject, SocketEventPayload
 from slack_fuse_server.slurper.api import SlackClient
 from slack_fuse_server.slurper.users import (
     _parse_envelope_allow_user_change,
+    apply_team_join_event,
     apply_user_change_event,
     populate_users_once,
 )
@@ -111,6 +112,31 @@ def test_apply_user_change_event_emits_user_renamed(
     assert renamed == {"user_id": "U0001", "new_display_name": "Alice Renamed"}
 
 
+def test_apply_team_join_event_emits_user_added_idempotently(
+    server_conn: psycopg.Connection[TupleRow],
+) -> None:
+    writer = make_test_writer(server_conn)
+    raw_event: JsonObject = {
+        "type": "team_join",
+        "user": {
+            "id": "U0003",
+            "name": "charlie",
+            "profile": {"display_name": "Charlie", "real_name": "Charlie Clark"},
+        },
+    }
+    event = SocketEventPayload(type="team_join", user="U0003")
+
+    trio.run(apply_team_join_event, writer, event, raw_event)
+    trio.run(apply_team_join_event, writer, event, raw_event)
+
+    rows = _user_rows(server_conn)
+    assert len(rows) == 1
+    _, kind, payload = rows[0]
+    assert kind == "user_added"
+    assert payload == raw_event["user"]
+    assert _users_next_offset(server_conn) == 2
+
+
 def test_parse_envelope_allows_user_change_payload_with_nested_user() -> None:
     raw = json.dumps(
         {
@@ -134,3 +160,33 @@ def test_parse_envelope_allows_user_change_payload_with_nested_user() -> None:
     assert envelope.payload is not None
     assert envelope.payload.event.type == "user_change"
     assert envelope.payload.event.user == "U0001"
+
+
+def test_parse_envelope_allows_team_join_payload_with_nested_user() -> None:
+    raw = json.dumps(
+        {
+            "type": "events_api",
+            "envelope_id": "env-1",
+            "payload": {
+                "event": {
+                    "type": "team_join",
+                    "user": {
+                        "id": "U0003",
+                        "name": "charlie",
+                        "profile": {"display_name": "Charlie", "real_name": "Charlie Clark"},
+                    },
+                }
+            },
+        },
+    )
+    parsed = _parse_envelope_allow_user_change(raw)
+    assert parsed is not None
+    envelope, raw_env = parsed
+    assert envelope.payload is not None
+    assert envelope.payload.event.type == "team_join"
+    assert envelope.payload.event.user == "U0003"
+    payload = raw_env["payload"]
+    assert isinstance(payload, dict)
+    raw_event = payload["event"]
+    assert isinstance(raw_event, dict)
+    assert isinstance(raw_event["user"], dict)

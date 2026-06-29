@@ -1,0 +1,13 @@
+{
+  "type": "events_api",
+  "envelope_id": "env-channel-history-changed",
+  "payload": {
+    "event": {
+      "type": "channel_history_changed",
+      "channel": "C0001",
+      "latest": "1700000300.000400",
+      "ts": "1700000200.000300",
+      "event_ts": "1700000400.000500"
+    }
+  }
+}

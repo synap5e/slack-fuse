@@ -1,0 +1,12 @@
+{
+  "type": "events_api",
+  "envelope_id": "env-channel-id-changed",
+  "payload": {
+    "event": {
+      "type": "channel_id_changed",
+      "old_channel_id": "COLD",
+      "new_channel_id": "CNEW",
+      "event_ts": "1700000000.000100"
+    }
+  }
+}

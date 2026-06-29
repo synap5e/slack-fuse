@@ -33,6 +33,25 @@ CREATE UNIQUE INDEX events_users_added_dedup
     ON events (stream, kind, (payload ->> 'id'))
     WHERE stream = 'users' AND kind = 'user_added';
 
+-- Socket-mode replay dedup for additive event kinds introduced after initial
+-- backfill. Each index is scoped to one logical event family so existing edit /
+-- delete and non-message append semantics remain unchanged.
+CREATE UNIQUE INDEX events_parent_replied_dedup
+    ON events (stream, kind, (payload ->> 'parent_ts'), (payload ->> 'reply_count'))
+    WHERE kind = 'parent_replied';
+CREATE UNIQUE INDEX events_channel_id_changed_dedup
+    ON events (stream, kind, (payload ->> 'old_channel_id'), (payload ->> 'new_channel_id'), (payload ->> 'event_ts'))
+    WHERE stream = 'channel-list' AND kind = 'channel_id_changed';
+CREATE UNIQUE INDEX events_channel_history_changed_dedup
+    ON events (stream, kind, (payload ->> 'channel_id'), (payload ->> 'latest'), (payload ->> 'ts'), (payload ->> 'event_ts'))
+    WHERE stream = 'channel-list' AND kind = 'channel_history_changed';
+CREATE UNIQUE INDEX events_channel_member_user_dedup
+    ON events (stream, kind, (payload ->> 'channel_id'), (payload ->> 'user_id'), (payload ->> 'event_ts'))
+    WHERE stream = 'channel-list' AND kind IN ('channel_member_joined', 'channel_member_left');
+CREATE UNIQUE INDEX events_tokens_revoked_dedup
+    ON events (stream, kind, (payload -> 'tokens'))
+    WHERE stream = 'slurper-health' AND kind = 'tokens_revoked';
+
 -- Periodic snapshots so cold consumers don't replay from offset 0.
 -- The cost columns are first-party instrumentation for the
 -- still-open snapshot-cadence question — they let us measure whether

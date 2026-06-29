@@ -72,8 +72,10 @@ PG_TIMEOUT_EXCEPTIONS: tuple[type[BaseException], ...] = (
 class EventRecord:
     """One event ready to append to the `events` table.
 
-    `dedup` is set for `message` events (the only kind the `events_message_dedup`
-    partial unique index covers); a re-written message is then a no-op.
+    `dedup` opts into `ON CONFLICT DO NOTHING` against any matching partial
+    unique index. Historically only `message` events used this via
+    `events_message_dedup`; narrow event-specific indexes can opt other replay-
+    prone socket events into the same gap-free no-op behavior.
     """
 
     stream: str
@@ -112,8 +114,8 @@ def assign_offset(cur: Cursor[TupleRow], stream: str) -> int:
 def insert_event(cur: Cursor[TupleRow], offset: int, record: EventRecord) -> bool:
     """Insert one event row at `offset`. Returns whether a row was written.
 
-    When `record.dedup` is set the insert is `ON CONFLICT DO NOTHING` against the
-    message-dedup index, so a re-written message returns False instead of
+    When `record.dedup` is set the insert is `ON CONFLICT DO NOTHING` against any
+    matching partial unique index, so a replayed event returns False instead of
     raising. A real insert also fires `NOTIFY new_event, '<stream>'` so the WS
     server's tail loop wakes; a deduped no-op fires no NOTIFY.
     """

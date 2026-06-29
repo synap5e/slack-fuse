@@ -17,7 +17,9 @@ happen:
 Translation of a `SocketEventPayload` to wire events:
 
 - `message` family → `channel:<id>` stream (`message` / `message_changed` /
-  `message_deleted`). `message` events are deduped on `(stream, ts)`.
+  `message_deleted` / `parent_replied`). `message` events are deduped on
+  `(stream, ts)`; `parent_replied` is deduped on parent ts + reply count so
+  socket replays collapse without losing each reply-count transition.
 - channel-structure events → `channel-list` stream. The slurper owns the Slack
   token, so it enriches via `conversations.info` to produce the full channel
   object / current name / membership the wire kinds carry.
@@ -86,6 +88,8 @@ _UNARCHIVE_EVENTS = frozenset({"channel_unarchive", "group_unarchive"})
 _RENAME_EVENTS = frozenset({"channel_rename", "group_rename"})
 _CREATE_EVENTS = frozenset({"channel_created", "im_created"})
 _MEMBER_EVENTS = frozenset({"member_joined_channel", "member_left_channel"})
+_RAW_CHANNEL_LIST_EVENTS = frozenset({"channel_history_changed", "channel_id_changed"})
+_TOKEN_REVOKED_EVENT = "tokens_revoked"
 
 
 class _AuthFailed(Exception):
@@ -138,6 +142,144 @@ def _classify_open_failure(exc: BaseException) -> str:
     return "api_error"
 
 
+def _str_or_none(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _event_ts(raw_event: JsonObject) -> str | None:
+    """Best-effort event timestamp from the inner Slack event payload.
+
+    Most Events API event objects carry `event_ts`; a few older examples only
+    show `ts`. If neither exists we leave the field null rather than inventing a
+    timestamp, because replay-dedup indexes should not collapse distinct real
+    events that Slack failed to timestamp.
+    """
+    return _str_or_none(raw_event.get("event_ts")) or _str_or_none(raw_event.get("ts"))
+
+
+def _latest_reply_from_parent(parent: JsonObject) -> str | None:
+    latest = _str_or_none(parent.get("latest_reply"))
+    if latest is not None:
+        return latest
+    replies = parent.get("replies")
+    if not isinstance(replies, list) or not replies:
+        return None
+    last = replies[-1]
+    if not isinstance(last, dict):
+        return None
+    return _str_or_none(last.get("ts"))
+
+
+def _looks_like_message_replied_without_subtype(event: SocketEventPayload, raw_event: JsonObject) -> bool:
+    """Detect Slack's Events API `message_replied` subtype omission.
+
+    Slack's docs currently warn that Events API dispatch can omit
+    `subtype=message_replied`. In that shape the event still carries a nested
+    parent `message` object with refreshed thread metadata; treating it as a
+    normal message would collide with the original parent row and be dropped by
+    message dedup. The shape check stays conservative so ordinary top-level
+    messages and edit/delete subtypes keep their existing semantics.
+    """
+    if event.subtype is not None:
+        return False
+    parent = raw_event.get("message")
+    if not isinstance(parent, dict):
+        return False
+    parent_ts = _str_or_none(parent.get("ts"))
+    top_level_ts = _str_or_none(raw_event.get("ts"))
+    if parent_ts is None or top_level_ts == parent_ts:
+        return False
+    return "reply_count" in parent or "latest_reply" in parent or "replies" in parent
+
+
+def _build_parent_replied_write(event: SocketEventPayload, raw_event: JsonObject, stream: str) -> EventRecord | None:
+    """Build a `parent_replied` event from a refreshed thread parent.
+
+    We choose schema-backed replay dedup on `(stream, kind, parent_ts,
+    reply_count)`. That preserves every observed reply-count transition while
+    collapsing identical socket replays. If Slack emitted two distinct parent
+    refreshes with the same count but different ancillary metadata, the latter
+    would be treated as a replay; that is acceptable for v1 because the capture
+    guarantee here is specifically the parent count/latest-reply signal.
+    """
+    parent_raw = raw_event.get("message")
+    if isinstance(parent_raw, dict):
+        parent: JsonObject = cast(JsonObject, parent_raw)
+    elif event.message is not None:
+        parent = cast(JsonObject, event.message.model_dump(mode="json"))
+    else:
+        return None
+
+    parent_ts = _str_or_none(parent.get("ts"))
+    if parent_ts is None:
+        return None
+    reply_count_raw = parent.get("reply_count")
+    reply_count = reply_count_raw if isinstance(reply_count_raw, int) else None
+    payload: JsonObject = {
+        "channel_id": stream.removeprefix("channel:"),
+        "parent_ts": parent_ts,
+        "reply_count": reply_count,
+        "latest_reply": _latest_reply_from_parent(parent),
+        "probed_at": _event_ts(raw_event),
+        "message": parent,
+    }
+    return EventRecord(stream=stream, kind="parent_replied", ts=parent_ts, payload=payload, dedup=True)
+
+
+def _build_message_changed_write(
+    event: SocketEventPayload,
+    raw_event: JsonObject,
+    stream: str,
+) -> EventRecord | None:
+    new_msg = event.message
+    if new_msg is None:
+        return None
+    # Persist the raw nested message + the previous_ts marker. The nested
+    # message dict is the wire shape under ``raw_event["message"]``;
+    # defensively fall back to a dump if the wire payload is shaped
+    # unexpectedly.
+    raw_msg = raw_event.get("message")
+    if isinstance(raw_msg, dict):
+        msg_dict: JsonObject = cast(JsonObject, raw_msg)
+    else:
+        msg_dict = cast(JsonObject, new_msg.model_dump(mode="json"))
+    payload: JsonObject = {"message": msg_dict, "previous_ts": new_msg.ts}
+    return EventRecord(stream=stream, kind="message_changed", ts=new_msg.ts, payload=payload)
+
+
+def _build_message_deleted_write(
+    event: SocketEventPayload,
+    raw_event: JsonObject,
+    stream: str,
+) -> EventRecord | None:
+    deleted_ts = event.deleted_ts
+    if not deleted_ts:
+        return None
+    prev = event.previous_message
+    raw_prev = raw_event.get("previous_message")
+    prev_dict: JsonObject | None
+    if isinstance(raw_prev, dict):
+        prev_dict = cast(JsonObject, raw_prev)
+    elif prev is not None:
+        prev_dict = cast(JsonObject, prev.model_dump(mode="json"))
+    else:
+        prev_dict = None
+    del_payload: JsonObject = {"deleted_ts": deleted_ts, "previous_message": prev_dict}
+    return EventRecord(stream=stream, kind="message_deleted", ts=deleted_ts, payload=del_payload)
+
+
+def _build_message_write(event: SocketEventPayload, raw_event: JsonObject, stream: str) -> EventRecord | None:
+    ts = event.ts
+    if not ts:
+        return None
+    # For the top-level "message" subtype, the raw event dict already IS
+    # the message shape (after _normalize_message_event flattens it for
+    # validation). Persist as-is.
+    nested = raw_event.get("message")
+    msg_payload: JsonObject = cast(JsonObject, nested) if isinstance(nested, dict) else raw_event
+    return EventRecord(stream=stream, kind="message", ts=ts, payload=msg_payload, dedup=True)
+
+
 def translate_message_event(event: SocketEventPayload, raw_event: JsonObject) -> EventRecord | None:
     """Translate a `message`-type socket event to a `channel:<id>` write.
 
@@ -155,47 +297,16 @@ def translate_message_event(event: SocketEventPayload, raw_event: JsonObject) ->
         return None
     stream = f"channel:{channel_id}"
 
+    if event.subtype == "message_replied" or _looks_like_message_replied_without_subtype(event, raw_event):
+        return _build_parent_replied_write(event, raw_event, stream)
+
     if event.subtype == "message_changed":
-        new_msg = event.message
-        if new_msg is None:
-            return None
-        # Persist the raw nested message + the previous_ts marker. The
-        # nested message dict is the wire shape under
-        # ``raw_event["message"]``; defensively fall back to a dump if
-        # the wire payload is shaped unexpectedly.
-        raw_msg = raw_event.get("message")
-        if isinstance(raw_msg, dict):
-            msg_dict: JsonObject = cast(JsonObject, raw_msg)
-        else:
-            msg_dict = cast(JsonObject, new_msg.model_dump(mode="json"))
-        payload: JsonObject = {"message": msg_dict, "previous_ts": new_msg.ts}
-        return EventRecord(stream=stream, kind="message_changed", ts=new_msg.ts, payload=payload)
+        return _build_message_changed_write(event, raw_event, stream)
 
     if event.subtype == "message_deleted":
-        deleted_ts = event.deleted_ts
-        if not deleted_ts:
-            return None
-        prev = event.previous_message
-        raw_prev = raw_event.get("previous_message")
-        prev_dict: JsonObject | None
-        if isinstance(raw_prev, dict):
-            prev_dict = cast(JsonObject, raw_prev)
-        elif prev is not None:
-            prev_dict = cast(JsonObject, prev.model_dump(mode="json"))
-        else:
-            prev_dict = None
-        del_payload: JsonObject = {"deleted_ts": deleted_ts, "previous_message": prev_dict}
-        return EventRecord(stream=stream, kind="message_deleted", ts=deleted_ts, payload=del_payload)
+        return _build_message_deleted_write(event, raw_event, stream)
 
-    ts = event.ts
-    if not ts:
-        return None
-    # For the top-level "message" subtype, the raw event dict already IS
-    # the message shape (after _normalize_message_event flattens it for
-    # validation). Persist as-is.
-    nested = raw_event.get("message")
-    msg_payload: JsonObject = cast(JsonObject, nested) if isinstance(nested, dict) else raw_event
-    return EventRecord(stream=stream, kind="message", ts=ts, payload=msg_payload, dedup=True)
+    return _build_message_write(event, raw_event, stream)
 
 
 def extract_raw_event(raw_envelope: JsonObject) -> JsonObject:
@@ -218,6 +329,54 @@ def _channel_added_write(channel_raw: JsonObject) -> EventRecord:
     silently drops anything we haven't declared, so we keep the wire dict.
     """
     return EventRecord(stream="channel-list", kind="channel_added", ts=None, payload=channel_raw)
+
+
+def _channel_id_changed_write(raw_event: JsonObject) -> EventRecord | None:
+    old_channel_id = _str_or_none(raw_event.get("old_channel_id"))
+    new_channel_id = _str_or_none(raw_event.get("new_channel_id"))
+    if old_channel_id is None or new_channel_id is None:
+        return None
+    payload: JsonObject = {
+        "old_channel_id": old_channel_id,
+        "new_channel_id": new_channel_id,
+        "event_ts": _event_ts(raw_event),
+    }
+    return EventRecord(stream="channel-list", kind="channel_id_changed", ts=None, payload=payload, dedup=True)
+
+
+def _channel_history_changed_write(event: SocketEventPayload, raw_event: JsonObject) -> EventRecord:
+    channel_id = event.channel or _str_or_none(raw_event.get("channel")) or _str_or_none(raw_event.get("channel_id"))
+    payload: JsonObject = {
+        "channel_id": channel_id,
+        "latest": _str_or_none(raw_event.get("latest")),
+        "ts": _str_or_none(raw_event.get("ts")),
+        "event_ts": _event_ts(raw_event),
+    }
+    return EventRecord(stream="channel-list", kind="channel_history_changed", ts=None, payload=payload, dedup=True)
+
+
+def _member_event_write(event: SocketEventPayload, raw_event: JsonObject) -> EventRecord | None:
+    if event.type not in _MEMBER_EVENTS:
+        return None
+    user_id = _str_or_none(raw_event.get("user")) or event.user
+    if not event.channel or not user_id:
+        return None
+    payload: JsonObject = {
+        "channel_id": event.channel,
+        "user_id": user_id,
+        "inviter_id": _str_or_none(raw_event.get("inviter")),
+        "event_ts": _event_ts(raw_event),
+    }
+    kind = "channel_member_joined" if event.type == "member_joined_channel" else "channel_member_left"
+    return EventRecord(stream="channel-list", kind=kind, ts=None, payload=payload, dedup=True)
+
+
+def _raw_channel_list_write(event: SocketEventPayload, raw_event: JsonObject) -> EventRecord | None:
+    if event.type == "channel_id_changed":
+        return _channel_id_changed_write(raw_event)
+    if event.type == "channel_history_changed":
+        return _channel_history_changed_write(event, raw_event)
+    return _member_event_write(event, raw_event)
 
 
 def _record_channel_id(record: EventRecord) -> str | None:
@@ -385,8 +544,13 @@ class SocketModeRunner:
                     return
                 await self._write_event_or_drop_timeout(write, parent_span=event_span)
                 return
+            if event.type == _TOKEN_REVOKED_EVENT:
+                wrote = await self._handle_tokens_revoked(raw_event, parent_span=event_span)
+                if not wrote and event_span.result == "ok":
+                    event_span.mark_skipped()
+                return
             if event.type in CHANNEL_LIST_EVENT_TYPES:
-                wrote = await self._handle_structural_event(event, parent_span=event_span)
+                wrote = await self._handle_structural_event(event, raw_event, parent_span=event_span)
                 if not wrote and event_span.result == "ok":
                     event_span.mark_skipped()
                 return
@@ -425,9 +589,40 @@ class SocketModeRunner:
                 write_span.set("offset", offset)
             return True
 
+    async def _handle_tokens_revoked(
+        self,
+        raw_event: JsonObject,
+        *,
+        parent_span: SpanRecorder | None = None,
+    ) -> bool:
+        """Capture Slack's direct token-revocation signal and mark auth failed.
+
+        The raw `tokens_revoked` event is stored separately from the existing
+        `auth_token_invalid` health transition so operators can see both the
+        precise Slack revocation payload and the coarse health state that
+        clients already understand.
+        """
+        write = EventRecord(
+            stream="slurper-health",
+            kind=_TOKEN_REVOKED_EVENT,
+            ts=None,
+            payload=raw_event,
+            dedup=True,
+        )
+        wrote = await self._write_event_or_drop_timeout(write, parent_span=parent_span)
+        try:
+            await self._health.emit(HealthKind.AUTH_TOKEN_INVALID, {"reason": _TOKEN_REVOKED_EVENT})
+        except PG_TIMEOUT_EXCEPTIONS as exc:
+            if parent_span is not None:
+                parent_span.mark_timeout(type(exc).__name__)
+            log.warning("socket-mode: dropped auth health after tokens_revoked PostgreSQL timeout", exc_info=True)
+            return False
+        return wrote
+
     async def _handle_structural_event(
         self,
         event: SocketEventPayload,
+        raw_event: JsonObject,
         *,
         parent_span: SpanRecorder | None = None,
     ) -> bool:
@@ -441,18 +636,28 @@ class SocketModeRunner:
         if event.channel:
             extra["channel_id"] = event.channel
         async with span(op="slurper.socket.handle_structural_event", task="socket", extra=extra) as structural_span:
+            raw_write = _raw_channel_list_write(event, raw_event)
+            wrote_any = False
+            if raw_write is not None:
+                raw_wrote = await self._write_event_or_drop_timeout(raw_write, parent_span=parent_span)
+                wrote_any = wrote_any or raw_wrote
+                if not raw_wrote:
+                    structural_span.mark_timeout()
+                    return wrote_any
+            if event.type in _RAW_CHANNEL_LIST_EVENTS:
+                return wrote_any
             channel_id = event.channel
             if not channel_id:
                 structural_span.mark_skipped()
-                return False
+                return wrote_any
             write = await self._build_structural_write(event, channel_id, span=structural_span)
             if write is None:
                 structural_span.mark_skipped()
-                return False
+                return wrote_any
             wrote = await self._write_event_or_drop_timeout(write, parent_span=parent_span)
             if not wrote:
                 structural_span.mark_timeout()
-            return wrote
+            return wrote_any or wrote
 
     async def _build_structural_write(
         self,

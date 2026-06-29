@@ -1,0 +1,22 @@
+{
+  "type": "events_api",
+  "envelope_id": "env-message-replied",
+  "payload": {
+    "event": {
+      "type": "message",
+      "subtype": "message_replied",
+      "channel": "C0001",
+      "ts": "1700000300.000400",
+      "event_ts": "1700000300.000400",
+      "message": {
+        "type": "message",
+        "user": "U0001",
+        "text": "thread parent",
+        "ts": "1700000000.000100",
+        "thread_ts": "1700000000.000100",
+        "reply_count": 2,
+        "latest_reply": "1700000200.000300"
+      }
+    }
+  }
+}

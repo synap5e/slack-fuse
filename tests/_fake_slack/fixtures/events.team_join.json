@@ -1,0 +1,17 @@
+{
+  "type": "events_api",
+  "envelope_id": "env-team-join",
+  "payload": {
+    "event": {
+      "type": "team_join",
+      "user": {
+        "id": "U0003",
+        "name": "charlie",
+        "profile": {
+          "display_name": "Charlie",
+          "real_name": "Charlie Clark"
+        }
+      }
+    }
+  }
+}

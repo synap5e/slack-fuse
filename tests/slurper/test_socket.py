@@ -75,6 +75,67 @@ def test_translate_message_deleted() -> None:
     assert write.payload["deleted_ts"] == "100.0001"
 
 
+def test_translate_message_replied_parent_refresh() -> None:
+    raw_event: JsonObject = {
+        "type": "message",
+        "subtype": "message_replied",
+        "channel": "C1",
+        "ts": "1700000300.000400",
+        "event_ts": "1700000300.000400",
+        "message": {
+            "type": "message",
+            "user": "U1",
+            "text": "parent",
+            "ts": "1700000000.000100",
+            "thread_ts": "1700000000.000100",
+            "reply_count": 2,
+            "latest_reply": "1700000200.000300",
+        },
+    }
+    event = SocketEventPayload.model_validate(raw_event)
+
+    write = translate_message_event(event, raw_event)
+
+    assert write is not None
+    assert (write.stream, write.kind, write.ts, write.dedup) == (
+        "channel:C1",
+        "parent_replied",
+        "1700000000.000100",
+        True,
+    )
+    assert write.payload["channel_id"] == "C1"
+    assert write.payload["parent_ts"] == "1700000000.000100"
+    assert write.payload["reply_count"] == 2
+    assert write.payload["latest_reply"] == "1700000200.000300"
+    assert write.payload["probed_at"] == "1700000300.000400"
+
+
+def test_translate_message_replied_without_subtype() -> None:
+    raw_event: JsonObject = {
+        "type": "message",
+        "channel": "C1",
+        "hidden": True,
+        "ts": "1700000300.000400",
+        "event_ts": "1700000300.000400",
+        "message": {
+            "type": "message",
+            "user": "U1",
+            "text": "parent",
+            "ts": "1700000000.000100",
+            "thread_ts": "1700000000.000100",
+            "reply_count": 2,
+            "replies": [{"user": "U2", "ts": "1700000200.000300"}],
+        },
+    }
+    event = SocketEventPayload.model_validate(raw_event)
+
+    write = translate_message_event(event, raw_event)
+
+    assert write is not None
+    assert write.kind == "parent_replied"
+    assert write.payload["latest_reply"] == "1700000200.000300"
+
+
 def test_translate_missing_channel_returns_none() -> None:
     event = SocketEventPayload(type="message", ts="1.0")
     assert translate_message_event(event, _raw_for(event)) is None
@@ -189,6 +250,43 @@ def test_handle_message_event_writes_channel_stream(
     assert payload["ts"] == "100.0001"
 
 
+def test_handle_message_replied_writes_parent_replied_idempotently(
+    server_conn: psycopg.Connection[TupleRow],
+    fake_slack_http: httpx.Client,
+) -> None:
+    runner = _make_runner(server_conn, fake_slack_http)
+    parent = SocketEventPayload(type="message", channel="C1", ts="100.0001", user="U1", text="parent")
+    reply_refresh: JsonObject = {
+        "type": "message",
+        "subtype": "message_replied",
+        "channel": "C1",
+        "ts": "101.0002",
+        "event_ts": "101.0002",
+        "message": {
+            "type": "message",
+            "user": "U1",
+            "text": "parent",
+            "ts": "100.0001",
+            "thread_ts": "100.0001",
+            "reply_count": 1,
+            "latest_reply": "101.0002",
+        },
+    }
+    event = SocketEventPayload.model_validate(reply_refresh)
+
+    trio.run(runner._handle_event, parent, _raw_for(parent))
+    trio.run(runner._handle_event, event, reply_refresh)
+    trio.run(runner._handle_event, event, reply_refresh)
+
+    rows = _rows(server_conn, "channel:C1")
+    assert [kind for kind, _ in rows] == ["message", "parent_replied"]
+    parent_replied = rows[1][1]
+    assert isinstance(parent_replied, dict)
+    assert parent_replied["parent_ts"] == "100.0001"
+    assert parent_replied["reply_count"] == 1
+    assert parent_replied["latest_reply"] == "101.0002"
+
+
 def test_handle_event_declares_handling_phase(
     server_conn: psycopg.Connection[TupleRow],
     fake_slack_http: httpx.Client,
@@ -251,6 +349,84 @@ def test_handle_message_event_drops_pg_timeout_with_warning(
     )
 
 
+def test_handle_channel_id_changed_writes_channel_list(
+    server_conn: psycopg.Connection[TupleRow],
+    fake_slack_http: httpx.Client,
+) -> None:
+    runner = _make_runner(server_conn, fake_slack_http)
+    raw_event: JsonObject = {
+        "type": "channel_id_changed",
+        "old_channel_id": "COLD",
+        "new_channel_id": "CNEW",
+        "event_ts": "1700000000.000100",
+    }
+    event = SocketEventPayload.model_validate(raw_event)
+
+    trio.run(runner._handle_event, event, raw_event)
+
+    rows = _rows(server_conn, "channel-list")
+    assert len(rows) == 1
+    kind, payload = rows[0]
+    assert kind == "channel_id_changed"
+    assert payload == {
+        "old_channel_id": "COLD",
+        "new_channel_id": "CNEW",
+        "event_ts": "1700000000.000100",
+    }
+
+
+def test_handle_channel_history_changed_writes_channel_list_idempotently(
+    server_conn: psycopg.Connection[TupleRow],
+    fake_slack_http: httpx.Client,
+) -> None:
+    runner = _make_runner(server_conn, fake_slack_http)
+    raw_event: JsonObject = {
+        "type": "channel_history_changed",
+        "channel": "C0001",
+        "latest": "1700000300.000400",
+        "ts": "1700000200.000300",
+        "event_ts": "1700000400.000500",
+    }
+    event = SocketEventPayload.model_validate(raw_event)
+
+    trio.run(runner._handle_event, event, raw_event)
+    trio.run(runner._handle_event, event, raw_event)
+
+    rows = _rows(server_conn, "channel-list")
+    assert len(rows) == 1
+    kind, payload = rows[0]
+    assert kind == "channel_history_changed"
+    assert payload == {
+        "channel_id": "C0001",
+        "latest": "1700000300.000400",
+        "ts": "1700000200.000300",
+        "event_ts": "1700000400.000500",
+    }
+
+
+def test_handle_tokens_revoked_writes_payload_and_auth_health(
+    server_conn: psycopg.Connection[TupleRow],
+    fake_slack_http: httpx.Client,
+) -> None:
+    runner = _make_runner(server_conn, fake_slack_http)
+    raw_event: JsonObject = {
+        "type": "tokens_revoked",
+        "tokens": {"oauth": ["U0001"], "bot": ["B0001"]},
+    }
+    event = SocketEventPayload.model_validate(raw_event)
+
+    trio.run(runner._handle_event, event, raw_event)
+    trio.run(runner._handle_event, event, raw_event)
+
+    rows = _rows(server_conn, "slurper-health")
+    assert [kind for kind, _ in rows] == ["tokens_revoked", "auth_token_invalid", "auth_token_invalid"]
+    tokens_payload = rows[0][1]
+    assert isinstance(tokens_payload, dict)
+    assert tokens_payload["tokens"] == {"oauth": ["U0001"], "bot": ["B0001"]}
+    auth_payloads = [payload for kind, payload in rows if kind == "auth_token_invalid"]
+    assert all(payload == {"reason": "tokens_revoked"} for payload in auth_payloads)
+
+
 def test_handle_structural_event_enriches_via_conversations_info(
     server_conn: psycopg.Connection[TupleRow],
     fake_slack_http: httpx.Client,
@@ -268,6 +444,63 @@ def test_handle_structural_event_enriches_via_conversations_info(
     assert kind == "channel_renamed"
     assert isinstance(payload, dict)
     assert payload == {"channel_id": "C0001", "new_name": "general"}
+
+
+def test_handle_member_joined_channel_writes_user_membership_and_existing_membership(
+    server_conn: psycopg.Connection[TupleRow],
+    fake_slack_http: httpx.Client,
+) -> None:
+    runner = _make_runner(server_conn, fake_slack_http)
+    raw_event: JsonObject = {
+        "type": "member_joined_channel",
+        "channel": "C0001",
+        "user": "UOTHER",
+        "inviter": "UINVITER",
+        "event_ts": "1700000000.000100",
+    }
+    event = SocketEventPayload.model_validate(raw_event)
+
+    trio.run(runner._handle_event, event, raw_event)
+    trio.run(runner._handle_event, event, raw_event)
+
+    rows = _rows(server_conn, "channel-list")
+    joined = [payload for kind, payload in rows if kind == "channel_member_joined"]
+    changed = [payload for kind, payload in rows if kind == "channel_member_changed"]
+    assert len(joined) == 1
+    assert joined[0] == {
+        "channel_id": "C0001",
+        "user_id": "UOTHER",
+        "inviter_id": "UINVITER",
+        "event_ts": "1700000000.000100",
+    }
+    assert changed == [{"channel_id": "C0001", "is_member": True}, {"channel_id": "C0001", "is_member": True}]
+
+
+def test_handle_member_left_channel_writes_user_membership(
+    server_conn: psycopg.Connection[TupleRow],
+    fake_slack_http: httpx.Client,
+) -> None:
+    runner = _make_runner(server_conn, fake_slack_http)
+    raw_event: JsonObject = {
+        "type": "member_left_channel",
+        "channel": "C0001",
+        "user": "UOTHER",
+        "event_ts": "1700000001.000200",
+    }
+    event = SocketEventPayload.model_validate(raw_event)
+
+    trio.run(runner._handle_event, event, raw_event)
+
+    rows = _rows(server_conn, "channel-list")
+    left = [payload for kind, payload in rows if kind == "channel_member_left"]
+    assert left == [
+        {
+            "channel_id": "C0001",
+            "user_id": "UOTHER",
+            "inviter_id": None,
+            "event_ts": "1700000001.000200",
+        }
+    ]
 
 
 def test_on_hello_fires_reconnect_hook_only_after_a_disconnect(
