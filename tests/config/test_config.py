@@ -23,6 +23,8 @@ backfill_abort_at = 99999
 backfill_page_sleep_min_s = 12.5
 slurper_lock_timeout_s = 1.5
 slurper_statement_timeout_s = 12.25
+probe_sweep_interval_s = 1800.0
+probe_channel_newest_message_cadence_s = 43200.0
 """
 
 _CLIENT_TOML = """\
@@ -60,10 +62,15 @@ def test_server_config_from_toml(tmp_path: Path) -> None:
     assert abs(cfg.backfill_page_sleep_min_s - 12.5) < 1e-9
     assert abs(cfg.slurper_lock_timeout_s - 1.5) < 1e-9
     assert abs(cfg.slurper_statement_timeout_s - 12.25) < 1e-9
+    assert abs(cfg.probe_sweep_interval_s - 1800.0) < 1e-9
+    assert abs(cfg.probe_channel_newest_message_cadence_s - 43200.0) < 1e-9
     # Untouched keys fall back to RFC defaults.
     assert cfg.backfill_warn_at == 5000
     assert cfg.auto_backfill_skip_if_completed is True
     assert cfg.snapshot_max_age_hours == 24
+    assert abs(cfg.probe_channel_older_than_oldest_cadence_s - 7 * 86400.0) < 1e-9
+    assert abs(cfg.probe_channel_inventory_cadence_s - 86400.0) < 1e-9
+    assert abs(cfg.probe_workspace_user_count_cadence_s - 86400.0) < 1e-9
 
 
 def test_client_config_from_toml(tmp_path: Path) -> None:

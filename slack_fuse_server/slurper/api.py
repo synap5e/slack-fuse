@@ -35,6 +35,8 @@ from slack_fuse.models import (
     SearchFile,
     SearchFilesResponse,
     SlackFile,
+    SlackUser,
+    UsersListResponse,
 )
 
 log = logging.getLogger(__name__)
@@ -320,6 +322,117 @@ class SlackClient:
         if oldest is not None:
             params["oldest"] = f"{oldest:.6f}"
         return self._get_validated("conversations.history", params, ConversationsHistoryResponse)
+
+    def sample_conversations_history(
+        self,
+        *,
+        channel_id: str,
+        limit: int,
+        oldest: str | None = None,
+        latest: str | None = None,
+    ) -> JsonObject:
+        """Capture one validated raw ``conversations.history`` page for probes."""
+        params: dict[str, str] = {
+            "channel": channel_id,
+            "limit": str(limit),
+        }
+        if oldest is not None:
+            params["oldest"] = oldest
+        if latest is not None:
+            params["latest"] = latest
+        return self._get_validated("conversations.history", params, ConversationsHistoryResponse).raw
+
+    def sample_conversations_list(
+        self,
+        *,
+        types: str,
+        exclude_archived: bool,
+    ) -> JsonObject:
+        """Capture a validated logical ``conversations.list`` response.
+
+        The API is paginated, but probe consumers want one inventory capture.
+        We concatenate all channel objects into ``channels`` and add
+        ``page_count``. This is intentionally modest: even 1000 channels is on
+        the order of hundreds of KB, while preserving the raw channel objects
+        lets future detection SQL reinterpret the capture.
+        """
+        channels: list[JsonObject] = []
+        cursor = ""
+        page_count = 0
+        while True:
+            params: dict[str, str] = {
+                "types": types,
+                "limit": "200",
+                "exclude_archived": "true" if exclude_archived else "false",
+            }
+            if cursor:
+                params["cursor"] = cursor
+            page = self._get_validated("conversations.list", params, ConversationsListResponse)
+            page_count += 1
+            raw_channels = page.raw.get("channels")
+            if isinstance(raw_channels, list):
+                channels.extend(cast(JsonObject, item) for item in raw_channels if isinstance(item, dict))
+            cursor = page.model.response_metadata.next_cursor
+            if not cursor:
+                break
+            time.sleep(_PAGE_DELAY)
+        return cast(
+            JsonObject,
+            {
+                "ok": True,
+                "channels": channels,
+                "response_metadata": {"next_cursor": ""},
+                "page_count": page_count,
+            },
+        )
+
+    def list_users(self) -> list[Validated[SlackUser]]:
+        """List all workspace users, preserving raw member objects."""
+        users: list[Validated[SlackUser]] = []
+        cursor = ""
+        while True:
+            params: dict[str, str] = {"limit": "200"}
+            if cursor:
+                params["cursor"] = cursor
+            page = self._get_validated("users.list", params, UsersListResponse)
+            raw_members = page.raw.get("members")
+            raw_list: list[object] = list(raw_members) if isinstance(raw_members, list) else []
+            for raw_member, model_member in zip(raw_list, page.model.members, strict=False):
+                if isinstance(raw_member, dict):
+                    users.append(Validated(raw=cast(JsonObject, raw_member), model=model_member))
+            cursor = page.model.response_metadata.next_cursor
+            if not cursor:
+                break
+            time.sleep(_PAGE_DELAY)
+        return users
+
+    def sample_users_list(self, *, limit: int) -> JsonObject:
+        """Capture a validated logical ``users.list`` response for probes."""
+        members: list[JsonObject] = []
+        cursor = ""
+        page_count = 0
+        while True:
+            params: dict[str, str] = {"limit": str(limit)}
+            if cursor:
+                params["cursor"] = cursor
+            page = self._get_validated("users.list", params, UsersListResponse)
+            page_count += 1
+            raw_members = page.raw.get("members")
+            if isinstance(raw_members, list):
+                members.extend(cast(JsonObject, item) for item in raw_members if isinstance(item, dict))
+            cursor = page.model.response_metadata.next_cursor
+            if not cursor:
+                break
+            time.sleep(_PAGE_DELAY)
+        return cast(
+            JsonObject,
+            {
+                "ok": True,
+                "members": members,
+                "response_metadata": {"next_cursor": ""},
+                "page_count": page_count,
+            },
+        )
 
     def get_replies(self, channel_id: str, thread_ts: str) -> list[Validated[Message]]:
         """Fetch all messages in a thread (parent + replies), lossless.

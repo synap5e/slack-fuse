@@ -84,6 +84,15 @@ class ServerConfig(BaseSettings):
     catchup_thread_sleep_min_s: float = 1.0
     catchup_thread_sleep_max_s: float = 3.0
 
+    # State-reconciliation probes (slurper/probes.py). The sweep task runs
+    # hourly by default; each job has its own restart-safe cadence anchored on
+    # the latest persisted raw API sample event.
+    probe_sweep_interval_s: float = 3600.0
+    probe_channel_older_than_oldest_cadence_s: float = 7 * 86400.0
+    probe_channel_newest_message_cadence_s: float = 86400.0
+    probe_channel_inventory_cadence_s: float = 86400.0
+    probe_workspace_user_count_cadence_s: float = 86400.0
+
     @classmethod
     def settings_customise_sources(
         cls,

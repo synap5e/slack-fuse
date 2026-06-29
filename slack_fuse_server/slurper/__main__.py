@@ -74,6 +74,7 @@ from slack_fuse_server.slurper.channels import ensure_channel_added, populate_ch
 from slack_fuse_server.slurper.health import HealthEmitter, HealthKind
 from slack_fuse_server.slurper.limiters import SlurperLimiters
 from slack_fuse_server.slurper.offsets import OffsetWriter
+from slack_fuse_server.slurper.probes import probe_sweep
 from slack_fuse_server.slurper.refresh import RefreshTrigger, refresh_channels_periodically
 from slack_fuse_server.slurper.socket import SocketModeOptions, SocketModeStatus
 from slack_fuse_server.slurper.spans import configure_span_thresholds_from_config, span
@@ -428,6 +429,7 @@ async def _serve(config: ServerConfig) -> None:
             # fires only on demand. Rendezvous channel means a second
             # POST while one is running gets 409, not a queued cycle.
             nursery.start_soon(refresh_trigger.consume, writer, client, limiters, supervisor)
+            nursery.start_soon(probe_sweep, writer, client, limiters, supervisor, config)
             nursery.start_soon(backfill_trigger.consume, config, supervisor)
             # Reconnect/restart catchup consumer: runs one bounded gap-fill at
             # startup (the restart case) and one per gap-reconnect the socket
