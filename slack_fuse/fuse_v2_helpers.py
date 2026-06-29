@@ -91,6 +91,9 @@ CONTROL_REFRESH_CHANNELS: Final = "refresh_channels"
 CONTROL_REFRESH_CHANNEL: Final = "refresh_channel"
 CONTROL_BLOCKED_CHANNELS: Final = "blocked_channels"
 CONTROL_BACKFILL_CHANNEL: Final = "backfill_channel"
+CONTROL_PROBE_SWEEP: Final = "probe_sweep"
+CONTROL_PROBE_SWEEP_JOB: Final = "probe_sweep_job"
+CONTROL_PROBE_SWEEP_TARGET: Final = "probe_sweep_target"
 #: Write a channel slug or id → re-render that channel's chunks with the current
 #: renderer (re-derives from the server's latest snapshot). Use after a renderer
 #: change ships to refresh historical chunks rendered by the old code.
@@ -104,6 +107,9 @@ CONTROL_WRITABLE: Final[frozenset[str]] = frozenset(
         CONTROL_REFRESH_CHANNEL,
         CONTROL_BLOCKED_CHANNELS,
         CONTROL_BACKFILL_CHANNEL,
+        CONTROL_PROBE_SWEEP,
+        CONTROL_PROBE_SWEEP_JOB,
+        CONTROL_PROBE_SWEEP_TARGET,
         CONTROL_RERENDER_CHANNEL,
     }
 )

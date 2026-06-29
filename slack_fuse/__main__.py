@@ -440,6 +440,7 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
         post_backfill_channel,
         post_block_channel,
     )
+    from slack_fuse.projector.probe_fetch import post_probe_sweep
     from slack_fuse.projector.refresh_fetch import post_refresh_channel, post_refresh_channels
 
     control_state = ControlState()
@@ -505,6 +506,15 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
             shared_secret=config.shared_secret,
         )
 
+    def _control_probe_sweep(job_id: str | None, target: str | None) -> tuple[int, str | None]:
+        return post_probe_sweep(
+            ghost_http_client,
+            ghost_base_http_url,
+            job_id=job_id,
+            target=target,
+            shared_secret=config.shared_secret,
+        )
+
     # ``_control/rerender_channel`` hands resolved channel ids to a background
     # consumer (``_run_rerender_consumer``) rather than running inline: a
     # snapshot fetch + re-apply is far heavier than the sub-second per-callback
@@ -541,6 +551,7 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
         control_block_channel=_control_block_channel,
         control_unblock_channel=_control_unblock_channel,
         control_backfill_channel=_control_backfill_channel,
+        control_probe_sweep=_control_probe_sweep,
         control_rerender_channel=_control_rerender_channel,
     )
 

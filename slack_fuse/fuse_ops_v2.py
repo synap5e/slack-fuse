@@ -49,6 +49,9 @@ from slack_fuse.fuse_v2_helpers import (
     CONTROL_BACKFILL_CHANNEL,
     CONTROL_BLOCKED_CHANNELS,
     CONTROL_DIR,
+    CONTROL_PROBE_SWEEP,
+    CONTROL_PROBE_SWEEP_JOB,
+    CONTROL_PROBE_SWEEP_TARGET,
     CONTROL_REFRESH_CHANNEL,
     CONTROL_REFRESH_CHANNELS,
     CONTROL_RERENDER_CHANNEL,
@@ -153,6 +156,7 @@ ControlBlockedChannelsListFn = Callable[[], set[str]]
 ControlBlockChannelFn = Callable[[str, str | None], int]
 ControlUnblockChannelFn = Callable[[str], int]
 ControlBackfillChannelFn = Callable[[str], tuple[int, str | None]]
+ControlProbeSweepFn = Callable[[str | None, str | None], tuple[int, str | None]]
 # ``_control/rerender_channel`` hands a resolved channel id off to a background
 # consumer (the rerender is too heavy for the per-callback budget). Returns True
 # if the request was accepted (queued), False if the queue is full / busy. Wired
@@ -470,6 +474,8 @@ class _ControlResult:
 
     result: str
     channel: str | None = None
+    job_id: str | None = None
+    target: str | None = None
 
 
 # ============================================================================
@@ -514,6 +520,7 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         control_block_channel: ControlBlockChannelFn | None = None,
         control_unblock_channel: ControlUnblockChannelFn | None = None,
         control_backfill_channel: ControlBackfillChannelFn | None = None,
+        control_probe_sweep: ControlProbeSweepFn | None = None,
         control_rerender_channel: ControlRerenderChannelFn | None = None,
     ) -> None:
         super().__init__()
@@ -593,6 +600,7 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         self._control_block_channel = control_block_channel
         self._control_unblock_channel = control_unblock_channel
         self._control_backfill_channel = control_backfill_channel
+        self._control_probe_sweep = control_probe_sweep
         self._control_rerender_channel = control_rerender_channel
         self._control_write_buffers: dict[int, _ControlWrite] = {}
         self._control_write_lock = threading.Lock()
@@ -953,12 +961,22 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             await self._fire_block_toggle(data)
         elif name == CONTROL_BACKFILL_CHANNEL:
             await self._fire_backfill(data)
+        elif name in {CONTROL_PROBE_SWEEP, CONTROL_PROBE_SWEEP_JOB, CONTROL_PROBE_SWEEP_TARGET}:
+            await self._fire_probe_control(name, data)
         elif name == CONTROL_RERENDER_CHANNEL:
             token = data.decode("utf-8", errors="replace").strip()
             if not token:
                 return
             result = await self._fire_rerender(token)
             self._control_state.record_rerender(result.channel or token, result.result)
+
+    async def _fire_probe_control(self, name: str, data: bytes) -> None:
+        if name == CONTROL_PROBE_SWEEP:
+            await self._fire_probe_sweep(data)
+        elif name == CONTROL_PROBE_SWEEP_JOB:
+            await self._fire_probe_sweep_job(data)
+        elif name == CONTROL_PROBE_SWEEP_TARGET:
+            await self._fire_probe_sweep_target(data)
 
     async def _fire_refresh_channel(self, data: bytes) -> None:
         assert self._control_state is not None
@@ -986,6 +1004,39 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             return
         result = await self._control_action_or_unavailable(lambda: self._do_backfill(token))
         self._control_state.record_backfill(result.channel or token, result.result)
+
+    async def _fire_probe_sweep(self, data: bytes) -> None:
+        assert self._control_state is not None
+        if not data.strip():
+            return
+        result = await self._control_action_or_unavailable(lambda: self._do_probe_sweep(None, None))
+        self._control_state.record_probe_sweep(result.result, job_id=result.job_id, target=result.target)
+
+    async def _fire_probe_sweep_job(self, data: bytes) -> None:
+        assert self._control_state is not None
+        text = data.decode("utf-8", errors="replace").strip()
+        if not text:
+            return
+        parts = text.split()
+        if len(parts) != 1:
+            self._control_state.record_probe_sweep(result_for_status(400))
+            return
+        job_id = parts[0]
+        result = await self._control_action_or_unavailable(lambda: self._do_probe_sweep(job_id, None))
+        self._control_state.record_probe_sweep(result.result, job_id=result.job_id, target=result.target)
+
+    async def _fire_probe_sweep_target(self, data: bytes) -> None:
+        assert self._control_state is not None
+        text = data.decode("utf-8", errors="replace").strip()
+        if not text:
+            return
+        parts = text.split()
+        if len(parts) != 2:
+            self._control_state.record_probe_sweep(result_for_status(400))
+            return
+        job_id, target = parts
+        result = await self._control_action_or_unavailable(lambda: self._do_probe_sweep(job_id, target))
+        self._control_state.record_probe_sweep(result.result, job_id=result.job_id, target=result.target)
 
     async def _control_action_or_unavailable(self, fn: Callable[[], _ControlResult]) -> _ControlResult:
         try:
@@ -1038,6 +1089,13 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         if code == 409 and message == "blocked":
             return _ControlResult(result="blocked", channel=channel_id)
         return _ControlResult(result=result_for_status(code), channel=channel_id)
+
+    def _do_probe_sweep(self, job_id: str | None, target: str | None) -> _ControlResult:
+        if self._control_probe_sweep is None:
+            return _ControlResult(result="server_unavailable", job_id=job_id, target=target)
+        code, message = self._control_probe_sweep(job_id, target)
+        result = "unknown_job" if code == 400 and message == "unknown_job" else result_for_status(code)
+        return _ControlResult(result=result, job_id=job_id, target=target)
 
     async def _fire_rerender(self, token: str) -> _ControlResult:
         """Resolve a rerender token and hand it to the background consumer.
@@ -1129,6 +1187,9 @@ class SlackFuseOpsV2(pyfuse3.Operations):
                     (CONTROL_REFRESH_CHANNEL, False),
                     (CONTROL_BLOCKED_CHANNELS, False),
                     (CONTROL_BACKFILL_CHANNEL, False),
+                    (CONTROL_PROBE_SWEEP, False),
+                    (CONTROL_PROBE_SWEEP_JOB, False),
+                    (CONTROL_PROBE_SWEEP_TARGET, False),
                     (CONTROL_RERENDER_CHANNEL, False),
                     (CONTROL_STATUS, False),
                 ]

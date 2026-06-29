@@ -29,6 +29,7 @@ from slack_fuse.projector.block_fetch import (
     post_backfill_channel,
     post_block_channel,
 )
+from slack_fuse.projector.probe_fetch import post_probe_sweep
 from slack_fuse.projector.refresh_fetch import post_refresh_channel, post_refresh_channels
 from tests.fuse_v2.conftest import seed_channel
 
@@ -55,6 +56,7 @@ def _make_control_ops(  # noqa: PLR0913 — test-injection knobs for each contro
     block_fn: Callable[[str, str | None], int] | None = None,
     unblock_fn: Callable[[str], int] | None = None,
     backfill_fn: Callable[[str], tuple[int, str | None]] | None = None,
+    probe_fn: Callable[[str | None, str | None], tuple[int, str | None]] | None = None,
     rerender_fn: Callable[[str], bool] | None = None,
     state: ControlState | None = None,
 ) -> tuple[SlackFuseOpsV2, ControlState]:
@@ -71,6 +73,7 @@ def _make_control_ops(  # noqa: PLR0913 — test-injection knobs for each contro
         control_block_channel=block_fn,
         control_unblock_channel=unblock_fn,
         control_backfill_channel=backfill_fn,
+        control_probe_sweep=probe_fn,
         control_rerender_channel=rerender_fn,
     )
     return ops, control_state
@@ -103,6 +106,7 @@ def test_control_state_render_empty_and_recorded() -> None:
         "last_block": None,
         "last_unblock": None,
         "last_backfill": None,
+        "last_probe_sweep": None,
     }
 
     state.record_workspace("queued")
@@ -111,6 +115,7 @@ def test_control_state_render_empty_and_recorded() -> None:
     state.record_block("CBLK", "blocked")
     state.record_unblock("CBLK", "unblocked")
     state.record_backfill("CBLK", "queued")
+    state.record_probe_sweep("queued", job_id="channel_newest_message", target="C123")
     payload = json.loads(state.render())
     assert payload["last_workspace_refresh"] == {"at": "2026-06-27T11:00:00Z", "result": "queued"}
     assert payload["last_channel_refresh"] == {
@@ -130,6 +135,11 @@ def test_control_state_render_empty_and_recorded() -> None:
         "channel": "CBLK",
     }
     assert payload["last_backfill"] == {"at": "2026-06-27T11:00:00Z", "result": "queued", "channel": "CBLK"}
+    assert payload["last_probe_sweep"] == {
+        "at": "2026-06-27T11:00:00Z",
+        "verb": "queued",
+        "requested": {"job_id": "channel_newest_message", "target": "C123"},
+    }
 
 
 # ============================================================================
@@ -146,6 +156,9 @@ def test_control_dir_listed_when_enabled(client_conn: Connection[TupleRow], utc_
         "refresh_channel",
         "blocked_channels",
         "backfill_channel",
+        "probe_sweep",
+        "probe_sweep_job",
+        "probe_sweep_target",
         "rerender_channel",
         "status",
     }
@@ -172,7 +185,15 @@ def test_control_file_modes(client_conn: Connection[TupleRow], utc_tz: ZoneInfo)
     assert status_attr is not None
     assert stat.S_IMODE(status_attr.st_mode) == 0o444
 
-    for name in ("refresh_channels", "refresh_channel", "backfill_channel", "rerender_channel"):
+    for name in (
+        "refresh_channels",
+        "refresh_channel",
+        "backfill_channel",
+        "probe_sweep",
+        "probe_sweep_job",
+        "probe_sweep_target",
+        "rerender_channel",
+    ):
         attr = ops.control_file_attr_for_test(f"/_control/{name}", 11)
         assert attr is not None
         assert stat.S_IMODE(attr.st_mode) == 0o644
@@ -195,6 +216,9 @@ def test_control_read_bytes(client_conn: Connection[TupleRow], utc_tz: ZoneInfo)
     assert ops.control_read_for_test("/_control/refresh_channels") == b""
     assert ops.control_read_for_test("/_control/refresh_channel") == b""
     assert ops.control_read_for_test("/_control/backfill_channel") == b""
+    assert ops.control_read_for_test("/_control/probe_sweep") == b""
+    assert ops.control_read_for_test("/_control/probe_sweep_job") == b""
+    assert ops.control_read_for_test("/_control/probe_sweep_target") == b""
     assert ops.control_read_for_test("/_control/rerender_channel") == b""
     assert json.loads(ops.control_read_for_test("/_control/blocked_channels") or b"{}") == {
         "error": "server_unavailable"
@@ -208,6 +232,7 @@ def test_control_read_bytes(client_conn: Connection[TupleRow], utc_tz: ZoneInfo)
         "last_block": None,
         "last_unblock": None,
         "last_backfill": None,
+        "last_probe_sweep": None,
     }
     # not a control file.
     assert ops.control_read_for_test("/channels/general/channel.md") is None
@@ -226,6 +251,7 @@ async def test_cat_status_via_read_callback(client_conn: Connection[TupleRow], u
         "last_block": None,
         "last_unblock": None,
         "last_backfill": None,
+        "last_probe_sweep": None,
     }
 
 
@@ -344,6 +370,117 @@ async def test_write_backfill_channel_records_blocked_outcome(
     status = json.loads(ops.control_read_for_test("/_control/status") or b"{}")
     assert status["last_backfill"]["result"] == "blocked"
     assert status["last_backfill"]["channel"] == "C0BLOCK"
+
+
+@pytest.mark.trio
+async def test_write_probe_sweep_fires_workspace(client_conn: Connection[TupleRow], utc_tz: ZoneInfo) -> None:
+    seen: list[tuple[str | None, str | None]] = []
+
+    ops, _ = _make_control_ops(
+        client_conn,
+        utc_tz,
+        probe_fn=lambda job_id, target: seen.append((job_id, target)) or (202, "probe sweep queued"),
+    )
+    inode = ops.inodes.get_or_create("/_control/probe_sweep")
+    fi = await ops.open(inode, os.O_WRONLY, pyfuse3.RequestContext())
+    await ops.write(fi.fh, 0, b"now\n")
+    await ops.release(fi.fh)
+
+    assert seen == [(None, None)]
+    status = json.loads(ops.control_read_for_test("/_control/status") or b"{}")
+    assert status["last_probe_sweep"] == {
+        **status["last_probe_sweep"],
+        "verb": "queued",
+        "requested": None,
+    }
+
+
+@pytest.mark.trio
+async def test_write_probe_sweep_job_fires_job(client_conn: Connection[TupleRow], utc_tz: ZoneInfo) -> None:
+    seen: list[tuple[str | None, str | None]] = []
+
+    ops, _ = _make_control_ops(
+        client_conn,
+        utc_tz,
+        probe_fn=lambda job_id, target: seen.append((job_id, target)) or (202, "probe sweep queued"),
+    )
+    inode = ops.inodes.get_or_create("/_control/probe_sweep_job")
+    fi = await ops.open(inode, os.O_WRONLY, pyfuse3.RequestContext())
+    await ops.write(fi.fh, 0, b"channel_newest_message\n")
+    await ops.release(fi.fh)
+
+    assert seen == [("channel_newest_message", None)]
+    status = json.loads(ops.control_read_for_test("/_control/status") or b"{}")
+    assert status["last_probe_sweep"]["verb"] == "queued"
+    assert status["last_probe_sweep"]["requested"] == {
+        "job_id": "channel_newest_message",
+        "target": None,
+    }
+
+
+@pytest.mark.trio
+async def test_write_probe_sweep_target_fires_job_target(
+    client_conn: Connection[TupleRow], utc_tz: ZoneInfo
+) -> None:
+    seen: list[tuple[str | None, str | None]] = []
+
+    ops, _ = _make_control_ops(
+        client_conn,
+        utc_tz,
+        probe_fn=lambda job_id, target: seen.append((job_id, target)) or (202, "probe sweep queued"),
+    )
+    inode = ops.inodes.get_or_create("/_control/probe_sweep_target")
+    fi = await ops.open(inode, os.O_WRONLY, pyfuse3.RequestContext())
+    await ops.write(fi.fh, 0, b"channel_newest_message\tC0ALLT6Q3SQ\n")
+    await ops.release(fi.fh)
+
+    assert seen == [("channel_newest_message", "C0ALLT6Q3SQ")]
+    status = json.loads(ops.control_read_for_test("/_control/status") or b"{}")
+    assert status["last_probe_sweep"]["verb"] == "queued"
+    assert status["last_probe_sweep"]["requested"] == {
+        "job_id": "channel_newest_message",
+        "target": "C0ALLT6Q3SQ",
+    }
+
+
+@pytest.mark.trio
+async def test_write_probe_sweep_target_malformed_records_400_without_post(
+    client_conn: Connection[TupleRow], utc_tz: ZoneInfo
+) -> None:
+    seen: list[tuple[str | None, str | None]] = []
+    ops, _ = _make_control_ops(
+        client_conn,
+        utc_tz,
+        probe_fn=lambda job_id, target: seen.append((job_id, target)) or (202, "probe sweep queued"),
+    )
+    inode = ops.inodes.get_or_create("/_control/probe_sweep_target")
+    fi = await ops.open(inode, os.O_WRONLY, pyfuse3.RequestContext())
+    await ops.write(fi.fh, 0, b"no_separator\n")
+    await ops.release(fi.fh)
+
+    assert seen == []
+    status = json.loads(ops.control_read_for_test("/_control/status") or b"{}")
+    assert status["last_probe_sweep"]["verb"] == "bad_request"
+    assert status["last_probe_sweep"]["requested"] is None
+
+
+@pytest.mark.trio
+async def test_write_probe_sweep_unknown_job_records_unknown_job(
+    client_conn: Connection[TupleRow], utc_tz: ZoneInfo
+) -> None:
+    ops, _ = _make_control_ops(
+        client_conn,
+        utc_tz,
+        probe_fn=lambda _job_id, _target: (400, "unknown_job"),
+    )
+    inode = ops.inodes.get_or_create("/_control/probe_sweep_job")
+    fi = await ops.open(inode, os.O_WRONLY, pyfuse3.RequestContext())
+    await ops.write(fi.fh, 0, b"unknown\n")
+    await ops.release(fi.fh)
+
+    status = json.loads(ops.control_read_for_test("/_control/status") or b"{}")
+    assert status["last_probe_sweep"]["verb"] == "unknown_job"
+    assert status["last_probe_sweep"]["requested"] == {"job_id": "unknown", "target": None}
 
 
 @pytest.mark.trio
@@ -663,6 +800,40 @@ def test_post_refresh_channel_path_and_transport_error() -> None:
 
     bad_client = httpx.Client(transport=httpx.MockTransport(boom))
     assert post_refresh_channel(bad_client, "http://srv", "C123") == 0
+
+
+def test_post_probe_sweep_paths_and_transport_error() -> None:
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(202, json={"status": "probe sweep queued"})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    assert post_probe_sweep(client, "http://srv", shared_secret="sek") == (202, "probe sweep queued")
+    assert post_probe_sweep(client, "http://srv", job_id="channel_newest_message", shared_secret="sek") == (
+        202,
+        "probe sweep queued",
+    )
+    assert post_probe_sweep(
+        client,
+        "http://srv",
+        job_id="channel_newest_message",
+        target="C123",
+        shared_secret="sek",
+    ) == (202, "probe sweep queued")
+    assert [request.url.path for request in captured] == [
+        "/probe-sweep",
+        "/probe-sweep/channel_newest_message",
+        "/probe-sweep/channel_newest_message/C123",
+    ]
+    assert all(request.headers["authorization"] == "Bearer sek" for request in captured)
+
+    def boom(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("unreachable", request=request)
+
+    bad_client = httpx.Client(transport=httpx.MockTransport(boom))
+    assert post_probe_sweep(bad_client, "http://srv", job_id="channel_newest_message") == (0, None)
 
 
 def test_block_http_helpers_paths_and_payloads() -> None:

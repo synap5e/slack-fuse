@@ -24,6 +24,7 @@ from slack_fuse_server.http.handlers import (
     GapsDeps,
     LivezDeps,
     OriginalsDeps,
+    ProbeDeps,
     RefreshDeps,
     ResolvePermalinkDeps,
     SnapshotDeps,
@@ -36,6 +37,7 @@ from slack_fuse_server.http.handlers import (
     handle_metrics,
     handle_originals,
     handle_permalink,
+    handle_probe_sweep,
     handle_refresh_channel,
     handle_refresh_channels,
     handle_resolve,
@@ -107,6 +109,7 @@ def route_request(  # noqa: C901, PLR0913 - endpoint routing dispatch hub.
     refresh_deps: RefreshDeps | None = None,
     blocked_channels_deps: BlockedChannelsDeps | None = None,
     backfill_deps: BackfillDeps | None = None,
+    probe_deps: ProbeDeps | None = None,
     livez_deps: LivezDeps | None = None,
 ) -> HttpResponse:
     """Pure routing table for supported HTTP endpoints."""
@@ -184,6 +187,15 @@ def route_request(  # noqa: C901, PLR0913 - endpoint routing dispatch hub.
         body = json.dumps({"status": message}, separators=(",", ":")).encode("utf-8")
         return HttpResponse(status_code=status_code, body=body)
 
+    if request.path == "/probe-sweep":
+        if request.method != "POST":
+            return _error_response(status_code=405, code="method_not_allowed")
+        if probe_deps is None:
+            return _error_response(status_code=503, code="service_unavailable")
+        status_code, message = handle_probe_sweep(request.headers, deps=probe_deps)
+        body = json.dumps({"status": message}, separators=(",", ":")).encode("utf-8")
+        return HttpResponse(status_code=status_code, body=body)
+
     if request.path == "/blocked-channels":
         if request.method == "GET":
             if blocked_channels_deps is None:
@@ -233,6 +245,22 @@ def route_request(  # noqa: C901, PLR0913 - endpoint routing dispatch hub.
         body = json.dumps({"status": message}, separators=(",", ":")).encode("utf-8")
         return HttpResponse(status_code=status_code, body=body)
 
+    probe_sweep_request = _probe_sweep_from_path(request.path)
+    if probe_sweep_request is not None:
+        if request.method != "POST":
+            return _error_response(status_code=405, code="method_not_allowed")
+        if probe_deps is None:
+            return _error_response(status_code=503, code="service_unavailable")
+        job_id, target = probe_sweep_request
+        status_code, message = handle_probe_sweep(
+            request.headers,
+            deps=probe_deps,
+            job_id=job_id,
+            target=target,
+        )
+        body = json.dumps({"status": message}, separators=(",", ":")).encode("utf-8")
+        return HttpResponse(status_code=status_code, body=body)
+
     gaps_channel = _gaps_channel_from_path(request.path)
     if gaps_channel is not None:
         if request.method != "GET":
@@ -256,6 +284,7 @@ async def serve_http(  # noqa: PLR0913 - HTTP wiring needs explicit deps.
     refresh_deps: RefreshDeps | None = None,
     blocked_channels_deps: BlockedChannelsDeps | None = None,
     backfill_deps: BackfillDeps | None = None,
+    probe_deps: ProbeDeps | None = None,
     livez_deps: LivezDeps | None = None,
 ) -> None:
     """Serve HTTP endpoints on the given host/port."""
@@ -269,6 +298,7 @@ async def serve_http(  # noqa: PLR0913 - HTTP wiring needs explicit deps.
         refresh_deps=refresh_deps,
         blocked_channels_deps=blocked_channels_deps,
         backfill_deps=backfill_deps,
+        probe_deps=probe_deps,
         livez_deps=livez_deps,
     )
     await trio.serve_tcp(handler, port=port, host=host)
@@ -284,6 +314,7 @@ async def serve_http_on_listeners(  # noqa: PLR0913, PLR0917 - HTTP wiring needs
     refresh_deps: RefreshDeps | None = None,
     blocked_channels_deps: BlockedChannelsDeps | None = None,
     backfill_deps: BackfillDeps | None = None,
+    probe_deps: ProbeDeps | None = None,
     livez_deps: LivezDeps | None = None,
 ) -> None:
     """Serve on already-open listeners (useful for tests and shared-port setups)."""
@@ -297,6 +328,7 @@ async def serve_http_on_listeners(  # noqa: PLR0913, PLR0917 - HTTP wiring needs
         refresh_deps=refresh_deps,
         blocked_channels_deps=blocked_channels_deps,
         backfill_deps=backfill_deps,
+        probe_deps=probe_deps,
         livez_deps=livez_deps,
     )
     await trio.serve_listeners(handler, listeners)
@@ -313,6 +345,7 @@ async def serve_http_from_listen_addr(  # noqa: PLR0913 - HTTP wiring needs expl
     refresh_deps: RefreshDeps | None = None,
     blocked_channels_deps: BlockedChannelsDeps | None = None,
     backfill_deps: BackfillDeps | None = None,
+    probe_deps: ProbeDeps | None = None,
     livez_deps: LivezDeps | None = None,
 ) -> None:
     """Serve HTTP endpoints using an RFC-style `listen_addr` string."""
@@ -328,6 +361,7 @@ async def serve_http_from_listen_addr(  # noqa: PLR0913 - HTTP wiring needs expl
         refresh_deps=refresh_deps,
         blocked_channels_deps=blocked_channels_deps,
         backfill_deps=backfill_deps,
+        probe_deps=probe_deps,
         livez_deps=livez_deps,
     )
 
@@ -343,6 +377,7 @@ async def serve_http_connection(  # noqa: PLR0913 - HTTP wiring needs explicit d
     refresh_deps: RefreshDeps | None = None,
     blocked_channels_deps: BlockedChannelsDeps | None = None,
     backfill_deps: BackfillDeps | None = None,
+    probe_deps: ProbeDeps | None = None,
     livez_deps: LivezDeps | None = None,
 ) -> None:
     """Serve a single already-accepted connection as HTTP.
@@ -361,6 +396,7 @@ async def serve_http_connection(  # noqa: PLR0913 - HTTP wiring needs explicit d
         refresh_deps=refresh_deps,
         blocked_channels_deps=blocked_channels_deps,
         backfill_deps=backfill_deps,
+        probe_deps=probe_deps,
         livez_deps=livez_deps,
     )
 
@@ -376,6 +412,7 @@ async def _serve_connection(  # noqa: PLR0913 - HTTP wiring needs explicit deps.
     refresh_deps: RefreshDeps | None = None,
     blocked_channels_deps: BlockedChannelsDeps | None = None,
     backfill_deps: BackfillDeps | None = None,
+    probe_deps: ProbeDeps | None = None,
     livez_deps: LivezDeps | None = None,
 ) -> None:
     conn = h11.Connection(h11.SERVER)
@@ -393,6 +430,7 @@ async def _serve_connection(  # noqa: PLR0913 - HTTP wiring needs explicit deps.
             refresh_deps=refresh_deps,
             blocked_channels_deps=blocked_channels_deps,
             backfill_deps=backfill_deps,
+            probe_deps=probe_deps,
             livez_deps=livez_deps,
         )
         await _send_response(conn, stream, response)
@@ -652,6 +690,27 @@ def _backfill_channel_from_path(path: str) -> str | None:
     if not encoded:
         return None
     return unquote(encoded) or None
+
+
+def _probe_sweep_from_path(path: str) -> tuple[str, str | None] | None:
+    parts = path.split("/")
+    if len(parts) not in (3, 4) or parts[1] != "probe-sweep":
+        return None
+    encoded_job = parts[2]
+    if not encoded_job:
+        return None
+    job_id = unquote(encoded_job)
+    if not job_id:
+        return None
+    if len(parts) == 3:
+        return job_id, None
+    encoded_target = parts[3]
+    if not encoded_target:
+        return None
+    target = unquote(encoded_target)
+    if not target:
+        return None
+    return job_id, target
 
 
 def _handle_channel_gaps(channel_id: str, *, deps: GapsDeps) -> HttpResponse:

@@ -23,10 +23,12 @@ from slack_fuse_server.slurper.probes import (
     PROBE_SWEEP_COMPLETED,
     USERS_LIST_SAMPLED,
     ProbeTarget,
+    ProbeTrigger,
     _sample_channel_inventory,
     _sample_newest_history,
     _sample_older_than_oldest_history,
     _sample_workspace_users,
+    build_probe_registry,
     probe_sweep,
 )
 from tests.conftest import RecordingSupervisor, make_test_limiters, make_test_writer
@@ -84,6 +86,14 @@ def _health_events(conn: psycopg.Connection[TupleRow]) -> list[tuple[str, JsonOb
 
 def _health_events_of(conn: psycopg.Connection[TupleRow], kind: str) -> list[JsonObject]:
     return [payload for event_kind, payload in _health_events(conn) if event_kind == kind]
+
+
+async def _wait_for_health_event_count(conn: psycopg.Connection[TupleRow], kind: str, count: int) -> None:
+    for _ in range(100):
+        if len(_health_events_of(conn, kind)) >= count:
+            return
+        await trio.sleep(0.01)
+    raise AssertionError(f"timed out waiting for {count} {kind} event(s)")
 
 
 def test_older_than_oldest_writes_raw_history_sample(
@@ -235,6 +245,8 @@ def test_probe_sweep_once_writes_all_samples_and_then_skips_when_not_due(
     assert second_counts[JOB_CHANNEL_NEWEST_MESSAGE] == {"succeeded": 0, "failed": 0, "skipped": 2}
     assert second_counts[JOB_CHANNEL_INVENTORY] == {"succeeded": 0, "failed": 0, "skipped": 1}
     assert second_counts[JOB_WORKSPACE_USER_COUNT] == {"succeeded": 0, "failed": 0, "skipped": 1}
+    assert first_heartbeat["triggered_by"] == "scheduled"
+    assert first_heartbeat["requested"] is None
 
     phases = [(item.task_name, item.phase) for item in supervisor.declarations]
     assert ("probe-sweep", JOB_CHANNEL_OLDER_THAN_OLDEST) in phases
@@ -244,3 +256,65 @@ def test_probe_sweep_once_writes_all_samples_and_then_skips_when_not_due(
     assert "op=slurper.probe.conversations_history" in caplog.text
     assert f"job_id={JOB_CHANNEL_NEWEST_MESSAGE}" in caplog.text
     assert f"event_kind={CONVERSATIONS_HISTORY_SAMPLED}" in caplog.text
+    assert "trigger=scheduled" in caplog.text
+
+
+def test_probe_trigger_rejects_when_buffer_full() -> None:
+    trigger = ProbeTrigger(max_buffer_size=1)
+    assert trigger.request(job_id=JOB_CHANNEL_NEWEST_MESSAGE) is True
+    assert trigger.request(job_id=JOB_CHANNEL_NEWEST_MESSAGE) is False
+
+
+def test_manual_probe_trigger_bypasses_due_and_emits_manual_heartbeat(
+    server_conn: psycopg.Connection[TupleRow],
+    fake_slack_http: httpx.Client,
+) -> None:
+    _seed_channel(server_conn, "C0001")
+    registry = tuple(
+        descriptor
+        for descriptor in build_probe_registry(_ProbeConfig())
+        if descriptor.job_id == JOB_CHANNEL_NEWEST_MESSAGE
+    )
+    assert len(registry) == 1
+
+    async def body() -> None:
+        writer = make_test_writer(server_conn)
+        client = _fake_client(fake_slack_http)
+        limiters = make_test_limiters()
+        await probe_sweep(
+            writer,
+            client,
+            limiters,
+            None,
+            _ProbeConfig(),
+            registry=registry,
+            run_once=True,
+        )
+
+        trigger = ProbeTrigger(max_buffer_size=1)
+        async with trio.open_nursery() as nursery:
+            nursery.start_soon(
+                trigger.consume,
+                writer,
+                client,
+                limiters,
+                None,
+                registry,
+                _ProbeConfig().probe_sweep_interval_s,
+            )
+            await trio.sleep(0.01)
+            assert trigger.request(job_id=JOB_CHANNEL_NEWEST_MESSAGE, target="C0001") is True
+            await _wait_for_health_event_count(server_conn, CONVERSATIONS_HISTORY_SAMPLED, 2)
+            await _wait_for_health_event_count(server_conn, PROBE_SWEEP_COMPLETED, 2)
+            nursery.cancel_scope.cancel()
+
+    trio.run(body)
+
+    samples = _health_events_of(server_conn, CONVERSATIONS_HISTORY_SAMPLED)
+    assert len(samples) == 2
+    completions = _health_events_of(server_conn, PROBE_SWEEP_COMPLETED)
+    assert completions[0]["triggered_by"] == "scheduled"
+    assert completions[1]["triggered_by"] == "manual"
+    assert completions[1]["requested"] == {"job_id": JOB_CHANNEL_NEWEST_MESSAGE, "target": "C0001"}
+    counts = cast(JsonObject, completions[1]["probes"])
+    assert counts[JOB_CHANNEL_NEWEST_MESSAGE] == {"succeeded": 1, "failed": 0, "skipped": 0}

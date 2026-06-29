@@ -29,6 +29,7 @@ from slack_fuse_server.http.permalink import resolve_path_to_permalink_url
 from slack_fuse_server.http.resolve import resolve_permalink_url
 from slack_fuse_server.http.snapshot import SnapshotPayload, fetch_snapshot_payload
 from slack_fuse_server.slurper.api import SlackClient
+from slack_fuse_server.slurper.probes import PROBE_REGISTRY
 from slack_fuse_server.slurper.supervisor import TaskPhase, TaskSupervisor
 
 log = logging.getLogger(__name__)
@@ -123,6 +124,22 @@ class BackfillTrigger(Protocol):
     def request_channel(self, channel_id: str) -> bool:
         """Queue a manual backfill. False means one is already in progress."""
         ...
+
+
+class ProbeTrigger(Protocol):
+    """``POST /probe-sweep[/<job_id>[/<target>]]`` manual probe trigger."""
+
+    def request(self, *, job_id: str | None = None, target: str | None = None) -> bool:
+        """Queue a manual probe sweep. False means the bounded queue is full."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class ProbeDeps:
+    """Dependencies for ``POST /probe-sweep``."""
+
+    shared_secret: str | None
+    trigger: ProbeTrigger
 
 
 @dataclass(frozen=True, slots=True)
@@ -346,6 +363,45 @@ def handle_backfill_channel(
     if deps.trigger.request_channel(channel_id):
         return 202, f"backfill queued for {channel_id}"
     return 409, "backfill already in progress"
+
+
+def handle_probe_sweep(
+    headers: Sequence[tuple[bytes, bytes]],
+    *,
+    deps: ProbeDeps,
+    job_id: str | None = None,
+    target: str | None = None,
+) -> tuple[int, str]:
+    """``POST /probe-sweep[/<job_id>[/<target>]]`` — queue a manual probe sweep."""
+    if not is_http_authorized(headers, deps.shared_secret):
+        return 401, "unauthorized"
+
+    error = _validate_probe_request(job_id=job_id, target=target)
+    if error is not None:
+        return 400, error
+
+    if deps.trigger.request(job_id=job_id, target=target):
+        if job_id is None:
+            return 202, "probe sweep queued"
+        if target is None:
+            return 202, f"probe sweep queued for {job_id}"
+        return 202, f"probe sweep queued for {job_id} {target}"
+    return 409, "probe sweep already busy"
+
+
+def _validate_probe_request(*, job_id: str | None, target: str | None) -> str | None:
+    if job_id is None:
+        if target is None:
+            return None
+        return "bad_target"
+    descriptor = next((probe for probe in PROBE_REGISTRY if probe.job_id == job_id), None)
+    if descriptor is None:
+        return "unknown_job"
+    if target is not None and (not target.strip() or any(char.isspace() for char in target)):
+        return "bad_target"
+    if target is not None and not descriptor.is_per_target:
+        return "bad_target"
+    return None
 
 
 # === auth helper (shared with WS) ===

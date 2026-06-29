@@ -8,6 +8,12 @@ The probe sweep writes raw Slack API captures to `events` on the
 - `users_list_sampled`
 - `probe_sweep_completed`
 
+`probe_sweep_completed` includes `triggered_by` (`scheduled` or `manual`) and
+`requested` (null for scheduled/all-jobs sweeps, otherwise the requested
+`job_id`/`target`). The liveness query below intentionally counts both
+scheduled and manual completions: a manual smoke sweep proves the task can still
+run, so it is valid heartbeat evidence.
+
 The list captures concatenate paginated Slack responses into one logical
 payload. Expected size is modest: roughly hundreds of KB for a workspace with
 around 1000 channels or users. If this becomes slow, add targeted indexes after

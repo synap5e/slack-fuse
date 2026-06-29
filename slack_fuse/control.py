@@ -25,7 +25,9 @@ from datetime import UTC, datetime
 #: or timeout) and reads the same as a real 503.
 _STATUS_VERBS: dict[int, str] = {
     0: "server_unavailable",
+    200: "sweep_completed",
     202: "queued",
+    400: "bad_request",
     401: "unauthorised",
     403: "unauthorised",
     409: "busy",
@@ -57,6 +59,24 @@ class RefreshOutcome:
         return payload
 
 
+@dataclass(frozen=True, slots=True)
+class ProbeSweepOutcome:
+    """One recorded manual probe-sweep trigger result."""
+
+    at: str
+    verb: str
+    job_id: str | None = None
+    target: str | None = None
+
+    def to_json(self) -> dict[str, object]:
+        requested: dict[str, str | None] | None
+        if self.job_id is None and self.target is None:
+            requested = None
+        else:
+            requested = {"job_id": self.job_id, "target": self.target}
+        return {"at": self.at, "verb": self.verb, "requested": requested}
+
+
 class ControlState:
     """Thread-safe holder for the last workspace / per-channel refresh outcome."""
 
@@ -69,6 +89,7 @@ class ControlState:
         self._block: RefreshOutcome | None = None
         self._unblock: RefreshOutcome | None = None
         self._backfill: RefreshOutcome | None = None
+        self._probe_sweep: ProbeSweepOutcome | None = None
 
     def _stamp(self) -> str:
         return self._now_fn().astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -97,6 +118,15 @@ class ControlState:
         with self._lock:
             self._backfill = RefreshOutcome(at=self._stamp(), result=result, channel=channel)
 
+    def record_probe_sweep(self, verb: str, *, job_id: str | None = None, target: str | None = None) -> None:
+        with self._lock:
+            self._probe_sweep = ProbeSweepOutcome(
+                at=self._stamp(),
+                verb=verb,
+                job_id=job_id,
+                target=target,
+            )
+
     def render(self) -> bytes:
         """Serialize the current state to the ``status`` file body."""
         with self._lock:
@@ -106,15 +136,17 @@ class ControlState:
             block = self._block
             unblock = self._unblock
             backfill = self._backfill
-        payload: dict[str, dict[str, str] | None] = {
+            probe_sweep = self._probe_sweep
+        payload: dict[str, object] = {
             "last_workspace_refresh": workspace.to_json() if workspace is not None else None,
             "last_channel_refresh": channel.to_json() if channel is not None else None,
             "last_rerender": rerender.to_json() if rerender is not None else None,
             "last_block": block.to_json() if block is not None else None,
             "last_unblock": unblock.to_json() if unblock is not None else None,
             "last_backfill": backfill.to_json() if backfill is not None else None,
+            "last_probe_sweep": probe_sweep.to_json() if probe_sweep is not None else None,
         }
         return (json.dumps(payload, indent=2) + "\n").encode()
 
 
-__all__ = ["ControlState", "RefreshOutcome", "result_for_status"]
+__all__ = ["ControlState", "ProbeSweepOutcome", "RefreshOutcome", "result_for_status"]

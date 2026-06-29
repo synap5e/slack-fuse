@@ -20,7 +20,7 @@ from slack_fuse_server.http.dto import (
     StreamMetrics,
     SubscribersMetrics,
 )
-from slack_fuse_server.http.handlers import LivezDeps
+from slack_fuse_server.http.handlers import LivezDeps, ProbeDeps
 from slack_fuse_server.http.metrics import MetricsSource
 from slack_fuse_server.http.server import (
     HttpRequest,
@@ -28,6 +28,7 @@ from slack_fuse_server.http.server import (
     route_request,
     serve_http_on_listeners,
 )
+from slack_fuse_server.slurper.probes import JOB_CHANNEL_INVENTORY, JOB_CHANNEL_NEWEST_MESSAGE
 from slack_fuse_server.slurper.supervisor import TaskSupervisor
 
 
@@ -37,6 +38,18 @@ class StaticMetricsSource:
 
     def snapshot(self) -> MetricsResponse:
         return self.payload
+
+
+@dataclass(slots=True)
+class _RecordingProbeTrigger:
+    accepted: bool = True
+    calls: list[tuple[str | None, str | None]] | None = None
+
+    def request(self, *, job_id: str | None = None, target: str | None = None) -> bool:
+        if self.calls is None:
+            self.calls = []
+        self.calls.append((job_id, target))
+        return self.accepted
 
 
 def _sample_metrics() -> MetricsResponse:
@@ -205,6 +218,92 @@ def test_route_request_method_not_allowed() -> None:
     )
     assert response.status_code == 405
     assert response.body == b'{"error":"method_not_allowed"}'
+
+
+def test_route_request_probe_sweep_unwired_is_503() -> None:
+    response = route_request(
+        HttpRequest(method="POST", target="/probe-sweep"),
+        metrics_source=StaticMetricsSource(_sample_metrics()),
+    )
+
+    assert response.status_code == 503
+    assert response.body == b'{"error":"service_unavailable"}'
+
+
+def test_route_request_probe_sweep_all_jobs_queues() -> None:
+    trigger = _RecordingProbeTrigger()
+    response = route_request(
+        HttpRequest(method="POST", target="/probe-sweep"),
+        metrics_source=StaticMetricsSource(_sample_metrics()),
+        probe_deps=ProbeDeps(shared_secret=None, trigger=trigger),
+    )
+
+    assert response.status_code == 202
+    assert json.loads(response.body) == {"status": "probe sweep queued"}
+    assert trigger.calls == [(None, None)]
+
+
+def test_route_request_probe_sweep_unknown_job_is_400() -> None:
+    trigger = _RecordingProbeTrigger()
+    response = route_request(
+        HttpRequest(method="POST", target="/probe-sweep/not_a_job"),
+        metrics_source=StaticMetricsSource(_sample_metrics()),
+        probe_deps=ProbeDeps(shared_secret=None, trigger=trigger),
+    )
+
+    assert response.status_code == 400
+    assert json.loads(response.body) == {"status": "unknown_job"}
+    assert trigger.calls is None
+
+
+def test_route_request_probe_sweep_workspace_job_rejects_target() -> None:
+    trigger = _RecordingProbeTrigger()
+    response = route_request(
+        HttpRequest(method="POST", target=f"/probe-sweep/{JOB_CHANNEL_INVENTORY}/C123"),
+        metrics_source=StaticMetricsSource(_sample_metrics()),
+        probe_deps=ProbeDeps(shared_secret=None, trigger=trigger),
+    )
+
+    assert response.status_code == 400
+    assert json.loads(response.body) == {"status": "bad_target"}
+    assert trigger.calls is None
+
+
+def test_route_request_probe_sweep_target_queues() -> None:
+    trigger = _RecordingProbeTrigger()
+    response = route_request(
+        HttpRequest(method="POST", target=f"/probe-sweep/{JOB_CHANNEL_NEWEST_MESSAGE}/C123"),
+        metrics_source=StaticMetricsSource(_sample_metrics()),
+        probe_deps=ProbeDeps(shared_secret=None, trigger=trigger),
+    )
+
+    assert response.status_code == 202
+    assert trigger.calls == [(JOB_CHANNEL_NEWEST_MESSAGE, "C123")]
+
+
+def test_route_request_probe_sweep_target_rejects_whitespace() -> None:
+    trigger = _RecordingProbeTrigger()
+    response = route_request(
+        HttpRequest(method="POST", target=f"/probe-sweep/{JOB_CHANNEL_NEWEST_MESSAGE}/C%20123"),
+        metrics_source=StaticMetricsSource(_sample_metrics()),
+        probe_deps=ProbeDeps(shared_secret=None, trigger=trigger),
+    )
+
+    assert response.status_code == 400
+    assert json.loads(response.body) == {"status": "bad_target"}
+    assert trigger.calls is None
+
+
+def test_route_request_probe_sweep_busy_is_409() -> None:
+    trigger = _RecordingProbeTrigger(accepted=False)
+    response = route_request(
+        HttpRequest(method="POST", target=f"/probe-sweep/{JOB_CHANNEL_NEWEST_MESSAGE}"),
+        metrics_source=StaticMetricsSource(_sample_metrics()),
+        probe_deps=ProbeDeps(shared_secret=None, trigger=trigger),
+    )
+
+    assert response.status_code == 409
+    assert json.loads(response.body) == {"status": "probe sweep already busy"}
 
 
 @pytest.mark.trio

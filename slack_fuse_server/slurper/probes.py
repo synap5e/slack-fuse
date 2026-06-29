@@ -23,7 +23,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import LiteralString, Protocol, cast
+from typing import Literal, LiteralString, Protocol, cast
 
 import httpx
 import trio
@@ -113,6 +113,74 @@ class ProbeDescriptor:
     op: str
     tier: int
     cadence_config_field: str
+    is_per_target: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ProbeSweepRequest:
+    """One manual probe-sweep request.
+
+    ``None`` means "all" for both fields. A non-``None`` target is valid only
+    for per-channel probe jobs.
+    """
+
+    job_id: str | None = None
+    target: str | None = None
+
+    def details(self) -> JsonObject:
+        return {"job_id": self.job_id, "target": self.target}
+
+
+class ProbeTrigger:
+    """Bounded trigger used by ``POST /probe-sweep`` to request manual runs."""
+
+    def __init__(self, *, max_buffer_size: int = 1) -> None:
+        self._send, self._recv = trio.open_memory_channel[ProbeSweepRequest](max_buffer_size=max_buffer_size)
+
+    def request(self, *, job_id: str | None = None, target: str | None = None) -> bool:
+        try:
+            self._send.send_nowait(ProbeSweepRequest(job_id=job_id, target=target))
+        except trio.WouldBlock:
+            return False
+        return True
+
+    async def __aexit__(self, *_args: object) -> None:
+        await self._send.aclose()
+        await self._recv.aclose()
+
+    async def consume(  # noqa: PLR0913, PLR0917 - mirrors refresh trigger consumer wiring.
+        self,
+        writer: OffsetWriter,
+        client: SlackClient,
+        limiters: SlurperLimiters,
+        supervisor: TaskSupervisor | None,
+        registry: Sequence[ProbeDescriptor],
+        interval_s: float,
+    ) -> None:
+        """Drain manual probe-sweep requests one at a time."""
+        active_registry = tuple(registry)
+        while True:
+            if supervisor is not None:
+                supervisor.declare("probe-sweep-trigger", "waiting_for_trigger", deadline_s=None)
+            try:
+                request = await self._recv.receive()
+            except trio.EndOfChannel:
+                return
+            try:
+                await _run_probe_cycle(
+                    writer,
+                    client,
+                    limiters,
+                    supervisor,
+                    active_registry,
+                    trigger="manual",
+                    requested=request,
+                    bypass_cadence=True,
+                    task_name="probe-sweep-trigger",
+                    deadline_s=interval_s * 0.5,
+                )
+            except Exception:
+                log.exception("probe-sweep: manual trigger failed for %s", request.details())
 
 
 def build_probe_registry(config: ProbeCadenceConfig) -> tuple[ProbeDescriptor, ...]:
@@ -123,12 +191,13 @@ def build_probe_registry(config: ProbeCadenceConfig) -> tuple[ProbeDescriptor, .
     )
 
 
-async def probe_sweep(  # noqa: PLR0913 - nursery task wiring passes explicit service dependencies.
+async def probe_sweep(  # noqa: PLR0913, PLR0917 - nursery task wiring passes explicit service dependencies.
     writer: OffsetWriter,
     client: SlackClient,
     limiters: SlurperLimiters,
     supervisor: TaskSupervisor | None,
     config: ProbeCadenceConfig,
+    trigger: ProbeTrigger | None = None,
     *,
     registry: Sequence[ProbeDescriptor] | None = None,
     run_once: bool = False,
@@ -137,48 +206,173 @@ async def probe_sweep(  # noqa: PLR0913 - nursery task wiring passes explicit se
     active_registry = tuple(registry) if registry is not None else build_probe_registry(config)
     sweep_interval_s = float(config.probe_sweep_interval_s)
 
-    while True:
-        started_at = _utc_iso()
-        counters: dict[str, dict[str, int]] = {
-            descriptor.job_id: {"succeeded": 0, "failed": 0, "skipped": 0} for descriptor in active_registry
-        }
-        for descriptor in active_registry:
-            if supervisor is None:
-                await _run_probe_descriptor(writer, client, limiters, descriptor, counters[descriptor.job_id])
-            else:
-                async with phase(supervisor, "probe-sweep", descriptor.job_id, deadline_s=None):
-                    await _run_probe_descriptor(writer, client, limiters, descriptor, counters[descriptor.job_id])
+    if run_once:
+        await _run_probe_cycle(
+            writer,
+            client,
+            limiters,
+            supervisor,
+            active_registry,
+            trigger="scheduled",
+            requested=None,
+            bypass_cadence=False,
+            task_name="probe-sweep",
+            deadline_s=None,
+        )
+        return
 
-        await _emit_probe_sweep_completed(writer, started_at=started_at, counters=counters)
-        if run_once:
-            return
+    if trigger is not None:
+        async with trio.open_nursery() as nursery:
+            nursery.start_soon(
+                _run_probe_periodic_loop,
+                writer,
+                client,
+                limiters,
+                supervisor,
+                active_registry,
+                sweep_interval_s,
+            )
+            nursery.start_soon(
+                trigger.consume,
+                writer,
+                client,
+                limiters,
+                supervisor,
+                active_registry,
+                sweep_interval_s,
+            )
+        return
+
+    await _run_probe_periodic_loop(
+        writer,
+        client,
+        limiters,
+        supervisor,
+        active_registry,
+        sweep_interval_s,
+    )
+
+
+async def _run_probe_periodic_loop(  # noqa: PLR0913, PLR0917 - task wiring keeps dependencies explicit.
+    writer: OffsetWriter,
+    client: SlackClient,
+    limiters: SlurperLimiters,
+    supervisor: TaskSupervisor | None,
+    registry: Sequence[ProbeDescriptor],
+    sweep_interval_s: float,
+) -> None:
+    while True:
+        await _run_probe_cycle(
+            writer,
+            client,
+            limiters,
+            supervisor,
+            registry,
+            trigger="scheduled",
+            requested=None,
+            bypass_cadence=False,
+            task_name="probe-sweep",
+            deadline_s=None,
+        )
         if supervisor is not None:
             supervisor.declare("probe-sweep", "sleeping_until", deadline_s=None)
         await trio.sleep(sweep_interval_s)
 
 
-async def _run_probe_descriptor(
+async def _run_probe_cycle(  # noqa: PLR0913 - common scheduled/manual runner.
+    writer: OffsetWriter,
+    client: SlackClient,
+    limiters: SlurperLimiters,
+    supervisor: TaskSupervisor | None,
+    registry: Sequence[ProbeDescriptor],
+    *,
+    trigger: Literal["scheduled", "manual"],
+    requested: ProbeSweepRequest | None,
+    bypass_cadence: bool,
+    task_name: str,
+    deadline_s: float | None,
+) -> None:
+    started_at = _utc_iso()
+    active_registry = tuple(registry)
+    counters: dict[str, dict[str, int]] = {
+        descriptor.job_id: {"succeeded": 0, "failed": 0, "skipped": 0} for descriptor in active_registry
+    }
+    selected = _select_probe_descriptors(active_registry, requested)
+    for descriptor in selected:
+        target = None if requested is None else requested.target
+        if supervisor is None:
+            await _run_probe_descriptor(
+                writer,
+                client,
+                limiters,
+                descriptor,
+                counters[descriptor.job_id],
+                requested_target=target,
+                bypass_cadence=bypass_cadence,
+                trigger=trigger,
+            )
+        else:
+            details: JsonObject = {} if target is None else {"target": target}
+            async with phase(supervisor, task_name, descriptor.job_id, details=details, deadline_s=deadline_s):
+                await _run_probe_descriptor(
+                    writer,
+                    client,
+                    limiters,
+                    descriptor,
+                    counters[descriptor.job_id],
+                    requested_target=target,
+                    bypass_cadence=bypass_cadence,
+                    trigger=trigger,
+                )
+
+    await _emit_probe_sweep_completed(
+        writer,
+        started_at=started_at,
+        counters=counters,
+        triggered_by=trigger,
+        requested=requested,
+    )
+
+
+def _select_probe_descriptors(
+    registry: Sequence[ProbeDescriptor],
+    requested: ProbeSweepRequest | None,
+) -> tuple[ProbeDescriptor, ...]:
+    if requested is None or requested.job_id is None:
+        return tuple(registry)
+    return tuple(descriptor for descriptor in registry if descriptor.job_id == requested.job_id)
+
+
+async def _run_probe_descriptor(  # noqa: PLR0913 - common scheduled/manual runner keeps knobs explicit.
     writer: OffsetWriter,
     client: SlackClient,
     limiters: SlurperLimiters,
     descriptor: ProbeDescriptor,
     counts: dict[str, int],
+    *,
+    requested_target: str | None = None,
+    bypass_cadence: bool = False,
+    trigger: Literal["scheduled", "manual"] = "scheduled",
 ) -> None:
-    try:
-        targets = await descriptor.targets(writer, limiters)
-    except Exception:
-        log.exception("probe job %s failed while listing targets", descriptor.job_id)
-        counts["failed"] += 1
-        return
+    if requested_target is not None:
+        targets: Sequence[ProbeTarget] = (ProbeTarget(requested_target, "channel_id"),)
+    else:
+        try:
+            targets = await descriptor.targets(writer, limiters)
+        except Exception:
+            log.exception("probe job %s failed while listing targets", descriptor.job_id)
+            counts["failed"] += 1
+            return
 
     for target in targets:
-        if not await is_due(writer, limiters, descriptor, target):
+        if not bypass_cadence and not await is_due(writer, limiters, descriptor, target):
             counts["skipped"] += 1
             continue
         extra = target.span_extra()
         extra["job_id"] = descriptor.job_id
         extra["event_kind"] = descriptor.event_kind
         extra["tier"] = descriptor.tier
+        extra["trigger"] = trigger
         async with span(op=descriptor.op, task="probe-sweep", extra=extra) as probe_span:
             try:
                 wrote = await descriptor.run(writer, client, limiters, target, probe_span)
@@ -549,10 +743,14 @@ async def _emit_probe_sweep_completed(
     *,
     started_at: str,
     counters: dict[str, dict[str, int]],
+    triggered_by: Literal["scheduled", "manual"] = "scheduled",
+    requested: ProbeSweepRequest | None = None,
 ) -> None:
     payload: JsonObject = {
         "started_at": started_at,
         "ended_at": _utc_iso(),
+        "triggered_by": triggered_by,
+        "requested": None if requested is None else requested.details(),
         "probes": cast(JsonObject, {job_id: dict(counts) for job_id, counts in counters.items()}),
     }
     await _write_probe_event(writer, PROBE_SWEEP_COMPLETED, payload, None)
@@ -581,6 +779,7 @@ PROBE_REGISTRY: tuple[ProbeDescriptor, ...] = (
         op="slurper.probe.conversations_history",
         tier=3,
         cadence_config_field="probe_channel_older_than_oldest_cadence_s",
+        is_per_target=True,
     ),
     ProbeDescriptor(
         job_id=JOB_CHANNEL_NEWEST_MESSAGE,
@@ -592,6 +791,7 @@ PROBE_REGISTRY: tuple[ProbeDescriptor, ...] = (
         op="slurper.probe.conversations_history",
         tier=3,
         cadence_config_field="probe_channel_newest_message_cadence_s",
+        is_per_target=True,
     ),
     ProbeDescriptor(
         job_id=JOB_CHANNEL_INVENTORY,
@@ -603,6 +803,7 @@ PROBE_REGISTRY: tuple[ProbeDescriptor, ...] = (
         op="slurper.probe.conversations_list",
         tier=2,
         cadence_config_field="probe_channel_inventory_cadence_s",
+        is_per_target=False,
     ),
     ProbeDescriptor(
         job_id=JOB_WORKSPACE_USER_COUNT,
@@ -614,6 +815,7 @@ PROBE_REGISTRY: tuple[ProbeDescriptor, ...] = (
         op="slurper.probe.users_list",
         tier=2,
         cadence_config_field="probe_workspace_user_count_cadence_s",
+        is_per_target=False,
     ),
 )
 

@@ -57,6 +57,7 @@ from slack_fuse_server.http.handlers import (
     GapsDeps,
     LivezDeps,
     OriginalsDeps,
+    ProbeDeps,
     RefreshDeps,
     ResolvePermalinkDeps,
     SnapshotDeps,
@@ -74,7 +75,7 @@ from slack_fuse_server.slurper.channels import ensure_channel_added, populate_ch
 from slack_fuse_server.slurper.health import HealthEmitter, HealthKind
 from slack_fuse_server.slurper.limiters import SlurperLimiters
 from slack_fuse_server.slurper.offsets import OffsetWriter
-from slack_fuse_server.slurper.probes import probe_sweep
+from slack_fuse_server.slurper.probes import ProbeTrigger, probe_sweep
 from slack_fuse_server.slurper.refresh import RefreshTrigger, refresh_channels_periodically
 from slack_fuse_server.slurper.socket import SocketModeOptions, SocketModeStatus
 from slack_fuse_server.slurper.spans import configure_span_thresholds_from_config, span
@@ -366,6 +367,11 @@ async def _serve(config: ServerConfig) -> None:
         database_url=config.database_url,
         trigger=backfill_trigger,
     )
+    probe_trigger = ProbeTrigger(max_buffer_size=1)
+    probe_deps = ProbeDeps(
+        shared_secret=config.shared_secret,
+        trigger=probe_trigger,
+    )
     health = HealthEmitter(writer)
 
     # Reconnect/restart catchup: a startup gap-fill plus an on-demand one fired
@@ -417,6 +423,7 @@ async def _serve(config: ServerConfig) -> None:
                 refresh_deps,
                 blocked_channels_deps,
                 backfill_deps,
+                probe_deps,
                 livez_deps,
             )
             nursery.start_soon(snapshot_scheduler.run, supervisor)
@@ -429,7 +436,7 @@ async def _serve(config: ServerConfig) -> None:
             # fires only on demand. Rendezvous channel means a second
             # POST while one is running gets 409, not a queued cycle.
             nursery.start_soon(refresh_trigger.consume, writer, client, limiters, supervisor)
-            nursery.start_soon(probe_sweep, writer, client, limiters, supervisor, config)
+            nursery.start_soon(probe_sweep, writer, client, limiters, supervisor, config, probe_trigger)
             nursery.start_soon(backfill_trigger.consume, config, supervisor)
             # Reconnect/restart catchup consumer: runs one bounded gap-fill at
             # startup (the restart case) and one per gap-reconnect the socket
@@ -501,6 +508,7 @@ async def _serve_dispatch_task(  # noqa: PLR0913, PLR0917 - dispatch wiring need
     refresh_deps: RefreshDeps,
     blocked_channels_deps: BlockedChannelsDeps,
     backfill_deps: BackfillDeps,
+    probe_deps: ProbeDeps,
     livez_deps: LivezDeps,
 ) -> None:
     await serve_dispatch(
@@ -514,6 +522,7 @@ async def _serve_dispatch_task(  # noqa: PLR0913, PLR0917 - dispatch wiring need
         refresh_deps=refresh_deps,
         blocked_channels_deps=blocked_channels_deps,
         backfill_deps=backfill_deps,
+        probe_deps=probe_deps,
         livez_deps=livez_deps,
     )
 
