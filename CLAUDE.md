@@ -71,6 +71,16 @@ When asking "is the slurper healthy?", name the observable: serving HTTP, ingest
 
 The server `events` table is reserved for facts that happened upstream in Slack: messages, edits/deletes, channel metadata changes, membership, and health observations. Operator intent is mutable policy and does **not** belong in replayable Slack event streams. Channel blocks live in the server-side `blocked_channels` table (`channel_id`, `blocked_at`, `reason`) and are propagated to clients by periodic block sync, not by `channel_blocked` / `channel_unblocked` events.
 
+## Events source envelope (`events.source`)
+
+Every event row has a `source` jsonb column (migration 0009; NULL on pre-migration rows) carrying **ambient facts about the ingestion transaction**: which task instance wrote it (`producer`, `boot_id`, `task_id`, `run_id`), which cursor Slack returned (`slack_cursor`/`prior_cursor`/`page_index`/`has_more`/`final_page`), which deploy (`commit`, `image_digest`), which HTTP exchange (`api_endpoint`, `api_latency_ms`, `slack_request_id`), which span (`span_id`, joins Loki `slurper-span` lines), and what triggered the run (`triggered_by`: `startup | scheduled | reconnect | control-surface | admin-cli`). Slack facts stay in `payload`; `source` is invisible to the wire protocol and clients.
+
+**Guardrail**: `source` may NOT carry **derived state** — running counters, aggregate flags computed across events, or state that answers "what work remains". Ambient facts stay; derived state belongs in views or is computed on read. Test: if you had to fold rows from multiple events to compute a field, it's derived — don't put it in `source`.
+
+Mechanics (`slack_fuse_server/slurper/ingestion.py`): tasks run inside `ingesting(IngestionContext(...))` scopes (trio propagates the ContextVar into `to_thread.run_sync` bodies and `nursery.start_soon` children); per-write fields ride on `EventRecord.source` via `make_source(...)`; `insert_event` merges the two (record wins) plus the current write span id. A producer that writes events without an ingestion scope leaves `source = NULL` — wire new event-writing tasks through `_ingesting_task` in `slurper/__main__.py`.
+
+Restart-safe backfill resume (`slack_fuse_server/backfill/resume.py`) reads this envelope: a crashed run's committed pages resume from the last stored cursor, thread completion is Slack's own `has_more` (`final_page`), and only rows newer than the channel's latest `backfill_completed`/`backfill_aborted` health event count as resume state (a completed run must not no-op a later re-backfill; an aborted run must not be dug past its cap). `--since` pages carry `oldest` and are never resume anchors.
+
 ## Dev commands
 
 ```bash

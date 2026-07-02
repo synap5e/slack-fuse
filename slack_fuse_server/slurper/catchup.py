@@ -50,6 +50,7 @@ import trio
 from slack_fuse_render import ChannelId
 from slack_fuse_server.backfill.types import Backfiller
 from slack_fuse_server.slurper.api import SlackAPIError
+from slack_fuse_server.slurper.ingestion import ingesting_run
 from slack_fuse_server.slurper.limiters import SlurperLimiters
 from slack_fuse_server.slurper.offsets import PG_TIMEOUT_EXCEPTIONS, EventRecord, OffsetWriter
 from slack_fuse_server.slurper.spans import span
@@ -306,7 +307,7 @@ class CatchupTrigger:
         if supervisor is not None:
             supervisor.declare("catchup", "startup_delay", deadline_s=None)
         await trio.sleep(deps.config.startup_delay_s)
-        await self._safe_run(deps, "startup", supervisor)
+        await self._safe_run(deps, "startup", "startup", supervisor)
         while True:
             if supervisor is not None:
                 supervisor.declare("catchup", "idle", deadline_s=None)
@@ -314,11 +315,20 @@ class CatchupTrigger:
                 gap = await self._recv.receive()
             except trio.EndOfChannel:
                 return
-            await self._safe_run(deps, f"reconnect gap={gap:.0f}s", supervisor)
+            await self._safe_run(deps, f"reconnect gap={gap:.0f}s", "reconnect", supervisor)
 
-    async def _safe_run(self, deps: CatchupDeps, trigger: str, supervisor: TaskSupervisor | None) -> None:
+    async def _safe_run(
+        self,
+        deps: CatchupDeps,
+        trigger: str,
+        triggered_by: str,
+        supervisor: TaskSupervisor | None,
+    ) -> None:
         log.info("catchup: starting cycle (%s)", trigger)
         try:
-            await run_catchup_once(deps, supervisor=supervisor)
+            # One sweep = one logical run: every event it writes shares a
+            # fresh source run_id and the startup/reconnect trigger fact.
+            with ingesting_run(triggered_by=triggered_by):
+                await run_catchup_once(deps, supervisor=supervisor)
         except Exception:
             log.exception("catchup: cycle failed")

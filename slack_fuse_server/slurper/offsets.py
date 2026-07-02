@@ -50,6 +50,7 @@ from psycopg.rows import TupleRow
 from psycopg.types.json import Jsonb
 
 from slack_fuse_server._json import JsonObject
+from slack_fuse_server.slurper.ingestion import CURRENT_SPAN_ID, compose_source
 
 if TYPE_CHECKING:
     from slack_fuse_server.slurper.spans import SpanRecorder
@@ -76,6 +77,10 @@ class EventRecord:
     unique index. Historically only `message` events used this via
     `events_message_dedup`; narrow event-specific indexes can opt other replay-
     prone socket events into the same gap-free no-op behavior.
+
+    `source` holds the *explicit per-write* ingestion-envelope fields
+    (`ingestion.make_source(...)`); ambient task fields and the write span id
+    are merged in at insert time by `ingestion.compose_source`.
     """
 
     stream: str
@@ -83,6 +88,7 @@ class EventRecord:
     ts: str | None
     payload: JsonObject = field(default_factory=dict)
     dedup: bool = False
+    source: JsonObject | None = None
 
 
 class _DuplicateSkip(Exception):
@@ -119,18 +125,26 @@ def insert_event(cur: Cursor[TupleRow], offset: int, record: EventRecord) -> boo
     raising. A real insert also fires `NOTIFY new_event, '<stream>'` so the WS
     server's tail loop wakes; a deduped no-op fires no NOTIFY.
     """
-    values = (record.stream, offset, record.kind, record.ts, Jsonb(record.payload))
+    source = compose_source(record.source)
+    values = (
+        record.stream,
+        offset,
+        record.kind,
+        record.ts,
+        Jsonb(record.payload),
+        Jsonb(source) if source is not None else None,
+    )
     if record.dedup:
         cur.execute(
-            "INSERT INTO events (stream, offset_in_stream, kind, ts, payload) "
-            "VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING RETURNING offset_in_stream",
+            "INSERT INTO events (stream, offset_in_stream, kind, ts, payload, source) "
+            "VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING RETURNING offset_in_stream",
             values,
         )
         if cur.fetchone() is None:
             return False
     else:
         cur.execute(
-            "INSERT INTO events (stream, offset_in_stream, kind, ts, payload) VALUES (%s, %s, %s, %s, %s)",
+            "INSERT INTO events (stream, offset_in_stream, kind, ts, payload, source) VALUES (%s, %s, %s, %s, %s, %s)",
             values,
         )
     # Wake the WS server's LISTEN new_event tail loop. Payload = stream id;
@@ -175,11 +189,14 @@ def _has_matching_message_changed(cur: Cursor[TupleRow], stream: str, ts: str, p
 
 
 def _corrective_record(record: EventRecord, ts: str) -> EventRecord:
+    # The corrective edit is written from the same ingestion transaction as the
+    # original record, so it inherits the same explicit source fields.
     return EventRecord(
         stream=record.stream,
         kind="message_changed",
         ts=ts,
         payload={"message": record.payload, "previous_ts": ts},
+        source=record.source,
     )
 
 
@@ -410,13 +427,20 @@ async def _run_sync_recorded[U](
 ) -> U:
     started_ns = time.monotonic_ns()
     sync_ns = 0
+    span_id = None if span is None else span.span_id
 
     def _timed() -> U:
         nonlocal sync_ns
         sync_started_ns = time.monotonic_ns()
+        # Publish the write span's id for `insert_event` → `compose_source`.
+        # The worker thread runs in a copy of this task's context, so the set
+        # is scoped to this operation and never leaks across writes.
+        token = CURRENT_SPAN_ID.set(span_id) if span_id is not None else None
         try:
             return func()
         finally:
+            if token is not None:
+                CURRENT_SPAN_ID.reset(token)
             sync_ns += time.monotonic_ns() - sync_started_ns
 
     try:

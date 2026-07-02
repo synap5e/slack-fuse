@@ -58,6 +58,7 @@ from slack_fuse.models import (
 from slack_fuse_server._json import JsonObject
 from slack_fuse_server.slurper.api import SlackAPIError, SlackClient, Validated
 from slack_fuse_server.slurper.health import HealthEmitter, HealthKind, SlackDegradedTracker
+from slack_fuse_server.slurper.ingestion import make_source
 from slack_fuse_server.slurper.limiters import SlurperLimiters
 from slack_fuse_server.slurper.offsets import PG_TIMEOUT_EXCEPTIONS, EventRecord, OffsetWriter
 from slack_fuse_server.slurper.spans import run_sync_with_span, span
@@ -223,7 +224,14 @@ def _build_parent_replied_write(event: SocketEventPayload, raw_event: JsonObject
         "probed_at": _event_ts(raw_event),
         "message": parent,
     }
-    return EventRecord(stream=stream, kind="parent_replied", ts=parent_ts, payload=payload, dedup=True)
+    return EventRecord(
+        stream=stream,
+        kind="parent_replied",
+        ts=parent_ts,
+        payload=payload,
+        dedup=True,
+        source=make_source(slack_event_ts=_event_ts(raw_event)),
+    )
 
 
 def _build_message_changed_write(
@@ -244,7 +252,15 @@ def _build_message_changed_write(
     else:
         msg_dict = cast(JsonObject, new_msg.model_dump(mode="json"))
     payload: JsonObject = {"message": msg_dict, "previous_ts": new_msg.ts}
-    return EventRecord(stream=stream, kind="message_changed", ts=new_msg.ts, payload=payload)
+    return EventRecord(
+        stream=stream,
+        kind="message_changed",
+        ts=new_msg.ts,
+        payload=payload,
+        # The outer event's event_ts: the EDIT time, distinct from the edited
+        # message's own ts.
+        source=make_source(slack_event_ts=_event_ts(raw_event)),
+    )
 
 
 def _build_message_deleted_write(
@@ -265,7 +281,13 @@ def _build_message_deleted_write(
     else:
         prev_dict = None
     del_payload: JsonObject = {"deleted_ts": deleted_ts, "previous_message": prev_dict}
-    return EventRecord(stream=stream, kind="message_deleted", ts=deleted_ts, payload=del_payload)
+    return EventRecord(
+        stream=stream,
+        kind="message_deleted",
+        ts=deleted_ts,
+        payload=del_payload,
+        source=make_source(slack_event_ts=_event_ts(raw_event)),
+    )
 
 
 def _build_message_write(event: SocketEventPayload, raw_event: JsonObject, stream: str) -> EventRecord | None:
@@ -277,7 +299,14 @@ def _build_message_write(event: SocketEventPayload, raw_event: JsonObject, strea
     # validation). Persist as-is.
     nested = raw_event.get("message")
     msg_payload: JsonObject = cast(JsonObject, nested) if isinstance(nested, dict) else raw_event
-    return EventRecord(stream=stream, kind="message", ts=ts, payload=msg_payload, dedup=True)
+    return EventRecord(
+        stream=stream,
+        kind="message",
+        ts=ts,
+        payload=msg_payload,
+        dedup=True,
+        source=make_source(slack_event_ts=_event_ts(raw_event)),
+    )
 
 
 def translate_message_event(event: SocketEventPayload, raw_event: JsonObject) -> EventRecord | None:
@@ -530,12 +559,15 @@ class SocketModeRunner:
         extra: JsonObject = {"kind": event.type}
         if event.channel:
             extra["channel_id"] = event.channel
-        async with span(op="slurper.socket.handle_event", task="socket", extra=extra) as event_span, phase(
-            self._supervisor,
-            "socket",
-            "handling_event",
-            details={"kind": event.type},
-            deadline_s=10,
+        async with (
+            span(op="slurper.socket.handle_event", task="socket", extra=extra) as event_span,
+            phase(
+                self._supervisor,
+                "socket",
+                "handling_event",
+                details={"kind": event.type},
+                deadline_s=10,
+            ),
         ):
             if event.type == "message":
                 write = translate_message_event(event, raw_event)

@@ -12,10 +12,26 @@ CREATE TABLE events (
     kind TEXT NOT NULL,
     ts TEXT,                          -- Slack message ts when applicable
     payload JSONB NOT NULL,
+    source JSONB,                     -- ambient ingestion envelope (0009; NULL pre-migration)
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (stream, offset_in_stream)
 );
 CREATE INDEX events_stream_offset_idx ON events (stream, offset_in_stream);
+
+-- Source-envelope indexes (0009). Slack facts live in `payload`; `source`
+-- carries ambient facts about the ingestion transaction (producer, boot/task/
+-- run ids, Slack cursors, commit, span id — see slurper/ingestion.py). The
+-- backfill partial indexes drive restart-resume; the expression indexes drive
+-- forensic correlation with deploys / boots / Loki spans.
+CREATE INDEX events_source_backfill_history_idx
+    ON events (stream, offset_in_stream DESC)
+    WHERE source->>'producer' = 'backfill-history-page';
+CREATE INDEX events_source_backfill_replies_idx
+    ON events (stream, (source->>'thread_ts'), offset_in_stream DESC)
+    WHERE source->>'producer' = 'backfill-replies-page';
+CREATE INDEX events_source_commit_idx ON events ((source->>'commit')) WHERE source IS NOT NULL;
+CREATE INDEX events_source_boot_idx ON events ((source->>'boot_id')) WHERE source IS NOT NULL;
+CREATE INDEX events_source_span_idx ON events ((source->>'span_id')) WHERE source IS NOT NULL;
 
 -- Backfill dedup: same Slack ts = same message. Keyed by (stream, ts) and
 -- scoped to message events only, so re-running either backfiller is a no-op

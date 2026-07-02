@@ -32,6 +32,7 @@ from psycopg.rows import TupleRow
 from slack_fuse.models import ConversationsHistoryResponse, ConversationsRepliesResponse, Message
 from slack_fuse_render import ChannelId
 from slack_fuse_server._json import JsonObject
+from slack_fuse_server.backfill.resume import ResumePlan, ThreadResume
 from slack_fuse_server.backfill.types import (
     BackfillAbortReason,
     Backfiller,
@@ -42,6 +43,7 @@ from slack_fuse_server.backfill.types import (
 from slack_fuse_server.blocked_channels import is_channel_blocked
 from slack_fuse_server.slurper.api import FatalAPIError, RateLimitedError, SlackClient, Validated
 from slack_fuse_server.slurper.health import HealthEmitter, HealthKind
+from slack_fuse_server.slurper.ingestion import ingesting_run, make_source
 from slack_fuse_server.slurper.limiters import SlurperLimiters
 from slack_fuse_server.slurper.offsets import (
     PG_TIMEOUT_EXCEPTIONS,
@@ -142,12 +144,58 @@ def _validated_messages_from_page(
     return out
 
 
-def _records_from_validated(channel_id: str, messages: Sequence[Validated[Message]]) -> tuple[EventRecord, ...]:
+def _records_from_validated(
+    channel_id: str,
+    messages: Sequence[Validated[Message]],
+    source: JsonObject | None = None,
+) -> tuple[EventRecord, ...]:
     stream = f"channel:{channel_id}"
     return tuple(
-        EventRecord(stream=stream, kind="message", ts=wrapped.model.ts, payload=wrapped.raw, dedup=True)
+        EventRecord(stream=stream, kind="message", ts=wrapped.model.ts, payload=wrapped.raw, dedup=True, source=source)
         for wrapped in messages
     )
+
+
+def _oldest_field(since_ts: float | None) -> str | None:
+    """`--since` runs mark their pages so resume never anchors on a bounded walk."""
+    return None if since_ts is None else f"{since_ts:.6f}"
+
+
+def _parent_record_from_page(
+    channel_id: str,
+    wrapped: Validated[ConversationsRepliesResponse],
+    thread_ts: str,
+) -> EventRecord | None:
+    """The thread parent as a corrective-capable record, when the page carries it.
+
+    ``conversations.replies`` returns the parent as the first message of the
+    first page only; resumed mid-thread pages don't include it.
+    """
+    for wrapped_msg in _validated_messages_from_page(wrapped.raw, wrapped.model.messages):
+        if wrapped_msg.model.ts != thread_ts:
+            continue
+        return EventRecord(
+            stream=f"channel:{channel_id}",
+            kind="message",
+            ts=thread_ts,
+            payload=wrapped_msg.raw,
+            dedup=True,
+            source=make_source(producer="backfill-corrective-parent", thread_ts=thread_ts),
+        )
+    return None
+
+
+def _merge_thread_worklist(plan: ResumePlan | None, discovered: Sequence[str]) -> tuple[ThreadResume, ...]:
+    """DB-known worklist (with per-thread cursors) plus freshly discovered parents.
+
+    Threads that already reached a `final_page=true` replies row are excluded
+    even when a resumed history walk rediscovers their parents.
+    """
+    if plan is None:
+        return tuple(ThreadResume(thread_ts=ts) for ts in discovered)
+    known = {t.thread_ts for t in plan.threads}
+    extra = tuple(ThreadResume(thread_ts=ts) for ts in discovered if ts not in known and ts not in plan.done_thread_ts)
+    return plan.threads + extra
 
 
 class SlackApiBackfiller:
@@ -157,19 +205,21 @@ class SlackApiBackfiller:
     slurper wires the RFC defaults (or the operator's config overrides).
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913, PLR0917 - injected dependencies stay explicit, mirroring the socket runner.
         self,
         client: SlackClient,
         limiter: trio.CapacityLimiter,
         sleeps: SleepBounds | None = None,
         blocked_channel_ids: Callable[[], Awaitable[set[str]]] | None = None,
         task_name: str = "backfill",
+        resume_plan: Callable[[str], Awaitable[ResumePlan | None]] | None = None,
     ) -> None:
         self._client = client
         self._limiter = limiter
         self._sleeps = sleeps if sleeps is not None else SleepBounds()
         self._blocked_channel_ids = blocked_channel_ids
         self._task_name = task_name
+        self._resume_plan = resume_plan
 
     @property
     def name(self) -> str:
@@ -220,13 +270,34 @@ class SlackApiBackfiller:
         channel_id: ChannelId,
         since_ts: float | None = None,
     ) -> AsyncIterator[MessageBatch]:
-        """Yield one atomic write batch per Slack API response."""
+        """Yield one atomic write batch per Slack API response.
+
+        When a resume-plan reader is wired and this is a full-history run,
+        a crashed prior run's committed pages (recorded in `events.source`)
+        skip straight to the last Slack cursor / the unfinished threads.
+        """
+        plan: ResumePlan | None = None
+        if self._resume_plan is not None and since_ts is None:
+            plan = await self._resume_plan(channel_id.value)
+            if plan is not None:
+                log.info(
+                    "backfill: resuming %s (history_done=%s, threads=%d, done_threads=%d)",
+                    channel_id.value,
+                    plan.history_done,
+                    len(plan.threads),
+                    len(plan.done_thread_ts),
+                )
         thread_parents: list[str] = []
         page_index = 0
-        async for batch in self._history_batches(channel_id.value, since_ts, thread_parents, page_index):
-            page_index += 1
-            yield batch
-        async for batch in self._reply_batches(channel_id.value, since_ts, thread_parents, page_index):
+        if plan is None or not plan.history_done:
+            start_cursor = "" if plan is None else plan.history_cursor
+            async for batch in self._history_batches(
+                channel_id.value, since_ts, thread_parents, page_index, start_cursor=start_cursor
+            ):
+                page_index += 1
+                yield batch
+        threads = _merge_thread_worklist(plan, thread_parents)
+        async for batch in self._reply_batches(channel_id.value, since_ts, threads, page_index):
             page_index += 1
             yield batch
 
@@ -286,15 +357,19 @@ class SlackApiBackfiller:
         since_ts: float | None,
         thread_parents: list[str],
         first_page_index: int,
+        *,
+        start_cursor: str = "",
     ) -> AsyncIterator[MessageBatch]:
-        cursor = ""
+        cursor = start_cursor
         page = 0
+        attempt = 1
         while True:
             if page > 0:
                 await trio.sleep(random.uniform(self._sleeps.page_min_s, self._sleeps.page_max_s))
             request_cursor = cursor
             wrapped = await self._history_page(channel_id, cursor, oldest=since_ts, page=page)
             if wrapped is None:  # rate-limited; _history_page already slept — retry same cursor
+                attempt += 1
                 continue
             resp = wrapped.model
             messages: list[Validated[Message]] = []
@@ -304,10 +379,28 @@ class SlackApiBackfiller:
                     thread_parents.append(msg.ts)
                 if _passes_since(msg.ts, since_ts):
                     messages.append(wrapped_msg)
+            next_cursor = resp.response_metadata.next_cursor
+            meta = wrapped.meta
+            source = make_source(
+                producer="backfill-history-page",
+                slack_cursor=next_cursor,
+                prior_cursor=request_cursor or None,
+                page_index=first_page_index + page,
+                has_more=resp.has_more,
+                # The loop-termination fact, not just NOT has_more: Slack can
+                # report has_more with an empty cursor, and resume must see the
+                # same signal the pagination loop acted on.
+                final_page=not resp.has_more or not next_cursor,
+                oldest=_oldest_field(since_ts),
+                attempt=attempt if attempt > 1 else None,
+                api_endpoint=None if meta is None else meta.endpoint,
+                api_latency_ms=None if meta is None else meta.latency_ms,
+                slack_request_id=None if meta is None else meta.request_id,
+            )
             yield MessageBatch(
                 kind="history_page",
                 channel_id=channel_id,
-                records=_records_from_validated(channel_id, messages),
+                records=_records_from_validated(channel_id, messages, source),
                 origin=MessageBatchOrigin(
                     channel_id=channel_id,
                     thread_ts=None,
@@ -316,9 +409,10 @@ class SlackApiBackfiller:
                 ),
             )
             page += 1
+            attempt = 1
             if not resp.has_more:
                 break
-            cursor = resp.response_metadata.next_cursor
+            cursor = next_cursor
             if not cursor:
                 break
 
@@ -326,32 +420,60 @@ class SlackApiBackfiller:
         self,
         channel_id: str,
         since_ts: float | None,
-        thread_parents: Sequence[str],
+        threads: Sequence[ThreadResume],
         first_page_index: int,
     ) -> AsyncIterator[MessageBatch]:
         page_index = first_page_index
-        for i, thread_ts in enumerate(thread_parents):
+        for i, thread in enumerate(threads):
             if i > 0:
                 await trio.sleep(random.uniform(self._sleeps.thread_min_s, self._sleeps.thread_max_s))
-            async for wrapped in self._replies_pages(channel_id, thread_ts):
+            thread_ts = thread.thread_ts
+            request_cursor = thread.cursor
+            async for wrapped in self._replies_pages(channel_id, thread_ts, start_cursor=thread.cursor):
                 resp = wrapped.model
+                next_cursor = resp.response_metadata.next_cursor
+                meta = wrapped.meta
+                source = make_source(
+                    producer="backfill-replies-page",
+                    thread_ts=thread_ts,
+                    slack_cursor=next_cursor,
+                    prior_cursor=request_cursor or None,
+                    page_index=page_index,
+                    has_more=resp.has_more,
+                    final_page=not resp.has_more or not next_cursor,
+                    oldest=_oldest_field(since_ts),
+                    api_endpoint=None if meta is None else meta.endpoint,
+                    api_latency_ms=None if meta is None else meta.latency_ms,
+                    slack_request_id=None if meta is None else meta.request_id,
+                )
                 messages = [
                     wrapped_msg
                     for wrapped_msg in _validated_messages_from_page(wrapped.raw, resp.messages)
                     if wrapped_msg.model.ts != thread_ts and _passes_since(wrapped_msg.model.ts, since_ts)
                 ]
+                records = _records_from_validated(channel_id, messages, source)
+                # The first page (cursor "") carries the thread parent with
+                # Slack's *current* thread metadata. Persist it in the same
+                # atomic batch as its replies: through the corrective write
+                # path a stale parent (e.g. reply_count high after a real
+                # reply deletion) is repaired, and a crash can never leave a
+                # corrected parent without the replies that justified it.
+                parent = _parent_record_from_page(channel_id, wrapped, thread_ts)
+                if parent is not None:
+                    records = (parent, *records)
                 yield MessageBatch(
                     kind="replies_page",
                     channel_id=channel_id,
-                    records=_records_from_validated(channel_id, messages),
+                    records=records,
                     origin=MessageBatchOrigin(
                         channel_id=channel_id,
                         thread_ts=thread_ts,
                         page_index=page_index,
-                        slack_cursor=resp.response_metadata.next_cursor,
+                        slack_cursor=next_cursor,
                     ),
                 )
                 page_index += 1
+                request_cursor = next_cursor
 
     async def _history_page(
         self,
@@ -402,13 +524,15 @@ class SlackApiBackfiller:
         self,
         channel_id: str,
         thread_ts: str,
+        *,
+        start_cursor: str = "",
     ) -> AsyncIterator[Validated[ConversationsRepliesResponse]]:
         async with span(
             op="slurper.backfill.thread_replies",
             task=self._task_name,
             extra={"channel_id": channel_id, "thread_ts": thread_ts},
         ) as recorder:
-            iterator = self._client.iter_replies_pages(channel_id, thread_ts)
+            iterator = self._client.iter_replies_pages(channel_id, thread_ts, start_cursor)
             page = 0
             while True:
                 try:
@@ -514,7 +638,22 @@ async def backfill_channel(
     client's global ingestion-health state — see `HealthKind` for the split.
     `/metrics` reads the latest `backfill_progress` payload to populate
     `in_progress.messages_so_far`.
+
+    One channel backfill is one logical ingestion run: every event it writes
+    (messages, correctives, and the health sentinels) shares a fresh
+    `source->>'run_id'`.
     """
+    with ingesting_run():
+        return await _backfill_channel_run(backfiller, channel_id, ctx, since_ts=since_ts)
+
+
+async def _backfill_channel_run(
+    backfiller: Backfiller,
+    channel_id: ChannelId,
+    ctx: BackfillContext,
+    *,
+    since_ts: float | None = None,
+) -> BackfillResult:
     cid = channel_id.value
     if await ctx.writer.run_read(lambda conn: is_channel_blocked(conn, cid), limiter=ctx.limiters.admin_read):
         await ctx.health.emit(

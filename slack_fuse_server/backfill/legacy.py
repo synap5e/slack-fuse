@@ -27,6 +27,7 @@ from slack_fuse_render import ChannelId
 from slack_fuse_server._json import JsonObject
 from slack_fuse_server.backfill.types import MessageBatch, MessageBatchOrigin
 from slack_fuse_server.slurper.api import Validated
+from slack_fuse_server.slurper.ingestion import make_source
 from slack_fuse_server.slurper.offsets import EventRecord
 
 log = logging.getLogger(__name__)
@@ -92,8 +93,16 @@ class LegacyCacheBackfiller:
                 lambda p=day_file: _read_day_messages(p),
                 limiter=self._limiter,
             )
+            source = make_source(producer="legacy-cache-day", page_index=page_index, day_file=day_file.name)
             records = tuple(
-                EventRecord(stream=stream, kind="message", ts=wrapped.model.ts, payload=wrapped.raw, dedup=True)
+                EventRecord(
+                    stream=stream,
+                    kind="message",
+                    ts=wrapped.model.ts,
+                    payload=wrapped.raw,
+                    dedup=True,
+                    source=source,
+                )
                 for wrapped in messages
                 if _passes_since(wrapped.model.ts, since_ts)
             )

@@ -19,6 +19,7 @@ import trio
 
 from slack_fuse_server._json import JsonObject
 from slack_fuse_server.slurper.api import RateLimitedError
+from slack_fuse_server.slurper.ingestion import new_ulid
 from slack_fuse_server.slurper.offsets import PG_TIMEOUT_EXCEPTIONS
 
 log = logging.getLogger(__name__)
@@ -28,15 +29,13 @@ _RESULT_ERROR = "error"
 _RESULT_TIMEOUT = "timeout"
 _RESULT_RATE_LIMITED = "rate_limited"
 _RESULT_SKIPPED = "skipped"
-_VALID_RESULTS = frozenset(
-    {
-        _RESULT_OK,
-        _RESULT_ERROR,
-        _RESULT_TIMEOUT,
-        _RESULT_RATE_LIMITED,
-        _RESULT_SKIPPED,
-    }
-)
+_VALID_RESULTS = frozenset({
+    _RESULT_OK,
+    _RESULT_ERROR,
+    _RESULT_TIMEOUT,
+    _RESULT_RATE_LIMITED,
+    _RESULT_SKIPPED,
+})
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +49,7 @@ class SpanResult:
     limiter_wait_ms: int
     sync_ms: int
     extra: JsonObject
+    span_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +111,9 @@ class SpanRecorder:
         self.result_label = _RESULT_OK
         self.limiter_wait_ms = 0
         self.sync_ms = 0
+        # Join key between this span's log line and any event rows written
+        # under it: `OffsetWriter` stamps it into `events.source->>'span_id'`.
+        self.span_id: str = new_ulid()
 
     @property
     def result(self) -> str:
@@ -155,6 +158,7 @@ class SpanRecorder:
             limiter_wait_ms=self.limiter_wait_ms,
             sync_ms=self.sync_ms,
             extra=cast(JsonObject, dict(self.extra)),
+            span_id=self.span_id,
         )
 
 
@@ -242,12 +246,14 @@ def _emit_result(result: SpanResult, *, slow_threshold_ms: int | None) -> None:
         "duration_ms": result.duration_ms,
         "limiter_wait_ms": result.limiter_wait_ms,
         "sync_ms": result.sync_ms,
+        "span_id": result.span_id,
     }
     fields.update(result.extra)
     extra_format = " ".join(f"{key}=%({key})s" for key in sorted(result.extra))
     message = (
         "slurper-span op=%(op)s task=%(task)s result=%(result)s "
-        "duration_ms=%(duration_ms)d limiter_wait_ms=%(limiter_wait_ms)d sync_ms=%(sync_ms)d"
+        "duration_ms=%(duration_ms)d limiter_wait_ms=%(limiter_wait_ms)d sync_ms=%(sync_ms)d "
+        "span_id=%(span_id)s"
     )
     if extra_format:
         message = f"{message} {extra_format}"

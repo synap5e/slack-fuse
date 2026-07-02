@@ -36,6 +36,7 @@ from psycopg import Connection
 
 from slack_fuse_server._json import JsonObject
 from slack_fuse_server.slurper.api import ChannelNotFoundError, SlackAPIError, SlackClient
+from slack_fuse_server.slurper.ingestion import ingesting_run
 from slack_fuse_server.slurper.limiters import SlurperLimiters
 from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter, assign_offset, insert_event
 from slack_fuse_server.slurper.spans import run_sync_with_span, span
@@ -95,7 +96,22 @@ async def _refresh_all_once(
     *,
     task_name: str = "refresh",
 ) -> None:
-    """One full pass: walk known channels, refresh each."""
+    """One full pass: walk known channels, refresh each.
+
+    One sweep = one logical ingestion run (fresh source run_id).
+    """
+    with ingesting_run():
+        await _refresh_all_once_run(writer, client, limiters, supervisor, task_name=task_name)
+
+
+async def _refresh_all_once_run(
+    writer: OffsetWriter,
+    client: SlackClient,
+    limiters: SlurperLimiters,
+    supervisor: TaskSupervisor | None = None,
+    *,
+    task_name: str = "refresh",
+) -> None:
     async with span(op="slurper.refresh.list_known_channels", task=task_name) as list_span:
         if supervisor is None:
             channel_ids = await writer.run_read(_list_known_channel_ids, limiter=limiters.admin_read, span=list_span)
@@ -258,6 +274,24 @@ async def refresh_channels_once(writer: OffsetWriter, client: SlackClient, limit
 # ===================================================================
 
 
+async def _consume_refresh_item(
+    writer: OffsetWriter,
+    client: SlackClient,
+    limiters: SlurperLimiters,
+    item: str | None,
+) -> None:
+    """One trigger request: workspace sweep (None) or a single channel.
+
+    The sweep derives its own per-run ingestion scope inside
+    `_refresh_all_once`; the single-channel path derives one here.
+    """
+    if item is None:
+        await _refresh_all_once(writer, client, limiters)
+        return
+    with ingesting_run():
+        await _refresh_channel_with_span(writer, client, item, limiters, task_name="refresh-trigger")
+
+
 class RefreshTrigger:
     """Rendezvous-channel trigger used by the refresh HTTP endpoints to
     ask the in-process consumer for a sweep.
@@ -323,16 +357,7 @@ class RefreshTrigger:
             try:
                 details: JsonObject = {} if item is None else {"channel_id": item}
                 if supervisor is None:
-                    if item is None:
-                        await _refresh_all_once(writer, client, limiters)
-                    else:
-                        await _refresh_channel_with_span(
-                            writer,
-                            client,
-                            item,
-                            limiters,
-                            task_name="refresh-trigger",
-                        )
+                    await _consume_refresh_item(writer, client, limiters, item)
                 else:
                     async with phase(
                         supervisor,
@@ -341,16 +366,7 @@ class RefreshTrigger:
                         details=details,
                         deadline_s=interval_s * 0.5,
                     ):
-                        if item is None:
-                            await _refresh_all_once(writer, client, limiters)
-                        else:
-                            await _refresh_channel_with_span(
-                                writer,
-                                client,
-                                item,
-                                limiters,
-                                task_name="refresh-trigger",
-                            )
+                        await _consume_refresh_item(writer, client, limiters, item)
             except ChannelNotFoundError:
                 log.info("refresh: HTTP-triggered run for %s: channel not found", item)
             except Exception:

@@ -32,6 +32,7 @@ from psycopg.rows import TupleRow
 
 from slack_fuse_server._json import JsonObject
 from slack_fuse_server.slurper.api import SlackAPIError, SlackClient
+from slack_fuse_server.slurper.ingestion import ingesting_run
 from slack_fuse_server.slurper.limiters import SlurperLimiters
 from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter
 from slack_fuse_server.slurper.spans import SpanRecorder, run_sync_with_span, span
@@ -298,6 +299,38 @@ async def _run_probe_cycle(  # noqa: PLR0913 - common scheduled/manual runner.
         descriptor.job_id: {"succeeded": 0, "failed": 0, "skipped": 0} for descriptor in active_registry
     }
     selected = _select_probe_descriptors(active_registry, requested)
+    with ingesting_run(triggered_by="scheduled" if trigger == "scheduled" else "control-surface"):
+        await _run_probe_cycle_body(
+            writer,
+            client,
+            limiters,
+            supervisor,
+            selected,
+            counters,
+            started_at=started_at,
+            trigger=trigger,
+            requested=requested,
+            bypass_cadence=bypass_cadence,
+            task_name=task_name,
+            deadline_s=deadline_s,
+        )
+
+
+async def _run_probe_cycle_body(  # noqa: PLR0913, PLR0917 - mirrors _run_probe_cycle's explicit knobs.
+    writer: OffsetWriter,
+    client: SlackClient,
+    limiters: SlurperLimiters,
+    supervisor: TaskSupervisor | None,
+    selected: tuple[ProbeDescriptor, ...],
+    counters: dict[str, dict[str, int]],
+    *,
+    started_at: str,
+    trigger: Literal["scheduled", "manual"],
+    requested: ProbeSweepRequest | None,
+    bypass_cadence: bool,
+    task_name: str,
+    deadline_s: float | None,
+) -> None:
     for descriptor in selected:
         target = None if requested is None else requested.target
         if supervisor is None:

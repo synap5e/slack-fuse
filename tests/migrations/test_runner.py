@@ -32,6 +32,7 @@ def test_discover_server_migrations() -> None:
         "0006_blocked_channels.sql",
         "0007_socket_event_dedup.sql",
         "0008_active_messages_view.sql",
+        "0009_events_source_column.sql",
     ]
 
 
@@ -62,6 +63,7 @@ def test_apply_server_migrations_idempotent(pg_conn: psycopg.Connection[TupleRow
         "0006_blocked_channels.sql",
         "0007_socket_event_dedup.sql",
         "0008_active_messages_view.sql",
+        "0009_events_source_column.sql",
     ]
     assert _table_exists(pg_conn, "events")
     assert _table_exists(pg_conn, "snapshots")
@@ -86,6 +88,11 @@ def test_apply_server_migrations_idempotent(pg_conn: psycopg.Connection[TupleRow
         "events_message_changed_target_idx",
         "events_message_deleted_target_idx",
         "events_parent_replied_target_idx",
+        "events_source_backfill_history_idx",
+        "events_source_backfill_replies_idx",
+        "events_source_commit_idx",
+        "events_source_boot_idx",
+        "events_source_span_idx",
     ):
         with pg_conn.cursor() as cur:
             cur.execute("SELECT to_regclass(%s)", (index,))

@@ -25,7 +25,7 @@ import json
 import logging
 import os
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
@@ -40,6 +40,7 @@ from slack_fuse.user_cache import UserCache
 from slack_fuse_render import ChannelId
 from slack_fuse_server.backfill.api import BackfillContext, SlackApiBackfiller, SleepBounds, backfill_channel
 from slack_fuse_server.backfill.legacy import LegacyCacheBackfiller
+from slack_fuse_server.backfill.resume import ResumePlan, find_resume_plan
 from slack_fuse_server.backfill.types import BackfillAbortReason, Backfiller
 from slack_fuse_server.blocked_channels import (
     BlockedChannelError,
@@ -73,6 +74,7 @@ from slack_fuse_server.slurper.catchup import (
 )
 from slack_fuse_server.slurper.channels import ensure_channel_added, populate_channels_once
 from slack_fuse_server.slurper.health import HealthEmitter, HealthKind
+from slack_fuse_server.slurper.ingestion import BootContext, IngestionContext, ingesting, process_boot
 from slack_fuse_server.slurper.limiters import SlurperLimiters
 from slack_fuse_server.slurper.offsets import OffsetWriter
 from slack_fuse_server.slurper.probes import ProbeTrigger, probe_sweep
@@ -177,7 +179,30 @@ def _make_api_backfiller(
         thread_max_s=config.backfill_thread_sleep_max_s,
     )
     blocked = None if writer is None else lambda: writer.run_read(blocked_channel_ids, limiter=limiters.admin_read)
-    return SlackApiBackfiller(client, limiters.slack_api, sleeps, blocked_channel_ids=blocked, task_name=task_name)
+    # Restart-safe resume: a crashed run's committed pages (events.source)
+    # tell the next full-history run which Slack cursor / threads remain.
+    resume = None if writer is None else _make_resume_plan_reader(writer, limiters)
+    return SlackApiBackfiller(
+        client,
+        limiters.slack_api,
+        sleeps,
+        blocked_channel_ids=blocked,
+        task_name=task_name,
+        resume_plan=resume,
+    )
+
+
+def _make_resume_plan_reader(
+    writer: OffsetWriter,
+    limiters: SlurperLimiters,
+) -> Callable[[str], Awaitable[ResumePlan | None]]:
+    async def _resume_plan(channel_id: str) -> ResumePlan | None:
+        return await writer.run_read(
+            lambda conn: find_resume_plan(conn, channel_id),
+            limiter=limiters.admin_read,
+        )
+
+    return _resume_plan
 
 
 def _make_catchup_deps(
@@ -308,6 +333,24 @@ def _build_metrics_aggregator(
     )
 
 
+def _ingesting_task(
+    ctx: IngestionContext,
+    fn: Callable[..., Awaitable[None]],
+    *args: object,
+) -> Callable[[], Awaitable[None]]:
+    """A zero-arg task thunk that runs `fn(*args)` inside an ingestion scope.
+
+    Trio copies the contextvars context at `start_soon`, so every write the
+    task (and its worker threads) makes carries the task's source envelope.
+    """
+
+    async def _run() -> None:
+        with ingesting(ctx):
+            await fn(*args)
+
+    return _run
+
+
 def _log_slurper_started() -> None:
     """Emit the canonical startup line for restart counting."""
     log.info(
@@ -318,7 +361,7 @@ def _log_slurper_started() -> None:
     )
 
 
-async def _serve(config: ServerConfig) -> None:
+async def _serve(config: ServerConfig, boot: BootContext) -> None:
     slack_api_limiter = trio.CapacityLimiter(2)
     writer_limiter = trio.CapacityLimiter(config.slurper_writer_pool_size)
     snapshot_limiter = trio.CapacityLimiter(1)
@@ -398,19 +441,44 @@ async def _serve(config: ServerConfig) -> None:
     try:
         async with trio.open_nursery() as nursery:
             _log_slurper_started()
+            # Every event-writing task runs inside an ingestion scope so its
+            # writes carry the source envelope (producer/boot/task ids —
+            # see slurper/ingestion.py). Dispatch/snapshot/wire tasks write no
+            # events and stay unwrapped.
             nursery.start_soon(
-                _run_socket_mode_with_users_task,
-                writer,
-                health,
-                client,
-                config,
-                status,
-                catchup_trigger,
-                limiters,
-                supervisor,
+                _ingesting_task(
+                    boot.task_context("socket-mode"),
+                    _run_socket_mode_with_users_task,
+                    writer,
+                    health,
+                    client,
+                    config,
+                    status,
+                    catchup_trigger,
+                    limiters,
+                    supervisor,
+                )
             )
-            nursery.start_soon(populate_users_once, writer, client, limiters, supervisor)
-            nursery.start_soon(populate_channels_once, writer, client, limiters, supervisor)
+            nursery.start_soon(
+                _ingesting_task(
+                    boot.task_context("populate-users-list", triggered_by="startup"),
+                    populate_users_once,
+                    writer,
+                    client,
+                    limiters,
+                    supervisor,
+                )
+            )
+            nursery.start_soon(
+                _ingesting_task(
+                    boot.task_context("populate-channels-list", triggered_by="startup"),
+                    populate_channels_once,
+                    writer,
+                    client,
+                    limiters,
+                    supervisor,
+                )
+            )
             nursery.start_soon(
                 _serve_dispatch_task,
                 config.listen_addr,
@@ -430,21 +498,75 @@ async def _serve(config: ServerConfig) -> None:
             # Periodic ``conversations.info`` refresh: backfills lossy
             # legacy channel_added payloads (pre raw-persistence) and
             # catches drift the webhook flow doesn't surface.
-            nursery.start_soon(refresh_channels_periodically, writer, client, limiters, supervisor)
+            nursery.start_soon(
+                _ingesting_task(
+                    boot.task_context("refresh-info", triggered_by="scheduled"),
+                    refresh_channels_periodically,
+                    writer,
+                    client,
+                    limiters,
+                    supervisor,
+                )
+            )
             # Long-lived consumer for HTTP-triggered refresh requests
             # (POST /refresh-channels). Same job as the periodic task,
             # fires only on demand. Rendezvous channel means a second
             # POST while one is running gets 409, not a queued cycle.
-            nursery.start_soon(refresh_trigger.consume, writer, client, limiters, supervisor)
-            nursery.start_soon(probe_sweep, writer, client, limiters, supervisor, config, probe_trigger)
-            nursery.start_soon(backfill_trigger.consume, config, supervisor)
+            nursery.start_soon(
+                _ingesting_task(
+                    boot.task_context("refresh-info", triggered_by="control-surface"),
+                    refresh_trigger.consume,
+                    writer,
+                    client,
+                    limiters,
+                    supervisor,
+                )
+            )
+            nursery.start_soon(
+                _ingesting_task(
+                    boot.task_context("probe-sweep"),
+                    probe_sweep,
+                    writer,
+                    client,
+                    limiters,
+                    supervisor,
+                    config,
+                    probe_trigger,
+                )
+            )
+            nursery.start_soon(
+                _ingesting_task(
+                    boot.task_context("backfill", triggered_by="control-surface"),
+                    backfill_trigger.consume,
+                    config,
+                    supervisor,
+                )
+            )
             # Reconnect/restart catchup consumer: runs one bounded gap-fill at
             # startup (the restart case) and one per gap-reconnect the socket
             # runner signals via catchup_trigger.
             if catchup_trigger is not None and catchup_deps is not None:
-                nursery.start_soon(catchup_trigger.consume, catchup_deps, supervisor)
+                nursery.start_soon(
+                    _ingesting_task(
+                        boot.task_context("catchup"),
+                        catchup_trigger.consume,
+                        catchup_deps,
+                        supervisor,
+                    )
+                )
             if auto_backfill:
-                nursery.start_soon(_auto_backfill, config, writer, health, client, limiters, supervisor)
+                nursery.start_soon(
+                    _ingesting_task(
+                        boot.task_context("auto-backfill", triggered_by="startup"),
+                        _auto_backfill,
+                        config,
+                        writer,
+                        health,
+                        client,
+                        limiters,
+                        supervisor,
+                    )
+                )
             log.info("slack-fuse-server listening on %s (HTTP /health, /metrics + WS /ws)", config.listen_addr)
     finally:
         client.close()
@@ -867,9 +989,13 @@ def main() -> None:
     args = _build_parser().parse_args()
     config = load_server_config()
     configure_span_thresholds_from_config(config)
+    # Process-level ingestion identity: one boot_id per serve loop / CLI
+    # invocation, commit + image digest read once from the environment.
+    boot = process_boot()
 
     if args.command == "refresh-channels":
-        trio.run(_run_refresh_channels_once, config)
+        with ingesting(boot.task_context("refresh-info", triggered_by="admin-cli")):
+            trio.run(_run_refresh_channels_once, config)
         return
     if args.command == "backfill":
         channel_id: str = args.channel_id
@@ -889,7 +1015,8 @@ def main() -> None:
             )
 
         try:
-            trio.run(_thunk)
+            with ingesting(boot.task_context("backfill", triggered_by="admin-cli")):
+                trio.run(_thunk)
         except BlockedChannelError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             raise SystemExit(2) from exc
@@ -903,7 +1030,7 @@ def main() -> None:
     if args.command == "list-blocked":
         _run_list_blocked_command(config)
         return
-    trio.run(_serve, config)
+    trio.run(_serve, config, boot)
 
 
 if __name__ == "__main__":

@@ -49,6 +49,20 @@ _T = TypeVar("_T", bound=BaseModel)
 
 
 @dataclass(frozen=True, slots=True)
+class ResponseMeta:
+    """Ambient facts about the HTTP exchange that produced a response.
+
+    Captured for persistence-bound page fetches so the events `source`
+    envelope can record which Slack request produced a row (`x-slack-req-id`
+    is the handle Slack support asks for) and how long it took.
+    """
+
+    endpoint: str
+    request_id: str | None
+    latency_ms: int
+
+
+@dataclass(frozen=True, slots=True)
 class Validated[M]:
     """Lossless capture of a Slack API response.
 
@@ -67,6 +81,9 @@ class Validated[M]:
 
     raw: JsonObject
     model: M
+    #: Set on page-level responses fetched via `_get_validated`; None on
+    #: per-item slices (one message/channel/user out of a page).
+    meta: ResponseMeta | None = None
 
 
 # Slack ok=False values that mean "stop, this won't recover"
@@ -133,8 +150,25 @@ class SlackClient:
         params: dict[str, str] | None = None,
     ) -> JsonObject:
         """Low-level GET. Handles HTTP/body errors, returns parsed JSON dict."""
+        body, _meta = self._get_raw_with_meta(method, params)
+        return body
+
+    def _get_raw_with_meta(
+        self,
+        method: str,
+        params: dict[str, str] | None = None,
+    ) -> tuple[JsonObject, ResponseMeta]:
+        """GET that also captures the exchange metadata (request id, latency)."""
+        started_ns = time.monotonic_ns()
         resp = self._http.get(f"{_BASE_URL}/{method}", params=params)
-        return self._handle_response(resp, method)
+        latency_ms = int((time.monotonic_ns() - started_ns) / 1_000_000)
+        body = self._handle_response(resp, method)
+        meta = ResponseMeta(
+            endpoint=method,
+            request_id=resp.headers.get("x-slack-req-id"),
+            latency_ms=latency_ms,
+        )
+        return body, meta
 
     def _post_raw(
         self,
@@ -195,8 +229,8 @@ class SlackClient:
         ``Validated.raw`` for the payload and ``Validated.model`` for any
         in-process logic.
         """
-        raw = self._get_raw(method, params)
-        return Validated(raw=raw, model=response_type.model_validate(raw))
+        raw, meta = self._get_raw_with_meta(method, params)
+        return Validated(raw=raw, model=response_type.model_validate(raw), meta=meta)
 
     def _post(
         self,
@@ -247,9 +281,7 @@ class SlackClient:
 
     def get_channel_info(self, channel_id: str) -> Validated[Channel]:
         """Fetch info for a single channel by ID, lossless."""
-        page = self._get_validated(
-            "conversations.info", {"channel": channel_id}, ConversationsInfoResponse
-        )
+        page = self._get_validated("conversations.info", {"channel": channel_id}, ConversationsInfoResponse)
         if page.model.channel is None:
             raise SlackAPIError(f"conversations.info returned no channel for {channel_id}")
         raw_channel = page.raw.get("channel")
@@ -467,9 +499,15 @@ class SlackClient:
         self,
         channel_id: str,
         thread_ts: str,
+        start_cursor: str = "",
     ) -> Iterator[Validated[ConversationsRepliesResponse]]:
-        """Yield one raw+validated ``conversations.replies`` page at a time."""
-        cursor = ""
+        """Yield one raw+validated ``conversations.replies`` page at a time.
+
+        ``start_cursor`` resumes mid-thread pagination (restart-safe backfill);
+        the default fetches from the beginning, where Slack includes the thread
+        parent as the first message.
+        """
+        cursor = start_cursor
         while True:
             params: dict[str, str] = {
                 "channel": channel_id,

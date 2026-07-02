@@ -76,9 +76,14 @@ def test_messages_pages_for_channel_yields_one_batch_per_slack_response(fake_sla
     batches = trio.run(collect)
 
     assert [batch.kind for batch in batches] == ["history_page", "replies_page"]
-    assert [len(batch.records) for batch in batches] == [2, 1]
+    # The replies batch leads with the corrective parent (Slack's current
+    # thread metadata), atomic with the replies it justifies.
+    assert [len(batch.records) for batch in batches] == [2, 2]
     assert [record.ts for record in batches[0].records] == ["1700000100.000200", "1700000000.000100"]
-    assert [record.ts for record in batches[1].records] == ["1700000200.000300"]
+    assert [record.ts for record in batches[1].records] == ["1700000100.000200", "1700000200.000300"]
+    parent_record = batches[1].records[0]
+    assert parent_record.source is not None
+    assert parent_record.source["producer"] == "backfill-corrective-parent"
     assert batches[1].origin.thread_ts == "1700000100.000200"
 
 
