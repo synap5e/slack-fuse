@@ -92,6 +92,7 @@ class ServerConfig(BaseSettings):
     probe_channel_newest_message_cadence_s: float = 86400.0
     probe_channel_inventory_cadence_s: float = 86400.0
     probe_workspace_user_count_cadence_s: float = 86400.0
+    probe_channel_day_presence_cadence_s: float = 7 * 86400.0
 
     @classmethod
     def settings_customise_sources(

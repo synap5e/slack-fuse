@@ -12,7 +12,14 @@ the event log rather than from in-memory timers.
 Slack ``conversations.history`` timestamp bounds are exclusive unless callers
 pass ``inclusive=true``. These probes deliberately do not pass ``inclusive``:
 ``latest=<local_oldest_ts>`` asks Slack for messages strictly older than the
-oldest local active message.
+oldest local active message, and the day-presence windows tolerate excluding
+a message landing on an exact microsecond boundary (that can only delay a
+detection, never fabricate one).
+
+The three ``conversations_history_sampled`` sampling purposes are disjoint on
+``call_params`` keys: newest-message samples carry neither bound,
+older-than-oldest samples carry only ``latest``, day-presence samples carry
+both ``oldest`` and ``latest``. Due checks and detection SQL rely on this.
 """
 
 from __future__ import annotations
@@ -21,7 +28,7 @@ import logging
 import re
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Literal, LiteralString, Protocol, cast
 
@@ -51,18 +58,26 @@ JOB_CHANNEL_OLDER_THAN_OLDEST = "channel_older_than_oldest_exists"
 JOB_CHANNEL_NEWEST_MESSAGE = "channel_newest_message"
 JOB_CHANNEL_INVENTORY = "channel_inventory"
 JOB_WORKSPACE_USER_COUNT = "workspace_user_count"
+JOB_CHANNEL_DAY_PRESENCE = "channel_day_presence"
 
 DEFAULT_PROBE_SWEEP_INTERVAL_S = 60 * 60.0
 DEFAULT_CHANNEL_OLDER_THAN_OLDEST_CADENCE_S = 7 * 24 * 60 * 60.0
 DEFAULT_CHANNEL_NEWEST_MESSAGE_CADENCE_S = 24 * 60 * 60.0
 DEFAULT_CHANNEL_INVENTORY_CADENCE_S = 24 * 60 * 60.0
 DEFAULT_WORKSPACE_USER_COUNT_CADENCE_S = 24 * 60 * 60.0
+DEFAULT_CHANNEL_DAY_PRESENCE_CADENCE_S = 7 * 24 * 60 * 60.0
 
 _TS_RE = re.compile(r"^[0-9]+\.[0-9]+$")
 _WORKSPACE_TARGET = "workspace"
 _CONVERSATION_TYPES = "public_channel,private_channel,im,mpim"
 _USERS_LIST_LIMIT = 200
 _HISTORY_SAMPLE_LIMIT = 1
+_DAY_S = 86400
+# Rolling detection window: the last N complete UTC days. Today is excluded
+# because a partial day cannot prove a gap. Each run samples exactly one day
+# (the stalest), so per-channel API spend self-paces to window/cadence calls
+# per day (30/7 ≈ 4.3) once the window is fully sampled.
+_DAY_PRESENCE_WINDOW_DAYS = 30
 
 
 class ProbeCadenceConfig(Protocol):
@@ -80,6 +95,9 @@ class ProbeCadenceConfig(Protocol):
 
     @property
     def probe_workspace_user_count_cadence_s(self) -> float: ...
+
+    @property
+    def probe_channel_day_presence_cadence_s(self) -> float: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -585,6 +603,111 @@ async def _sample_newest_history(
     return True
 
 
+@dataclass(frozen=True, slots=True)
+class _DayWindow:
+    """One complete UTC day expressed as Slack ts-string bounds."""
+
+    oldest: str
+    latest: str
+
+
+def _presence_day_windows(now: datetime) -> tuple[_DayWindow, ...]:
+    """The last ``_DAY_PRESENCE_WINDOW_DAYS`` complete UTC days, most recent first."""
+    today_start = datetime(now.year, now.month, now.day, tzinfo=UTC)
+    windows: list[_DayWindow] = []
+    for offset in range(1, _DAY_PRESENCE_WINDOW_DAYS + 1):
+        day_epoch = int((today_start - timedelta(days=offset)).timestamp())
+        windows.append(_DayWindow(oldest=f"{day_epoch}.000000", latest=f"{day_epoch + _DAY_S - 1}.999999"))
+    return tuple(windows)
+
+
+def _presence_sample_ages_sync(
+    conn: Connection[TupleRow],
+    channel_id: str,
+    day_starts: Sequence[str],
+) -> dict[str, float]:
+    """Seconds since the latest day-presence sample, keyed by day-start ts.
+
+    Days never sampled are absent from the result. Only rows carrying both
+    ``oldest`` and ``latest`` count: that key shape is exclusive to the
+    day-presence job.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT payload->'call_params'->>'oldest',
+                   EXTRACT(EPOCH FROM (now() - max(created_at)))
+            FROM events
+            WHERE stream = %s
+              AND kind = %s
+              AND payload->'call_params'->>'channel' = %s
+              AND payload->'call_params' ? 'oldest'
+              AND payload->'call_params' ? 'latest'
+              AND payload->'call_params'->>'oldest' = ANY(%s)
+            GROUP BY 1
+            """,
+            (HEALTH_STREAM, CONVERSATIONS_HISTORY_SAMPLED, channel_id, list(day_starts)),
+        )
+        rows = cur.fetchall()
+    return {str(row[0]): float(row[1]) for row in rows if row[0] is not None and row[1] is not None}
+
+
+def _day_presence_due_sync(conn: Connection[TupleRow], target: ProbeTarget, cadence_s: float) -> bool:
+    windows = _presence_day_windows(datetime.now(UTC))
+    ages = _presence_sample_ages_sync(conn, target.value, [window.oldest for window in windows])
+    return any(ages.get(window.oldest, float("inf")) >= cadence_s for window in windows)
+
+
+async def _sample_day_presence_history(
+    writer: OffsetWriter,
+    client: SlackClient,
+    limiters: SlurperLimiters,
+    target: ProbeTarget,
+    recorder: SpanRecorder | None,
+) -> bool:
+    """Sample one (channel, day) window for message presence.
+
+    Detects mid-stream gaps that head/tail probes cannot: a single
+    post-reconnect live message advances the local newest ts past a lost
+    window, but a day probe still sees Slack holding messages where the local
+    ``active_messages`` view has none. Each call samples the stalest window
+    (never-sampled first, most-recent-day tiebreak) so recent days — the most
+    likely to hold fresh gaps — fill in first.
+    """
+    channel_id = target.value
+    windows = _presence_day_windows(datetime.now(UTC))
+    ages = await writer.run_read(
+        lambda conn: _presence_sample_ages_sync(conn, channel_id, [window.oldest for window in windows]),
+        limiter=limiters.admin_read,
+        span=recorder,
+    )
+    window = max(windows, key=lambda candidate: ages.get(candidate.oldest, float("inf")))
+    call_params: JsonObject = {
+        "channel": channel_id,
+        "oldest": window.oldest,
+        "latest": window.latest,
+        "limit": _HISTORY_SAMPLE_LIMIT,
+    }
+    response = await run_sync_with_span(
+        lambda: client.sample_conversations_history(
+            channel_id=channel_id,
+            oldest=window.oldest,
+            latest=window.latest,
+            limit=_HISTORY_SAMPLE_LIMIT,
+        ),
+        limiter=limiters.slack_api,
+        span=recorder,
+    )
+    await _write_probe_event(
+        writer,
+        CONVERSATIONS_HISTORY_SAMPLED,
+        {"call_params": call_params, "response": response, "captured_at": _utc_iso()},
+        recorder,
+    )
+    _record_sample_stats(recorder, response, "messages")
+    return True
+
+
 async def _sample_channel_inventory(
     writer: OffsetWriter,
     client: SlackClient,
@@ -688,6 +811,8 @@ def _valid_ts(value: object) -> str | None:
 
 
 def _history_older_due_sync(conn: Connection[TupleRow], target: ProbeTarget, cadence_s: float) -> bool:
+    # latest-only: day-presence samples also carry `latest` (plus `oldest`)
+    # and must not reset this job's cadence.
     return _latest_sample_is_due(
         conn,
         """
@@ -697,6 +822,7 @@ def _history_older_due_sync(conn: Connection[TupleRow], target: ProbeTarget, cad
           AND kind = %s
           AND payload->'call_params'->>'channel' = %s
           AND payload->'call_params'->>'latest' IS NOT NULL
+          AND NOT (COALESCE(payload->'call_params', '{}'::jsonb) ? 'oldest')
         ORDER BY created_at DESC
         LIMIT 1
         """,
@@ -824,6 +950,18 @@ PROBE_REGISTRY: tuple[ProbeDescriptor, ...] = (
         op="slurper.probe.conversations_history",
         tier=3,
         cadence_config_field="probe_channel_newest_message_cadence_s",
+        is_per_target=True,
+    ),
+    ProbeDescriptor(
+        job_id=JOB_CHANNEL_DAY_PRESENCE,
+        event_kind=CONVERSATIONS_HISTORY_SAMPLED,
+        cadence_s=DEFAULT_CHANNEL_DAY_PRESENCE_CADENCE_S,
+        run=_sample_day_presence_history,
+        targets=_channel_targets,
+        due=_day_presence_due_sync,
+        op="slurper.probe.conversations_history",
+        tier=3,
+        cadence_config_field="probe_channel_day_presence_cadence_s",
         is_per_target=True,
     ),
     ProbeDescriptor(

@@ -32,6 +32,17 @@ WHERE stream = 'slurper-health'
 HAVING max(created_at) IS NULL OR max(created_at) < now() - interval '2 hours';
 ```
 
+## Sampling-purpose discriminators
+
+Three jobs share the `conversations_history_sampled` kind and are disjoint on
+`call_params` keys:
+
+- newest-message: neither `oldest` nor `latest`
+- older-than-oldest: `latest` only
+- day-presence: both `oldest` and `latest`
+
+Queries over history samples must filter on this key shape, not just the kind.
+
 ## Older History Not Walked
 
 The older-history job calls:
@@ -52,6 +63,7 @@ WITH latest_samples AS (
   WHERE stream = 'slurper-health'
     AND kind = 'conversations_history_sampled'
     AND payload->'call_params'->>'latest' IS NOT NULL
+    AND NOT (COALESCE(payload->'call_params', '{}'::jsonb) ? 'oldest')
   ORDER BY payload->'call_params'->>'channel', created_at DESC
 )
 SELECT
@@ -68,7 +80,8 @@ ORDER BY created_at DESC;
 
 This catches head drift: Slack has a newest message more than 5 minutes newer
 than the locally active message set. It does not catch mid-stream gaps after a
-later local message has arrived; that needs the future day-presence probe.
+later local message has arrived; that is the day-presence job's territory
+(see "Day-Presence Gaps" below).
 
 ```sql
 WITH history_samples AS (
@@ -136,6 +149,83 @@ WHERE h.slack_newest_ts ~ '^[0-9]+\.[0-9]+$'
   AND (l.local_newest_ts IS NULL OR h.slack_newest_ts::numeric - l.local_newest_ts > 300)
 ORDER BY delta_seconds DESC NULLS FIRST;
 ```
+
+## Day-Presence Gaps
+
+The day-presence job calls:
+
+```text
+conversations.history(channel=<channel>, oldest=<day 00:00:00.000000>,
+                      latest=<day 23:59:59.999999>, limit=1)
+```
+
+for one UTC day per channel per sweep, rotating over the last 30 complete UTC
+days (stalest day first, most-recent-day tiebreak; each (channel, day) pair is
+resampled on a 7-day cadence). This catches mid-stream gaps: a catchup hole
+where a single post-reconnect live message advanced the local newest ts past a
+lost window, so head/tail probes see nothing wrong.
+
+With `limit=1` Slack returns its newest message inside the window. If that
+exact ts is not an active local message, we lost it (or everything around it).
+This also catches partial-day gaps where the local view has *some* messages
+for the day but not Slack's newest one.
+
+```sql
+WITH samples AS (
+  SELECT DISTINCT ON (
+      payload->'call_params'->>'channel',
+      payload->'call_params'->>'oldest'
+  )
+      payload->'call_params'->>'channel' AS channel_id,
+      (payload->'call_params'->>'oldest')::numeric AS day_start,
+      (payload->'call_params'->>'latest')::numeric AS day_end,
+      payload->'response'->'messages'->0->>'ts' AS slack_sample_ts,
+      created_at AS sampled_at
+  FROM events
+  WHERE stream = 'slurper-health'
+    AND kind = 'conversations_history_sampled'
+    AND payload->'call_params' ? 'oldest'
+    AND payload->'call_params' ? 'latest'
+  ORDER BY
+      payload->'call_params'->>'channel',
+      payload->'call_params'->>'oldest',
+      created_at DESC
+)
+SELECT
+    s.channel_id,
+    to_timestamp(s.day_start)::date AS day,
+    s.slack_sample_ts,
+    (SELECT count(*)
+       FROM active_messages am
+      WHERE am.stream = 'channel:' || s.channel_id
+        AND am.ts_numeric >= s.day_start
+        AND am.ts_numeric <= s.day_end) AS local_count_in_day,
+    s.sampled_at
+FROM samples s
+WHERE s.slack_sample_ts IS NOT NULL
+  AND NOT EXISTS (
+    SELECT 1
+    FROM active_messages am
+    WHERE am.stream = 'channel:' || s.channel_id
+      AND am.ts = s.slack_sample_ts
+  )
+ORDER BY s.sampled_at DESC;
+```
+
+Known benign-result classes (read `sampled_at` before paging anyone):
+
+- **Delete race**: a message deleted in Slack after the capture leaves a stale
+  sample pointing at a now-tombstoned ts. Self-heals on the next weekly
+  resample while the day is inside the 30-day window; samples for days that
+  have slid out of the window are never refreshed, so treat old `sampled_at`
+  rows with suspicion.
+- **Backfill/catchup in progress**: the local side of the comparison is
+  computed at query time, so a gap that backfill has since filled disappears
+  from this query on its own. A row that persists across a completed backfill
+  is a real loss.
+- Boundary exclusivity (Slack's `oldest`/`latest` are exclusive) can only make
+  Slack's window smaller than the local comparison window, i.e. it can delay a
+  detection but never fabricate one.
 
 ## Missing Channel Inventory
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, cast
 
 import httpx
@@ -11,11 +12,13 @@ import pytest
 import trio
 
 from slack_fuse_server._json import JsonObject, JsonValue
+from slack_fuse_server.slurper import probes
 from slack_fuse_server.slurper.api import SlackClient
 from slack_fuse_server.slurper.offsets import EventRecord, write_event
 from slack_fuse_server.slurper.probes import (
     CONVERSATIONS_HISTORY_SAMPLED,
     CONVERSATIONS_LIST_SAMPLED,
+    JOB_CHANNEL_DAY_PRESENCE,
     JOB_CHANNEL_INVENTORY,
     JOB_CHANNEL_NEWEST_MESSAGE,
     JOB_CHANNEL_OLDER_THAN_OLDEST,
@@ -24,7 +27,11 @@ from slack_fuse_server.slurper.probes import (
     USERS_LIST_SAMPLED,
     ProbeTarget,
     ProbeTrigger,
+    _day_presence_due_sync,
+    _history_older_due_sync,
+    _presence_day_windows,
     _sample_channel_inventory,
+    _sample_day_presence_history,
     _sample_newest_history,
     _sample_older_than_oldest_history,
     _sample_workspace_users,
@@ -45,6 +52,7 @@ class _ProbeConfig:
     probe_channel_newest_message_cadence_s: float = 86400.0
     probe_channel_inventory_cadence_s: float = 86400.0
     probe_workspace_user_count_cadence_s: float = 86400.0
+    probe_channel_day_presence_cadence_s: float = 7 * 86400.0
 
 
 def _fake_client(http: httpx.Client) -> SlackClient:
@@ -155,6 +163,80 @@ def test_newest_writes_raw_history_sample_without_latest(
     assert "oldest" not in cast(dict[str, object], payload["call_params"])
 
 
+def test_presence_day_windows_are_complete_utc_days_excluding_today() -> None:
+    now = datetime(2026, 7, 3, 12, 30, tzinfo=UTC)
+    windows = _presence_day_windows(now)
+    assert len(windows) == 30
+    # Most recent complete day first: 2026-07-02T00:00:00Z .. 23:59:59.999999.
+    assert windows[0].oldest == "1782950400.000000"
+    assert windows[0].latest == "1783036799.999999"
+    # Oldest window day: 2026-06-03.
+    assert windows[-1].oldest == "1780444800.000000"
+    assert all(w.oldest.endswith(".000000") and w.latest.endswith(".999999") for w in windows)
+    assert all(int(w.latest.split(".")[0]) - int(w.oldest.split(".")[0]) == 86399 for w in windows)
+
+
+def test_day_presence_samples_most_recent_unsampled_day_first(
+    server_conn: psycopg.Connection[TupleRow],
+    fake_slack_http: httpx.Client,
+) -> None:
+    windows = _presence_day_windows(datetime.now(UTC))
+
+    async def body() -> None:
+        writer = make_test_writer(server_conn)
+        client = _fake_client(fake_slack_http)
+        limiters = make_test_limiters()
+        await _sample_day_presence_history(writer, client, limiters, ProbeTarget("C0001", "channel_id"), None)
+        await _sample_day_presence_history(writer, client, limiters, ProbeTarget("C0001", "channel_id"), None)
+
+    trio.run(body)
+
+    samples = _health_events_of(server_conn, CONVERSATIONS_HISTORY_SAMPLED)
+    assert len(samples) == 2
+    assert samples[0]["call_params"] == {
+        "channel": "C0001",
+        "oldest": windows[0].oldest,
+        "latest": windows[0].latest,
+        "limit": 1,
+    }
+    assert samples[1]["call_params"] == {
+        "channel": "C0001",
+        "oldest": windows[1].oldest,
+        "latest": windows[1].latest,
+        "limit": 1,
+    }
+    response = cast(JsonObject, samples[0]["response"])
+    assert response["ok"] is True
+    assert isinstance(response["messages"], list)
+    assert isinstance(samples[0]["captured_at"], str)
+
+
+def test_day_presence_due_and_older_than_oldest_cadence_are_independent(
+    server_conn: psycopg.Connection[TupleRow],
+    fake_slack_http: httpx.Client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(probes, "_DAY_PRESENCE_WINDOW_DAYS", 2)
+    target = ProbeTarget("C0001", "channel_id")
+    cadence_s = 7 * 86400.0
+    assert _day_presence_due_sync(server_conn, target, cadence_s) is True
+
+    async def body() -> None:
+        writer = make_test_writer(server_conn)
+        client = _fake_client(fake_slack_http)
+        limiters = make_test_limiters()
+        await _sample_day_presence_history(writer, client, limiters, target, None)
+        await _sample_day_presence_history(writer, client, limiters, target, None)
+
+    trio.run(body)
+
+    assert len(_health_events_of(server_conn, CONVERSATIONS_HISTORY_SAMPLED)) == 2
+    assert _day_presence_due_sync(server_conn, target, cadence_s) is False
+    # Day-presence samples carry `latest` too; they must not reset the
+    # older-than-oldest job's cadence for the same channel.
+    assert _history_older_due_sync(server_conn, target, cadence_s) is True
+
+
 def test_inventory_writes_raw_conversations_list_sample(
     server_conn: psycopg.Connection[TupleRow],
     fake_slack_http: httpx.Client,
@@ -228,7 +310,10 @@ def test_probe_sweep_once_writes_all_samples_and_then_skips_when_not_due(
 
     events = _health_events(server_conn)
     kinds = [kind for kind, _payload in events]
-    assert kinds.count(CONVERSATIONS_HISTORY_SAMPLED) == 3
+    # First sweep: older(1) + newest(2) + day-presence(2). Second sweep: the
+    # older/newest jobs are within cadence, but day-presence still has 29
+    # unsampled window days per channel, so it samples one more day each (+2).
+    assert kinds.count(CONVERSATIONS_HISTORY_SAMPLED) == 7
     assert kinds.count(CONVERSATIONS_LIST_SAMPLED) == 1
     assert kinds.count(USERS_LIST_SAMPLED) == 1
     assert kinds.count(PROBE_SWEEP_COMPLETED) == 2
@@ -239,10 +324,12 @@ def test_probe_sweep_once_writes_all_samples_and_then_skips_when_not_due(
     second_counts = cast(JsonObject, second_heartbeat["probes"])
     assert first_counts[JOB_CHANNEL_OLDER_THAN_OLDEST] == {"succeeded": 1, "failed": 0, "skipped": 0}
     assert first_counts[JOB_CHANNEL_NEWEST_MESSAGE] == {"succeeded": 2, "failed": 0, "skipped": 0}
+    assert first_counts[JOB_CHANNEL_DAY_PRESENCE] == {"succeeded": 2, "failed": 0, "skipped": 0}
     assert first_counts[JOB_CHANNEL_INVENTORY] == {"succeeded": 1, "failed": 0, "skipped": 0}
     assert first_counts[JOB_WORKSPACE_USER_COUNT] == {"succeeded": 1, "failed": 0, "skipped": 0}
     assert second_counts[JOB_CHANNEL_OLDER_THAN_OLDEST] == {"succeeded": 0, "failed": 0, "skipped": 1}
     assert second_counts[JOB_CHANNEL_NEWEST_MESSAGE] == {"succeeded": 0, "failed": 0, "skipped": 2}
+    assert second_counts[JOB_CHANNEL_DAY_PRESENCE] == {"succeeded": 2, "failed": 0, "skipped": 0}
     assert second_counts[JOB_CHANNEL_INVENTORY] == {"succeeded": 0, "failed": 0, "skipped": 1}
     assert second_counts[JOB_WORKSPACE_USER_COUNT] == {"succeeded": 0, "failed": 0, "skipped": 1}
     assert first_heartbeat["triggered_by"] == "scheduled"
@@ -251,6 +338,7 @@ def test_probe_sweep_once_writes_all_samples_and_then_skips_when_not_due(
     phases = [(item.task_name, item.phase) for item in supervisor.declarations]
     assert ("probe-sweep", JOB_CHANNEL_OLDER_THAN_OLDEST) in phases
     assert ("probe-sweep", JOB_CHANNEL_NEWEST_MESSAGE) in phases
+    assert ("probe-sweep", JOB_CHANNEL_DAY_PRESENCE) in phases
     assert ("probe-sweep", JOB_CHANNEL_INVENTORY) in phases
     assert ("probe-sweep", JOB_WORKSPACE_USER_COUNT) in phases
     assert "op=slurper.probe.conversations_history" in caplog.text

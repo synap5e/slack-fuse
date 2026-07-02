@@ -71,6 +71,7 @@ def test_server_config_from_toml(tmp_path: Path) -> None:
     assert abs(cfg.probe_channel_older_than_oldest_cadence_s - 7 * 86400.0) < 1e-9
     assert abs(cfg.probe_channel_inventory_cadence_s - 86400.0) < 1e-9
     assert abs(cfg.probe_workspace_user_count_cadence_s - 86400.0) < 1e-9
+    assert abs(cfg.probe_channel_day_presence_cadence_s - 7 * 86400.0) < 1e-9
 
 
 def test_client_config_from_toml(tmp_path: Path) -> None:
