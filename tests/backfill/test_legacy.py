@@ -19,6 +19,7 @@ from slack_fuse.models import Message
 from slack_fuse_render import ChannelId
 from slack_fuse_server.backfill.api import BackfillContext, backfill_channel
 from slack_fuse_server.backfill.legacy import LegacyCacheBackfiller
+from slack_fuse_server.backfill.types import MessageBatch
 from slack_fuse_server.slurper.__main__ import _build_parser
 from slack_fuse_server.slurper.health import HealthEmitter
 from slack_fuse_server.wire.frames import EventFrame
@@ -47,6 +48,17 @@ async def _collect_messages(
     out: list[Message] = []
     async for wrapped in backfiller.messages_for_channel(ChannelId(channel_id), since_ts=since_ts):
         out.append(wrapped.model)
+    return out
+
+
+async def _collect_batches(
+    backfiller: LegacyCacheBackfiller,
+    channel_id: str,
+    since_ts: float | None = None,
+) -> list[MessageBatch]:
+    out: list[MessageBatch] = []
+    async for batch in backfiller.messages_pages_for_channel(ChannelId(channel_id), since_ts=since_ts):
+        out.append(batch)
     return out
 
 
@@ -130,6 +142,37 @@ def test_messages_for_channel_order_and_since_filter(tmp_path: Path) -> None:
 
     filtered = trio.run(_collect_messages, backfiller, "C1", 100.000001)
     assert [m.ts for m in filtered] == ["100.000002", "101.000001", "101.000002"]
+
+
+def test_messages_pages_for_channel_yields_one_batch_per_day_file(tmp_path: Path) -> None:
+    cache_dir = tmp_path / "cache"
+    _write_day(
+        cache_dir,
+        "C1",
+        "2026-06-06",
+        [
+            Message(ts="100.000001", user="U1", text="d1-a"),
+            Message(ts="100.000002", user="U1", text="d1-b"),
+        ],
+    )
+    _write_day(
+        cache_dir,
+        "C1",
+        "2026-06-07",
+        [
+            Message(ts="101.000001", user="U1", text="d2-a"),
+            Message(ts="101.000002", user="U1", text="d2-b"),
+        ],
+    )
+
+    batches = trio.run(_collect_batches, LegacyCacheBackfiller(cache_dir), "C1", 100.000001)
+
+    assert [batch.kind for batch in batches] == ["history_page", "history_page"]
+    assert [batch.origin.slack_cursor for batch in batches] == ["2026-06-06.json", "2026-06-07.json"]
+    assert [[record.ts for record in batch.records] for batch in batches] == [
+        ["100.000002"],
+        ["101.000001", "101.000002"],
+    ]
 
 
 def test_legacy_backfill_channel_is_idempotent_and_payloads_validate(

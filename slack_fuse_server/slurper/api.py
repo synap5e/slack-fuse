@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import TypeVar, cast
 
@@ -451,6 +452,23 @@ class SlackClient:
         for the Linear thread that motivated this promotion.
         """
         out: list[Validated[Message]] = []
+        for page in self.iter_replies_pages(channel_id, thread_ts):
+            raw_msgs = page.raw.get("messages")
+            raw_list: list[object] = list(raw_msgs) if isinstance(raw_msgs, list) else []
+            # Pair each validated model with its raw dict by index — same
+            # invariant as ``list_conversations`` / ``_paginate_history``:
+            # both come from the same wire payload, indices line up.
+            for raw_msg, model_msg in zip(raw_list, page.model.messages, strict=False):
+                if isinstance(raw_msg, dict):
+                    out.append(Validated(raw=cast(JsonObject, raw_msg), model=model_msg))
+        return out
+
+    def iter_replies_pages(
+        self,
+        channel_id: str,
+        thread_ts: str,
+    ) -> Iterator[Validated[ConversationsRepliesResponse]]:
+        """Yield one raw+validated ``conversations.replies`` page at a time."""
         cursor = ""
         while True:
             params: dict[str, str] = {
@@ -465,21 +483,13 @@ class SlackClient:
                 params,
                 ConversationsRepliesResponse,
             )
-            raw_msgs = page.raw.get("messages")
-            raw_list: list[object] = list(raw_msgs) if isinstance(raw_msgs, list) else []
-            # Pair each validated model with its raw dict by index — same
-            # invariant as ``list_conversations`` / ``_paginate_history``:
-            # both come from the same wire payload, indices line up.
-            for raw_msg, model_msg in zip(raw_list, page.model.messages, strict=False):
-                if isinstance(raw_msg, dict):
-                    out.append(Validated(raw=cast(JsonObject, raw_msg), model=model_msg))
+            yield page
             if not page.model.has_more:
                 break
             cursor = page.model.response_metadata.next_cursor
             if not cursor:
                 break
             time.sleep(_PAGE_DELAY)
-        return out
 
     def get_permalink(self, channel_id: str, message_ts: str) -> str:
         """Fetch Slack's canonical permalink for a message."""

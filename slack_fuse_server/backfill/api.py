@@ -4,36 +4,51 @@ Per RFC §Backfill. Lifts the pagination + throttling from
 `slack_fuse/backfill.py` (30-180s between `conversations.history` pages, 2-8s
 between `conversations.replies` calls, one channel at a time) but changes the
 write target: instead of writing JSON to the disk cache, the driver
-(`backfill_channel`) writes each historical message as a `message` event via
-the `OffsetWriter`, deduped on `(stream, ts)` so re-running is a no-op.
+(`backfill_channel`) writes each source page as one transaction of `message`
+events via the `OffsetWriter`, deduped on `(stream, ts)` so re-running is a
+no-op.
 
-The backfiller is a pure *source* of `Message` items (the `Backfiller`
+The backfiller is a pure *source* of message batches (the `Backfiller`
 protocol). The driver owns orchestration: it counts messages, honours the
-`BACKFILL_WARN_AT` / `BACKFILL_ABORT_AT` thresholds, and emits the
-`backfill_started` / `backfill_completed` / `backfill_aborted` /
-`slack_degraded` health events. Yielding newest-first means an aborted huge
-channel keeps the truncated *head* (most-recent messages) per the RFC.
+`BACKFILL_WARN_AT` / `BACKFILL_ABORT_AT` thresholds at history-page
+boundaries, and emits the `backfill_started` / `backfill_completed` /
+`backfill_aborted` / `slack_degraded` health events. Yielding newest-first
+means an aborted huge channel keeps the truncated *head* (most-recent
+messages) per the RFC.
 """
 
 from __future__ import annotations
 
 import logging
 import random
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import cast
 
 import trio
+from psycopg import Connection
+from psycopg.rows import TupleRow
 
-from slack_fuse.models import ConversationsHistoryResponse, Message
+from slack_fuse.models import ConversationsHistoryResponse, ConversationsRepliesResponse, Message
 from slack_fuse_render import ChannelId
 from slack_fuse_server._json import JsonObject
-from slack_fuse_server.backfill.types import BackfillAbortReason, Backfiller, BackfillResult
+from slack_fuse_server.backfill.types import (
+    BackfillAbortReason,
+    Backfiller,
+    BackfillResult,
+    MessageBatch,
+    MessageBatchOrigin,
+)
 from slack_fuse_server.blocked_channels import is_channel_blocked
 from slack_fuse_server.slurper.api import FatalAPIError, RateLimitedError, SlackClient, Validated
 from slack_fuse_server.slurper.health import HealthEmitter, HealthKind
 from slack_fuse_server.slurper.limiters import SlurperLimiters
-from slack_fuse_server.slurper.offsets import PG_TIMEOUT_EXCEPTIONS, EventRecord, OffsetWriter
+from slack_fuse_server.slurper.offsets import (
+    PG_TIMEOUT_EXCEPTIONS,
+    EventRecord,
+    OffsetWriter,
+    write_message_or_corrective,
+)
 from slack_fuse_server.slurper.spans import run_sync_with_span, span
 
 log = logging.getLogger(__name__)
@@ -83,6 +98,9 @@ class BackfillContext:
     """Write sink + thresholds for the `backfill_channel` driver.
 
     `abort_at=None` lifts the per-channel size limit (operator override).
+    Size thresholds are checked only at history-page boundaries: a page that
+    would push the cumulative count past `abort_at` is skipped entirely, making
+    the threshold a soft ceiling at the last fully committed page.
     `progress_every` controls the `backfill_progress` emission cadence.
     """
 
@@ -104,6 +122,32 @@ def _ts_float(ts: str) -> float | None:
 
 def _is_thread_parent(msg: Message) -> bool:
     return msg.reply_count > 0 and (msg.thread_ts is None or msg.thread_ts == msg.ts)
+
+
+def _validated_messages_from_page(
+    raw: JsonObject,
+    messages: Sequence[Message],
+    *,
+    reverse: bool = False,
+) -> list[Validated[Message]]:
+    raw_msgs = raw.get("messages")
+    raw_list: list[object] = list(raw_msgs) if isinstance(raw_msgs, list) else []
+    paired = list(zip(raw_list, messages, strict=False))
+    if reverse:
+        paired.reverse()
+    out: list[Validated[Message]] = []
+    for raw_msg, msg in paired:
+        if isinstance(raw_msg, dict):
+            out.append(Validated(raw=cast(JsonObject, raw_msg), model=msg))
+    return out
+
+
+def _records_from_validated(channel_id: str, messages: Sequence[Validated[Message]]) -> tuple[EventRecord, ...]:
+    stream = f"channel:{channel_id}"
+    return tuple(
+        EventRecord(stream=stream, kind="message", ts=wrapped.model.ts, payload=wrapped.raw, dedup=True)
+        for wrapped in messages
+    )
 
 
 class SlackApiBackfiller:
@@ -171,6 +215,21 @@ class SlackApiBackfiller:
         async for reply in self._expand_threads(channel_id.value, since_ts, thread_parents):
             yield reply
 
+    async def messages_pages_for_channel(
+        self,
+        channel_id: ChannelId,
+        since_ts: float | None = None,
+    ) -> AsyncIterator[MessageBatch]:
+        """Yield one atomic write batch per Slack API response."""
+        thread_parents: list[str] = []
+        page_index = 0
+        async for batch in self._history_batches(channel_id.value, since_ts, thread_parents, page_index):
+            page_index += 1
+            yield batch
+        async for batch in self._reply_batches(channel_id.value, since_ts, thread_parents, page_index):
+            page_index += 1
+            yield batch
+
     async def _paginate_history(
         self,
         channel_id: str,
@@ -186,19 +245,13 @@ class SlackApiBackfiller:
             if wrapped is None:  # rate-limited; _history_page already slept — retry same cursor
                 continue
             resp = wrapped.model
-            # Pair raw with validated by index. The wire response's
-            # ``messages`` array maps 1:1 to ``resp.messages``.
-            raw_msgs = wrapped.raw.get("messages")
-            raw_list: list[object] = list(raw_msgs) if isinstance(raw_msgs, list) else []
-            paired = list(zip(raw_list, resp.messages, strict=False))
-            for raw_msg, msg in reversed(paired):
-                if not isinstance(raw_msg, dict):
-                    continue
+            for wrapped_msg in _validated_messages_from_page(wrapped.raw, resp.messages, reverse=True):
+                msg = wrapped_msg.model
                 if _is_thread_parent(msg):
                     thread_parents.append(msg.ts)
                 if not _passes_since(msg.ts, since_ts):
                     continue
-                yield Validated(raw=cast(JsonObject, raw_msg), model=msg)
+                yield wrapped_msg
             page += 1
             if not resp.has_more:
                 break
@@ -226,6 +279,79 @@ class SlackApiBackfiller:
             for reply in thread_msgs[1:]:
                 if _passes_since(reply.model.ts, since_ts):
                     yield reply
+
+    async def _history_batches(
+        self,
+        channel_id: str,
+        since_ts: float | None,
+        thread_parents: list[str],
+        first_page_index: int,
+    ) -> AsyncIterator[MessageBatch]:
+        cursor = ""
+        page = 0
+        while True:
+            if page > 0:
+                await trio.sleep(random.uniform(self._sleeps.page_min_s, self._sleeps.page_max_s))
+            request_cursor = cursor
+            wrapped = await self._history_page(channel_id, cursor, oldest=since_ts, page=page)
+            if wrapped is None:  # rate-limited; _history_page already slept — retry same cursor
+                continue
+            resp = wrapped.model
+            messages: list[Validated[Message]] = []
+            for wrapped_msg in _validated_messages_from_page(wrapped.raw, resp.messages, reverse=True):
+                msg = wrapped_msg.model
+                if _is_thread_parent(msg):
+                    thread_parents.append(msg.ts)
+                if _passes_since(msg.ts, since_ts):
+                    messages.append(wrapped_msg)
+            yield MessageBatch(
+                kind="history_page",
+                channel_id=channel_id,
+                records=_records_from_validated(channel_id, messages),
+                origin=MessageBatchOrigin(
+                    channel_id=channel_id,
+                    thread_ts=None,
+                    page_index=first_page_index + page,
+                    slack_cursor=request_cursor,
+                ),
+            )
+            page += 1
+            if not resp.has_more:
+                break
+            cursor = resp.response_metadata.next_cursor
+            if not cursor:
+                break
+
+    async def _reply_batches(
+        self,
+        channel_id: str,
+        since_ts: float | None,
+        thread_parents: Sequence[str],
+        first_page_index: int,
+    ) -> AsyncIterator[MessageBatch]:
+        page_index = first_page_index
+        for i, thread_ts in enumerate(thread_parents):
+            if i > 0:
+                await trio.sleep(random.uniform(self._sleeps.thread_min_s, self._sleeps.thread_max_s))
+            async for wrapped in self._replies_pages(channel_id, thread_ts):
+                resp = wrapped.model
+                messages = [
+                    wrapped_msg
+                    for wrapped_msg in _validated_messages_from_page(wrapped.raw, resp.messages)
+                    if wrapped_msg.model.ts != thread_ts and _passes_since(wrapped_msg.model.ts, since_ts)
+                ]
+                yield MessageBatch(
+                    kind="replies_page",
+                    channel_id=channel_id,
+                    records=_records_from_validated(channel_id, messages),
+                    origin=MessageBatchOrigin(
+                        channel_id=channel_id,
+                        thread_ts=thread_ts,
+                        page_index=page_index,
+                        slack_cursor=resp.response_metadata.next_cursor,
+                    ),
+                )
+                page_index += 1
 
     async def _history_page(
         self,
@@ -272,6 +398,36 @@ class SlackApiBackfiller:
             recorder.set("messages", len(replies))
             return replies
 
+    async def _replies_pages(
+        self,
+        channel_id: str,
+        thread_ts: str,
+    ) -> AsyncIterator[Validated[ConversationsRepliesResponse]]:
+        async with span(
+            op="slurper.backfill.thread_replies",
+            task=self._task_name,
+            extra={"channel_id": channel_id, "thread_ts": thread_ts},
+        ) as recorder:
+            iterator = self._client.iter_replies_pages(channel_id, thread_ts)
+            page = 0
+            while True:
+                try:
+                    wrapped = await run_sync_with_span(
+                        lambda: _next_replies_page(iterator),
+                        limiter=self._limiter,
+                        span=recorder,
+                    )
+                except RateLimitedError as exc:
+                    recorder.mark_rate_limited(exc.retry_after)
+                    await _sleep_rate_limited(exc.retry_after)
+                    return
+                if wrapped is None:
+                    return
+                recorder.set("messages", len(wrapped.model.messages))
+                recorder.set("pages", page + 1)
+                page += 1
+                yield wrapped
+
 
 def _passes_since(ts: str, since_ts: float | None) -> bool:
     if since_ts is None:
@@ -288,35 +444,58 @@ async def _sleep_rate_limited(retry_after: float | None) -> None:
     await trio.sleep(wait)
 
 
-async def _write_message_or_corrective_retry_once(
+def _next_replies_page(
+    iterator: Iterator[Validated[ConversationsRepliesResponse]],
+) -> Validated[ConversationsRepliesResponse] | None:
+    try:
+        return next(iterator)
+    except StopIteration:
+        return None
+
+
+def _write_batch_sync(conn: Connection[TupleRow], records: Sequence[EventRecord]) -> int:
+    inserted = 0
+    for record in records:
+        offset = write_message_or_corrective(conn, record)
+        if offset is not None:
+            inserted += 1
+    return inserted
+
+
+async def _write_batch_with_retry(
     writer: OffsetWriter,
-    record: EventRecord,
+    batch: MessageBatch,
     *,
     task_name: str,
-) -> int | None:
-    channel_id = record.stream.removeprefix("channel:") if record.stream.startswith("channel:") else None
+) -> int:
+    extra: JsonObject = {
+        "messages_in_batch": len(batch.records),
+        "batch_kind": batch.kind,
+        "channel_id": batch.channel_id,
+    }
+    if batch.origin.thread_ts is not None:
+        extra["thread_ts"] = batch.origin.thread_ts
     async with span(
-        op="slurper.backfill.write_message",
+        op="slurper.backfill.write_batch",
         task=task_name,
-        extra={"stream": record.stream, "kind": record.kind, "channel_id": channel_id},
+        extra=extra,
     ) as recorder:
         try:
-            offset = await writer.write_message_or_corrective(record, span=recorder)
+            inserted = await writer.run_transaction(lambda conn: _write_batch_sync(conn, batch.records), span=recorder)
         except PG_TIMEOUT_EXCEPTIONS:
             wait = random.uniform(_PG_TIMEOUT_RETRY_MIN_S, _PG_TIMEOUT_RETRY_MAX_S)
             log.warning(
-                "backfill: PostgreSQL timeout writing stream=%s kind=%s; retrying once in %.2fs",
-                record.stream,
-                record.kind,
+                "backfill: PostgreSQL timeout writing batch channel=%s kind=%s records=%d; retrying once in %.2fs",
+                batch.channel_id,
+                batch.kind,
+                len(batch.records),
                 wait,
                 exc_info=True,
             )
             await trio.sleep(wait)
-            offset = await writer.write_message_or_corrective(record, span=recorder)
-        recorder.set("events_written", 1 if offset is not None else 0)
-        if offset is not None:
-            recorder.set("offset", offset)
-        return offset
+            inserted = await writer.run_transaction(lambda conn: _write_batch_sync(conn, batch.records), span=recorder)
+        recorder.set("events_written", inserted)
+        return inserted
 
 
 async def backfill_channel(
@@ -337,7 +516,6 @@ async def backfill_channel(
     `in_progress.messages_so_far`.
     """
     cid = channel_id.value
-    stream = f"channel:{cid}"
     if await ctx.writer.run_read(lambda conn: is_channel_blocked(conn, cid), limiter=ctx.limiters.admin_read):
         await ctx.health.emit(
             HealthKind.BACKFILL_SKIPPED,
@@ -356,16 +534,19 @@ async def backfill_channel(
 
     messages = 0
     events_written = 0
+    last_progress_messages = 0
     warned = False
     aborted = False
 
     try:
-        async for wrapped in backfiller.messages_for_channel(channel_id, since_ts):
-            msg = wrapped.model
-            if ctx.abort_at is not None and messages >= ctx.abort_at:
+        async for batch in backfiller.messages_pages_for_channel(channel_id, since_ts):
+            batch_count = len(batch.records)
+            if batch.kind == "history_page" and ctx.abort_at is not None and messages + batch_count > ctx.abort_at:
                 aborted = True
                 break
-            messages += 1
+            inserted = await _write_batch_with_retry(ctx.writer, batch, task_name=ctx.task_name)
+            events_written += inserted
+            messages += batch_count
             if not warned and messages >= ctx.warn_at:
                 warned = True
                 # Per-channel size warning; doesn't affect global slurper health.
@@ -373,15 +554,9 @@ async def backfill_channel(
                 # workspace-wide trailer for hours after a single large
                 # backfill — see BACKLOG entry on health hysteresis.)
                 await ctx.health.emit(HealthKind.BACKFILL_WARN_LARGE, {"channel_id": cid})
-            if ctx.progress_every > 0 and messages % ctx.progress_every == 0:
+            if ctx.progress_every > 0 and messages >= last_progress_messages + ctx.progress_every:
                 await ctx.health.emit(HealthKind.BACKFILL_PROGRESS, {"channel_id": cid, "messages_so_far": messages})
-            # Persist the RAW message dict, not model_dump (see Validated
-            # docstring). The events log stays lossless; future projections
-            # can read fields the Message model doesn't declare today.
-            record = EventRecord(stream=stream, kind="message", ts=msg.ts, payload=wrapped.raw, dedup=True)
-            offset = await _write_message_or_corrective_retry_once(ctx.writer, record, task_name=ctx.task_name)
-            if offset is not None:
-                events_written += 1
+                last_progress_messages = messages
     except FatalAPIError:
         log.error("backfill: fatal API error on %s; stopping", cid)
         raise

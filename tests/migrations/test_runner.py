@@ -31,6 +31,7 @@ def test_discover_server_migrations() -> None:
         "0005_health_log_view.sql",
         "0006_blocked_channels.sql",
         "0007_socket_event_dedup.sql",
+        "0008_active_messages_view.sql",
     ]
 
 
@@ -60,6 +61,7 @@ def test_apply_server_migrations_idempotent(pg_conn: psycopg.Connection[TupleRow
         "0005_health_log_view.sql",
         "0006_blocked_channels.sql",
         "0007_socket_event_dedup.sql",
+        "0008_active_messages_view.sql",
     ]
     assert _table_exists(pg_conn, "events")
     assert _table_exists(pg_conn, "snapshots")
@@ -69,6 +71,8 @@ def test_apply_server_migrations_idempotent(pg_conn: psycopg.Connection[TupleRow
     # VIEWs over the events log (ES-clean: one source of truth, no dual write).
     assert _relkind(pg_conn, "channels") == "v"
     assert _relkind(pg_conn, "health_log") == "v"
+    assert _relkind(pg_conn, "active_messages") == "v"
+    assert _relkind(pg_conn, "active_thread_parents") == "v"
     # The partial dedup indexes exist.
     for index in (
         "events_message_dedup",
@@ -79,6 +83,9 @@ def test_apply_server_migrations_idempotent(pg_conn: psycopg.Connection[TupleRow
         "events_channel_history_changed_dedup",
         "events_channel_member_user_dedup",
         "events_tokens_revoked_dedup",
+        "events_message_changed_target_idx",
+        "events_message_deleted_target_idx",
+        "events_parent_replied_target_idx",
     ):
         with pg_conn.cursor() as cur:
             cur.execute("SELECT to_regclass(%s)", (index,))

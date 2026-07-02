@@ -16,17 +16,26 @@ import httpx
 import psycopg
 import pytest
 import trio
+from psycopg.conninfo import make_conninfo
 from psycopg.rows import TupleRow
 
 from slack_fuse.models import Message
 from slack_fuse_render import ChannelId
 from slack_fuse_server._json import JsonObject
-from slack_fuse_server.backfill.api import BackfillContext, SlackApiBackfiller, SleepBounds, backfill_channel
-from slack_fuse_server.backfill.types import BackfillAbortReason
+from slack_fuse_server.backfill import api as backfill_api
+from slack_fuse_server.backfill.api import (
+    BackfillContext,
+    SlackApiBackfiller,
+    SleepBounds,
+    _write_batch_with_retry,
+    backfill_channel,
+)
+from slack_fuse_server.backfill.types import BackfillAbortReason, MessageBatch, MessageBatchOrigin
 from slack_fuse_server.slurper.api import RateLimitedError, SlackClient, Validated
 from slack_fuse_server.slurper.health import HealthEmitter, HealthKind
 from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter, write_event
-from tests.conftest import make_test_limiters, make_test_writer
+from slack_fuse_server.wire.tail import EventTailer
+from tests.conftest import ServerConnFactory, make_test_limiters, make_test_writer
 
 _NO_SLEEP = SleepBounds(page_min_s=0.0, page_max_s=0.0, thread_min_s=0.0, thread_max_s=0.0)
 
@@ -53,6 +62,24 @@ def test_messages_for_channel_yields_history_and_thread_replies(fake_slack_http:
     # 2 top-level (fixture) + 1 thread reply (replies[1:]).
     by_ts = {m.ts for m in messages}
     assert by_ts == {"1700000000.000100", "1700000100.000200", "1700000200.000300"}
+
+
+def test_messages_pages_for_channel_yields_one_batch_per_slack_response(fake_slack_http: httpx.Client) -> None:
+    backfiller = SlackApiBackfiller(_fake_client(fake_slack_http), trio.CapacityLimiter(1), _NO_SLEEP)
+
+    async def collect() -> list[MessageBatch]:
+        out: list[MessageBatch] = []
+        async for batch in backfiller.messages_pages_for_channel(ChannelId("C0001")):
+            out.append(batch)
+        return out
+
+    batches = trio.run(collect)
+
+    assert [batch.kind for batch in batches] == ["history_page", "replies_page"]
+    assert [len(batch.records) for batch in batches] == [2, 1]
+    assert [record.ts for record in batches[0].records] == ["1700000100.000200", "1700000000.000100"]
+    assert [record.ts for record in batches[1].records] == ["1700000200.000300"]
+    assert batches[1].origin.thread_ts == "1700000100.000200"
 
 
 def test_thread_reply_raw_is_lossless_not_model_dump(fake_slack_http: httpx.Client) -> None:
@@ -206,14 +233,76 @@ def test_get_replies_preserves_attachments_lossless() -> None:
     assert raw_att.get("color") == "#5E6AD2"
 
 
+def test_iter_replies_pages_yields_pages_and_get_replies_flattens_them() -> None:
+    first_page: JsonObject = {
+        "ok": True,
+        "messages": [
+            {
+                "type": "message",
+                "ts": "1700000100.000200",
+                "user": "U0001",
+                "text": "parent",
+                "thread_ts": "1700000100.000200",
+                "reply_count": 2,
+            },
+            {
+                "type": "message",
+                "ts": "1700000200.000300",
+                "user": "U0002",
+                "text": "reply 1",
+                "thread_ts": "1700000100.000200",
+            },
+        ],
+        "has_more": True,
+        "response_metadata": {"next_cursor": "cursor-2"},
+    }
+    second_page: JsonObject = {
+        "ok": True,
+        "messages": [
+            {
+                "type": "message",
+                "ts": "1700000300.000400",
+                "user": "U0003",
+                "text": "reply 2",
+                "thread_ts": "1700000100.000200",
+            },
+        ],
+        "has_more": False,
+        "response_metadata": {"next_cursor": ""},
+    }
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        cursor = request.url.params.get("cursor")
+        return httpx.Response(200, json=second_page if cursor == "cursor-2" else first_page)
+
+    client = SlackClient("xoxp-test")
+    client._http = httpx.Client(transport=httpx.MockTransport(_handler))  # pyright: ignore[reportPrivateUsage]
+
+    pages = list(client.iter_replies_pages("C0001", "1700000100.000200"))
+    replies = client.get_replies("C0001", "1700000100.000200")
+
+    assert len(pages) == 2
+    assert [message.ts for page in pages for message in page.model.messages] == [
+        "1700000100.000200",
+        "1700000200.000300",
+        "1700000300.000400",
+    ]
+    assert [wrapped.model.ts for wrapped in replies] == [
+        "1700000100.000200",
+        "1700000200.000300",
+        "1700000300.000400",
+    ]
+
+
 # === Driver: backfill_channel against a stub Backfiller ===
 
 
 class _StubBackfiller:
     """Yields `count` synthetic messages with distinct ts. No API."""
 
-    def __init__(self, count: int) -> None:
+    def __init__(self, count: int, *, page_size: int | None = None) -> None:
         self._count = count
+        self._page_size = page_size if page_size is not None else count
 
     @property
     def name(self) -> str:
@@ -229,9 +318,38 @@ class _StubBackfiller:
         since_ts: float | None = None,
     ) -> AsyncIterator[Validated[Message]]:
         for i in range(self._count):
-            ts = f"{1000 + i}.{i:06d}"
-            msg = Message(ts=ts, user="U1", text=f"m{i}")
-            yield Validated(raw=cast(JsonObject, msg.model_dump(mode="json")), model=msg)
+            yield _validated_stub_message(i)
+
+    async def messages_pages_for_channel(
+        self,
+        channel_id: ChannelId,
+        since_ts: float | None = None,
+    ) -> AsyncIterator[MessageBatch]:
+        stream = f"channel:{channel_id.value}"
+        page_size = max(self._page_size, 1)
+        for page_index, start in enumerate(range(0, self._count, page_size)):
+            messages = [_validated_stub_message(i) for i in range(start, min(start + page_size, self._count))]
+            records = tuple(
+                EventRecord(stream=stream, kind="message", ts=wrapped.model.ts, payload=wrapped.raw, dedup=True)
+                for wrapped in messages
+            )
+            yield MessageBatch(
+                kind="history_page",
+                channel_id=channel_id.value,
+                records=records,
+                origin=MessageBatchOrigin(
+                    channel_id=channel_id.value,
+                    thread_ts=None,
+                    page_index=page_index,
+                    slack_cursor=f"stub-{page_index}",
+                ),
+            )
+
+
+def _validated_stub_message(i: int) -> Validated[Message]:
+    ts = f"{1000 + i}.{i:06d}"
+    msg = Message(ts=ts, user="U1", text=f"m{i}")
+    return Validated(raw=cast(JsonObject, msg.model_dump(mode="json")), model=msg)
 
 
 class _OneMessageBackfiller:
@@ -256,6 +374,32 @@ class _OneMessageBackfiller:
         msg = Message.model_validate(self._raw)
         yield Validated(raw=self._raw, model=msg)
 
+    async def messages_pages_for_channel(
+        self,
+        channel_id: ChannelId,
+        since_ts: float | None = None,
+    ) -> AsyncIterator[MessageBatch]:
+        msg = Message.model_validate(self._raw)
+        yield MessageBatch(
+            kind="history_page",
+            channel_id=channel_id.value,
+            records=(
+                EventRecord(
+                    stream=f"channel:{channel_id.value}",
+                    kind="message",
+                    ts=msg.ts,
+                    payload=self._raw,
+                    dedup=True,
+                ),
+            ),
+            origin=MessageBatchOrigin(
+                channel_id=channel_id.value,
+                thread_ts=None,
+                page_index=0,
+                slack_cursor="one-message",
+            ),
+        )
+
 
 class _NullHealth:
     def __init__(self) -> None:
@@ -266,11 +410,9 @@ class _NullHealth:
         return len(self.kinds)
 
 
-class _FlakyWriter:
-    def __init__(self, conn: psycopg.Connection[TupleRow], *, failures: int) -> None:
-        self.conn = conn
-        self.failures_remaining = failures
-        self.calls = 0
+class _RunTransactionOnlyWriter:
+    def __init__(self) -> None:
+        self.run_transaction_calls = 0
 
     async def run_read(
         self,
@@ -278,14 +420,18 @@ class _FlakyWriter:
         *,
         limiter: trio.CapacityLimiter,
     ) -> object:
-        return func(self.conn)
+        del func, limiter
+        return False
+
+    async def run_transaction(self, func: Callable[[object], int], **_kwargs: object) -> int:
+        self.run_transaction_calls += 1
+        return func(object())
+
+    def acquire_transaction(self, **_kwargs: object) -> object:
+        raise AssertionError("backfill driver must use run_transaction")
 
     async def write_message_or_corrective(self, _record: EventRecord, **_kwargs: object) -> int | None:
-        self.calls += 1
-        if self.failures_remaining > 0:
-            self.failures_remaining -= 1
-            raise psycopg.errors.LockNotAvailable("test lock timeout")
-        return 1
+        raise AssertionError("backfill driver must write batches via run_transaction")
 
 
 def _disable_pg_retry_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -301,6 +447,43 @@ def _events_count(conn: psycopg.Connection[TupleRow], stream: str) -> int:
         row = cur.fetchone()
     assert row is not None
     return int(row[0])
+
+
+def _batch_for_records(channel_id: str, count: int) -> MessageBatch:
+    stream = f"channel:{channel_id}"
+    records = tuple(
+        EventRecord(
+            stream=stream,
+            kind="message",
+            ts=f"1800000{i:03d}.000000",
+            payload={"ts": f"1800000{i:03d}.000000", "user": "U1", "text": f"m{i}"},
+            dedup=True,
+        )
+        for i in range(count)
+    )
+    return MessageBatch(
+        kind="history_page",
+        channel_id=channel_id,
+        records=records,
+        origin=MessageBatchOrigin(channel_id=channel_id, thread_ts=None, page_index=0, slack_cursor="test"),
+    )
+
+
+class _FailingRunTransactionWriter:
+    def __init__(self, *, failures: int) -> None:
+        self.failures_remaining = failures
+        self.calls = 0
+
+    async def run_transaction(self, _func: object, **_kwargs: object) -> int:
+        self.calls += 1
+        if self.failures_remaining > 0:
+            self.failures_remaining -= 1
+            raise psycopg.errors.LockNotAvailable("test lock timeout")
+        return 1
+
+
+async def _write_batch_for_test(writer: OffsetWriter, batch: MessageBatch) -> int:
+    return await _write_batch_with_retry(writer, batch, task_name="backfill")
 
 
 def _channel_events(conn: psycopg.Connection[TupleRow], stream: str) -> list[tuple[str, JsonObject]]:
@@ -320,6 +503,14 @@ def _health_kinds(conn: psycopg.Connection[TupleRow]) -> list[str]:
         return [str(r[0]) for r in cur.fetchall()]
 
 
+def _database_url_for_conn(conn: psycopg.Connection[TupleRow]) -> str:
+    with conn.cursor() as cur:
+        cur.execute("SELECT current_schema()")
+        row = cur.fetchone()
+    assert row is not None
+    return make_conninfo(conn.info.dsn, options=f"-c search_path={row[0]}")
+
+
 def test_backfill_channel_writes_events_and_emits_health(server_conn: psycopg.Connection[TupleRow]) -> None:
     writer = make_test_writer(server_conn)
     health = HealthEmitter(writer)
@@ -332,12 +523,111 @@ def test_backfill_channel_writes_events_and_emits_health(server_conn: psycopg.Co
     assert _health_kinds(server_conn) == ["backfill_started", "backfill_completed"]
 
 
-def test_backfill_channel_retries_pg_timeout_once_then_continues(
+def test_backfill_channel_write_batch_span_shape(
+    server_conn: psycopg.Connection[TupleRow],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("INFO", logger="slack_fuse_server.slurper.spans")
+    writer = make_test_writer(server_conn)
+    health = HealthEmitter(writer)
+    ctx = BackfillContext(writer=writer, health=health, limiters=make_test_limiters(), warn_at=1000, abort_at=20000)
+
+    result = trio.run(backfill_channel, _StubBackfiller(3), ChannelId("CSPAN"), ctx)
+
+    assert result.events_written == 3
+    assert "op=slurper.backfill.write_batch" in caplog.text
+    assert "messages_in_batch=3" in caplog.text
+    assert "batch_kind=history_page" in caplog.text
+    assert "channel_id=CSPAN" in caplog.text
+    assert "events_written=3" in caplog.text
+
+
+def test_write_batch_mid_batch_runtime_error_rolls_back_all_records(
+    server_conn: psycopg.Connection[TupleRow],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writer = make_test_writer(server_conn)
+    batch = _batch_for_records("CATOMIC", 5)
+    original = backfill_api.write_message_or_corrective
+    calls = 0
+
+    def _fail_after_third(conn: psycopg.Connection[TupleRow], record: EventRecord) -> int | None:
+        nonlocal calls
+        calls += 1
+        offset = original(conn, record)
+        if calls == 3:
+            raise RuntimeError("boom mid-page")
+        return offset
+
+    monkeypatch.setattr(backfill_api, "write_message_or_corrective", _fail_after_third)
+
+    with pytest.raises(RuntimeError, match="boom mid-page"):
+        trio.run(_write_batch_for_test, writer, batch)
+
+    assert _events_count(server_conn, "channel:CATOMIC") == 0
+
+
+def test_write_batch_retries_pg_timeout_once_for_whole_page(
     server_conn: psycopg.Connection[TupleRow],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _disable_pg_retry_sleep(monkeypatch)
-    writer = _FlakyWriter(server_conn, failures=1)
+    writer = make_test_writer(server_conn)
+    batch = _batch_for_records("CRETRY", 5)
+    original = backfill_api.write_message_or_corrective
+    calls = 0
+    injected = False
+
+    def _timeout_after_third(conn: psycopg.Connection[TupleRow], record: EventRecord) -> int | None:
+        nonlocal calls, injected
+        calls += 1
+        offset = original(conn, record)
+        if not injected and calls == 3:
+            injected = True
+            raise psycopg.errors.LockNotAvailable("test lock timeout")
+        return offset
+
+    monkeypatch.setattr(backfill_api, "write_message_or_corrective", _timeout_after_third)
+
+    inserted = trio.run(_write_batch_for_test, writer, batch)
+
+    assert inserted == 5
+    assert injected is True
+    assert calls == 8
+    assert _events_count(server_conn, "channel:CRETRY") == 5
+
+
+def test_pg_notify_wakes_once_for_page_transaction_and_tailer_reads_all_offsets(
+    server_conn_factory: ServerConnFactory,
+) -> None:
+    conn = server_conn_factory()
+    database_url = _database_url_for_conn(conn)
+    listen_conn: psycopg.Connection[TupleRow] = psycopg.connect(database_url, autocommit=True)
+    try:
+        listen_conn.execute("LISTEN new_event")
+        writer = make_test_writer(conn)
+        batch = _batch_for_records("CNOTIFY", 5)
+
+        inserted = trio.run(_write_batch_for_test, writer, batch)
+        notifications = list(listen_conn.notifies(timeout=2.0))
+
+        async def collect_offsets() -> list[int]:
+            tailer = EventTailer(database_url)
+            return [event.offset async for event in tailer.iter_events_after("channel:CNOTIFY", 0)]
+
+        offsets = trio.run(collect_offsets)
+    finally:
+        listen_conn.close()
+
+    assert inserted == 5
+    assert [notify.payload for notify in notifications] == ["channel:CNOTIFY"]
+    assert offsets == [1, 2, 3, 4, 5]
+
+
+def test_backfill_channel_uses_writer_run_transaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writer = _RunTransactionOnlyWriter()
     health = _NullHealth()
     ctx = BackfillContext(
         writer=cast(OffsetWriter, writer),
@@ -347,46 +637,51 @@ def test_backfill_channel_retries_pg_timeout_once_then_continues(
         abort_at=20000,
     )
 
-    result = trio.run(backfill_channel, _StubBackfiller(1), ChannelId("CRETRY"), ctx)
+    def _fake_write_batch_sync(_conn: object, records: object) -> int:
+        return len(cast(tuple[object, ...], records))
 
-    assert writer.calls == 2
+    monkeypatch.setattr(backfill_api, "_write_batch_sync", _fake_write_batch_sync)
+
+    result = trio.run(backfill_channel, _StubBackfiller(1), ChannelId("CRUN"), ctx)
+
+    assert writer.run_transaction_calls == 1
     assert result.messages == 1
     assert result.events_written == 1
     assert health.kinds == ["backfill_started", "backfill_completed"]
 
 
-def test_backfill_channel_propagates_second_pg_timeout(
-    server_conn: psycopg.Connection[TupleRow],
+def test_write_batch_propagates_second_pg_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _disable_pg_retry_sleep(monkeypatch)
-    writer = _FlakyWriter(server_conn, failures=2)
-    ctx = BackfillContext(
-        writer=cast(OffsetWriter, writer),
-        health=cast(HealthEmitter, _NullHealth()),
-        limiters=make_test_limiters(),
-        warn_at=1000,
-        abort_at=20000,
-    )
+    batch = _batch_for_records("CFAIL", 1)
+    writer = _FailingRunTransactionWriter(failures=2)
 
     with pytest.raises(psycopg.errors.LockNotAvailable):
-        trio.run(backfill_channel, _StubBackfiller(1), ChannelId("CFAIL"), ctx)
+        trio.run(_write_batch_for_test, cast(OffsetWriter, writer), batch)
 
     assert writer.calls == 2
 
 
-def test_backfill_channel_aborts_at_threshold(server_conn: psycopg.Connection[TupleRow]) -> None:
+def test_backfill_channel_aborts_at_history_page_boundary(server_conn: psycopg.Connection[TupleRow]) -> None:
     writer = make_test_writer(server_conn)
     health = HealthEmitter(writer)
-    ctx = BackfillContext(writer=writer, health=health, limiters=make_test_limiters(), warn_at=2, abort_at=3)
+    ctx = BackfillContext(
+        writer=writer,
+        health=health,
+        limiters=make_test_limiters(),
+        warn_at=1000,
+        abort_at=1500,
+        progress_every=0,
+    )
 
-    result = trio.run(backfill_channel, _StubBackfiller(100), ChannelId("CBIG"), ctx)
+    result = trio.run(backfill_channel, _StubBackfiller(1600, page_size=200), ChannelId("CBIG"), ctx)
 
     assert result.aborted is True
     assert result.abort_reason is not None and str(result.abort_reason) == "exceeded_default_limit"
-    # Stops after abort_at messages — only the truncated head is written.
-    assert result.messages == 3
-    assert _events_count(server_conn, "channel:CBIG") == 3
+    # 1400 committed; the next 200-message page would cross 1500 and is skipped.
+    assert result.messages == 1400
+    assert _events_count(server_conn, "channel:CBIG") == 1400
     # warn_at triggers a per-channel BACKFILL_WARN_LARGE (not SLACK_DEGRADED —
     # one channel hitting its size cap is observability, not a global
     # ingestion-health signal; see BACKLOG entry on health hysteresis).
@@ -509,14 +804,10 @@ def test_backfill_channel_emits_progress_every_n_messages(server_conn: psycopg.C
     assert (result.messages, result.aborted) == (5, False)
     rows = _health_rows(server_conn)
     progress = [payload for kind, payload in rows if kind == "backfill_progress"]
-    # 5 messages, progress every 2 → emitted at the 2nd and 4th message.
-    assert progress == [
-        {"channel_id": "CP", "messages_so_far": 2},
-        {"channel_id": "CP", "messages_so_far": 4},
-    ]
+    # Progress is emitted after the whole batch commits, not per record.
+    assert progress == [{"channel_id": "CP", "messages_so_far": 5}]
     assert [kind for kind, _ in rows] == [
         "backfill_started",
-        "backfill_progress",
         "backfill_progress",
         "backfill_completed",
     ]

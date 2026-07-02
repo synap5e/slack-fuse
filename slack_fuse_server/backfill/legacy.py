@@ -25,7 +25,9 @@ from pydantic import ValidationError
 from slack_fuse.models import Message
 from slack_fuse_render import ChannelId
 from slack_fuse_server._json import JsonObject
+from slack_fuse_server.backfill.types import MessageBatch, MessageBatchOrigin
 from slack_fuse_server.slurper.api import Validated
+from slack_fuse_server.slurper.offsets import EventRecord
 
 log = logging.getLogger(__name__)
 
@@ -74,6 +76,38 @@ class LegacyCacheBackfiller:
             for wrapped in messages:
                 if _passes_since(wrapped.model.ts, since_ts):
                     yield wrapped
+
+    async def messages_pages_for_channel(
+        self,
+        channel_id: ChannelId,
+        since_ts: float | None = None,
+    ) -> AsyncIterator[MessageBatch]:
+        day_files = await trio.to_thread.run_sync(
+            lambda: _discover_day_files(self._messages_dir / channel_id.value),
+            limiter=self._limiter,
+        )
+        stream = f"channel:{channel_id.value}"
+        for page_index, day_file in enumerate(day_files):
+            messages = await trio.to_thread.run_sync(
+                lambda p=day_file: _read_day_messages(p),
+                limiter=self._limiter,
+            )
+            records = tuple(
+                EventRecord(stream=stream, kind="message", ts=wrapped.model.ts, payload=wrapped.raw, dedup=True)
+                for wrapped in messages
+                if _passes_since(wrapped.model.ts, since_ts)
+            )
+            yield MessageBatch(
+                kind="history_page",
+                channel_id=channel_id.value,
+                records=records,
+                origin=MessageBatchOrigin(
+                    channel_id=channel_id.value,
+                    thread_ts=None,
+                    page_index=page_index,
+                    slack_cursor=day_file.name,
+                ),
+            )
 
 
 def _discover_channels_with_content(messages_dir: Path) -> list[ChannelId]:

@@ -18,11 +18,12 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol
+from typing import Literal, Protocol
 
 from slack_fuse.models import Message
 from slack_fuse_render import ChannelId
 from slack_fuse_server.slurper.api import Validated
+from slack_fuse_server.slurper.offsets import EventRecord
 
 
 class BackfillAbortReason(StrEnum):
@@ -59,12 +60,37 @@ class BackfillResult:
     abort_reason: BackfillAbortReason | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class MessageBatchOrigin:
+    """Diagnostic source coordinates for one source page.
+
+    ``slack_cursor`` is not persisted and must not be used as a progress fact.
+    Legacy-cache batches use the day filename here for the same diagnostic role.
+    """
+
+    channel_id: str
+    thread_ts: str | None
+    page_index: int
+    slack_cursor: str
+
+
+@dataclass(frozen=True, slots=True)
+class MessageBatch:
+    """One source page of messages ready for atomic persistence."""
+
+    kind: Literal["history_page", "replies_page"]
+    channel_id: str
+    records: tuple[EventRecord, ...]
+    origin: MessageBatchOrigin
+
+
 class Backfiller(Protocol):
     """A source of historical `message` events for the slurper.
 
     The slurper runs implementations in priority order (legacy cache first,
     Slack API second), draining `channels_to_backfill()` and, for each,
-    `messages_for_channel()`. Writes are idempotent on `(stream, slack_ts)`.
+    `messages_pages_for_channel()`. Writes are idempotent on `(stream,
+    slack_ts)`.
     """
 
     @property
@@ -90,5 +116,18 @@ class Backfiller(Protocol):
         ``since_ts=None`` means from the oldest available; a value means
         only messages newer than it (used to gap-fill after the legacy
         cache's tip).
+        """
+        ...
+
+    def messages_pages_for_channel(
+        self,
+        channel_id: ChannelId,
+        since_ts: float | None = None,
+    ) -> AsyncIterator[MessageBatch]:
+        """Yield one ``MessageBatch`` per source page.
+
+        API backfill yields all Slack history pages first, then one replies
+        batch per Slack replies page for each discovered thread parent. The
+        legacy cache adapter treats one day JSON file as one atomic source page.
         """
         ...

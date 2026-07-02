@@ -29,6 +29,7 @@ from slack_fuse.models import Message
 from slack_fuse_render import ChannelId
 from slack_fuse_server._json import JsonObject
 from slack_fuse_server.backfill.api import SlackApiBackfiller, SleepBounds
+from slack_fuse_server.backfill.types import MessageBatch, MessageBatchOrigin
 from slack_fuse_server.slurper.api import SlackAPIError, SlackClient, Validated
 from slack_fuse_server.slurper.catchup import (
     CatchupConfig,
@@ -214,6 +215,29 @@ class _RecordingBackfiller:
         ts = f"{1800000000 + hash(channel_id.value) % 1000}.000000"
         msg = Message(ts=ts, user="U1", text=f"m-{channel_id.value}")
         yield Validated(raw=cast(JsonObject, msg.model_dump(mode="json")), model=msg)
+
+    async def messages_pages_for_channel(
+        self,
+        channel_id: ChannelId,
+        since_ts: float | None = None,
+    ) -> AsyncIterator[MessageBatch]:
+        self.since_by_channel[channel_id.value] = since_ts
+        ts = f"{1800000000 + hash(channel_id.value) % 1000}.000000"
+        msg = Message(ts=ts, user="U1", text=f"m-{channel_id.value}")
+        raw = cast(JsonObject, msg.model_dump(mode="json"))
+        yield MessageBatch(
+            kind="history_page",
+            channel_id=channel_id.value,
+            records=(
+                EventRecord(stream=f"channel:{channel_id.value}", kind="message", ts=msg.ts, payload=raw, dedup=True),
+            ),
+            origin=MessageBatchOrigin(
+                channel_id=channel_id.value,
+                thread_ts=None,
+                page_index=0,
+                slack_cursor="catchup-stub",
+            ),
+        )
 
 
 class _FlakyCatchupWriter:
