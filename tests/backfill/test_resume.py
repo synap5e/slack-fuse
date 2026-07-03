@@ -9,17 +9,28 @@ the prior review's A.3 stale-parent construction, which must terminate.
 
 from __future__ import annotations
 
+import json
+import logging
+import time
 from typing import cast
 
 import httpx
 import psycopg
+import pytest
 import trio
+from psycopg import Cursor
+from psycopg.abc import Params, QueryNoTemplate
 from psycopg.rows import TupleRow
 
 from slack_fuse_render import ChannelId
 from slack_fuse_server._json import JsonObject
 from slack_fuse_server.backfill.api import BackfillContext, SlackApiBackfiller, SleepBounds, backfill_channel
-from slack_fuse_server.backfill.resume import ResumePlan, ThreadResume, find_resume_plan
+from slack_fuse_server.backfill.resume import (
+    _KNOWN_PARENTS_SQL,
+    ResumePlan,
+    ThreadResume,
+    find_resume_plan,
+)
 from slack_fuse_server.slurper.api import SlackClient
 from slack_fuse_server.slurper.health import HealthEmitter
 from slack_fuse_server.slurper.ingestion import make_source
@@ -186,6 +197,225 @@ def test_replies_rows_without_history_rows_imply_history_done(
     assert plan is not None
     assert plan.history_done is True
     assert plan.threads == (ThreadResume(thread_ts=parent_ts, cursor="rc9"),)
+
+
+# === Thread-worklist query (direct events query, not the view) ===
+
+
+def test_worklist_excludes_deleted_parent(server_conn: psycopg.Connection[TupleRow]) -> None:
+    """A tombstoned parent must never re-enter the worklist: fetching replies
+    for a deleted thread is a Slack error, not an empty page."""
+    deleted_parent = "1700000100.000100"
+    live_parent = "1700000200.000100"
+    for parent_ts in (deleted_parent, live_parent):
+        _seed_message(
+            server_conn,
+            parent_ts,
+            payload_extra={"reply_count": 1, "thread_ts": parent_ts},
+            source=_history_source(cursor="", page_index=0, final=True),
+        )
+    record = EventRecord(
+        stream=_STREAM,
+        kind="message_deleted",
+        ts=deleted_parent,
+        payload={"deleted_ts": deleted_parent},
+    )
+    assert write_event(server_conn, record) is not None
+    plan = find_resume_plan(server_conn, _CHANNEL)
+    assert plan is not None
+    assert plan.threads == (ThreadResume(thread_ts=live_parent, cursor=""),)
+
+
+def test_worklist_includes_parent_known_only_via_message_changed(
+    server_conn: psycopg.Connection[TupleRow],
+) -> None:
+    """A parent whose only reply_count evidence is a corrective/edit
+    `message_changed` row (its base `message` row predates any replies) must
+    stay in the worklist — parity with `active_thread_parents`."""
+    parent_ts = "1700000100.000100"
+    _seed_message(server_conn, parent_ts, source=_history_source(cursor="", page_index=0, final=True))
+    record = EventRecord(
+        stream=_STREAM,
+        kind="message_changed",
+        ts=parent_ts,
+        payload={
+            "previous_ts": parent_ts,
+            "message": {"ts": parent_ts, "user": "U1", "text": "parent", "reply_count": 1, "thread_ts": parent_ts},
+        },
+    )
+    assert write_event(server_conn, record) is not None
+    plan = find_resume_plan(server_conn, _CHANNEL)
+    assert plan is not None
+    assert plan.threads == (ThreadResume(thread_ts=parent_ts, cursor=""),)
+
+
+# === Timeout fallback ===
+
+
+class _TimeoutInjectingCursor:
+    """Delegates to a real cursor; the owning conn decides which execute dies."""
+
+    def __init__(self, cur: Cursor[TupleRow], owner: _TimeoutInjectingConn) -> None:
+        self._cur = cur
+        self._owner = owner
+
+    def __enter__(self) -> _TimeoutInjectingCursor:
+        self._cur.__enter__()
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self._cur.__exit__(*exc_info)  # pyright: ignore[reportArgumentType]
+
+    def execute(self, query: QueryNoTemplate, params: Params | None = None) -> None:
+        self._owner.executes += 1
+        if self._owner.executes == self._owner.fail_on:
+            raise self._owner.exc_type("canceling statement due to statement timeout")
+        self._cur.execute(query, params)
+
+    def fetchone(self) -> TupleRow | None:
+        return self._cur.fetchone()
+
+    def fetchall(self) -> list[TupleRow]:
+        return self._cur.fetchall()
+
+
+class _TimeoutInjectingConn:
+    """Wraps a real connection so the Nth cursor.execute raises a PG timeout."""
+
+    def __init__(
+        self,
+        conn: psycopg.Connection[TupleRow],
+        fail_on: int,
+        exc_type: type[Exception] = psycopg.errors.QueryCanceled,
+    ) -> None:
+        self._conn = conn
+        self.fail_on = fail_on
+        self.exc_type = exc_type
+        self.executes = 0
+
+    def cursor(self) -> _TimeoutInjectingCursor:
+        return _TimeoutInjectingCursor(self._conn.cursor(), self)
+
+
+def _seed_full_resume_state(conn: psycopg.Connection[TupleRow]) -> None:
+    """Enough state that every find_resume_plan query genuinely runs."""
+    parent_ts = "1700000200.000100"
+    _seed_message(conn, "1700000300.000100", source=_history_source(cursor="c1", page_index=0, final=False))
+    _seed_message(
+        conn,
+        parent_ts,
+        payload_extra={"reply_count": 1, "thread_ts": parent_ts},
+        source=_history_source(cursor="c1", page_index=0, final=False),
+    )
+    _seed_message(
+        conn,
+        "1700000210.000100",
+        payload_extra={"thread_ts": parent_ts},
+        source=_replies_source(thread_ts=parent_ts, cursor="rc1", page_index=1, final=False),
+    )
+
+
+# Execute order inside find_resume_plan: 1=terminal_watermark, 2=latest_history_page,
+# 3=replies_progress, 4=known parents, 5=tombstones.
+@pytest.mark.parametrize("fail_on", [1, 2, 3, 4, 5])
+def test_pg_timeout_falls_back_to_fresh_plan(
+    server_conn: psycopg.Connection[TupleRow],
+    caplog: pytest.LogCaptureFixture,
+    fail_on: int,
+) -> None:
+    """A statement timeout anywhere in the plan computation degrades to the
+    first-boot answer (None) instead of propagating — the 2026-07-03
+    CrashLoop. Atomic per plan: no partial worklists."""
+    _seed_full_resume_state(server_conn)
+    assert find_resume_plan(server_conn, _CHANNEL) is not None  # the seed is real resume state
+
+    wrapped = cast("psycopg.Connection[TupleRow]", _TimeoutInjectingConn(server_conn, fail_on=fail_on))
+    with caplog.at_level(logging.WARNING, logger="slack_fuse_server.backfill.resume"):
+        assert find_resume_plan(wrapped, _CHANNEL) is None
+    [record] = caplog.records
+    assert _CHANNEL in record.getMessage()
+    assert "timeout" in record.getMessage()
+
+
+def test_lock_timeout_also_falls_back(
+    server_conn: psycopg.Connection[TupleRow],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _seed_full_resume_state(server_conn)
+    wrapped = cast(
+        "psycopg.Connection[TupleRow]",
+        _TimeoutInjectingConn(server_conn, fail_on=1, exc_type=psycopg.errors.LockNotAvailable),
+    )
+    with caplog.at_level(logging.WARNING, logger="slack_fuse_server.backfill.resume"):
+        assert find_resume_plan(wrapped, _CHANNEL) is None
+    assert len(caplog.records) == 1
+
+
+# === Worklist query scale (the 2026-07-03 CrashLoop regression) ===
+
+
+def _seed_bulk_parents(conn: psycopg.Connection[TupleRow], n_parents: int, n_filler: int) -> None:
+    """Bulk-seed via generate_series — write_event row-at-a-time is too slow here."""
+    history_source = json.dumps({
+        "producer": "backfill-history-page",
+        "slack_cursor": "",
+        "page_index": 0,
+        "has_more": False,
+        "final_page": True,
+    })
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO events (stream, offset_in_stream, kind, ts, payload, source)
+            SELECT %(stream)s, i, 'message', g.ts,
+                   jsonb_build_object('ts', g.ts, 'user', 'U1', 'text', 'parent',
+                                      'reply_count', 2, 'thread_ts', g.ts),
+                   %(source)s::jsonb
+            FROM (
+                SELECT i, (1700000000 + i)::text || '.' || lpad((i %% 1000000)::text, 6, '0') AS ts
+                FROM generate_series(1, %(n)s) AS i
+            ) g
+            """,
+            {"stream": _STREAM, "n": n_parents, "source": history_source},
+        )
+        cur.execute(
+            """
+            INSERT INTO events (stream, offset_in_stream, kind, ts, payload)
+            SELECT %(stream)s, %(base)s + i, 'message', g.ts,
+                   jsonb_build_object('ts', g.ts, 'user', 'U1', 'text', 'plain')
+            FROM (
+                SELECT i, (1600000000 + i)::text || '.' || lpad((i %% 1000000)::text, 6, '0') AS ts
+                FROM generate_series(1, %(n)s) AS i
+            ) g
+            """,
+            {"stream": _STREAM, "base": n_parents, "n": n_filler},
+        )
+        cur.execute("ANALYZE events")
+
+
+@pytest.mark.parametrize("n_parents", [1000, 5000])
+def test_resume_plan_fast_at_scale(server_conn: psycopg.Connection[TupleRow], n_parents: int) -> None:
+    """5000 thread parents among 20k filler rows must plan well under the
+    budget — production hit the 30s statement_timeout via the view fold."""
+    _seed_bulk_parents(server_conn, n_parents=n_parents, n_filler=20_000)
+    start = time.perf_counter()
+    plan = find_resume_plan(server_conn, _CHANNEL)
+    elapsed = time.perf_counter() - start
+    assert plan is not None
+    assert plan.history_done is True
+    assert len(plan.threads) == n_parents
+    assert elapsed < 0.5, f"find_resume_plan took {elapsed:.3f}s at {n_parents} parents"
+
+
+def test_worklist_query_uses_partial_indexes(server_conn: psycopg.Connection[TupleRow]) -> None:
+    """The direct query must be served by the migration-0010 partial indexes,
+    not a stream-wide scan — that's what keeps it fast cold-cache."""
+    _seed_bulk_parents(server_conn, n_parents=1000, n_filler=20_000)
+    with server_conn.cursor() as cur:
+        cur.execute("EXPLAIN " + _KNOWN_PARENTS_SQL, {"stream": _STREAM})
+        plan_text = "\n".join(str(row[0]) for row in cur.fetchall())
+    assert "events_message_parent_hint_idx" in plan_text
+    assert "events_changed_parent_hint_idx" in plan_text
 
 
 # === End-to-end resume over a scripted fake Slack transport ===

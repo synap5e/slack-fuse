@@ -33,6 +33,7 @@ def test_discover_server_migrations() -> None:
         "0007_socket_event_dedup.sql",
         "0008_active_messages_view.sql",
         "0009_events_source_column.sql",
+        "0010_thread_parent_hint_idx.sql",
     ]
 
 
@@ -64,6 +65,7 @@ def test_apply_server_migrations_idempotent(pg_conn: psycopg.Connection[TupleRow
         "0007_socket_event_dedup.sql",
         "0008_active_messages_view.sql",
         "0009_events_source_column.sql",
+        "0010_thread_parent_hint_idx.sql",
     ]
     assert _table_exists(pg_conn, "events")
     assert _table_exists(pg_conn, "snapshots")
@@ -93,6 +95,8 @@ def test_apply_server_migrations_idempotent(pg_conn: psycopg.Connection[TupleRow
         "events_source_commit_idx",
         "events_source_boot_idx",
         "events_source_span_idx",
+        "events_message_parent_hint_idx",
+        "events_changed_parent_hint_idx",
     ):
         with pg_conn.cursor() as cur:
             cur.execute("SELECT to_regclass(%s)", (index,))
