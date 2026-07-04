@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import logging
 from dataclasses import dataclass
 from functools import partial
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -48,6 +50,8 @@ from slack_fuse_server.http.handlers import (
 from slack_fuse_server.http.metrics import MetricsSource
 from slack_fuse_server.http.snapshot import SnapshotNotFoundError
 from slack_fuse_server.slurper.api import SlackAPIError
+
+log = logging.getLogger(__name__)
 
 _JSON_CONTENT_TYPE = "application/json"
 _READ_CHUNK_SIZE = 16_384
@@ -436,9 +440,20 @@ async def _serve_connection(  # noqa: PLR0913 - HTTP wiring needs explicit deps.
         await _send_response(conn, stream, response)
     except h11.RemoteProtocolError:
         if conn.our_state is not h11.ERROR:
-            await _send_response(conn, stream, _error_response(status_code=400, code="bad_request"))
+            # Client may already have hung up while we try to send the 400.
+            with contextlib.suppress(trio.BrokenResourceError, trio.ClosedResourceError):
+                await _send_response(conn, stream, _error_response(status_code=400, code="bad_request"))
+    except (trio.BrokenResourceError, trio.ClosedResourceError) as exc:
+        # Client disconnected mid-request or mid-response. Normal HTTP behaviour
+        # (kubelet probes give up under load; curl aborts; projector times out
+        # and retries). Nothing to send back; just close the stream. Log at INFO
+        # so a spike is visible in Loki without drowning steady-state noise.
+        log.info("http: connection dropped by peer: %s", exc)
     finally:
-        await stream.aclose()
+        with trio.CancelScope(shield=True), contextlib.suppress(
+            trio.BrokenResourceError, trio.ClosedResourceError
+        ):
+            await stream.aclose()
 
 
 async def _read_request(conn: h11.Connection, stream: trio.abc.Stream) -> HttpRequest | None:

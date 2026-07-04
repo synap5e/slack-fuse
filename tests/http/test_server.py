@@ -26,6 +26,7 @@ from slack_fuse_server.http.server import (
     HttpRequest,
     parse_listen_addr,
     route_request,
+    serve_http_connection,
     serve_http_on_listeners,
 )
 from slack_fuse_server.slurper.probes import JOB_CHANNEL_INVENTORY, JOB_CHANNEL_NEWEST_MESSAGE
@@ -339,3 +340,62 @@ async def test_http_server_metrics_endpoint_round_trip() -> None:
     assert response.status_code == 200
     parsed = MetricsResponse.model_validate(response.json())
     assert parsed == expected
+
+
+class _FailingStream(trio.abc.Stream):
+    """A stream that raises BrokenResourceError on send_all — simulates a
+    client that hung up mid-response (kubelet probe timeout, curl abort,
+    projector connection drop). The handler must not propagate the exception
+    to the accept loop, or the whole process crashes (2026-07-05 prod).
+    """
+
+    def __init__(self, raise_on_send: BaseException, request_bytes: bytes) -> None:
+        self._raise_on_send = raise_on_send
+        self._request_bytes = request_bytes
+        self.closed = False
+
+    async def send_all(self, data: bytes | bytearray | memoryview) -> None:
+        raise self._raise_on_send
+
+    async def wait_send_all_might_not_block(self) -> None:  # pragma: no cover - unused
+        return None
+
+    async def receive_some(self, max_bytes: int | None = None) -> bytes:
+        if not self._request_bytes:
+            return b""
+        chunk = self._request_bytes if max_bytes is None else self._request_bytes[:max_bytes]
+        self._request_bytes = self._request_bytes[len(chunk):]
+        return chunk
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.trio
+@pytest.mark.parametrize(
+    "exc",
+    [
+        trio.BrokenResourceError("simulated peer hangup"),
+        trio.ClosedResourceError("simulated peer close"),
+    ],
+)
+async def test_serve_connection_swallows_client_hangup(
+    exc: BaseException, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Client disconnecting mid-response must not crash the accept loop.
+
+    Regression: 2026-07-05 saw slack-fuse-server restart 43 times in 32h
+    because ``trio.BrokenResourceError`` from ``_send_response`` ->
+    ``stream.send_all`` escaped ``_serve_connection`` -> the nursery ->
+    the trio.serve_tcp task, exiting the whole process with exit code 1.
+    """
+    request = b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n"
+    stream = _FailingStream(raise_on_send=exc, request_bytes=request)
+
+    with caplog.at_level("INFO", logger="slack_fuse_server.http.server"):
+        await serve_http_connection(stream, metrics_source=StaticMetricsSource(_sample_metrics()))
+
+    assert stream.closed, "stream should be closed even when send fails"
+    assert any("connection dropped by peer" in rec.message for rec in caplog.records), (
+        "expected an INFO log record noting the peer hangup"
+    )
