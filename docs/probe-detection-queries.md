@@ -171,14 +171,24 @@ This also catches partial-day gaps where the local view has *some* messages
 for the day but not Slack's newest one.
 
 ```sql
+-- Rewritten 2026-07-05: the earlier version used the ``active_messages`` view
+-- and folded the whole channel stream per row — 2min+ at prod scale (~300K
+-- events). The version below reads events directly using the shipped indexes:
+-- ``events_message_dedup`` (partial unique on ``(stream, kind, payload->>'ts')``
+-- for ``kind='message'``) covers both the exact-ts existence check and the day-
+-- range count as text comparisons (Slack ts is fixed-width so lex ordering
+-- equals numeric ordering). ``events_message_deleted_target_idx`` covers the
+-- tombstone anti-join. Completes in single-digit seconds at prod scale.
+
 WITH samples AS (
   SELECT DISTINCT ON (
       payload->'call_params'->>'channel',
       payload->'call_params'->>'oldest'
   )
       payload->'call_params'->>'channel' AS channel_id,
-      (payload->'call_params'->>'oldest')::numeric AS day_start,
-      (payload->'call_params'->>'latest')::numeric AS day_end,
+      payload->'call_params'->>'oldest' AS day_start_text,
+      payload->'call_params'->>'latest' AS day_end_text,
+      (payload->'call_params'->>'oldest')::numeric AS day_start_num,
       payload->'response'->'messages'->0->>'ts' AS slack_sample_ts,
       created_at AS sampled_at
   FROM events
@@ -193,24 +203,38 @@ WITH samples AS (
 )
 SELECT
     s.channel_id,
-    to_timestamp(s.day_start)::date AS day,
+    to_timestamp(s.day_start_num)::date AS day,
     s.slack_sample_ts,
     (SELECT count(*)
-       FROM active_messages am
-      WHERE am.stream = 'channel:' || s.channel_id
-        AND am.ts_numeric >= s.day_start
-        AND am.ts_numeric <= s.day_end) AS local_count_in_day,
+       FROM events m
+      WHERE m.stream = 'channel:' || s.channel_id
+        AND m.kind = 'message'
+        AND m.payload->>'ts' >= s.day_start_text
+        AND m.payload->>'ts' <= s.day_end_text) AS local_message_rows_in_day,
     s.sampled_at
 FROM samples s
 WHERE s.slack_sample_ts IS NOT NULL
   AND NOT EXISTS (
-    SELECT 1
-    FROM active_messages am
-    WHERE am.stream = 'channel:' || s.channel_id
-      AND am.ts = s.slack_sample_ts
+    SELECT 1 FROM events m
+    WHERE m.stream = 'channel:' || s.channel_id
+      AND m.kind = 'message'
+      AND m.payload->>'ts' = s.slack_sample_ts
+      AND NOT EXISTS (
+        SELECT 1 FROM events d
+        WHERE d.stream = m.stream
+          AND d.kind = 'message_deleted'
+          AND d.payload->>'deleted_ts' = m.payload->>'ts'
+      )
   )
 ORDER BY s.sampled_at DESC;
 ```
+
+The ``local_message_rows_in_day`` column is the raw ``kind='message'`` row
+count in the day range, without subtracting tombstones. For the alert
+predicate itself (``NOT EXISTS`` on Slack's sampled ts) the tombstone
+anti-join keeps semantics identical to the prior ``active_messages``
+version — a locally-deleted message that Slack still shows would not
+alert.
 
 Known benign-result classes (read `sampled_at` before paging anyone):
 
