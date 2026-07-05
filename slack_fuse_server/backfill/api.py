@@ -41,7 +41,7 @@ from slack_fuse_server.backfill.types import (
     MessageBatchOrigin,
 )
 from slack_fuse_server.blocked_channels import is_channel_blocked
-from slack_fuse_server.slurper.api import FatalAPIError, RateLimitedError, SlackClient, Validated
+from slack_fuse_server.slurper.api import ChannelNotFoundError, FatalAPIError, RateLimitedError, SlackClient, Validated
 from slack_fuse_server.slurper.health import HealthEmitter, HealthKind
 from slack_fuse_server.slurper.ingestion import ingesting_run, make_source
 from slack_fuse_server.slurper.limiters import SlurperLimiters
@@ -696,6 +696,23 @@ async def _backfill_channel_run(
             if ctx.progress_every > 0 and messages >= last_progress_messages + ctx.progress_every:
                 await ctx.health.emit(HealthKind.BACKFILL_PROGRESS, {"channel_id": cid, "messages_so_far": messages})
                 last_progress_messages = messages
+    except ChannelNotFoundError:
+        # Token can no longer see this channel (archived, kicked, id renamed
+        # without the projector picking it up yet). Abort just this channel —
+        # NOT the whole slurper — so the auto-backfill loop can keep going.
+        log.info("backfill: channel_not_found on %s; skipping", cid)
+        await ctx.health.emit(
+            HealthKind.BACKFILL_ABORTED,
+            {"channel_id": cid, "reason": str(BackfillAbortReason.CHANNEL_NOT_FOUND), "message_count": messages},
+        )
+        return BackfillResult(
+            channel_id=channel_id,
+            messages=messages,
+            events_written=events_written,
+            elapsed_s=trio.current_time() - start,
+            aborted=True,
+            abort_reason=BackfillAbortReason.CHANNEL_NOT_FOUND,
+        )
     except FatalAPIError:
         log.error("backfill: fatal API error on %s; stopping", cid)
         raise

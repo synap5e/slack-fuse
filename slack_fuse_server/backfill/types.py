@@ -31,6 +31,7 @@ class BackfillAbortReason(StrEnum):
 
     EXCEEDED_DEFAULT_LIMIT = "exceeded_default_limit"
     OPERATOR_BLOCKED = "operator_blocked"
+    CHANNEL_NOT_FOUND = "channel_not_found"
 
 
 @dataclass(frozen=True, slots=True)

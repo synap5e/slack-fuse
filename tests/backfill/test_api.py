@@ -31,7 +31,7 @@ from slack_fuse_server.backfill.api import (
     backfill_channel,
 )
 from slack_fuse_server.backfill.types import BackfillAbortReason, MessageBatch, MessageBatchOrigin
-from slack_fuse_server.slurper.api import RateLimitedError, SlackClient, Validated
+from slack_fuse_server.slurper.api import ChannelNotFoundError, RateLimitedError, SlackClient, Validated
 from slack_fuse_server.slurper.health import HealthEmitter, HealthKind
 from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter, write_event
 from slack_fuse_server.wire.tail import EventTailer
@@ -545,6 +545,66 @@ def test_backfill_channel_write_batch_span_shape(
     assert "batch_kind=history_page" in caplog.text
     assert "channel_id=CSPAN" in caplog.text
     assert "events_written=3" in caplog.text
+
+
+class _ChannelNotFoundBackfiller:
+    """Yields nothing — first iteration step raises ``ChannelNotFoundError``.
+
+    Mirrors what happens in production when the user token can no longer see a
+    channel (archived / kicked / id renamed) — the first ``conversations.history``
+    page raises before any batch is produced.
+    """
+
+    @property
+    def name(self) -> str:
+        return "channel-not-found"
+
+    async def channels_to_backfill(self) -> AsyncIterator[ChannelId]:
+        return
+        yield  # pragma: no cover — present only to make this an async generator
+
+    async def messages_for_channel(
+        self,
+        channel_id: ChannelId,
+        since_ts: float | None = None,
+    ) -> AsyncIterator[Validated[Message]]:
+        del channel_id, since_ts
+        raise ChannelNotFoundError("Slack API error on conversations.history: channel_not_found")
+        yield  # pragma: no cover
+
+    async def messages_pages_for_channel(
+        self,
+        channel_id: ChannelId,
+        since_ts: float | None = None,
+    ) -> AsyncIterator[MessageBatch]:
+        del channel_id, since_ts
+        raise ChannelNotFoundError("Slack API error on conversations.history: channel_not_found")
+        yield  # pragma: no cover
+
+
+def test_backfill_channel_channel_not_found_aborts_channel_not_slurper(
+    server_conn: psycopg.Connection[TupleRow],
+) -> None:
+    """A single channel returning channel_not_found must NOT crash the run.
+
+    Regression for the 2026-07-06 CrashLoopBackOff: an archived / access-lost
+    channel raised ``ChannelNotFoundError`` from ``get_history_page``, which
+    the previous ``except FatalAPIError`` block did NOT catch (they are sibling
+    subclasses of ``SlackAPIError``, not parent/child), so the exception blew
+    through the trio nursery and killed the whole slurper. The auto-backfill
+    loop needs the per-channel abort so it can keep iterating over the rest.
+    """
+    writer = make_test_writer(server_conn)
+    health = HealthEmitter(writer)
+    ctx = BackfillContext(writer=writer, health=health, limiters=make_test_limiters(), warn_at=1000, abort_at=20000)
+
+    result = trio.run(backfill_channel, _ChannelNotFoundBackfiller(), ChannelId("CGONE"), ctx)
+
+    assert result.aborted is True
+    assert result.abort_reason == BackfillAbortReason.CHANNEL_NOT_FOUND
+    assert result.events_written == 0
+    assert _events_count(server_conn, "channel:CGONE") == 0
+    assert _health_kinds(server_conn) == ["backfill_started", "backfill_aborted"]
 
 
 def test_write_batch_mid_batch_runtime_error_rolls_back_all_records(
