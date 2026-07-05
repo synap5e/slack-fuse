@@ -33,15 +33,25 @@ from slack_fuse.models import ConversationsHistoryResponse, ConversationsReplies
 from slack_fuse_render import ChannelId
 from slack_fuse_server._json import JsonObject
 from slack_fuse_server.backfill.resume import ResumePlan, ThreadResume
+from slack_fuse_server.backfill.run_events import (
+    new_backfill_run_id,
+    page_committed_record,
+    resolve_trigger,
+    run_finished_record,
+    run_started_record,
+    started_params,
+)
 from slack_fuse_server.backfill.types import (
     BackfillAbortReason,
     Backfiller,
     BackfillResult,
+    BackfillRunOutcome,
+    BackfillRunTrigger,
     MessageBatch,
     MessageBatchOrigin,
 )
 from slack_fuse_server.blocked_channels import is_channel_blocked
-from slack_fuse_server.slurper.api import FatalAPIError, RateLimitedError, SlackClient, Validated
+from slack_fuse_server.slurper.api import ChannelNotFoundError, FatalAPIError, RateLimitedError, SlackClient, Validated
 from slack_fuse_server.slurper.health import HealthEmitter, HealthKind
 from slack_fuse_server.slurper.ingestion import ingesting_run, make_source
 from slack_fuse_server.slurper.limiters import SlurperLimiters
@@ -49,6 +59,7 @@ from slack_fuse_server.slurper.offsets import (
     PG_TIMEOUT_EXCEPTIONS,
     EventRecord,
     OffsetWriter,
+    write_event,
     write_message_or_corrective,
 )
 from slack_fuse_server.slurper.spans import run_sync_with_span, span
@@ -273,8 +284,9 @@ class SlackApiBackfiller:
         """Yield one atomic write batch per Slack API response.
 
         When a resume-plan reader is wired and this is a full-history run,
-        a crashed prior run's committed pages (recorded in `events.source`)
-        skip straight to the last Slack cursor / the unfinished threads.
+        a crashed prior run's committed pages (recorded on the
+        ``backfill-run:<channel>`` lifecycle stream) skip straight to the last
+        Slack cursor / the unfinished threads.
         """
         plan: ResumePlan | None = None
         if self._resume_plan is not None and since_ts is None:
@@ -405,7 +417,9 @@ class SlackApiBackfiller:
                     channel_id=channel_id,
                     thread_ts=None,
                     page_index=first_page_index + page,
-                    slack_cursor=request_cursor,
+                    slack_cursor=next_cursor,
+                    has_more=resp.has_more,
+                    final_page=not resp.has_more or not next_cursor,
                 ),
             )
             page += 1
@@ -470,6 +484,8 @@ class SlackApiBackfiller:
                         thread_ts=thread_ts,
                         page_index=page_index,
                         slack_cursor=next_cursor,
+                        has_more=resp.has_more,
+                        final_page=not resp.has_more or not next_cursor,
                     ),
                 )
                 page_index += 1
@@ -577,20 +593,23 @@ def _next_replies_page(
         return None
 
 
-def _write_batch_sync(conn: Connection[TupleRow], records: Sequence[EventRecord]) -> int:
+def _write_batch_sync(conn: Connection[TupleRow], batch: MessageBatch, run_id: str | None) -> int:
     inserted = 0
-    for record in records:
+    for record in batch.records:
         offset = write_message_or_corrective(conn, record)
         if offset is not None:
             inserted += 1
+    if run_id is not None:
+        _ = write_event(conn, page_committed_record(batch=batch, run_id=run_id, messages_written=inserted))
     return inserted
 
 
-async def _write_batch_with_retry(
+async def write_backfill_batch_with_retry(
     writer: OffsetWriter,
     batch: MessageBatch,
     *,
     task_name: str,
+    run_id: str | None,
 ) -> int:
     extra: JsonObject = {
         "messages_in_batch": len(batch.records),
@@ -605,7 +624,7 @@ async def _write_batch_with_retry(
         extra=extra,
     ) as recorder:
         try:
-            inserted = await writer.run_transaction(lambda conn: _write_batch_sync(conn, batch.records), span=recorder)
+            inserted = await writer.run_transaction(lambda conn: _write_batch_sync(conn, batch, run_id), span=recorder)
         except PG_TIMEOUT_EXCEPTIONS:
             wait = random.uniform(_PG_TIMEOUT_RETRY_MIN_S, _PG_TIMEOUT_RETRY_MAX_S)
             log.warning(
@@ -617,7 +636,7 @@ async def _write_batch_with_retry(
                 exc_info=True,
             )
             await trio.sleep(wait)
-            inserted = await writer.run_transaction(lambda conn: _write_batch_sync(conn, batch.records), span=recorder)
+            inserted = await writer.run_transaction(lambda conn: _write_batch_sync(conn, batch, run_id), span=recorder)
         recorder.set("events_written", inserted)
         return inserted
 
@@ -628,6 +647,7 @@ async def backfill_channel(
     ctx: BackfillContext,
     *,
     since_ts: float | None = None,
+    triggered_by: BackfillRunTrigger | None = None,
 ) -> BackfillResult:
     """Drive one channel's backfill: write `message` events, honour thresholds.
 
@@ -640,25 +660,60 @@ async def backfill_channel(
     `in_progress.messages_so_far`.
 
     One channel backfill is one logical ingestion run: every event it writes
-    (messages, correctives, and the health sentinels) shares a fresh
-    `source->>'run_id'`.
+    (messages, correctives, lifecycle rows, and the health sentinels) shares a
+    fresh `source->>'run_id'`.
     """
-    with ingesting_run():
-        return await _backfill_channel_run(backfiller, channel_id, ctx, since_ts=since_ts)
+    with ingesting_run(triggered_by=None if triggered_by is None else str(triggered_by)):
+        run_id = new_backfill_run_id()
+        trigger = resolve_trigger(triggered_by, default=BackfillRunTrigger.ADMIN_CLI)
+        return await _backfill_channel_run(
+            backfiller, channel_id, ctx, since_ts=since_ts, run_id=run_id, trigger=trigger
+        )
 
 
-async def _backfill_channel_run(
+async def _backfill_channel_run(  # noqa: C901, PLR0913 - orchestration keeps the channel run boundary explicit.
     backfiller: Backfiller,
     channel_id: ChannelId,
     ctx: BackfillContext,
     *,
     since_ts: float | None = None,
+    run_id: str,
+    trigger: BackfillRunTrigger,
 ) -> BackfillResult:
     cid = channel_id.value
-    if await ctx.writer.run_read(lambda conn: is_channel_blocked(conn, cid), limiter=ctx.limiters.admin_read):
+    await ctx.writer.write_event(
+        run_started_record(
+            channel_id=cid,
+            run_id=run_id,
+            triggered_by=trigger,
+            params=started_params(since_ts=since_ts),
+        )
+    )
+    start = trio.current_time()
+    messages = 0
+    events_written = 0
+    try:
+        blocked = await ctx.writer.run_read(lambda conn: is_channel_blocked(conn, cid), limiter=ctx.limiters.admin_read)
+        if not blocked:
+            await ctx.health.emit(HealthKind.BACKFILL_STARTED, {"channel_id": cid})
+    except Exception as exc:
+        await _emit_exception_finished(
+            ctx, channel_id=cid, run_id=run_id, start=start, events_written=events_written, exc=exc
+        )
+        raise
+
+    if blocked:
         await ctx.health.emit(
             HealthKind.BACKFILL_SKIPPED,
             {"channel_id": cid, "reason": str(BackfillAbortReason.OPERATOR_BLOCKED)},
+        )
+        await _emit_run_finished(
+            ctx,
+            channel_id=cid,
+            run_id=run_id,
+            outcome=BackfillRunOutcome.OPERATOR_BLOCKED,
+            messages_written_total=0,
+            elapsed_s=trio.current_time() - start,
         )
         return BackfillResult(
             channel_id=channel_id,
@@ -668,11 +723,7 @@ async def _backfill_channel_run(
             aborted=True,
             abort_reason=BackfillAbortReason.OPERATOR_BLOCKED,
         )
-    await ctx.health.emit(HealthKind.BACKFILL_STARTED, {"channel_id": cid})
-    start = trio.current_time()
 
-    messages = 0
-    events_written = 0
     last_progress_messages = 0
     warned = False
     aborted = False
@@ -683,7 +734,7 @@ async def _backfill_channel_run(
             if batch.kind == "history_page" and ctx.abort_at is not None and messages + batch_count > ctx.abort_at:
                 aborted = True
                 break
-            inserted = await _write_batch_with_retry(ctx.writer, batch, task_name=ctx.task_name)
+            inserted = await write_backfill_batch_with_retry(ctx.writer, batch, task_name=ctx.task_name, run_id=run_id)
             events_written += inserted
             messages += batch_count
             if not warned and messages >= ctx.warn_at:
@@ -696,8 +747,21 @@ async def _backfill_channel_run(
             if ctx.progress_every > 0 and messages >= last_progress_messages + ctx.progress_every:
                 await ctx.health.emit(HealthKind.BACKFILL_PROGRESS, {"channel_id": cid, "messages_so_far": messages})
                 last_progress_messages = messages
-    except FatalAPIError:
+    except FatalAPIError as exc:
         log.error("backfill: fatal API error on %s; stopping", cid)
+        await _emit_exception_finished(
+            ctx,
+            channel_id=cid,
+            run_id=run_id,
+            start=start,
+            events_written=events_written,
+            exc=exc,
+        )
+        raise
+    except Exception as exc:
+        await _emit_exception_finished(
+            ctx, channel_id=cid, run_id=run_id, start=start, events_written=events_written, exc=exc
+        )
         raise
 
     elapsed = trio.current_time() - start
@@ -705,6 +769,14 @@ async def _backfill_channel_run(
         await ctx.health.emit(
             HealthKind.BACKFILL_ABORTED,
             {"channel_id": cid, "reason": str(BackfillAbortReason.EXCEEDED_DEFAULT_LIMIT), "message_count": messages},
+        )
+        await _emit_run_finished(
+            ctx,
+            channel_id=cid,
+            run_id=run_id,
+            outcome=BackfillRunOutcome.SIZE_CAPPED,
+            messages_written_total=events_written,
+            elapsed_s=elapsed,
         )
         return BackfillResult(
             channel_id=channel_id,
@@ -716,9 +788,64 @@ async def _backfill_channel_run(
         )
 
     await ctx.health.emit(HealthKind.BACKFILL_COMPLETED, {"channel_id": cid, "events_written": events_written})
+    await _emit_run_finished(
+        ctx,
+        channel_id=cid,
+        run_id=run_id,
+        outcome=BackfillRunOutcome.COMPLETED,
+        messages_written_total=events_written,
+        elapsed_s=elapsed,
+    )
     return BackfillResult(
         channel_id=channel_id,
         messages=messages,
         events_written=events_written,
         elapsed_s=elapsed,
+    )
+
+
+async def _emit_run_finished(  # noqa: PLR0913 - thin typed wrapper around the terminal event payload.
+    ctx: BackfillContext,
+    *,
+    channel_id: str,
+    run_id: str,
+    outcome: BackfillRunOutcome,
+    messages_written_total: int,
+    elapsed_s: float,
+    error_reason: str | None = None,
+) -> None:
+    await ctx.writer.write_event(
+        run_finished_record(
+            channel_id=channel_id,
+            run_id=run_id,
+            outcome=outcome,
+            messages_written_total=messages_written_total,
+            elapsed_s=elapsed_s,
+            error_reason=error_reason,
+        )
+    )
+
+
+async def _emit_exception_finished(  # noqa: PLR0913 - exception-to-terminal mapping needs explicit fields.
+    ctx: BackfillContext,
+    *,
+    channel_id: str,
+    run_id: str,
+    start: float,
+    events_written: int,
+    exc: Exception,
+) -> None:
+    outcome = (
+        BackfillRunOutcome.CHANNEL_NOT_FOUND
+        if isinstance(exc, ChannelNotFoundError)
+        else BackfillRunOutcome.FATAL_ERROR
+    )
+    await _emit_run_finished(
+        ctx,
+        channel_id=channel_id,
+        run_id=run_id,
+        outcome=outcome,
+        messages_written_total=events_written,
+        elapsed_s=trio.current_time() - start,
+        error_reason=type(exc).__name__,
     )

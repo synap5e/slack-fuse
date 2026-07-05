@@ -29,7 +29,7 @@ from slack_fuse.models import Message
 from slack_fuse_render import ChannelId
 from slack_fuse_server._json import JsonObject
 from slack_fuse_server.backfill.api import SlackApiBackfiller, SleepBounds
-from slack_fuse_server.backfill.types import MessageBatch, MessageBatchOrigin
+from slack_fuse_server.backfill.types import BackfillRunTrigger, MessageBatch, MessageBatchOrigin
 from slack_fuse_server.slurper.api import SlackAPIError, SlackClient, Validated
 from slack_fuse_server.slurper.catchup import (
     CatchupConfig,
@@ -42,6 +42,7 @@ from slack_fuse_server.slurper.catchup import (
     run_catchup_once,
     should_catchup,
 )
+from slack_fuse_server.slurper.ingestion import IngestionContext, ingesting
 from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter, write_event
 from tests.conftest import RecordingSupervisor, make_test_limiters, make_test_writer
 
@@ -72,6 +73,24 @@ def _events_count(conn: psycopg.Connection[TupleRow], stream: str) -> int:
         row = cur.fetchone()
     assert row is not None
     return int(row[0])
+
+
+def _run_rows(conn: psycopg.Connection[TupleRow], channel_id: str) -> list[tuple[str, JsonObject]]:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT kind, payload FROM events WHERE stream = %s ORDER BY offset_in_stream",
+            (f"backfill-run:{channel_id}",),
+        )
+        rows = cur.fetchall()
+    out: list[tuple[str, JsonObject]] = []
+    for kind, payload in rows:
+        assert isinstance(payload, dict)
+        out.append((str(kind), cast(JsonObject, payload)))
+    return out
+
+
+def _ingestion_ctx(boot_id: str) -> IngestionContext:
+    return IngestionContext(producer="catchup", boot_id=boot_id, task_id=f"TASK-{boot_id}", triggered_by="startup")
 
 
 # === 1. Gap detection ===
@@ -306,6 +325,77 @@ def test_run_catchup_once_sweeps_every_channel_with_resolved_resume_points(
     assert cnew_since is not None and abs(cnew_since - (1700100000.0 - _FAST.max_lookback_s)) < 1e-6
 
 
+def test_startup_catchup_emits_backfill_run_stream(
+    server_conn: psycopg.Connection[TupleRow],
+) -> None:
+    writer = make_test_writer(server_conn)
+    backfiller = _RecordingBackfiller(["CSTART"])
+    deps = CatchupDeps(writer=writer, backfiller=backfiller, config=_FAST, limiters=make_test_limiters())
+
+    async def go() -> CatchupResult:
+        with ingesting(_ingestion_ctx("BOOT1")):
+            return await run_catchup_once(
+                deps,
+                now_epoch=1700100000.0,
+                backfill_trigger=BackfillRunTrigger.STARTUP,
+            )
+
+    result = trio.run(go)
+
+    assert result.channels == 1
+    assert result.events == 1
+    rows = _run_rows(server_conn, "CSTART")
+    assert [kind for kind, _payload in rows] == [
+        "backfill_run_started",
+        "backfill_page_committed",
+        "backfill_run_finished",
+    ]
+    assert rows[0][1]["triggered_by"] == "startup"
+    assert rows[-1][1]["outcome"] == "completed"
+
+
+def test_startup_catchup_skips_same_boot_in_progress_run(
+    server_conn: psycopg.Connection[TupleRow],
+) -> None:
+    assert (
+        write_event(
+            server_conn,
+            EventRecord(
+                stream="backfill-run:CSKIP",
+                kind="backfill_run_started",
+                ts=None,
+                payload={"run_id": "RUN-SKIP", "params": {}, "triggered_by": "startup"},
+                dedup=True,
+                source={"boot_id": "BOOT2"},
+            ),
+        )
+        is not None
+    )
+    writer = make_test_writer(server_conn)
+    backfiller = _RecordingBackfiller(["CSKIP", "CRUN"])
+    deps = CatchupDeps(writer=writer, backfiller=backfiller, config=_FAST, limiters=make_test_limiters())
+
+    async def go() -> CatchupResult:
+        with ingesting(_ingestion_ctx("BOOT2")):
+            return await run_catchup_once(
+                deps,
+                now_epoch=1700100000.0,
+                backfill_trigger=BackfillRunTrigger.STARTUP,
+            )
+
+    result = trio.run(go)
+
+    assert result.channels == 2
+    assert result.events == 1
+    assert set(backfiller.since_by_channel) == {"CRUN"}
+    assert [kind for kind, _payload in _run_rows(server_conn, "CSKIP")] == ["backfill_run_started"]
+    assert [kind for kind, _payload in _run_rows(server_conn, "CRUN")] == [
+        "backfill_run_started",
+        "backfill_page_committed",
+        "backfill_run_finished",
+    ]
+
+
 class _FlakyBackfiller(_RecordingBackfiller):
     """Like the recording stub, but one channel raises a Slack API error."""
 
@@ -321,6 +411,23 @@ class _FlakyBackfiller(_RecordingBackfiller):
         if channel_id.value == self._failing:
             raise SlackAPIError(f"boom for {channel_id.value}")
         async for item in super().messages_for_channel(channel_id, since_ts):
+            yield item
+
+
+class _RuntimePageBackfiller(_RecordingBackfiller):
+    def __init__(self, channel_ids: list[str], failing: str) -> None:
+        super().__init__(channel_ids)
+        self._failing = failing
+
+    async def messages_pages_for_channel(
+        self,
+        channel_id: ChannelId,
+        since_ts: float | None = None,
+    ) -> AsyncIterator[MessageBatch]:
+        if channel_id.value == self._failing:
+            self.since_by_channel[channel_id.value] = since_ts
+            raise RuntimeError("novel page failure")
+        async for item in super().messages_pages_for_channel(channel_id, since_ts):
             yield item
 
 
@@ -340,6 +447,31 @@ def test_run_catchup_once_isolates_per_channel_errors(
     assert result.channels == 3
     assert result.events == 2
     assert result.errors == 1
+
+
+def test_startup_catchup_runtime_error_finishes_run_and_continues(
+    server_conn: psycopg.Connection[TupleRow],
+) -> None:
+    writer = make_test_writer(server_conn)
+    backfiller = _RuntimePageBackfiller(["CA", "CBAD", "CC"], failing="CBAD")
+    deps = CatchupDeps(writer=writer, backfiller=backfiller, config=_FAST, limiters=make_test_limiters())
+
+    async def go() -> CatchupResult:
+        with ingesting(_ingestion_ctx("BOOT3")):
+            return await run_catchup_once(
+                deps,
+                now_epoch=1700100000.0,
+                backfill_trigger=BackfillRunTrigger.STARTUP,
+            )
+
+    result = trio.run(go)
+
+    assert result.channels == 3
+    assert result.events == 2
+    assert result.errors == 1
+    assert _run_rows(server_conn, "CBAD")[-1][1]["outcome"] == "fatal_error"
+    assert _run_rows(server_conn, "CBAD")[-1][1]["error_reason"] == "RuntimeError"
+    assert _run_rows(server_conn, "CC")[-1][1]["outcome"] == "completed"
 
 
 def test_run_catchup_once_integration_over_fake_transport(

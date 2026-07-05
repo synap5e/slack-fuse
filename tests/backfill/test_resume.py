@@ -41,6 +41,8 @@ _NO_SLEEP = SleepBounds(page_min_s=0.0, page_max_s=0.0, thread_min_s=0.0, thread
 
 _CHANNEL = "CRESUME"
 _STREAM = f"channel:{_CHANNEL}"
+_RUN_STREAM = f"backfill-run:{_CHANNEL}"
+_DEFAULT_RUN_ID = "RUN_RESUME"
 
 
 # === Seeding helpers ===
@@ -59,10 +61,19 @@ def _seed_message(
         payload.update(payload_extra)
     record = EventRecord(stream=stream, kind="message", ts=ts, payload=payload, dedup=True, source=source)
     assert write_event(conn, record) is not None
+    if source is not None:
+        _seed_backfill_run_page(conn, stream, source)
 
 
-def _history_source(*, cursor: str, page_index: int, final: bool, oldest: str | None = None) -> JsonObject:
-    return make_source(
+def _history_source(
+    *,
+    cursor: str,
+    page_index: int,
+    final: bool,
+    oldest: str | None = None,
+    run_id: str = _DEFAULT_RUN_ID,
+) -> JsonObject:
+    source = make_source(
         producer="backfill-history-page",
         slack_cursor=cursor,
         page_index=page_index,
@@ -70,10 +81,19 @@ def _history_source(*, cursor: str, page_index: int, final: bool, oldest: str | 
         final_page=final,
         oldest=oldest,
     )
+    source["run_id"] = run_id
+    return source
 
 
-def _replies_source(*, thread_ts: str, cursor: str, page_index: int, final: bool) -> JsonObject:
-    return make_source(
+def _replies_source(
+    *,
+    thread_ts: str,
+    cursor: str,
+    page_index: int,
+    final: bool,
+    run_id: str = _DEFAULT_RUN_ID,
+) -> JsonObject:
+    source = make_source(
         producer="backfill-replies-page",
         thread_ts=thread_ts,
         slack_cursor=cursor,
@@ -81,10 +101,71 @@ def _replies_source(*, thread_ts: str, cursor: str, page_index: int, final: bool
         has_more=not final,
         final_page=final,
     )
+    source["run_id"] = run_id
+    return source
 
 
-def _seed_terminal(conn: psycopg.Connection[TupleRow], kind: str, channel_id: str = _CHANNEL) -> None:
-    record = EventRecord(stream="slurper-health", kind=kind, ts=None, payload={"channel_id": channel_id})
+def _seed_backfill_run_page(conn: psycopg.Connection[TupleRow], stream: str, source: JsonObject) -> None:
+    producer = source.get("producer")
+    if producer not in ("backfill-history-page", "backfill-replies-page"):
+        return
+    channel_id = stream.removeprefix("channel:")
+    run_id = str(source.get("run_id") or _DEFAULT_RUN_ID)
+    params: JsonObject = {}
+    oldest = source.get("oldest")
+    if isinstance(oldest, str):
+        params["since_ts"] = oldest
+    _ = write_event(
+        conn,
+        EventRecord(
+            stream=f"backfill-run:{channel_id}",
+            kind="backfill_run_started",
+            ts=None,
+            payload={"run_id": run_id, "params": params, "triggered_by": "admin-cli"},
+            dedup=True,
+        ),
+    )
+    page_kind = "history_page" if producer == "backfill-history-page" else "replies_page"
+    page_index_raw = source.get("page_index")
+    page_index = page_index_raw if isinstance(page_index_raw, int) else 0
+    payload: JsonObject = {
+        "run_id": run_id,
+        "page_index": page_index,
+        "has_more": bool(source.get("has_more")),
+        "final_page": bool(source.get("final_page")),
+        "slack_cursor": str(source.get("slack_cursor") or ""),
+        "messages_written": 1,
+        "kind": page_kind,
+    }
+    thread_ts = source.get("thread_ts")
+    if isinstance(thread_ts, str):
+        payload["thread_ts"] = thread_ts
+    _ = write_event(
+        conn,
+        EventRecord(
+            stream=f"backfill-run:{channel_id}",
+            kind="backfill_page_committed",
+            ts=None,
+            payload=payload,
+            dedup=True,
+        ),
+    )
+
+
+def _seed_terminal(
+    conn: psycopg.Connection[TupleRow],
+    kind: str,
+    channel_id: str = _CHANNEL,
+    run_id: str = _DEFAULT_RUN_ID,
+) -> None:
+    outcome = "completed" if kind == "backfill_completed" else "size_capped"
+    record = EventRecord(
+        stream=f"backfill-run:{channel_id}",
+        kind="backfill_run_finished",
+        ts=None,
+        payload={"run_id": run_id, "outcome": outcome, "messages_written_total": 0, "elapsed_s": 1.0},
+        dedup=True,
+    )
     assert write_event(conn, record) is not None
 
 
@@ -131,7 +212,11 @@ def test_terminal_abort_gates_out_aborted_runs(server_conn: psycopg.Connection[T
 def test_rows_after_terminal_are_resume_state(server_conn: psycopg.Connection[TupleRow]) -> None:
     _seed_message(server_conn, "1700000300.000100", source=_history_source(cursor="old", page_index=0, final=True))
     _seed_terminal(server_conn, "backfill_completed")
-    _seed_message(server_conn, "1700000200.000100", source=_history_source(cursor="fresh", page_index=0, final=False))
+    _seed_message(
+        server_conn,
+        "1700000200.000100",
+        source=_history_source(cursor="fresh", page_index=0, final=False, run_id="RUN_FRESH"),
+    )
     plan = find_resume_plan(server_conn, _CHANNEL)
     assert plan is not None
     assert plan.history_cursor == "fresh"
@@ -315,7 +400,7 @@ def _seed_full_resume_state(conn: psycopg.Connection[TupleRow]) -> None:
     )
 
 
-# Execute order inside find_resume_plan: 1=terminal_watermark, 2=latest_history_page,
+# Execute order inside find_resume_plan: 1=latest_unfinished_run, 2=latest_history_page,
 # 3=replies_progress, 4=known parents, 5=tombstones.
 @pytest.mark.parametrize("fail_on", [1, 2, 3, 4, 5])
 def test_pg_timeout_falls_back_to_fresh_plan(
@@ -358,12 +443,27 @@ def _seed_bulk_parents(conn: psycopg.Connection[TupleRow], n_parents: int, n_fil
     """Bulk-seed via generate_series — write_event row-at-a-time is too slow here."""
     history_source = json.dumps({
         "producer": "backfill-history-page",
+        "run_id": _DEFAULT_RUN_ID,
         "slack_cursor": "",
         "page_index": 0,
         "has_more": False,
         "final_page": True,
     })
     with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO events (stream, offset_in_stream, kind, ts, payload)
+            VALUES
+                (%(run_stream)s, 1, 'backfill_run_started', NULL,
+                 jsonb_build_object('run_id', (%(run_id)s)::text, 'params', '{}'::jsonb,
+                                    'triggered_by', 'admin-cli')),
+                (%(run_stream)s, 2, 'backfill_page_committed', NULL,
+                 jsonb_build_object('run_id', (%(run_id)s)::text, 'page_index', 0, 'has_more', false,
+                                    'final_page', true, 'slack_cursor', '',
+                                    'messages_written', (%(n)s)::int, 'kind', 'history_page'))
+            """,
+            {"run_stream": _RUN_STREAM, "run_id": _DEFAULT_RUN_ID, "n": n_parents},
+        )
         cur.execute(
             """
             INSERT INTO events (stream, offset_in_stream, kind, ts, payload, source)

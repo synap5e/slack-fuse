@@ -66,7 +66,6 @@ def test_server_config_from_toml(tmp_path: Path) -> None:
     assert abs(cfg.probe_channel_newest_message_cadence_s - 43200.0) < 1e-9
     # Untouched keys fall back to RFC defaults.
     assert cfg.backfill_warn_at == 5000
-    assert cfg.auto_backfill_skip_if_completed is True
     assert cfg.snapshot_max_age_hours == 24
     assert abs(cfg.probe_channel_older_than_oldest_cadence_s - 7 * 86400.0) < 1e-9
     assert abs(cfg.probe_channel_inventory_cadence_s - 86400.0) < 1e-9

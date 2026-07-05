@@ -3,19 +3,17 @@
 Two modes:
 
 - no subcommand (or `serve`): run the slurper — connect to postgres, apply
-  server migrations, then start a trio nursery with the Socket Mode ingestion
-  task (and, when `SLACK_FUSE_SERVER_BACKFILL` is truthy, the automatic
-  channel-backfill pass). The WS server (1B) and HTTP server (1C) tasks slot
-  into the same nursery later.
+  server migrations, then start the socket-mode, metadata refresh, probe,
+  bounded catchup, HTTP, WS, and snapshot tasks.
+- `initial-ingest --channel <channel-id>|--all`: the admin initial-ingest
+  command. It is unbounded per channel and is never started at boot.
 - `backfill <channel-id>`: the admin recovery command (RFC §Backfill → Manual).
   Backfills one channel through the same offset-assignment write path, honouring
   the configured size thresholds. `--allow-large` / `--max-messages N` raise or
   lift the per-channel limit and persist the choice in `backfill_overrides`.
 
 Config comes from the Sprint-0 `ServerConfig` loader (env vars prefixed
-`SLACK_FUSE_SERVER_`, then `~/.config/slack-fuse-server/config.toml`). The
-automatic-backfill gate is an env var rather than a config field so the frozen
-Sprint-0 config contract is untouched.
+`SLACK_FUSE_SERVER_`, then `~/.config/slack-fuse-server/config.toml`).
 """
 
 from __future__ import annotations
@@ -25,10 +23,10 @@ import json
 import logging
 import os
 import sys
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 import psycopg
 import trio
@@ -39,10 +37,30 @@ from slack_fuse.migrations.runner import apply_migrations
 from slack_fuse.user_cache import UserCache
 from slack_fuse_render import ChannelId
 from slack_fuse_server._json import JsonObject
-from slack_fuse_server.backfill.api import BackfillContext, SlackApiBackfiller, SleepBounds, backfill_channel
+from slack_fuse_server.backfill.api import (
+    BackfillContext,
+    SlackApiBackfiller,
+    SleepBounds,
+    backfill_channel,
+    write_backfill_batch_with_retry,
+)
 from slack_fuse_server.backfill.legacy import LegacyCacheBackfiller
 from slack_fuse_server.backfill.resume import ResumePlan, find_resume_plan
-from slack_fuse_server.backfill.types import BackfillAbortReason, Backfiller
+from slack_fuse_server.backfill.run_events import (
+    new_backfill_run_id,
+    resolve_trigger,
+    run_finished_record,
+    run_started_record,
+    started_params,
+)
+from slack_fuse_server.backfill.types import (
+    BackfillAbortReason,
+    Backfiller,
+    BackfillRunOutcome,
+    BackfillRunTrigger,
+    MessageBatch,
+    MessageBatchOrigin,
+)
 from slack_fuse_server.blocked_channels import (
     BlockedChannelError,
     block_channel,
@@ -66,7 +84,6 @@ from slack_fuse_server.http.handlers import (
 )
 from slack_fuse_server.http.metrics import MetricsAggregator, SubscriberSnapshot
 from slack_fuse_server.slurper.api import ChannelNotFoundError, SlackAPIError, SlackClient, Validated
-from slack_fuse_server.slurper.backfill_state import async_find_last_backfill_completion
 from slack_fuse_server.slurper.catchup import (
     CatchupConfig,
     CatchupDeps,
@@ -74,14 +91,14 @@ from slack_fuse_server.slurper.catchup import (
     should_catchup,
 )
 from slack_fuse_server.slurper.channels import ensure_channel_added, populate_channels_once
-from slack_fuse_server.slurper.health import HealthEmitter, HealthKind
-from slack_fuse_server.slurper.ingestion import BootContext, IngestionContext, ingesting, process_boot
+from slack_fuse_server.slurper.health import HealthEmitter
+from slack_fuse_server.slurper.ingestion import BootContext, IngestionContext, ingesting, ingesting_run, process_boot
 from slack_fuse_server.slurper.limiters import SlurperLimiters
-from slack_fuse_server.slurper.offsets import OffsetWriter
+from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter
 from slack_fuse_server.slurper.probes import ProbeTrigger, probe_sweep
 from slack_fuse_server.slurper.refresh import RefreshTrigger, refresh_channels_periodically
 from slack_fuse_server.slurper.socket import SocketModeOptions, SocketModeStatus
-from slack_fuse_server.slurper.spans import configure_span_thresholds_from_config, span
+from slack_fuse_server.slurper.spans import configure_span_thresholds_from_config
 from slack_fuse_server.slurper.supervisor import TaskSupervisor, phase
 from slack_fuse_server.slurper.users import populate_users_once, run_socket_mode_with_users
 from slack_fuse_server.snapshot import SnapshotScheduler
@@ -89,11 +106,11 @@ from slack_fuse_server.wire.server import WireServer
 
 log = logging.getLogger(__name__)
 
+if TYPE_CHECKING:
+    from slack_fuse.models import ConversationsHistoryResponse, ConversationsRepliesResponse
+
 _MIGRATIONS_DIR = Path(server_migrations.__file__).parent
-_AUTO_BACKFILL_ENV = "SLACK_FUSE_SERVER_BACKFILL"
-# Sleep between channels in the automatic backfill pass (RFC: yields between
-# channels so live ingestion stays responsive).
-_AUTO_BACKFILL_CHANNEL_GAP_S = 60.0
+_LEGACY_AUTO_BACKFILL_ENV = "SLACK_FUSE_SERVER_BACKFILL"
 _BACKFILL_SOURCES = ("slack-api", "legacy-cache")
 type BackfillSource = Literal["slack-api", "legacy-cache"]
 
@@ -437,8 +454,8 @@ async def _serve(config: ServerConfig, boot: BootContext) -> None:
     status = SocketModeStatus()
     wire_server = WireServer(config.database_url, shared_secret=config.shared_secret or None)
     metrics = _build_metrics_aggregator(config, status, wire_server, datetime.now(UTC))
+    _warn_legacy_auto_backfill_env()
 
-    auto_backfill = os.environ.get(_AUTO_BACKFILL_ENV, "").lower() in ("1", "true", "yes")
     try:
         async with trio.open_nursery() as nursery:
             _log_slurper_started()
@@ -555,24 +572,20 @@ async def _serve(config: ServerConfig, boot: BootContext) -> None:
                         supervisor,
                     )
                 )
-            if auto_backfill:
-                nursery.start_soon(
-                    _ingesting_task(
-                        boot.task_context("auto-backfill", triggered_by="startup"),
-                        _auto_backfill,
-                        config,
-                        writer,
-                        health,
-                        client,
-                        limiters,
-                        supervisor,
-                    )
-                )
             log.info("slack-fuse-server listening on %s (HTTP /health, /metrics + WS /ws)", config.listen_addr)
     finally:
         client.close()
         writer.close()
         snapshot_conn.close()
+
+
+def _warn_legacy_auto_backfill_env() -> None:
+    if _LEGACY_AUTO_BACKFILL_ENV not in os.environ:
+        return
+    log.warning(
+        "%s is deprecated and ignored; startup catchup is gated only by catchup_enabled",
+        _LEGACY_AUTO_BACKFILL_ENV,
+    )
 
 
 async def _run_socket_mode_with_users_task(  # noqa: PLR0913, PLR0917 - socket task needs its full dep set
@@ -650,103 +663,6 @@ async def _serve_dispatch_task(  # noqa: PLR0913, PLR0917 - dispatch wiring need
     )
 
 
-async def _auto_backfill(  # noqa: C901, PLR0913, PLR0917 - task dependencies and phase boundaries are explicit.
-    config: ServerConfig,
-    writer: OffsetWriter,
-    health: HealthEmitter,
-    client: SlackClient,
-    limiters: SlurperLimiters,
-    supervisor: TaskSupervisor | None = None,
-) -> None:
-    """Automatic first-bootup pass: backfill every member channel, throttled."""
-    if supervisor is not None:
-        supervisor.declare("auto-backfill", "startup_sleep", deadline_s=None)
-    await trio.sleep(30)  # let startup settle before hitting the API hard
-    backfiller = _make_backfiller(
-        "slack-api",
-        client=client,
-        limiters=limiters,
-        config=config,
-        writer=writer,
-        task_name="auto-backfill",
-    )
-    first_backfill = True
-    if supervisor is not None:
-        supervisor.declare("auto-backfill", "listing_channels", deadline_s=60)
-    async for channel_id in backfiller.channels_to_backfill():
-        if config.auto_backfill_skip_if_completed:
-            if supervisor is None:
-                completion = await async_find_last_backfill_completion(writer, channel_id.value, limiters)
-            else:
-                async with phase(
-                    supervisor,
-                    "auto-backfill",
-                    "checking_skip",
-                    details={"channel_id": channel_id.value},
-                    deadline_s=5,
-                ):
-                    completion = await async_find_last_backfill_completion(writer, channel_id.value, limiters)
-            if completion is not None:
-                async with span(
-                    op="slurper.auto_backfill.channel",
-                    task="auto-backfill",
-                    extra={"channel_id": channel_id.value},
-                ) as channel_span:
-                    channel_span.mark_skipped()
-                    channel_span.set("completed_at", completion.at.isoformat())
-                    channel_span.set("events_written", completion.events_written)
-                log.info(
-                    "auto-backfill: skipping %s — completed at %s, events_written=%d",
-                    channel_id.value,
-                    completion.at.isoformat(),
-                    completion.events_written,
-                )
-                continue
-        if not first_backfill:
-            if supervisor is not None:
-                supervisor.declare(
-                    "auto-backfill",
-                    "inter_channel_sleep",
-                    details={"channel_id": channel_id.value},
-                    deadline_s=None,
-                )
-            await trio.sleep(_AUTO_BACKFILL_CHANNEL_GAP_S)
-        first_backfill = False
-        async with span(
-            op="slurper.auto_backfill.channel",
-            task="auto-backfill",
-            extra={"channel_id": channel_id.value},
-        ) as channel_span:
-            log.info("auto-backfill: %s", channel_id.value)
-            ctx = BackfillContext(
-                writer=writer,
-                health=health,
-                limiters=limiters,
-                warn_at=config.backfill_warn_at,
-                abort_at=config.backfill_abort_at,
-                task_name="auto-backfill",
-            )
-            if supervisor is None:
-                result = await backfill_channel(backfiller, channel_id, ctx)
-            else:
-                async with phase(
-                    supervisor,
-                    "auto-backfill",
-                    "channel",
-                    details={"channel_id": channel_id.value},
-                    deadline_s=config.backfill_abort_at * 0.5,
-                ):
-                    result = await backfill_channel(backfiller, channel_id, ctx)
-            channel_span.set("messages", result.messages)
-            channel_span.set("events_written", result.events_written)
-            channel_span.set("aborted", result.aborted)
-            if result.abort_reason is not None:
-                channel_span.set("abort_reason", str(result.abort_reason))
-    if supervisor is not None:
-        supervisor.declare("auto-backfill", "complete", deadline_s=None)
-    log.info("auto-backfill: complete")
-
-
 # === refresh-channels (admin one-shot) ===
 
 
@@ -776,7 +692,7 @@ async def _run_refresh_channels_once(config: ServerConfig) -> None:
 # === Backfill (admin) mode ===
 
 
-async def _run_refill_window(  # noqa: C901 - two-phase CLI thunk (history pagination + thread expansion); further extraction adds ceremony without clarifying flow
+async def _run_refill_window(
     config: ServerConfig,
     channel_id: str,
     oldest_ts: float,
@@ -796,8 +712,6 @@ async def _run_refill_window(  # noqa: C901 - two-phase CLI thunk (history pagin
     Writes carry ``source.producer = "refill-window"`` so operators can
     distinguish these events from normal backfill / socket-mode / catchup.
     """
-    from slack_fuse.models import ConversationsHistoryResponse, Message  # noqa: PLC0415
-    from slack_fuse_server.slurper.offsets import EventRecord  # noqa: PLC0415
 
     limiters = _make_limiters(config)
     writer = OffsetWriter(
@@ -810,61 +724,114 @@ async def _run_refill_window(  # noqa: C901 - two-phase CLI thunk (history pagin
     history_written = 0
     replies_written = 0
     thread_parents: list[str] = []
-    try:
-        # Paginate history bounded by (oldest, latest). At limit=200 a single
-        # UTC day typically fits in one page, but we honour has_more just in case.
-        cursor = ""
-        while True:
-            def _fetch_history(
-                cursor: str = cursor,
-            ) -> Validated[ConversationsHistoryResponse]:
-                return client.get_history_page(
-                    channel_id, cursor=cursor, oldest=oldest_ts, latest=latest_ts
+    try:  # noqa: PLR1702 - linear history/replies pagination with one lifecycle boundary.
+        with ingesting_run(triggered_by=str(BackfillRunTrigger.REFILL_WINDOW)):
+            run_id = new_backfill_run_id()
+            trigger = resolve_trigger(BackfillRunTrigger.REFILL_WINDOW, default=BackfillRunTrigger.REFILL_WINDOW)
+            await writer.write_event(
+                run_started_record(
+                    channel_id=channel_id,
+                    run_id=run_id,
+                    triggered_by=trigger,
+                    params=started_params(extra={"oldest": oldest_ts, "latest": latest_ts}),
                 )
+            )
+            started_at = trio.current_time()
+            page_index = 0
+            try:
+                # Paginate history bounded by (oldest, latest). At limit=200 a
+                # single UTC day typically fits in one page, but has_more is
+                # still honoured.
+                cursor = ""
+                while True:
 
-            wrapped = await trio.to_thread.run_sync(_fetch_history, limiter=limiters.slack_api)
-            raw_msgs = wrapped.raw.get("messages")
-            raw_list = list(raw_msgs) if isinstance(raw_msgs, list) else []
-            for i, msg in enumerate(wrapped.model.messages):
-                if i < len(raw_list) and isinstance(raw_list[i], dict):
-                    raw = cast("JsonObject", raw_list[i])
-                else:
-                    raw = cast("JsonObject", msg.model_dump(mode="json"))
-                record = EventRecord(stream=stream, kind="message", ts=msg.ts, payload=raw, dedup=True)
-                offset = await writer.write_message_or_corrective(record)
-                if offset is not None:
-                    history_written += 1
-                if msg.reply_count > 0 and msg.ts not in thread_parents:
-                    thread_parents.append(msg.ts)
+                    def _fetch_history(
+                        cursor: str = cursor,
+                    ) -> Validated[ConversationsHistoryResponse]:
+                        return client.get_history_page(channel_id, cursor=cursor, oldest=oldest_ts, latest=latest_ts)
 
-            cursor = wrapped.model.response_metadata.next_cursor
-            if not wrapped.model.has_more or not cursor:
-                break
+                    wrapped = await trio.to_thread.run_sync(_fetch_history, limiter=limiters.slack_api)
+                    records = _records_from_history_page(stream, wrapped, thread_parents)
+                    next_cursor = wrapped.model.response_metadata.next_cursor
+                    final_page = not wrapped.model.has_more or not next_cursor
+                    batch = MessageBatch(
+                        kind="history_page",
+                        channel_id=channel_id,
+                        records=records,
+                        origin=MessageBatchOrigin(
+                            channel_id=channel_id,
+                            thread_ts=None,
+                            page_index=page_index,
+                            slack_cursor=next_cursor,
+                            has_more=wrapped.model.has_more,
+                            final_page=final_page,
+                        ),
+                    )
+                    history_written += await write_backfill_batch_with_retry(
+                        writer, batch, task_name="refill-window", run_id=run_id
+                    )
+                    page_index += 1
+                    cursor = next_cursor
+                    if final_page:
+                        break
 
-        # Expand threads for parents found in the window. get_replies is unbounded
-        # in ts (a thread parent inside the window can have replies outside it);
-        # that's fine — those replies are also legitimately part of the channel.
-        for parent_ts in thread_parents:
-            def _fetch_replies(
-                parent_ts: str = parent_ts,
-            ) -> list[Validated[Message]]:
-                return client.get_replies(channel_id, parent_ts)
-
-            replies = await trio.to_thread.run_sync(_fetch_replies, limiter=limiters.slack_api)
-            for wrapped_msg in replies:
-                if wrapped_msg.model.ts == parent_ts:
-                    # Parent itself is already written above.
-                    continue
-                record = EventRecord(
-                    stream=stream, kind="message", ts=wrapped_msg.model.ts, payload=wrapped_msg.raw, dedup=True
+                # Expand threads for parents found in the window. Replies are
+                # paged so every Slack page gets its own page-committed fact.
+                for parent_ts in thread_parents:
+                    iterator = client.iter_replies_pages(channel_id, parent_ts)
+                    while True:
+                        wrapped = await trio.to_thread.run_sync(
+                            lambda iterator=iterator: _next_refill_replies_page(iterator),
+                            limiter=limiters.slack_api,
+                        )
+                        if wrapped is None:
+                            break
+                        records = _records_from_replies_page(stream, wrapped)
+                        next_cursor = wrapped.model.response_metadata.next_cursor
+                        final_page = not wrapped.model.has_more or not next_cursor
+                        batch = MessageBatch(
+                            kind="replies_page",
+                            channel_id=channel_id,
+                            records=records,
+                            origin=MessageBatchOrigin(
+                                channel_id=channel_id,
+                                thread_ts=parent_ts,
+                                page_index=page_index,
+                                slack_cursor=next_cursor,
+                                has_more=wrapped.model.has_more,
+                                final_page=final_page,
+                            ),
+                        )
+                        replies_written += await write_backfill_batch_with_retry(
+                            writer, batch, task_name="refill-window", run_id=run_id
+                        )
+                        page_index += 1
+                        if final_page:
+                            break
+            except Exception as exc:
+                await writer.write_event(
+                    run_finished_record(
+                        channel_id=channel_id,
+                        run_id=run_id,
+                        outcome=BackfillRunOutcome.FATAL_ERROR,
+                        messages_written_total=history_written + replies_written,
+                        elapsed_s=trio.current_time() - started_at,
+                        error_reason=type(exc).__name__,
+                    )
                 )
-                offset = await writer.write_message_or_corrective(record)
-                if offset is not None:
-                    replies_written += 1
+                raise
+            await writer.write_event(
+                run_finished_record(
+                    channel_id=channel_id,
+                    run_id=run_id,
+                    outcome=BackfillRunOutcome.COMPLETED,
+                    messages_written_total=history_written + replies_written,
+                    elapsed_s=trio.current_time() - started_at,
+                )
+            )
 
         log.info(
-            "refill-window: channel=%s window=[%.6f,%.6f] "
-            "history_written=%d replies_written=%d thread_parents=%d",
+            "refill-window: channel=%s window=[%.6f,%.6f] history_written=%d replies_written=%d thread_parents=%d",
             channel_id,
             oldest_ts,
             latest_ts,
@@ -875,6 +842,116 @@ async def _run_refill_window(  # noqa: C901 - two-phase CLI thunk (history pagin
     finally:
         client.close()
         writer.close()
+
+
+def _records_from_history_page(
+    stream: str,
+    wrapped: Validated[ConversationsHistoryResponse],
+    thread_parents: list[str],
+) -> tuple[EventRecord, ...]:
+    raw_msgs = wrapped.raw.get("messages")
+    raw_list = list(raw_msgs) if isinstance(raw_msgs, list) else []
+    records: list[EventRecord] = []
+    for raw_msg, msg in zip(raw_list, wrapped.model.messages, strict=False):
+        if not isinstance(raw_msg, dict):
+            continue
+        raw = cast("JsonObject", raw_msg)
+        records.append(EventRecord(stream=stream, kind="message", ts=msg.ts, payload=raw, dedup=True))
+        if msg.reply_count > 0 and msg.ts not in thread_parents:
+            thread_parents.append(msg.ts)
+    return tuple(records)
+
+
+def _records_from_replies_page(
+    stream: str,
+    wrapped: Validated[ConversationsRepliesResponse],
+) -> tuple[EventRecord, ...]:
+    raw_msgs = wrapped.raw.get("messages")
+    raw_list = list(raw_msgs) if isinstance(raw_msgs, list) else []
+    return tuple(
+        EventRecord(stream=stream, kind="message", ts=msg.ts, payload=cast("JsonObject", raw_msg), dedup=True)
+        for raw_msg, msg in zip(raw_list, wrapped.model.messages, strict=False)
+        if isinstance(raw_msg, dict)
+    )
+
+
+def _next_refill_replies_page(
+    iterator: Iterator[Validated[ConversationsRepliesResponse]],
+) -> Validated[ConversationsRepliesResponse] | None:
+    try:
+        return next(iterator)
+    except StopIteration:
+        return None
+
+
+async def _run_initial_ingest(
+    config: ServerConfig,
+    *,
+    channel_id: str | None,
+) -> None:
+    if channel_id is not None:
+        await _run_backfill(
+            config,
+            channel_id,
+            allow_large=True,
+            max_messages=None,
+            source="slack-api",
+        )
+        return
+
+    limiters = _make_limiters(config)
+    writer = OffsetWriter(
+        _connect_writer_pool(config),
+        limiter=limiters.writer,
+        acquire_timeout_s=config.slurper_writer_pool_acquire_timeout_s,
+    )
+    health = HealthEmitter(writer)
+    client = SlackClient(config.slack_user_token)
+    backfiller = _make_backfiller(
+        "slack-api",
+        client=client,
+        limiters=limiters,
+        config=config,
+        writer=writer,
+        task_name="initial-ingest",
+    )
+    ctx = BackfillContext(
+        writer=writer,
+        health=health,
+        limiters=limiters,
+        warn_at=config.backfill_warn_at,
+        abort_at=None,
+        task_name="initial-ingest",
+    )
+    channels = 0
+    failures = 0
+    try:
+        async for discovered in backfiller.channels_to_backfill():
+            channels += 1
+            try:
+                emitted = await ensure_channel_added(writer, client, discovered.value, limiters)
+                if emitted:
+                    log.info("initial-ingest: emitted synthetic channel_added for %s", discovered.value)
+                result = await backfill_channel(
+                    backfiller,
+                    discovered,
+                    ctx,
+                    triggered_by=BackfillRunTrigger.ADMIN_CLI,
+                )
+                log.info(
+                    "initial-ingest: channel=%s messages=%d events_written=%d elapsed=%.1fs",
+                    discovered.value,
+                    result.messages,
+                    result.events_written,
+                    result.elapsed_s,
+                )
+            except Exception:
+                failures += 1
+                log.exception("initial-ingest: channel %s failed; continuing", discovered.value)
+    finally:
+        client.close()
+        writer.close()
+    log.info("initial-ingest: complete channels=%d failures=%d", channels, failures)
 
 
 async def _run_backfill(  # noqa: PLR0913 — thin CLI thunk; bundling into options dataclass adds more noise than it saves
@@ -895,12 +972,6 @@ async def _run_backfill(  # noqa: PLR0913 — thin CLI thunk; bundling into opti
     health = HealthEmitter(writer)
     client: SlackClient | None = None
     try:
-        if await writer.run_read(lambda conn: is_channel_blocked(conn, channel_id), limiter=limiters.admin_read):
-            await health.emit(
-                HealthKind.BACKFILL_SKIPPED,
-                {"channel_id": channel_id, "reason": str(BackfillAbortReason.OPERATOR_BLOCKED)},
-            )
-            raise BlockedChannelError(channel_id)
         # The SlackClient is required for `slack-api` source (history fetch) AND for
         # every source so we can call `conversations.info` to emit a synthetic
         # `channel_added` event before any per-channel writes. Without this, a
@@ -927,26 +998,29 @@ async def _run_backfill(  # noqa: PLR0913 — thin CLI thunk; bundling into opti
             warn_at=config.backfill_warn_at,
             abort_at=abort_at,
         )
-        # Bring the channel under the projector's normal model BEFORE we write
-        # any per-channel events. A channel the user token can't describe
-        # (left/closed DMs, archived-then-purged) gets skipped cleanly so the
-        # admin Job exits 0; any other API failure still fails loud because it
-        # would orphan events otherwise.
-        try:
-            emitted = await ensure_channel_added(writer, client, channel_id, limiters)
-        except ChannelNotFoundError:
-            log.warning(
-                "backfill: channel %s not accessible (channel_not_found); skipping cleanly. "
-                "Channel cache may still hold legacy data but the user token can't describe it.",
-                channel_id,
-            )
-            return
-        except SlackAPIError as exc:
-            log.error("backfill: cannot establish channel_added for %s: %s", channel_id, exc)
-            raise
-        if emitted:
-            log.info("backfill: emitted synthetic channel_added for %s", channel_id)
-        result = await backfill_channel(backfiller, ChannelId(channel_id), ctx, since_ts=since_ts)
+        if await writer.run_read(lambda conn: is_channel_blocked(conn, channel_id), limiter=limiters.admin_read):
+            result = await backfill_channel(backfiller, ChannelId(channel_id), ctx, since_ts=since_ts)
+        else:
+            # Bring the channel under the projector's normal model BEFORE we write
+            # any per-channel events. A channel the user token can't describe
+            # (left/closed DMs, archived-then-purged) gets skipped cleanly so the
+            # admin Job exits 0; any other API failure still fails loud because it
+            # would orphan events otherwise.
+            try:
+                emitted = await ensure_channel_added(writer, client, channel_id, limiters)
+            except ChannelNotFoundError:
+                log.warning(
+                    "backfill: channel %s not accessible (channel_not_found); skipping cleanly. "
+                    "Channel cache may still hold legacy data but the user token can't describe it.",
+                    channel_id,
+                )
+                return
+            except SlackAPIError as exc:
+                log.error("backfill: cannot establish channel_added for %s: %s", channel_id, exc)
+                raise
+            if emitted:
+                log.info("backfill: emitted synthetic channel_added for %s", channel_id)
+            result = await backfill_channel(backfiller, ChannelId(channel_id), ctx, since_ts=since_ts)
     finally:
         if client is not None:
             client.close()
@@ -1058,6 +1132,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "task does — exposed as a one-shot so operators can trigger drift "
         "catchup on demand.",
     )
+    ingest = sub.add_parser("initial-ingest", help="run unbounded admin initial ingest")
+    ingest_target = ingest.add_mutually_exclusive_group(required=True)
+    ingest_target.add_argument("--channel", dest="channel_id", help="Slack channel id, e.g. C0AKQ5DS0FQ")
+    ingest_target.add_argument("--all", action="store_true", help="ingest every visible member channel")
     bf = sub.add_parser("backfill", help="backfill one channel's history")
     bf.add_argument("channel_id", help="Slack channel id, e.g. C0AKQ5DS0FQ")
     bf.add_argument("--allow-large", action="store_true", help="lift the per-channel size limit entirely")
@@ -1107,7 +1185,7 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> None:
+def main() -> None:  # noqa: C901 - CLI command dispatch stays flat and explicit.
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     args = _build_parser().parse_args()
     config = load_server_config()
@@ -1119,6 +1197,15 @@ def main() -> None:
     if args.command == "refresh-channels":
         with ingesting(boot.task_context("refresh-info", triggered_by="admin-cli")):
             trio.run(_run_refresh_channels_once, config)
+        return
+    if args.command == "initial-ingest":
+        initial_channel_id: str | None = args.channel_id
+
+        async def _initial_ingest_thunk() -> None:
+            await _run_initial_ingest(config, channel_id=initial_channel_id)
+
+        with ingesting(boot.task_context("initial-ingest", triggered_by="admin-cli")):
+            trio.run(_initial_ingest_thunk)
         return
     if args.command == "backfill":
         channel_id: str = args.channel_id

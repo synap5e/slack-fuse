@@ -299,6 +299,20 @@ async def test_subscribe_since_too_high_returns_head_offset(pg_conn: psycopg.Con
     assert frame.head_offset == 1
 
 
+async def test_subscribe_backfill_run_stream_is_not_exposed(pg_conn: psycopg.Connection[TupleRow]) -> None:
+    database_url = _prepare_database(pg_conn)
+    stream = "backfill-run:C1"
+    _seed_stream(pg_conn, stream, [{"run_id": "01TEST", "triggered_by": "startup", "params": {}}])
+
+    async with _running_server(database_url) as port, _connect(port) as ws:
+        await ws.send_message(SubscribeFrame(stream=stream, since=0).model_dump_json())
+        frame = await _recv_frame(ws)
+
+    assert isinstance(frame, ErrorFrame)
+    assert frame.code is ErrorCode.STREAM_NOT_FOUND
+    assert frame.stream == stream
+
+
 async def test_subscribe_too_old_returns_snapshot_at_when_snapshot_exists(
     pg_conn: psycopg.Connection[TupleRow],
 ) -> None:

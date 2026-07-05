@@ -30,6 +30,7 @@ _DEFAULT_HEARTBEAT_INTERVAL_S = 30.0
 _DEFAULT_CLIENT_TIMEOUT_S = 90.0
 _SECRET_HEADER = b"x-slack-fuse-secret"
 _AUTHORIZATION_HEADER = b"authorization"
+_INTERNAL_STREAM_PREFIXES = ("backfill-run:",)
 
 
 def _snapshot_redirect_allowed(stream: str) -> bool:
@@ -41,6 +42,10 @@ def _snapshot_redirect_allowed(stream: str) -> bool:
     instead — the server never advertises a snapshot the client cannot consume.
     """
     return stream.startswith("channel:")
+
+
+def _subscription_allowed(stream: str) -> bool:
+    return not stream.startswith(_INTERNAL_STREAM_PREFIXES)
 
 
 class _OutgoingFrame(Protocol):
@@ -227,6 +232,10 @@ class _ConnectionHandler:
         if frame.since < 0:
             await self._ws.aclose(1003, "negative since")
             return
+        if not _subscription_allowed(frame.stream):
+            self._subscriptions.remove(frame.stream)
+            await self._send_frame(ErrorFrame(code=ErrorCode.STREAM_NOT_FOUND, stream=frame.stream))
+            return
 
         head_offset = await self._tailer.get_head_offset(frame.stream)
         if head_offset is None:
@@ -245,9 +254,7 @@ class _ConnectionHandler:
             # cursors instead of silently dropping the subscription.
             if frame.since > 0:
                 self._subscriptions.remove(frame.stream)
-                await self._send_frame(
-                    ErrorFrame(code=ErrorCode.SINCE_TOO_HIGH, stream=frame.stream, head_offset=0)
-                )
+                await self._send_frame(ErrorFrame(code=ErrorCode.SINCE_TOO_HIGH, stream=frame.stream, head_offset=0))
                 return
             _ = self._subscriptions.subscribe(frame.stream, 0)
             await self._send_frame(CaughtUpFrame(stream=frame.stream, head_offset=0))

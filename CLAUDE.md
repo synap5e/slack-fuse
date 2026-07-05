@@ -79,7 +79,7 @@ Every event row has a `source` jsonb column (migration 0009; NULL on pre-migrati
 
 Mechanics (`slack_fuse_server/slurper/ingestion.py`): tasks run inside `ingesting(IngestionContext(...))` scopes (trio propagates the ContextVar into `to_thread.run_sync` bodies and `nursery.start_soon` children); per-write fields ride on `EventRecord.source` via `make_source(...)`; `insert_event` merges the two (record wins) plus the current write span id. A producer that writes events without an ingestion scope leaves `source = NULL` — wire new event-writing tasks through `_ingesting_task` in `slurper/__main__.py`.
 
-Restart-safe backfill resume (`slack_fuse_server/backfill/resume.py`) reads this envelope: a crashed run's committed pages resume from the last stored cursor, thread completion is Slack's own `has_more` (`final_page`), and only rows newer than the channel's latest `backfill_completed`/`backfill_aborted` health event count as resume state (a completed run must not no-op a later re-backfill; an aborted run must not be dug past its cap). `--since` pages carry `oldest` and are never resume anchors.
+Restart-safe backfill resume (`slack_fuse_server/backfill/resume.py`) reads the dedicated `backfill-run:<channel>` lifecycle stream, not derived progress in this envelope: a crashed run's committed `backfill_page_committed` rows resume from the last stored cursor, thread completion is Slack's own `has_more` (`final_page`), and a `backfill_run_finished` terminator gates resume off. `--since` / startup catchup runs carry `params.since_ts` on `backfill_run_started` and are never full-history resume anchors.
 
 ## Dev commands
 

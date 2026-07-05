@@ -20,8 +20,11 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Literal, Protocol
 
+from pydantic import BaseModel, ConfigDict, Field
+
 from slack_fuse.models import Message
 from slack_fuse_render import ChannelId
+from slack_fuse_server._json import JsonObject
 from slack_fuse_server.slurper.api import Validated
 from slack_fuse_server.slurper.offsets import EventRecord
 
@@ -31,6 +34,56 @@ class BackfillAbortReason(StrEnum):
 
     EXCEEDED_DEFAULT_LIMIT = "exceeded_default_limit"
     OPERATOR_BLOCKED = "operator_blocked"
+    CHANNEL_NOT_FOUND = "channel_not_found"
+
+
+class BackfillRunTrigger(StrEnum):
+    """What asked for a backfill-run stream lifecycle."""
+
+    STARTUP = "startup"
+    ADMIN_CLI = "admin-cli"
+    CONTROL_SURFACE = "control-surface"
+    REFILL_WINDOW = "refill-window"
+    PROBE_REFILL = "probe-refill"
+
+
+class BackfillRunOutcome(StrEnum):
+    """Terminal outcome for ``backfill_run_finished``."""
+
+    COMPLETED = "completed"
+    SIZE_CAPPED = "size_capped"
+    CHANNEL_NOT_FOUND = "channel_not_found"
+    OPERATOR_BLOCKED = "operator_blocked"
+    FATAL_ERROR = "fatal_error"
+
+
+class _FrozenModel(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+
+class BackfillRunStartedPayload(_FrozenModel):
+    run_id: str
+    params: JsonObject = Field(default_factory=dict)
+    triggered_by: BackfillRunTrigger
+
+
+class BackfillPageCommittedPayload(_FrozenModel):
+    run_id: str
+    page_index: int
+    has_more: bool
+    final_page: bool
+    slack_cursor: str
+    messages_written: int
+    kind: Literal["history_page", "replies_page"]
+    thread_ts: str | None = None
+
+
+class BackfillRunFinishedPayload(_FrozenModel):
+    run_id: str
+    outcome: BackfillRunOutcome
+    messages_written_total: int
+    elapsed_s: float
+    error_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,14 +117,17 @@ class BackfillResult:
 class MessageBatchOrigin:
     """Diagnostic source coordinates for one source page.
 
-    ``slack_cursor`` is not persisted and must not be used as a progress fact.
-    Legacy-cache batches use the day filename here for the same diagnostic role.
+    ``slack_cursor`` is Slack's next cursor for API pages, or a source-local
+    page token for legacy-cache batches. It is copied into the
+    ``backfill_page_committed`` payload as a lifecycle fact.
     """
 
     channel_id: str
     thread_ts: str | None
     page_index: int
     slack_cursor: str
+    has_more: bool = False
+    final_page: bool = True
 
 
 @dataclass(frozen=True, slots=True)

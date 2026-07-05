@@ -59,7 +59,6 @@ class ServerConfig(BaseSettings):
     backfill_page_sleep_max_s: float = 90.0
     backfill_thread_sleep_min_s: float = 2.0
     backfill_thread_sleep_max_s: float = 8.0
-    auto_backfill_skip_if_completed: bool = True
 
     # Health-stream debouncing.
     slack_degraded_min_duration_s: float = 30.0

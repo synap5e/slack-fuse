@@ -1,22 +1,22 @@
-"""Restart-safe backfill resume, driven by the `events.source` envelope.
+"""Restart-safe backfill resume, driven by the ``backfill-run:<channel>`` stream.
 
 A crashed backfill (deploy mid-run, OOM, network loss) leaves committed
-page-atomic batches whose `source` rows record the Slack cursor each page was
-fetched with and whether Slack said the collection was exhausted
+page-atomic batches whose lifecycle stream records the Slack cursor each page
+was fetched with and whether Slack said the collection was exhausted
 (`final_page`). `find_resume_plan()` reads those rows back so the next run
 continues from the last committed page instead of re-walking the channel.
 
-Termination gate: only rows *newer* (by `events.id`) than the channel's latest
-`backfill_completed` / `backfill_aborted` health event count as resume state.
-A completed run must not make a later operator re-backfill a silent no-op, and
-an aborted run must not be dug past its size cap — only a crashed run (pages
-written, no terminal event) leaves resume state. This is read-side policy
-derivation, like Wave 1 D's skip-completed check; no progress facts are ever
-*written* anywhere.
+Termination gate: only the latest unfinished full-history run that has at least
+one committed page is eligible. A just-started replacement run has no pages yet,
+so it does not shadow the crashed run it is about to resume. A completed run
+must not make a later operator re-backfill a silent no-op, and an aborted run
+must not be dug past its size cap — only a crashed/interrupted run leaves
+resume state.
 
-`--since` gap-fill runs write `source->>'oldest'` and are never used as resume
-anchors: their history cursors walk a bounded window and their replies pages
-persist only the post-`since` tail, so neither is evidence of full coverage.
+`--since` gap-fill runs carry `params.since_ts` on `backfill_run_started` and
+are never used as resume anchors: their history cursors walk a bounded window
+and their replies pages persist only the post-`since` tail, so neither is
+evidence of full coverage.
 
 Completion signal is Slack's own `has_more` (stored as `final_page`), never
 local count arithmetic — the thread-predicate livelock class from the prior
@@ -65,41 +65,95 @@ class ResumePlan:
     done_thread_ts: frozenset[str]
 
 
-def _terminal_watermark(conn: Connection[TupleRow], channel_id: str) -> int:
+def _latest_unfinished_full_run(conn: Connection[TupleRow], channel_id: str) -> str | None:
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT COALESCE(MAX(id), 0)
-            FROM events
-            WHERE stream = 'slurper-health'
-              AND kind IN ('backfill_completed', 'backfill_aborted')
-              AND payload->>'channel_id' = %s
+            WITH latest_started AS (
+                SELECT started.id, started.stream, started.payload->>'run_id' AS run_id
+                FROM events started
+                WHERE started.stream = 'backfill-run:' || %s
+                  AND started.kind = 'backfill_run_started'
+                  AND NOT (COALESCE(started.payload->'params', '{}'::jsonb) ? 'since_ts')
+                ORDER BY started.id DESC
+                LIMIT 1
+            ),
+            latest_state AS (
+                SELECT
+                    latest_started.*,
+                    EXISTS (
+                        SELECT 1
+                        FROM events finished
+                        WHERE finished.stream = latest_started.stream
+                          AND finished.kind = 'backfill_run_finished'
+                          AND finished.payload->>'run_id' = latest_started.run_id
+                    ) AS finished,
+                    EXISTS (
+                        SELECT 1
+                        FROM events page
+                        WHERE page.stream = latest_started.stream
+                          AND page.kind = 'backfill_page_committed'
+                          AND page.payload->>'run_id' = latest_started.run_id
+                    ) AS has_pages
+                FROM latest_started
+            )
+            SELECT run_id
+            FROM latest_state
+            WHERE finished = false AND has_pages = true
+            UNION ALL
+            SELECT prior.payload->>'run_id'
+            FROM latest_state
+            JOIN LATERAL (
+                SELECT prior_started.payload
+                FROM events prior_started
+                WHERE prior_started.stream = latest_state.stream
+                  AND prior_started.kind = 'backfill_run_started'
+                  AND prior_started.id < latest_state.id
+                  AND NOT (COALESCE(prior_started.payload->'params', '{}'::jsonb) ? 'since_ts')
+                  AND EXISTS (
+                      SELECT 1
+                      FROM events page
+                      WHERE page.stream = prior_started.stream
+                        AND page.kind = 'backfill_page_committed'
+                        AND page.payload->>'run_id' = prior_started.payload->>'run_id'
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM events finished
+                      WHERE finished.stream = prior_started.stream
+                        AND finished.kind = 'backfill_run_finished'
+                        AND finished.payload->>'run_id' = prior_started.payload->>'run_id'
+                  )
+                ORDER BY prior_started.id DESC
+                LIMIT 1
+            ) prior ON latest_state.finished = false AND latest_state.has_pages = false
+            LIMIT 1
             """,
             (channel_id,),
         )
         row = cur.fetchone()
-    return 0 if row is None else int(row[0])
+    return None if row is None or row[0] is None else str(row[0])
 
 
 def _latest_history_page(
     conn: Connection[TupleRow],
     stream: str,
-    watermark: int,
+    run_id: str,
 ) -> tuple[str, bool] | None:
     """(next_cursor, final_page) of the newest un-terminated full-run history page."""
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT source->>'slack_cursor', (source->>'final_page')::bool
+            SELECT payload->>'slack_cursor', (payload->>'final_page')::bool
             FROM events
             WHERE stream = %s
-              AND source->>'producer' = 'backfill-history-page'
-              AND NOT (source ? 'oldest')
-              AND id > %s
-            ORDER BY offset_in_stream DESC
+              AND kind = 'backfill_page_committed'
+              AND payload->>'run_id' = %s
+              AND payload->>'kind' = 'history_page'
+            ORDER BY (payload->>'page_index')::bigint DESC, id DESC
             LIMIT 1
             """,
-            (stream, watermark),
+            (stream, run_id),
         )
         row = cur.fetchone()
     if row is None:
@@ -112,24 +166,24 @@ def _latest_history_page(
 def _replies_progress(
     conn: Connection[TupleRow],
     stream: str,
-    watermark: int,
+    run_id: str,
 ) -> dict[str, tuple[str, bool]]:
-    """Per-thread latest replies-page (next_cursor, final_page) past the watermark."""
+    """Per-thread latest replies-page (next_cursor, final_page) for this run."""
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT DISTINCT ON (source->>'thread_ts')
-                source->>'thread_ts',
-                source->>'slack_cursor',
-                (source->>'final_page')::bool
+            SELECT DISTINCT ON (payload->>'thread_ts')
+                payload->>'thread_ts',
+                payload->>'slack_cursor',
+                (payload->>'final_page')::bool
             FROM events
             WHERE stream = %s
-              AND source->>'producer' = 'backfill-replies-page'
-              AND NOT (source ? 'oldest')
-              AND id > %s
-            ORDER BY source->>'thread_ts', offset_in_stream DESC
+              AND kind = 'backfill_page_committed'
+              AND payload->>'run_id' = %s
+              AND payload->>'kind' = 'replies_page'
+            ORDER BY payload->>'thread_ts', (payload->>'page_index')::bigint DESC, id DESC
             """,
-            (stream, watermark),
+            (stream, run_id),
         )
         rows = cur.fetchall()
     progress: dict[str, tuple[str, bool]] = {}
@@ -206,13 +260,15 @@ def find_resume_plan(conn: Connection[TupleRow], channel_id: str) -> ResumePlan 
     livelock the channel. Cost is bounded at one redundant channel re-walk.
     """
     stream = f"channel:{channel_id}"
-    query_kind = "terminal_watermark"
+    query_kind = "latest_unfinished_run"
     try:
-        watermark = _terminal_watermark(conn, channel_id)
+        run_id = _latest_unfinished_full_run(conn, channel_id)
+        if run_id is None:
+            return None
         query_kind = "latest_history_page"
-        history = _latest_history_page(conn, stream, watermark)
+        history = _latest_history_page(conn, f"backfill-run:{channel_id}", run_id)
         query_kind = "replies_progress"
-        replies = _replies_progress(conn, stream, watermark)
+        replies = _replies_progress(conn, f"backfill-run:{channel_id}", run_id)
         if history is None and not replies:
             return None
         query_kind = "known_thread_parents"

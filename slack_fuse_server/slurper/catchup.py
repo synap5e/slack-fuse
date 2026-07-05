@@ -9,10 +9,9 @@ recovers them; before this module the only fix was a manual
 This task closes the gap automatically. For every member channel it calls
 ``conversations.history`` with ``oldest=<resume point>`` and writes the result
 through the normal offset-assignment path (deduped on ``(stream, ts)``, so a
-re-run is a no-op). It reuses the backfill machinery's pagination and
-thread-walk (`SlackApiBackfiller.messages_for_channel`) but NOT the
-`backfill_channel` driver — the driver's per-channel health events are right
-for an ad hoc admin run, not for a 100+-channel sweep on every restart.
+re-run is a no-op). Startup catchup writes a per-channel
+``backfill-run:<channel>`` lifecycle; reconnect catchup keeps the older
+message-only behavior because ``reconnect`` is not a backfill-run trigger.
 
 **Two triggers**
 
@@ -32,8 +31,7 @@ for an ad hoc admin run, not for a 100+-channel sweep on every restart.
   channel is one cheap page thanks to Slack's ``oldest`` bound).
 - If we have none (a never-active or never-backfilled channel), fall back to a
   bounded ``now - max_lookback_s`` floor so the sweep stays a *small* job and
-  never degrades into a full initial backfill — that remains opt-in via
-  ``SLACK_FUSE_SERVER_BACKFILL``.
+  never degrades into a full initial ingest — that remains admin-CLI-only.
 """
 
 from __future__ import annotations
@@ -44,13 +42,19 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-import httpx
 import trio
 
 from slack_fuse_render import ChannelId
-from slack_fuse_server.backfill.types import Backfiller
-from slack_fuse_server.slurper.api import SlackAPIError
-from slack_fuse_server.slurper.ingestion import ingesting_run
+from slack_fuse_server.backfill.api import write_backfill_batch_with_retry
+from slack_fuse_server.backfill.run_events import (
+    new_backfill_run_id,
+    resolve_trigger,
+    run_finished_record,
+    run_started_record,
+    started_params,
+)
+from slack_fuse_server.backfill.types import Backfiller, BackfillRunOutcome, BackfillRunTrigger
+from slack_fuse_server.slurper.ingestion import current_ingestion_context, ingesting_run
 from slack_fuse_server.slurper.limiters import SlurperLimiters
 from slack_fuse_server.slurper.offsets import PG_TIMEOUT_EXCEPTIONS, EventRecord, OffsetWriter
 from slack_fuse_server.slurper.spans import span
@@ -169,11 +173,49 @@ def last_seen_ts_by_stream(conn: psycopg.Connection[TupleRow]) -> dict[str, floa
         return result
 
 
+def latest_ingest_head_by_channel(conn: psycopg.Connection[TupleRow]) -> dict[str, float]:
+    """Read the derived ingest-head view used by startup catchup."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT channel_id, latest_ts FROM channel_ingest_head")
+        result: dict[str, float] = {}
+        for channel_id_raw, latest_ts_raw in cur.fetchall():
+            if latest_ts_raw is not None:
+                result[str(channel_id_raw)] = float(str(latest_ts_raw))
+        return result
+
+
+def has_in_progress_backfill_run_for_boot(
+    conn: psycopg.Connection[TupleRow],
+    channel_id: str,
+    boot_id: str,
+) -> bool:
+    """Whether this boot already started this channel's latest run and has no terminator."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT 1
+            FROM channel_backfill_state state
+            JOIN events started
+              ON started.stream = 'backfill-run:' || state.channel_id
+             AND started.kind = 'backfill_run_started'
+             AND started.payload->>'run_id' = state.last_run_id
+            WHERE state.channel_id = %s
+              AND state.last_run_finished_at IS NULL
+              AND started.source->>'boot_id' = %s
+            LIMIT 1
+            """,
+            (channel_id, boot_id),
+        )
+        return cur.fetchone() is not None
+
+
 async def catchup_channel(
     backfiller: Backfiller,
     writer: OffsetWriter,
     channel_id: ChannelId,
     since_ts: float,
+    *,
+    run_trigger: BackfillRunTrigger | None = None,
 ) -> int:
     """Gap-fill one channel from ``since_ts``; return the number of NEW events.
 
@@ -187,14 +229,75 @@ async def catchup_channel(
         task="catchup",
         extra={"channel_id": channel_id.value},
     ) as recorder:
-        stream = f"{_CHANNEL_STREAM_PREFIX}{channel_id.value}"
-        events = 0
-        async for wrapped in backfiller.messages_for_channel(channel_id, since_ts):
-            record = EventRecord(stream=stream, kind="message", ts=wrapped.model.ts, payload=wrapped.raw, dedup=True)
-            offset = await _write_message_or_corrective_retry_once(writer, record, span=recorder)
-            if offset is not None:
-                events += 1
+        if run_trigger is None:
+            stream = f"{_CHANNEL_STREAM_PREFIX}{channel_id.value}"
+            events = 0
+            async for wrapped in backfiller.messages_for_channel(channel_id, since_ts):
+                record = EventRecord(
+                    stream=stream, kind="message", ts=wrapped.model.ts, payload=wrapped.raw, dedup=True
+                )
+                offset = await _write_message_or_corrective_retry_once(writer, record, span=recorder)
+                if offset is not None:
+                    events += 1
+        else:
+            events = await _catchup_channel_with_run_events(
+                backfiller,
+                writer,
+                channel_id,
+                since_ts,
+                run_trigger=run_trigger,
+            )
         recorder.set("events_written", events)
+        return events
+
+
+async def _catchup_channel_with_run_events(
+    backfiller: Backfiller,
+    writer: OffsetWriter,
+    channel_id: ChannelId,
+    since_ts: float,
+    *,
+    run_trigger: BackfillRunTrigger,
+) -> int:
+    with ingesting_run(triggered_by=str(run_trigger)):
+        run_id = new_backfill_run_id()
+        trigger = resolve_trigger(run_trigger, default=BackfillRunTrigger.STARTUP)
+        cid = channel_id.value
+        await writer.write_event(
+            run_started_record(
+                channel_id=cid,
+                run_id=run_id,
+                triggered_by=trigger,
+                params=started_params(since_ts=since_ts),
+            )
+        )
+        start = trio.current_time()
+        events = 0
+        try:
+            async for batch in backfiller.messages_pages_for_channel(channel_id, since_ts):
+                events += await write_backfill_batch_with_retry(writer, batch, task_name="catchup", run_id=run_id)
+        except Exception as exc:
+            outcome = BackfillRunOutcome.FATAL_ERROR
+            await writer.write_event(
+                run_finished_record(
+                    channel_id=cid,
+                    run_id=run_id,
+                    outcome=outcome,
+                    messages_written_total=events,
+                    elapsed_s=trio.current_time() - start,
+                    error_reason=type(exc).__name__,
+                )
+            )
+            raise
+        await writer.write_event(
+            run_finished_record(
+                channel_id=cid,
+                run_id=run_id,
+                outcome=BackfillRunOutcome.COMPLETED,
+                messages_written_total=events,
+                elapsed_s=trio.current_time() - start,
+            )
+        )
         return events
 
 
@@ -224,6 +327,7 @@ async def run_catchup_once(
     *,
     now_epoch: float | None = None,
     supervisor: TaskSupervisor | None = None,
+    backfill_trigger: BackfillRunTrigger | None = None,
 ) -> CatchupResult:
     """One full sweep: gap-fill every member channel from its resume point.
 
@@ -234,10 +338,17 @@ async def run_catchup_once(
     """
     now = now_epoch if now_epoch is not None else time.time()
     if supervisor is None:
-        last_seen = await deps.writer.run_read(last_seen_ts_by_stream, limiter=deps.limiters.admin_read)
+        last_seen = await deps.writer.run_read(
+            latest_ingest_head_by_channel if backfill_trigger is not None else last_seen_ts_by_stream,
+            limiter=deps.limiters.admin_read,
+        )
     else:
         async with phase(supervisor, "catchup", "listing_channels", deadline_s=60):
-            last_seen = await deps.writer.run_read(last_seen_ts_by_stream, limiter=deps.limiters.admin_read)
+            last_seen = await deps.writer.run_read(
+                latest_ingest_head_by_channel if backfill_trigger is not None else last_seen_ts_by_stream,
+                limiter=deps.limiters.admin_read,
+            )
+    boot_id = _current_boot_id() if backfill_trigger is not None else None
     start = trio.current_time()
     channels = 0
     events = 0
@@ -248,12 +359,29 @@ async def run_catchup_once(
             await trio.sleep(deps.config.channel_gap_s)
         first = False
         channels += 1
+        if boot_id is not None:
+            already_running = await deps.writer.run_read(
+                lambda conn, cid=channel_id.value, bid=boot_id: has_in_progress_backfill_run_for_boot(conn, cid, bid),
+                limiter=deps.limiters.admin_read,
+            )
+            if already_running:
+                log.info("catchup: skipping %s; startup run already in progress for this boot", channel_id.value)
+                continue
         since_ts = resolve_since_ts(
-            channel_id.value, last_seen, now_epoch=now, max_lookback_s=deps.config.max_lookback_s
+            channel_id.value,
+            _last_seen_for_resolve(last_seen, backfill_trigger=backfill_trigger),
+            now_epoch=now,
+            max_lookback_s=deps.config.max_lookback_s,
         )
         try:
             if supervisor is None:
-                events += await catchup_channel(deps.backfiller, deps.writer, channel_id, since_ts)
+                events += await catchup_channel(
+                    deps.backfiller,
+                    deps.writer,
+                    channel_id,
+                    since_ts,
+                    run_trigger=backfill_trigger,
+                )
             else:
                 async with phase(
                     supervisor,
@@ -262,9 +390,15 @@ async def run_catchup_once(
                     details={"channel_id": channel_id.value},
                     deadline_s=300,
                 ):
-                    events += await catchup_channel(deps.backfiller, deps.writer, channel_id, since_ts)
-        except (SlackAPIError, httpx.HTTPError):
-            log.warning("catchup: API error for %s", channel_id.value, exc_info=True)
+                    events += await catchup_channel(
+                        deps.backfiller,
+                        deps.writer,
+                        channel_id,
+                        since_ts,
+                        run_trigger=backfill_trigger,
+                    )
+        except Exception:
+            log.info("catchup: channel %s failed; continuing", channel_id.value, exc_info=True)
             errors += 1
     elapsed = trio.current_time() - start
     log.info(
@@ -275,6 +409,21 @@ async def run_catchup_once(
         elapsed,
     )
     return CatchupResult(channels=channels, events=events, errors=errors, elapsed_s=elapsed)
+
+
+def _current_boot_id() -> str | None:
+    ctx = current_ingestion_context()
+    return None if ctx is None else ctx.boot_id
+
+
+def _last_seen_for_resolve(
+    last_seen: dict[str, float],
+    *,
+    backfill_trigger: BackfillRunTrigger | None,
+) -> dict[str, float]:
+    if backfill_trigger is None:
+        return last_seen
+    return {f"{_CHANNEL_STREAM_PREFIX}{channel_id}": latest_ts for channel_id, latest_ts in last_seen.items()}
 
 
 class CatchupTrigger:
@@ -329,6 +478,10 @@ class CatchupTrigger:
             # One sweep = one logical run: every event it writes shares a
             # fresh source run_id and the startup/reconnect trigger fact.
             with ingesting_run(triggered_by=triggered_by):
-                await run_catchup_once(deps, supervisor=supervisor)
+                await run_catchup_once(
+                    deps,
+                    supervisor=supervisor,
+                    backfill_trigger=BackfillRunTrigger.STARTUP if triggered_by == "startup" else None,
+                )
         except Exception:
             log.exception("catchup: cycle failed")

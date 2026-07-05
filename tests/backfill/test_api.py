@@ -27,8 +27,8 @@ from slack_fuse_server.backfill.api import (
     BackfillContext,
     SlackApiBackfiller,
     SleepBounds,
-    _write_batch_with_retry,
     backfill_channel,
+    write_backfill_batch_with_retry,
 )
 from slack_fuse_server.backfill.types import BackfillAbortReason, MessageBatch, MessageBatchOrigin
 from slack_fuse_server.slurper.api import RateLimitedError, SlackClient, Validated
@@ -418,6 +418,7 @@ class _NullHealth:
 class _RunTransactionOnlyWriter:
     def __init__(self) -> None:
         self.run_transaction_calls = 0
+        self.write_event_calls = 0
 
     async def run_read(
         self,
@@ -431,6 +432,10 @@ class _RunTransactionOnlyWriter:
     async def run_transaction(self, func: Callable[[object], int], **_kwargs: object) -> int:
         self.run_transaction_calls += 1
         return func(object())
+
+    async def write_event(self, _record: EventRecord, **_kwargs: object) -> int | None:
+        self.write_event_calls += 1
+        return self.write_event_calls
 
     def acquire_transaction(self, **_kwargs: object) -> object:
         raise AssertionError("backfill driver must use run_transaction")
@@ -488,7 +493,7 @@ class _FailingRunTransactionWriter:
 
 
 async def _write_batch_for_test(writer: OffsetWriter, batch: MessageBatch) -> int:
-    return await _write_batch_with_retry(writer, batch, task_name="backfill")
+    return await write_backfill_batch_with_retry(writer, batch, task_name="backfill", run_id="RUN_TEST")
 
 
 def _channel_events(conn: psycopg.Connection[TupleRow], stream: str) -> list[tuple[str, JsonObject]]:
@@ -506,6 +511,20 @@ def _health_kinds(conn: psycopg.Connection[TupleRow]) -> list[str]:
     with conn.cursor() as cur:
         cur.execute("SELECT kind FROM health_log ORDER BY id")
         return [str(r[0]) for r in cur.fetchall()]
+
+
+def _backfill_run_rows(conn: psycopg.Connection[TupleRow], channel_id: str) -> list[tuple[str, JsonObject]]:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT kind, payload FROM events WHERE stream = %s ORDER BY offset_in_stream",
+            (f"backfill-run:{channel_id}",),
+        )
+        rows = cur.fetchall()
+    out: list[tuple[str, JsonObject]] = []
+    for kind, payload in rows:
+        assert isinstance(payload, dict)
+        out.append((str(kind), cast(JsonObject, payload)))
+    return out
 
 
 def _database_url_for_conn(conn: psycopg.Connection[TupleRow]) -> str:
@@ -526,6 +545,13 @@ def test_backfill_channel_writes_events_and_emits_health(server_conn: psycopg.Co
     assert (result.messages, result.events_written, result.aborted) == (5, 5, False)
     assert _events_count(server_conn, "channel:CX") == 5
     assert _health_kinds(server_conn) == ["backfill_started", "backfill_completed"]
+    rows = _backfill_run_rows(server_conn, "CX")
+    assert [kind for kind, _payload in rows] == [
+        "backfill_run_started",
+        "backfill_page_committed",
+        "backfill_run_finished",
+    ]
+    assert rows[-1][1]["outcome"] == "completed"
 
 
 def test_backfill_channel_write_batch_span_shape(
@@ -570,6 +596,30 @@ def test_write_batch_mid_batch_runtime_error_rolls_back_all_records(
         trio.run(_write_batch_for_test, writer, batch)
 
     assert _events_count(server_conn, "channel:CATOMIC") == 0
+    assert _events_count(server_conn, "backfill-run:CATOMIC") == 0
+
+
+def test_write_batch_page_commit_failure_rolls_back_data_and_page_event(
+    server_conn: psycopg.Connection[TupleRow],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writer = make_test_writer(server_conn)
+    batch = _batch_for_records("CPAGEATOMIC", 2)
+    original = backfill_api.write_event
+
+    def _insert_page_then_fail(conn: psycopg.Connection[TupleRow], record: EventRecord) -> int | None:
+        offset = original(conn, record)
+        if record.kind == "backfill_page_committed":
+            raise RuntimeError("boom after page commit")
+        return offset
+
+    monkeypatch.setattr(backfill_api, "write_event", _insert_page_then_fail)
+
+    with pytest.raises(RuntimeError, match="boom after page commit"):
+        trio.run(_write_batch_for_test, writer, batch)
+
+    assert _events_count(server_conn, "channel:CPAGEATOMIC") == 0
+    assert _events_count(server_conn, "backfill-run:CPAGEATOMIC") == 0
 
 
 def test_write_batch_retries_pg_timeout_once_for_whole_page(
@@ -625,7 +675,7 @@ def test_pg_notify_wakes_once_for_page_transaction_and_tailer_reads_all_offsets(
         listen_conn.close()
 
     assert inserted == 5
-    assert [notify.payload for notify in notifications] == ["channel:CNOTIFY"]
+    assert [notify.payload for notify in notifications] == ["channel:CNOTIFY", "backfill-run:CNOTIFY"]
     assert offsets == [1, 2, 3, 4, 5]
 
 
@@ -642,14 +692,15 @@ def test_backfill_channel_uses_writer_run_transaction(
         abort_at=20000,
     )
 
-    def _fake_write_batch_sync(_conn: object, records: object) -> int:
-        return len(cast(tuple[object, ...], records))
+    def _fake_write_batch_sync(_conn: object, batch: MessageBatch, _run_id: str | None) -> int:
+        return len(batch.records)
 
     monkeypatch.setattr(backfill_api, "_write_batch_sync", _fake_write_batch_sync)
 
     result = trio.run(backfill_channel, _StubBackfiller(1), ChannelId("CRUN"), ctx)
 
     assert writer.run_transaction_calls == 1
+    assert writer.write_event_calls == 2
     assert result.messages == 1
     assert result.events_written == 1
     assert health.kinds == ["backfill_started", "backfill_completed"]
@@ -691,6 +742,8 @@ def test_backfill_channel_aborts_at_history_page_boundary(server_conn: psycopg.C
     # one channel hitting its size cap is observability, not a global
     # ingestion-health signal; see BACKLOG entry on health hysteresis).
     assert _health_kinds(server_conn) == ["backfill_started", "backfill_warn_large", "backfill_aborted"]
+    rows = _backfill_run_rows(server_conn, "CBIG")
+    assert rows[-1][1]["outcome"] == "size_capped"
 
 
 def test_backfill_channel_skips_blocked_channel(server_conn: psycopg.Connection[TupleRow]) -> None:
@@ -707,6 +760,9 @@ def test_backfill_channel_skips_blocked_channel(server_conn: psycopg.Connection[
     assert result.messages == 0
     assert _events_count(server_conn, "channel:CBLOCK") == 0
     assert _health_kinds(server_conn) == ["backfill_skipped"]
+    rows = _backfill_run_rows(server_conn, "CBLOCK")
+    assert [kind for kind, _payload in rows] == ["backfill_run_started", "backfill_run_finished"]
+    assert rows[-1][1]["outcome"] == "operator_blocked"
 
 
 def _health_rows(conn: psycopg.Connection[TupleRow]) -> list[tuple[str, object]]:
