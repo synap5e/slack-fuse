@@ -333,6 +333,7 @@ class SlackClient:
         channel_id: str,
         cursor: str = "",
         oldest: float | None = None,
+        latest: float | None = None,
     ) -> Validated[ConversationsHistoryResponse]:
         """Fetch a single page of conversation history (used by backfill).
 
@@ -341,6 +342,11 @@ class SlackClient:
         before paging starts, which is critical for gap-fill efficiency: a
         24-hour-old `--since` against a 2-year-old channel should be one
         page of API spend, not 30.
+
+        `latest` is the upper bound. Backfill leaves it unset (walks newest
+        first); the ``refill-window`` CLI subcommand sets both bounds to
+        surgically refill a specific ``(channel, day)`` gap the day-presence
+        probe surfaced.
 
         Returns the wrapped response so the backfill loop can persist the
         raw message dicts (lossless) — index-pair ``page.raw["messages"][i]``
@@ -354,6 +360,8 @@ class SlackClient:
             params["cursor"] = cursor
         if oldest is not None:
             params["oldest"] = f"{oldest:.6f}"
+        if latest is not None:
+            params["latest"] = f"{latest:.6f}"
         return self._get_validated("conversations.history", params, ConversationsHistoryResponse)
 
     def sample_conversations_history(

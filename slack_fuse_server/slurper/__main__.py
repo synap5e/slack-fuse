@@ -28,7 +28,7 @@ import sys
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 import psycopg
 import trio
@@ -38,6 +38,7 @@ import slack_fuse_server.migrations as server_migrations
 from slack_fuse.migrations.runner import apply_migrations
 from slack_fuse.user_cache import UserCache
 from slack_fuse_render import ChannelId
+from slack_fuse_server._json import JsonObject
 from slack_fuse_server.backfill.api import BackfillContext, SlackApiBackfiller, SleepBounds, backfill_channel
 from slack_fuse_server.backfill.legacy import LegacyCacheBackfiller
 from slack_fuse_server.backfill.resume import ResumePlan, find_resume_plan
@@ -64,7 +65,7 @@ from slack_fuse_server.http.handlers import (
     SnapshotDeps,
 )
 from slack_fuse_server.http.metrics import MetricsAggregator, SubscriberSnapshot
-from slack_fuse_server.slurper.api import ChannelNotFoundError, SlackAPIError, SlackClient
+from slack_fuse_server.slurper.api import ChannelNotFoundError, SlackAPIError, SlackClient, Validated
 from slack_fuse_server.slurper.backfill_state import async_find_last_backfill_completion
 from slack_fuse_server.slurper.catchup import (
     CatchupConfig,
@@ -775,6 +776,107 @@ async def _run_refresh_channels_once(config: ServerConfig) -> None:
 # === Backfill (admin) mode ===
 
 
+async def _run_refill_window(  # noqa: C901 - two-phase CLI thunk (history pagination + thread expansion); further extraction adds ceremony without clarifying flow
+    config: ServerConfig,
+    channel_id: str,
+    oldest_ts: float,
+    latest_ts: float,
+) -> None:
+    """One-shot CLI: refill a specific ``(channel, oldest, latest)`` window.
+
+    Fetches ``conversations.history`` bounded by BOTH timestamps (unlike the
+    regular ``backfill`` subcommand which only bounds oldest), then expands any
+    thread parents found in the window. Idempotent via dedup.
+
+    Motivating use case: the day-presence probe surfaces (channel, day) gaps
+    where Slack has messages we don't. This subcommand fills exactly one such
+    gap — bounded API cost per call, safe to run in a shell loop over a
+    detection report.
+
+    Writes carry ``source.producer = "refill-window"`` so operators can
+    distinguish these events from normal backfill / socket-mode / catchup.
+    """
+    from slack_fuse.models import ConversationsHistoryResponse, Message  # noqa: PLC0415
+    from slack_fuse_server.slurper.offsets import EventRecord  # noqa: PLC0415
+
+    limiters = _make_limiters(config)
+    writer = OffsetWriter(
+        _connect_writer_pool(config),
+        limiter=limiters.writer,
+        acquire_timeout_s=config.slurper_writer_pool_acquire_timeout_s,
+    )
+    client = SlackClient(config.slack_user_token)
+    stream = f"channel:{channel_id}"
+    history_written = 0
+    replies_written = 0
+    thread_parents: list[str] = []
+    try:
+        # Paginate history bounded by (oldest, latest). At limit=200 a single
+        # UTC day typically fits in one page, but we honour has_more just in case.
+        cursor = ""
+        while True:
+            def _fetch_history(
+                cursor: str = cursor,
+            ) -> Validated[ConversationsHistoryResponse]:
+                return client.get_history_page(
+                    channel_id, cursor=cursor, oldest=oldest_ts, latest=latest_ts
+                )
+
+            wrapped = await trio.to_thread.run_sync(_fetch_history, limiter=limiters.slack_api)
+            raw_msgs = wrapped.raw.get("messages")
+            raw_list = list(raw_msgs) if isinstance(raw_msgs, list) else []
+            for i, msg in enumerate(wrapped.model.messages):
+                if i < len(raw_list) and isinstance(raw_list[i], dict):
+                    raw = cast("JsonObject", raw_list[i])
+                else:
+                    raw = cast("JsonObject", msg.model_dump(mode="json"))
+                record = EventRecord(stream=stream, kind="message", ts=msg.ts, payload=raw, dedup=True)
+                offset = await writer.write_message_or_corrective(record)
+                if offset is not None:
+                    history_written += 1
+                if msg.reply_count > 0 and msg.ts not in thread_parents:
+                    thread_parents.append(msg.ts)
+
+            cursor = wrapped.model.response_metadata.next_cursor
+            if not wrapped.model.has_more or not cursor:
+                break
+
+        # Expand threads for parents found in the window. get_replies is unbounded
+        # in ts (a thread parent inside the window can have replies outside it);
+        # that's fine — those replies are also legitimately part of the channel.
+        for parent_ts in thread_parents:
+            def _fetch_replies(
+                parent_ts: str = parent_ts,
+            ) -> list[Validated[Message]]:
+                return client.get_replies(channel_id, parent_ts)
+
+            replies = await trio.to_thread.run_sync(_fetch_replies, limiter=limiters.slack_api)
+            for wrapped_msg in replies:
+                if wrapped_msg.model.ts == parent_ts:
+                    # Parent itself is already written above.
+                    continue
+                record = EventRecord(
+                    stream=stream, kind="message", ts=wrapped_msg.model.ts, payload=wrapped_msg.raw, dedup=True
+                )
+                offset = await writer.write_message_or_corrective(record)
+                if offset is not None:
+                    replies_written += 1
+
+        log.info(
+            "refill-window: channel=%s window=[%.6f,%.6f] "
+            "history_written=%d replies_written=%d thread_parents=%d",
+            channel_id,
+            oldest_ts,
+            latest_ts,
+            history_written,
+            replies_written,
+            len(thread_parents),
+        )
+    finally:
+        client.close()
+        writer.close()
+
+
 async def _run_backfill(  # noqa: PLR0913 — thin CLI thunk; bundling into options dataclass adds more noise than it saves
     config: ServerConfig,
     channel_id: str,
@@ -975,6 +1077,27 @@ def _build_parser() -> argparse.ArgumentParser:
         "Bounds pagination at the source; combined with the events_message_dedup index "
         "this makes per-channel gap-fills cheap and idempotent.",
     )
+    rw = sub.add_parser(
+        "refill-window",
+        help="fetch and write conversations.history for a specific (channel, oldest, latest) window, "
+        "plus expand any thread parents found. Idempotent via dedup. Motivating case: the day-presence "
+        "probe surfaces (channel, day) gaps and this subcommand fills exactly one such gap per call.",
+    )
+    rw.add_argument("channel_id", help="Slack channel id, e.g. C0AKQ5DS0FQ")
+    rw.add_argument(
+        "--oldest",
+        type=float,
+        required=True,
+        metavar="EPOCH",
+        help="lower ts bound (Slack ts is float seconds since epoch)",
+    )
+    rw.add_argument(
+        "--latest",
+        type=float,
+        required=True,
+        metavar="EPOCH",
+        help="upper ts bound (Slack ts is float seconds since epoch)",
+    )
     block = sub.add_parser("block", help="block a channel from refresh/backfill")
     block.add_argument("channel_id", help="Slack channel id, e.g. C0AKQ5DS0FQ")
     block.add_argument("--reason", default=None, help="optional operator reason")
@@ -1020,6 +1143,17 @@ def main() -> None:
         except BlockedChannelError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             raise SystemExit(2) from exc
+        return
+    if args.command == "refill-window":
+        channel_id = args.channel_id
+        oldest: float = args.oldest
+        latest: float = args.latest
+
+        async def _refill_thunk() -> None:
+            await _run_refill_window(config, channel_id, oldest, latest)
+
+        with ingesting(boot.task_context("refill-window", triggered_by="admin-cli")):
+            trio.run(_refill_thunk)
         return
     if args.command == "block":
         _run_block_command(config, args.channel_id, args.reason)
