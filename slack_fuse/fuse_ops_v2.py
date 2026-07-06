@@ -31,6 +31,7 @@ import stat
 import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -128,6 +129,14 @@ DEFAULT_CALLBACK_TIMEOUT_S: Final = 1.0
 #: for no operational reason. 15s comfortably fits the slowest known query
 #: while still guarding against wedges.
 CONTROL_CALLBACK_TIMEOUT_S: Final = 15.0
+
+#: The budget currently in force for this callback. ``_callback_guard`` sets
+#: this per-op based on the resolved path; ``_run_sync``'s inner fail_after
+#: guards read it so they honour the same budget instead of the default. If
+#: unset (e.g. tests or a direct call path that bypasses the guard), the
+#: reader falls back to ``self._callback_timeout_s`` — same behaviour as
+#: before this ContextVar existed.
+_current_callback_budget: ContextVar[float | None] = ContextVar("current_callback_budget", default=None)
 
 #: Generic for ``_run_sync``: the worker's return type flows through to the
 #: caller so each callback gets the right narrowed type.
@@ -691,6 +700,7 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             except Exception:
                 log.exception("FUSE sync body (conn-only) raised; returning EIO")
                 raise pyfuse3.FUSEError(errno.EIO) from None
+        budget = _current_callback_budget.get() or self._callback_timeout_s
         try:
             # IMPORTANT: pool acquire must also be inside a timeout. If all
             # pool slots are held by worker threads stuck in PG / kernel
@@ -700,10 +710,10 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             # slow-op logging: an unprotected acquire let one read sit
             # 115s on a wedge before completing. Use the same per-callback
             # budget for the whole borrow → run → release cycle.
-            with trio.fail_after(self._callback_timeout_s):
+            with trio.fail_after(budget):
                 conn = await self._pool.acquire()
         except trio.TooSlowError:
-            log.warning("pool acquire timed out after %.1fs; returning EIO", self._callback_timeout_s)
+            log.warning("pool acquire timed out after %.1fs; returning EIO", budget)
             raise pyfuse3.FUSEError(errno.EIO) from None
         except psycopg.OperationalError as exc:
             # Pool factory couldn't open a fresh conn — PG socket is gone.
@@ -714,8 +724,9 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.EIO) from None
         token = borrowed_fuse_conn.set(conn)
         released = False
+        budget = _current_callback_budget.get() or self._callback_timeout_s
         try:
-            with trio.fail_after(self._callback_timeout_s):
+            with trio.fail_after(budget):
                 return await trio.to_thread.run_sync(sync_fn, abandon_on_cancel=True)
         except trio.TooSlowError:
             # Close the conn so any SQL the abandoned thread is still running
@@ -723,7 +734,7 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             # itself keeps running pure-Python work but can't touch the DB.
             log.warning(
                 "FUSE callback exceeded %.1fs timeout — returning EIO and discarding the borrowed conn",
-                self._callback_timeout_s,
+                budget,
             )
             await self._pool.release(conn, discard=True)
             released = True
@@ -804,6 +815,10 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             if resolved_path is not None and resolved_path.startswith(f"/{CONTROL_DIR}/")
             else self._callback_timeout_s
         )
+        # Publish so ``_run_sync``'s own inner ``trio.fail_after`` guards
+        # inherit the same budget (otherwise the outer 15s is overridden by
+        # the inner 1s ``self._callback_timeout_s`` and we still EIO fast).
+        budget_token = _current_callback_budget.set(budget)
         with fuse_op(op, inode=inode, path=path):
             try:
                 with trio.fail_after(budget):
@@ -823,6 +838,8 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             except Exception:
                 log.exception("unexpected error; returning EIO")
                 raise pyfuse3.FUSEError(errno.EIO) from None
+            finally:
+                _current_callback_budget.reset(budget_token)
 
     @property
     def inodes(self) -> PersistentInodeMap:
