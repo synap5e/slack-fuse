@@ -886,9 +886,16 @@ class SlackFuseOpsV2(pyfuse3.Operations):
                 mode=stat.S_IFREG | 0o644,
             )
         if name == CONTROL_GAPS:
-            return _make_file_attr(inode, len(self._control_gaps_bytes()), mode=stat.S_IFREG | 0o444)
+            # Size reported as 0 — st_size is a hint, and computing the real
+            # size here would fetch /gap-candidates (a ~2s SQL query), which
+            # busts the FUSE per-callback budget on every getattr/lookup and
+            # DoSes the server via cascade amplification. `cat`/`grep`/`wc -c`
+            # all read until EOF regardless of st_size; the fetch happens once
+            # in the `read` callback.
+            return _make_file_attr(inode, 0, mode=stat.S_IFREG | 0o444)
         if name == CONTROL_PROBES:
-            return _make_file_attr(inode, len(self._control_probes_bytes()), mode=stat.S_IFREG | 0o444)
+            # Same reasoning as CONTROL_GAPS above.
+            return _make_file_attr(inode, 0, mode=stat.S_IFREG | 0o444)
         if name in CONTROL_WRITABLE:
             return _make_file_attr(inode, 0, mode=stat.S_IFREG | 0o644)
         return None
