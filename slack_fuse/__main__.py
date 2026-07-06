@@ -743,7 +743,7 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
             try:
                 await trio.to_thread.run_sync(_control_gaps_read)
                 await trio.to_thread.run_sync(_control_probes_read)
-            except Exception:  # noqa: BLE001 — prewarm must outlive any one bad cycle
+            except Exception:
                 log.warning("control-reads prewarm cycle failed", exc_info=True)
             await trio.sleep(25.0)
 
