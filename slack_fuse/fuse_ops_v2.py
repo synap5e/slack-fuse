@@ -49,9 +49,12 @@ from slack_fuse.fuse_v2_helpers import (
     CONTROL_BACKFILL_CHANNEL,
     CONTROL_BLOCKED_CHANNELS,
     CONTROL_DIR,
+    CONTROL_GAPS,
     CONTROL_PROBE_SWEEP,
     CONTROL_PROBE_SWEEP_JOB,
     CONTROL_PROBE_SWEEP_TARGET,
+    CONTROL_PROBES,
+    CONTROL_REFILL_GAP,
     CONTROL_REFRESH_CHANNEL,
     CONTROL_REFRESH_CHANNELS,
     CONTROL_RERENDER_CHANNEL,
@@ -157,6 +160,9 @@ ControlBlockChannelFn = Callable[[str, str | None], int]
 ControlUnblockChannelFn = Callable[[str], int]
 ControlBackfillChannelFn = Callable[[str], tuple[int, str | None]]
 ControlProbeSweepFn = Callable[[str | None, str | None], tuple[int, str | None]]
+ControlGapsReadFn = Callable[[], bytes]
+ControlProbesReadFn = Callable[[], bytes]
+ControlRefillGapFn = Callable[[str, float, float], str]
 # ``_control/rerender_channel`` hands a resolved channel id off to a background
 # consumer (the rerender is too heavy for the per-callback budget). Returns True
 # if the request was accepted (queued), False if the queue is full / busy. Wired
@@ -521,6 +527,9 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         control_unblock_channel: ControlUnblockChannelFn | None = None,
         control_backfill_channel: ControlBackfillChannelFn | None = None,
         control_probe_sweep: ControlProbeSweepFn | None = None,
+        control_gaps_read: ControlGapsReadFn | None = None,
+        control_probes_read: ControlProbesReadFn | None = None,
+        control_refill_gap: ControlRefillGapFn | None = None,
         control_rerender_channel: ControlRerenderChannelFn | None = None,
     ) -> None:
         super().__init__()
@@ -567,9 +576,7 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         # ENOENT — the dispatch is centralised in ``_resolve_content`` /
         # ``_list_dir(for_lookup=True)``.
         self._originals_fetch = originals_fetch
-        self._originals_cache: _BytesCache | None = (
-            _BytesCache() if originals_fetch is not None else None
-        )
+        self._originals_cache: _BytesCache | None = _BytesCache() if originals_fetch is not None else None
         # Gaps ghost-file plumbing. Two caches because the access patterns
         # differ — per-channel gaps mirror originals (many keys), workspace
         # gaps is a single-cell cache. Both gated on the corresponding
@@ -601,6 +608,9 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         self._control_unblock_channel = control_unblock_channel
         self._control_backfill_channel = control_backfill_channel
         self._control_probe_sweep = control_probe_sweep
+        self._control_gaps_read = control_gaps_read
+        self._control_probes_read = control_probes_read
+        self._control_refill_gap = control_refill_gap
         self._control_rerender_channel = control_rerender_channel
         self._control_write_buffers: dict[int, _ControlWrite] = {}
         self._control_write_lock = threading.Lock()
@@ -703,8 +713,7 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             # aborts; the pool slot is freed for the next caller. The thread
             # itself keeps running pure-Python work but can't touch the DB.
             log.warning(
-                "FUSE callback exceeded %.1fs timeout — returning EIO and "
-                "discarding the borrowed conn",
+                "FUSE callback exceeded %.1fs timeout — returning EIO and discarding the borrowed conn",
                 self._callback_timeout_s,
             )
             await self._pool.release(conn, discard=True)
@@ -783,9 +792,7 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             except pyfuse3.FUSEError:
                 raise
             except trio.TooSlowError:
-                log.warning(
-                    "callback exceeded %.1fs budget; returning EIO", self._callback_timeout_s
-                )
+                log.warning("callback exceeded %.1fs budget; returning EIO", self._callback_timeout_s)
                 raise pyfuse3.FUSEError(errno.EIO) from None
             except psycopg.OperationalError as exc:
                 # Pre-``_run_sync`` PG access (e.g. inode lookup on cache miss)
@@ -878,6 +885,10 @@ class SlackFuseOpsV2(pyfuse3.Operations):
                 len(self._control_blocked_channels_bytes()),
                 mode=stat.S_IFREG | 0o644,
             )
+        if name == CONTROL_GAPS:
+            return _make_file_attr(inode, len(self._control_gaps_bytes()), mode=stat.S_IFREG | 0o444)
+        if name == CONTROL_PROBES:
+            return _make_file_attr(inode, len(self._control_probes_bytes()), mode=stat.S_IFREG | 0o444)
         if name in CONTROL_WRITABLE:
             return _make_file_attr(inode, 0, mode=stat.S_IFREG | 0o644)
         return None
@@ -890,6 +901,16 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             return b'{"error":"server_unavailable"}\n'
         return self._control_blocked_channels_read()
 
+    def _control_gaps_bytes(self) -> bytes:
+        if self._control_gaps_read is None:
+            return b"# error\tserver_unavailable\n"
+        return self._control_gaps_read()
+
+    def _control_probes_bytes(self) -> bytes:
+        if self._control_probes_read is None:
+            return b'{"error":"server_unavailable"}\n'
+        return self._control_probes_read()
+
     def _control_read_bytes(self, path: str) -> bytes | None:
         """Read-side bytes for a ``_control/<name>`` file, or ``None``."""
         parts = parse_path(path)
@@ -900,6 +921,10 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             return self._control_status_bytes()
         if name == CONTROL_BLOCKED_CHANNELS:
             return self._control_blocked_channels_bytes()
+        if name == CONTROL_GAPS:
+            return self._control_gaps_bytes()
+        if name == CONTROL_PROBES:
+            return self._control_probes_bytes()
         if name in CONTROL_WRITABLE:
             return b""
         return None
@@ -937,7 +962,7 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         fi.keep_cache = False  # pyright: ignore[reportAttributeAccessIssue]
         return fi
 
-    async def _fire_control(self, entry: _ControlWrite) -> None:
+    async def _fire_control(self, entry: _ControlWrite) -> None:  # noqa: C901 - control-file dispatch hub.
         """Drain a finished control write and trigger the matching action.
 
         The action (slug resolution + HTTP POST) runs in a worker thread via
@@ -961,6 +986,8 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             await self._fire_block_toggle(data)
         elif name == CONTROL_BACKFILL_CHANNEL:
             await self._fire_backfill(data)
+        elif name == CONTROL_REFILL_GAP:
+            await self._fire_refill_gap(data)
         elif name in {CONTROL_PROBE_SWEEP, CONTROL_PROBE_SWEEP_JOB, CONTROL_PROBE_SWEEP_TARGET}:
             await self._fire_probe_control(name, data)
         elif name == CONTROL_RERENDER_CHANNEL:
@@ -1004,6 +1031,29 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             return
         result = await self._control_action_or_unavailable(lambda: self._do_backfill(token))
         self._control_state.record_backfill(result.channel or token, result.result)
+
+    async def _fire_refill_gap(self, data: bytes) -> None:
+        assert self._control_state is not None
+        text = data.decode("utf-8", errors="replace")
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parsed = self._parse_refill_gap_line(line)
+            if parsed is None:
+                channel_hint = line.split(None, 1)[0] if line.split(None, 1) else line
+                self._control_state.record_refill_gap(channel_hint, "bad_request")
+                continue
+            token, oldest, latest = parsed
+            result = await self._control_action_or_unavailable(
+                lambda token=token, oldest=oldest, latest=latest: self._do_refill_gap(token, oldest, latest)
+            )
+            self._control_state.record_refill_gap(
+                result.channel or token,
+                result.result,
+                oldest_ts=oldest,
+                latest_ts=latest,
+            )
 
     async def _fire_probe_sweep(self, data: bytes) -> None:
         assert self._control_state is not None
@@ -1090,6 +1140,14 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             return _ControlResult(result="blocked", channel=channel_id)
         return _ControlResult(result=result_for_status(code), channel=channel_id)
 
+    def _do_refill_gap(self, token: str, oldest: float, latest: float) -> _ControlResult:
+        channel_id = self._resolve_control_channel(token)
+        if channel_id is None:
+            return _ControlResult(result="unknown_channel", channel=token)
+        if self._control_refill_gap is None:
+            return _ControlResult(result="server_unavailable", channel=channel_id)
+        return _ControlResult(result=self._control_refill_gap(channel_id, oldest, latest), channel=channel_id)
+
     def _do_probe_sweep(self, job_id: str | None, target: str | None) -> _ControlResult:
         if self._control_probe_sweep is None:
             return _ControlResult(result="server_unavailable", job_id=job_id, target=target)
@@ -1154,6 +1212,20 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         reason = parts[1].strip() if len(parts) == 2 and parts[1].strip() else None
         return parts[0], reason
 
+    def _parse_refill_gap_line(self, line: str) -> tuple[str, float, float] | None:
+        parts = line.split()
+        if len(parts) != 3:
+            return None
+        token, oldest_text, latest_text = parts
+        try:
+            oldest = float(oldest_text)
+            latest = float(latest_text)
+        except ValueError:
+            return None
+        if oldest < 0.0 or latest <= oldest:
+            return None
+        return token, oldest, latest
+
     # ------------------------------------------------------------------
     # Path classification and dispatch
     # ------------------------------------------------------------------
@@ -1183,10 +1255,13 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         if parts[0] == CONTROL_DIR:
             if depth == 1 and self._control_enabled:
                 return [
+                    (CONTROL_GAPS, False),
+                    (CONTROL_PROBES, False),
                     (CONTROL_REFRESH_CHANNELS, False),
                     (CONTROL_REFRESH_CHANNEL, False),
                     (CONTROL_BLOCKED_CHANNELS, False),
                     (CONTROL_BACKFILL_CHANNEL, False),
+                    (CONTROL_REFILL_GAP, False),
                     (CONTROL_PROBE_SWEEP, False),
                     (CONTROL_PROBE_SWEEP_JOB, False),
                     (CONTROL_PROBE_SWEEP_TARGET, False),
@@ -1812,7 +1887,7 @@ class SlackFuseOpsV2(pyfuse3.Operations):
 
     async def _read_control_file(self, path: str, off: int, size: int) -> bytes:
         parts = parse_path(path)
-        if len(parts) == 2 and parts[1] == CONTROL_BLOCKED_CHANNELS:
+        if len(parts) == 2 and parts[1] in {CONTROL_BLOCKED_CHANNELS, CONTROL_GAPS, CONTROL_PROBES}:
             data = await self._run_sync(lambda: self._control_read_bytes(path))
         else:
             data = self._control_read_bytes(path)

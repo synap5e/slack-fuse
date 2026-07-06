@@ -404,8 +404,10 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
     # The fetcher runs in FUSE worker threads (dispatched by ``_run_sync``),
     # so a sync client fits cleanly — no trio context to thread through.
     # Long-lived: one process, connection-pooled.
-    from slack_fuse.projector.gaps_fetch import fetch_channel_gaps, fetch_workspace_gaps
+    from slack_fuse.projector.gaps_fetch import fetch_channel_gaps, fetch_gaps_tsv_bytes, fetch_workspace_gaps
     from slack_fuse.projector.originals_fetch import fetch_originals
+    from slack_fuse.projector.probes_fetch import fetch_probes_bytes
+    from slack_fuse.projector.refill_fetch import trigger_refill
     from slack_fuse.projector.ws_client import derive_http_base
 
     # One shared sync httpx.Client for all the ghost-file fetchers (originals,
@@ -454,9 +456,7 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
     )
 
     def _control_refresh_workspace() -> int:
-        return post_refresh_channels(
-            ghost_http_client, ghost_base_http_url, shared_secret=config.shared_secret
-        )
+        return post_refresh_channels(ghost_http_client, ghost_base_http_url, shared_secret=config.shared_secret)
 
     def _control_refresh_channel(channel_id: str) -> int:
         return post_refresh_channel(
@@ -515,6 +515,26 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
             shared_secret=config.shared_secret,
         )
 
+    def _control_gaps_read() -> bytes:
+        return fetch_gaps_tsv_bytes(ghost_http_client, ghost_base_http_url)
+
+    def _control_probes_read() -> bytes:
+        return fetch_probes_bytes(
+            ghost_http_client,
+            ghost_base_http_url,
+            shared_secret=config.shared_secret,
+        )
+
+    def _control_refill_gap(channel_id: str, oldest: float, latest: float) -> str:
+        return trigger_refill(
+            ghost_http_client,
+            ghost_base_http_url,
+            channel_id,
+            oldest,
+            latest,
+            shared_secret=config.shared_secret,
+        ).result
+
     # ``_control/rerender_channel`` hands resolved channel ids to a background
     # consumer (``_run_rerender_consumer``) rather than running inline: a
     # snapshot fetch + re-apply is far heavier than the sub-second per-callback
@@ -552,6 +572,9 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
         control_unblock_channel=_control_unblock_channel,
         control_backfill_channel=_control_backfill_channel,
         control_probe_sweep=_control_probe_sweep,
+        control_gaps_read=_control_gaps_read,
+        control_probes_read=_control_probes_read,
+        control_refill_gap=_control_refill_gap,
         control_rerender_channel=_control_rerender_channel,
     )
 

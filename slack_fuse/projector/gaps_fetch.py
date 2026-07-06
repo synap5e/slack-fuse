@@ -1,18 +1,42 @@
-"""Sync HTTP fetch for the gaps ghost-files.
+"""Sync HTTP fetch for gap views.
 
 Mirrors ``originals_fetch.py``: sync httpx because the FUSE read path
 runs in a worker thread (no trio context to thread through). Two
-endpoints:
+markdown ghost-file endpoints:
 
 - ``GET /gaps/{channel_id}`` for the per-channel ``gaps.md``
 - ``GET /gaps`` for the workspace ``/_workspace/gaps.md``
+
+Also carries the operator control-surface ``GET /gap-candidates`` helper, which
+returns day-presence refill candidates as typed JSON.
 """
 
 from __future__ import annotations
 
+from datetime import UTC, date, datetime
+
 import httpx
+from pydantic import BaseModel, ConfigDict, TypeAdapter
+
+from slack_fuse.projector.refresh_fetch import TRANSPORT_ERROR_CODE
 
 DEFAULT_FETCH_TIMEOUT_S = 5.0
+DEFAULT_CONTROL_TIMEOUT_S = 0.9
+
+
+class GapRow(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    channel_id: str
+    day: date
+    oldest_ts: float
+    latest_ts: float
+    slack_sample_ts: str
+    sampled_at: datetime
+    gap_type: str
+
+
+_GAP_ROWS = TypeAdapter(list[GapRow])
 
 
 def fetch_channel_gaps(
@@ -40,3 +64,65 @@ def fetch_workspace_gaps(
     response = http_client.get(url, timeout=timeout_s)
     response.raise_for_status()
     return response.content
+
+
+def fetch_gap_candidates(
+    http_client: httpx.Client,
+    base_http_url: str,
+    *,
+    timeout_s: float = DEFAULT_CONTROL_TIMEOUT_S,
+) -> tuple[int, list[GapRow]]:
+    """``GET {base}/gap-candidates`` → ``(status, rows)``; status ``0`` on transport error."""
+    url = f"{base_http_url.rstrip('/')}/gap-candidates"
+    try:
+        response = http_client.get(url, timeout=timeout_s)
+    except httpx.HTTPError:
+        return TRANSPORT_ERROR_CODE, []
+    if response.status_code != 200:
+        return response.status_code, []
+    try:
+        return response.status_code, _GAP_ROWS.validate_json(response.content)
+    except ValueError:
+        return 500, []
+
+
+def fetch_gaps_tsv_bytes(
+    http_client: httpx.Client,
+    base_http_url: str,
+    *,
+    timeout_s: float = DEFAULT_CONTROL_TIMEOUT_S,
+) -> bytes:
+    status, rows = fetch_gap_candidates(http_client, base_http_url, timeout_s=timeout_s)
+    if status != 200:
+        error = "server_unavailable" if status == TRANSPORT_ERROR_CODE else f"http_{status}"
+        return f"# error\t{error}\n".encode()
+    lines = [
+        "\t".join((
+            row.channel_id,
+            row.day.isoformat(),
+            f"{row.oldest_ts:.6f}",
+            f"{row.latest_ts:.6f}",
+            row.slack_sample_ts,
+            _format_sampled_at(row.sampled_at),
+            row.gap_type,
+        ))
+        for row in rows
+    ]
+    return ("\n".join(lines) + ("\n" if lines else "")).encode()
+
+
+def _format_sampled_at(value: datetime) -> str:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC).isoformat()
+    return value.astimezone(UTC).isoformat()
+
+
+__all__ = [
+    "DEFAULT_CONTROL_TIMEOUT_S",
+    "DEFAULT_FETCH_TIMEOUT_S",
+    "GapRow",
+    "fetch_channel_gaps",
+    "fetch_gap_candidates",
+    "fetch_gaps_tsv_bytes",
+    "fetch_workspace_gaps",
+]

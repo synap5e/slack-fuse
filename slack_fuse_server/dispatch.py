@@ -37,6 +37,8 @@ from slack_fuse_server.http.handlers import (
     LivezDeps,
     OriginalsDeps,
     ProbeDeps,
+    ProbeStatusDeps,
+    RefillWindowDeps,
     RefreshDeps,
     ResolvePermalinkDeps,
     SnapshotDeps,
@@ -172,6 +174,8 @@ async def serve_connection(  # noqa: PLR0913 - dispatch wiring needs explicit de
     blocked_channels_deps: BlockedChannelsDeps | None = None,
     backfill_deps: BackfillDeps | None = None,
     probe_deps: ProbeDeps | None = None,
+    probe_status_deps: ProbeStatusDeps | None = None,
+    refill_window_deps: RefillWindowDeps | None = None,
     livez_deps: LivezDeps | None = None,
 ) -> None:
     """Classify one accepted connection and route it to WS or HTTP."""
@@ -191,6 +195,8 @@ async def serve_connection(  # noqa: PLR0913 - dispatch wiring needs explicit de
             blocked_channels_deps=blocked_channels_deps,
             backfill_deps=backfill_deps,
             probe_deps=probe_deps,
+            probe_status_deps=probe_status_deps,
+            refill_window_deps=refill_window_deps,
             livez_deps=livez_deps,
         )
 
@@ -208,6 +214,8 @@ async def serve_dispatch(  # noqa: PLR0913 - dispatch wiring needs explicit deps
     blocked_channels_deps: BlockedChannelsDeps | None = None,
     backfill_deps: BackfillDeps | None = None,
     probe_deps: ProbeDeps | None = None,
+    probe_status_deps: ProbeStatusDeps | None = None,
+    refill_window_deps: RefillWindowDeps | None = None,
     livez_deps: LivezDeps | None = None,
     task_status: trio.TaskStatus[list[trio.SocketListener]] = trio.TASK_STATUS_IGNORED,
 ) -> None:
@@ -225,6 +233,8 @@ async def serve_dispatch(  # noqa: PLR0913 - dispatch wiring needs explicit deps
         blocked_channels_deps=blocked_channels_deps,
         backfill_deps=backfill_deps,
         probe_deps=probe_deps,
+        probe_status_deps=probe_status_deps,
+        refill_window_deps=refill_window_deps,
         livez_deps=livez_deps,
     )
     await trio.serve_tcp(handler, port=port, host=host, task_status=task_status)
@@ -243,6 +253,8 @@ async def serve_dispatch_on_listeners(  # noqa: PLR0913 - dispatch wiring needs 
     blocked_channels_deps: BlockedChannelsDeps | None = None,
     backfill_deps: BackfillDeps | None = None,
     probe_deps: ProbeDeps | None = None,
+    probe_status_deps: ProbeStatusDeps | None = None,
+    refill_window_deps: RefillWindowDeps | None = None,
     livez_deps: LivezDeps | None = None,
 ) -> None:
     """Serve on already-open listeners (tests bind port 0 and read the port back)."""
@@ -258,6 +270,8 @@ async def serve_dispatch_on_listeners(  # noqa: PLR0913 - dispatch wiring needs 
         blocked_channels_deps=blocked_channels_deps,
         backfill_deps=backfill_deps,
         probe_deps=probe_deps,
+        probe_status_deps=probe_status_deps,
+        refill_window_deps=refill_window_deps,
         livez_deps=livez_deps,
     )
     await trio.serve_listeners(handler, listeners)

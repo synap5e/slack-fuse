@@ -17,7 +17,7 @@ content-type/-encoding constants below pin that contract.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -99,6 +99,37 @@ class PermalinkResponse(_DTO):
 
 class HealthResponse(_DTO):
     ok: bool
+
+
+# === /gap-candidates + /probe-status + /refill-window ===
+
+
+class GapDetectionRow(_DTO):
+    channel_id: str
+    day: date
+    oldest_ts: float
+    latest_ts: float
+    slack_sample_ts: str
+    sampled_at: datetime
+    gap_type: str
+
+
+class ProbeStatusResponse(_DTO):
+    last_sweep_completed_at: datetime | None
+    age_seconds: int | None
+    channels_covered_last_sweep: int
+    days_covered_last_sweep: int
+    alert_threshold_seconds: int
+
+
+class RefillWindowRequest(_DTO):
+    oldest: float
+    latest: float
+
+
+class RefillWindowResponse(_DTO):
+    status: str
+    run_id: str | None = None
 
 
 # === /snapshot (query string only) ===

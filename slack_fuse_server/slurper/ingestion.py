@@ -152,6 +152,7 @@ def derived_run_context(
     *,
     producer: str | None = None,
     triggered_by: str | None = None,
+    run_id: str | None = None,
     new_run: bool = True,
 ) -> IngestionContext | None:
     """The current context specialized for one logical run (new `run_id`).
@@ -165,7 +166,7 @@ def derived_run_context(
     return replace(
         ctx,
         producer=producer if producer is not None else ctx.producer,
-        run_id=new_ulid() if new_run else ctx.run_id,
+        run_id=run_id if run_id is not None else (new_ulid() if new_run else ctx.run_id),
         triggered_by=triggered_by if triggered_by is not None else ctx.triggered_by,
     )
 
@@ -175,9 +176,10 @@ def ingesting_run(
     *,
     producer: str | None = None,
     triggered_by: str | None = None,
+    run_id: str | None = None,
 ) -> Iterator[IngestionContext | None]:
     """Scope a per-run derivation of the ambient context (no-op without one)."""
-    ctx = derived_run_context(producer=producer, triggered_by=triggered_by)
+    ctx = derived_run_context(producer=producer, triggered_by=triggered_by, run_id=run_id)
     if ctx is None:
         yield None
         return

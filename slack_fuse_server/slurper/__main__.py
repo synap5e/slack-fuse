@@ -24,6 +24,7 @@ import logging
 import os
 import sys
 from collections.abc import Awaitable, Callable, Iterator, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
@@ -78,6 +79,8 @@ from slack_fuse_server.http.handlers import (
     LivezDeps,
     OriginalsDeps,
     ProbeDeps,
+    ProbeStatusDeps,
+    RefillWindowDeps,
     RefreshDeps,
     ResolvePermalinkDeps,
     SnapshotDeps,
@@ -92,7 +95,14 @@ from slack_fuse_server.slurper.catchup import (
 )
 from slack_fuse_server.slurper.channels import ensure_channel_added, populate_channels_once
 from slack_fuse_server.slurper.health import HealthEmitter
-from slack_fuse_server.slurper.ingestion import BootContext, IngestionContext, ingesting, ingesting_run, process_boot
+from slack_fuse_server.slurper.ingestion import (
+    BootContext,
+    IngestionContext,
+    ingesting,
+    ingesting_run,
+    new_ulid,
+    process_boot,
+)
 from slack_fuse_server.slurper.limiters import SlurperLimiters
 from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter
 from slack_fuse_server.slurper.probes import ProbeTrigger, probe_sweep
@@ -408,6 +418,10 @@ async def _serve(config: ServerConfig, boot: BootContext) -> None:
     snapshot_deps = SnapshotDeps(database_url=config.database_url)
     originals_deps = OriginalsDeps(database_url=config.database_url)
     gaps_deps = GapsDeps(database_url=config.database_url)
+    probe_status_deps = ProbeStatusDeps(
+        database_url=config.database_url,
+        alert_threshold_seconds=int(config.probe_sweep_interval_s * 2),
+    )
     livez_deps = LivezDeps(supervisor=supervisor)
     # Trigger for ``POST /refresh-channels`` — request() rendezvous against
     # the consumer task spawned below. Auth lives at the HTTP layer (shared
@@ -427,6 +441,12 @@ async def _serve(config: ServerConfig, boot: BootContext) -> None:
         shared_secret=config.shared_secret,
         database_url=config.database_url,
         trigger=backfill_trigger,
+    )
+    refill_trigger = RefillWindowTrigger()
+    refill_window_deps = RefillWindowDeps(
+        shared_secret=config.shared_secret,
+        database_url=config.database_url,
+        trigger=refill_trigger,
     )
     probe_trigger = ProbeTrigger(max_buffer_size=1)
     probe_deps = ProbeDeps(
@@ -510,6 +530,8 @@ async def _serve(config: ServerConfig, boot: BootContext) -> None:
                 blocked_channels_deps,
                 backfill_deps,
                 probe_deps,
+                probe_status_deps,
+                refill_window_deps,
                 livez_deps,
             )
             nursery.start_soon(snapshot_scheduler.run, supervisor)
@@ -556,6 +578,14 @@ async def _serve(config: ServerConfig, boot: BootContext) -> None:
                 _ingesting_task(
                     boot.task_context("backfill", triggered_by="control-surface"),
                     backfill_trigger.consume,
+                    config,
+                    supervisor,
+                )
+            )
+            nursery.start_soon(
+                _ingesting_task(
+                    boot.task_context("refill-window", triggered_by="control-surface"),
+                    refill_trigger.consume,
                     config,
                     supervisor,
                 )
@@ -645,6 +675,8 @@ async def _serve_dispatch_task(  # noqa: PLR0913, PLR0917 - dispatch wiring need
     blocked_channels_deps: BlockedChannelsDeps,
     backfill_deps: BackfillDeps,
     probe_deps: ProbeDeps,
+    probe_status_deps: ProbeStatusDeps,
+    refill_window_deps: RefillWindowDeps,
     livez_deps: LivezDeps,
 ) -> None:
     await serve_dispatch(
@@ -659,6 +691,8 @@ async def _serve_dispatch_task(  # noqa: PLR0913, PLR0917 - dispatch wiring need
         blocked_channels_deps=blocked_channels_deps,
         backfill_deps=backfill_deps,
         probe_deps=probe_deps,
+        probe_status_deps=probe_status_deps,
+        refill_window_deps=refill_window_deps,
         livez_deps=livez_deps,
     )
 
@@ -697,6 +731,7 @@ async def _run_refill_window(
     channel_id: str,
     oldest_ts: float,
     latest_ts: float,
+    run_id: str | None = None,
 ) -> None:
     """One-shot CLI: refill a specific ``(channel, oldest, latest)`` window.
 
@@ -725,7 +760,7 @@ async def _run_refill_window(
     replies_written = 0
     thread_parents: list[str] = []
     try:  # noqa: PLR1702 - linear history/replies pagination with one lifecycle boundary.
-        with ingesting_run(triggered_by=str(BackfillRunTrigger.REFILL_WINDOW)):
+        with ingesting_run(triggered_by=str(BackfillRunTrigger.REFILL_WINDOW), run_id=run_id):
             run_id = new_backfill_run_id()
             trigger = resolve_trigger(BackfillRunTrigger.REFILL_WINDOW, default=BackfillRunTrigger.REFILL_WINDOW)
             await writer.write_event(
@@ -1092,6 +1127,58 @@ class ManualBackfillTrigger:
                 log.info("backfill: HTTP-triggered run for %s rejected: blocked", channel_id)
             except Exception:
                 log.exception("backfill: HTTP-triggered run for %s failed", channel_id)
+
+
+@dataclass(frozen=True, slots=True)
+class RefillWindowItem:
+    channel_id: str
+    oldest: float
+    latest: float
+    run_id: str
+
+
+class RefillWindowTrigger:
+    """Rendezvous trigger for HTTP-requested refill-window runs."""
+
+    def __init__(self) -> None:
+        self._send, self._recv = trio.open_memory_channel[RefillWindowItem](max_buffer_size=0)
+
+    def request_window(self, channel_id: str, oldest: float, latest: float) -> str | None:
+        run_id = new_ulid()
+        try:
+            self._send.send_nowait(RefillWindowItem(channel_id=channel_id, oldest=oldest, latest=latest, run_id=run_id))
+        except trio.WouldBlock:
+            return None
+        return run_id
+
+    async def consume(self, config: ServerConfig, supervisor: TaskSupervisor | None = None) -> None:
+        while True:
+            if supervisor is not None:
+                supervisor.declare("refill-window-trigger", "waiting_for_trigger", deadline_s=None)
+            try:
+                item = await self._recv.receive()
+            except trio.EndOfChannel:
+                return
+            try:
+                if supervisor is None:
+                    await _run_refill_window(config, item.channel_id, item.oldest, item.latest, item.run_id)
+                else:
+                    async with phase(
+                        supervisor,
+                        "refill-window-trigger",
+                        "running",
+                        details={"channel_id": item.channel_id, "oldest": item.oldest, "latest": item.latest},
+                        deadline_s=config.span_slow_threshold_backfill_channel_ms / 1000,
+                    ):
+                        await _run_refill_window(config, item.channel_id, item.oldest, item.latest, item.run_id)
+            except Exception:
+                log.exception(
+                    "refill-window: HTTP-triggered run failed channel=%s oldest=%.6f latest=%.6f run_id=%s",
+                    item.channel_id,
+                    item.oldest,
+                    item.latest,
+                    item.run_id,
+                )
 
 
 def _run_block_command(config: ServerConfig, channel_id: str, reason: str | None) -> None:

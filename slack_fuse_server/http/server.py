@@ -12,12 +12,15 @@ from urllib.parse import parse_qs, unquote, urlsplit
 import h11
 import psycopg
 import trio
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from slack_fuse_server.http.dto import (
     SNAPSHOT_CONTENT_ENCODING,
     SNAPSHOT_CONTENT_TYPE,
+    GapDetectionRow,
     PermalinkRequest,
+    RefillWindowRequest,
+    RefillWindowResponse,
     ResolveRequest,
 )
 from slack_fuse_server.http.handlers import (
@@ -27,19 +30,24 @@ from slack_fuse_server.http.handlers import (
     LivezDeps,
     OriginalsDeps,
     ProbeDeps,
+    ProbeStatusDeps,
+    RefillWindowDeps,
     RefreshDeps,
     ResolvePermalinkDeps,
     SnapshotDeps,
     handle_backfill_channel,
     handle_block_channel,
     handle_channel_gaps,
+    handle_gap_detection,
     handle_health,
     handle_list_blocked_channels,
     handle_livez,
     handle_metrics,
     handle_originals,
     handle_permalink,
+    handle_probe_status,
     handle_probe_sweep,
+    handle_refill_window,
     handle_refresh_channel,
     handle_refresh_channels,
     handle_resolve,
@@ -55,6 +63,7 @@ log = logging.getLogger(__name__)
 
 _JSON_CONTENT_TYPE = "application/json"
 _READ_CHUNK_SIZE = 16_384
+_GAP_ROWS_ADAPTER = TypeAdapter(list[GapDetectionRow])
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +123,8 @@ def route_request(  # noqa: C901, PLR0913 - endpoint routing dispatch hub.
     blocked_channels_deps: BlockedChannelsDeps | None = None,
     backfill_deps: BackfillDeps | None = None,
     probe_deps: ProbeDeps | None = None,
+    probe_status_deps: ProbeStatusDeps | None = None,
+    refill_window_deps: RefillWindowDeps | None = None,
     livez_deps: LivezDeps | None = None,
 ) -> HttpResponse:
     """Pure routing table for supported HTTP endpoints."""
@@ -171,9 +182,21 @@ def route_request(  # noqa: C901, PLR0913 - endpoint routing dispatch hub.
             from_epoch, to_epoch = _parse_originals_query(request.target)
         except ValueError:
             return _error_response(status_code=400, code="bad_request")
-        return _handle_originals(
-            originals_channel, from_epoch=from_epoch, to_epoch=to_epoch, deps=originals_deps
-        )
+        return _handle_originals(originals_channel, from_epoch=from_epoch, to_epoch=to_epoch, deps=originals_deps)
+
+    if request.path == "/gap-candidates":
+        if request.method != "GET":
+            return _error_response(status_code=405, code="method_not_allowed")
+        if gaps_deps is None:
+            return _error_response(status_code=503, code="service_unavailable")
+        return _handle_gap_detection(deps=gaps_deps)
+
+    if request.path == "/probe-status":
+        if request.method != "GET":
+            return _error_response(status_code=405, code="method_not_allowed")
+        if probe_status_deps is None:
+            return _error_response(status_code=503, code="service_unavailable")
+        return _handle_probe_status(deps=probe_status_deps)
 
     if request.path == "/gaps":
         if request.method != "GET":
@@ -204,9 +227,7 @@ def route_request(  # noqa: C901, PLR0913 - endpoint routing dispatch hub.
         if request.method == "GET":
             if blocked_channels_deps is None:
                 return _error_response(status_code=503, code="service_unavailable")
-            status_code, payload = handle_list_blocked_channels(
-                request.headers, deps=blocked_channels_deps
-            )
+            status_code, payload = handle_list_blocked_channels(request.headers, deps=blocked_channels_deps)
             return _json_response(status_code=status_code, payload=payload)
         if request.method == "POST":
             if blocked_channels_deps is None:
@@ -231,9 +252,7 @@ def route_request(  # noqa: C901, PLR0913 - endpoint routing dispatch hub.
             return _error_response(status_code=405, code="method_not_allowed")
         if refresh_deps is None:
             return _error_response(status_code=503, code="service_unavailable")
-        status_code, message = handle_refresh_channel(
-            refresh_channel_id, request.headers, deps=refresh_deps
-        )
+        status_code, message = handle_refresh_channel(refresh_channel_id, request.headers, deps=refresh_deps)
         body = json.dumps({"status": message}, separators=(",", ":")).encode("utf-8")
         return HttpResponse(status_code=status_code, body=body)
 
@@ -243,11 +262,17 @@ def route_request(  # noqa: C901, PLR0913 - endpoint routing dispatch hub.
             return _error_response(status_code=405, code="method_not_allowed")
         if backfill_deps is None:
             return _error_response(status_code=503, code="service_unavailable")
-        status_code, message = handle_backfill_channel(
-            backfill_channel_id, request.headers, deps=backfill_deps
-        )
+        status_code, message = handle_backfill_channel(backfill_channel_id, request.headers, deps=backfill_deps)
         body = json.dumps({"status": message}, separators=(",", ":")).encode("utf-8")
         return HttpResponse(status_code=status_code, body=body)
+
+    refill_channel_id = _refill_window_from_path(request.path)
+    if refill_channel_id is not None:
+        if request.method != "POST":
+            return _error_response(status_code=405, code="method_not_allowed")
+        if refill_window_deps is None:
+            return _error_response(status_code=503, code="service_unavailable")
+        return _handle_refill_window(refill_channel_id, request, refill_window_deps)
 
     probe_sweep_request = _probe_sweep_from_path(request.path)
     if probe_sweep_request is not None:
@@ -289,6 +314,8 @@ async def serve_http(  # noqa: PLR0913 - HTTP wiring needs explicit deps.
     blocked_channels_deps: BlockedChannelsDeps | None = None,
     backfill_deps: BackfillDeps | None = None,
     probe_deps: ProbeDeps | None = None,
+    probe_status_deps: ProbeStatusDeps | None = None,
+    refill_window_deps: RefillWindowDeps | None = None,
     livez_deps: LivezDeps | None = None,
 ) -> None:
     """Serve HTTP endpoints on the given host/port."""
@@ -303,6 +330,8 @@ async def serve_http(  # noqa: PLR0913 - HTTP wiring needs explicit deps.
         blocked_channels_deps=blocked_channels_deps,
         backfill_deps=backfill_deps,
         probe_deps=probe_deps,
+        probe_status_deps=probe_status_deps,
+        refill_window_deps=refill_window_deps,
         livez_deps=livez_deps,
     )
     await trio.serve_tcp(handler, port=port, host=host)
@@ -319,6 +348,8 @@ async def serve_http_on_listeners(  # noqa: PLR0913, PLR0917 - HTTP wiring needs
     blocked_channels_deps: BlockedChannelsDeps | None = None,
     backfill_deps: BackfillDeps | None = None,
     probe_deps: ProbeDeps | None = None,
+    probe_status_deps: ProbeStatusDeps | None = None,
+    refill_window_deps: RefillWindowDeps | None = None,
     livez_deps: LivezDeps | None = None,
 ) -> None:
     """Serve on already-open listeners (useful for tests and shared-port setups)."""
@@ -333,6 +364,8 @@ async def serve_http_on_listeners(  # noqa: PLR0913, PLR0917 - HTTP wiring needs
         blocked_channels_deps=blocked_channels_deps,
         backfill_deps=backfill_deps,
         probe_deps=probe_deps,
+        probe_status_deps=probe_status_deps,
+        refill_window_deps=refill_window_deps,
         livez_deps=livez_deps,
     )
     await trio.serve_listeners(handler, listeners)
@@ -350,6 +383,8 @@ async def serve_http_from_listen_addr(  # noqa: PLR0913 - HTTP wiring needs expl
     blocked_channels_deps: BlockedChannelsDeps | None = None,
     backfill_deps: BackfillDeps | None = None,
     probe_deps: ProbeDeps | None = None,
+    probe_status_deps: ProbeStatusDeps | None = None,
+    refill_window_deps: RefillWindowDeps | None = None,
     livez_deps: LivezDeps | None = None,
 ) -> None:
     """Serve HTTP endpoints using an RFC-style `listen_addr` string."""
@@ -366,6 +401,8 @@ async def serve_http_from_listen_addr(  # noqa: PLR0913 - HTTP wiring needs expl
         blocked_channels_deps=blocked_channels_deps,
         backfill_deps=backfill_deps,
         probe_deps=probe_deps,
+        probe_status_deps=probe_status_deps,
+        refill_window_deps=refill_window_deps,
         livez_deps=livez_deps,
     )
 
@@ -382,6 +419,8 @@ async def serve_http_connection(  # noqa: PLR0913 - HTTP wiring needs explicit d
     blocked_channels_deps: BlockedChannelsDeps | None = None,
     backfill_deps: BackfillDeps | None = None,
     probe_deps: ProbeDeps | None = None,
+    probe_status_deps: ProbeStatusDeps | None = None,
+    refill_window_deps: RefillWindowDeps | None = None,
     livez_deps: LivezDeps | None = None,
 ) -> None:
     """Serve a single already-accepted connection as HTTP.
@@ -401,6 +440,8 @@ async def serve_http_connection(  # noqa: PLR0913 - HTTP wiring needs explicit d
         blocked_channels_deps=blocked_channels_deps,
         backfill_deps=backfill_deps,
         probe_deps=probe_deps,
+        probe_status_deps=probe_status_deps,
+        refill_window_deps=refill_window_deps,
         livez_deps=livez_deps,
     )
 
@@ -417,6 +458,8 @@ async def _serve_connection(  # noqa: PLR0913 - HTTP wiring needs explicit deps.
     blocked_channels_deps: BlockedChannelsDeps | None = None,
     backfill_deps: BackfillDeps | None = None,
     probe_deps: ProbeDeps | None = None,
+    probe_status_deps: ProbeStatusDeps | None = None,
+    refill_window_deps: RefillWindowDeps | None = None,
     livez_deps: LivezDeps | None = None,
 ) -> None:
     conn = h11.Connection(h11.SERVER)
@@ -435,6 +478,8 @@ async def _serve_connection(  # noqa: PLR0913 - HTTP wiring needs explicit deps.
             blocked_channels_deps=blocked_channels_deps,
             backfill_deps=backfill_deps,
             probe_deps=probe_deps,
+            probe_status_deps=probe_status_deps,
+            refill_window_deps=refill_window_deps,
             livez_deps=livez_deps,
         )
         await _send_response(conn, stream, response)
@@ -450,9 +495,7 @@ async def _serve_connection(  # noqa: PLR0913 - HTTP wiring needs explicit deps.
         # so a spike is visible in Loki without drowning steady-state noise.
         log.info("http: connection dropped by peer: %s", exc)
     finally:
-        with trio.CancelScope(shield=True), contextlib.suppress(
-            trio.BrokenResourceError, trio.ClosedResourceError
-        ):
+        with trio.CancelScope(shield=True), contextlib.suppress(trio.BrokenResourceError, trio.ClosedResourceError):
             await stream.aclose()
 
 
@@ -503,6 +546,10 @@ async def _send_response(conn: h11.Connection, stream: trio.abc.Stream, response
 
 def _dto_response(*, status_code: int, payload: BaseModel) -> HttpResponse:
     return HttpResponse(status_code=status_code, body=payload.model_dump_json().encode("utf-8"))
+
+
+def _dto_list_response(*, status_code: int, payload: list[GapDetectionRow]) -> HttpResponse:
+    return HttpResponse(status_code=status_code, body=_GAP_ROWS_ADAPTER.dump_json(payload))
 
 
 def _json_response(*, status_code: int, payload: dict[str, object]) -> HttpResponse:
@@ -565,6 +612,41 @@ def _handle_blocked_channels_post(request: HttpRequest, deps: BlockedChannelsDep
         deps=deps,
     )
     return _json_response(status_code=status_code, payload=response)
+
+
+def _handle_gap_detection(*, deps: GapsDeps) -> HttpResponse:
+    try:
+        return _dto_list_response(status_code=200, payload=handle_gap_detection(deps=deps))
+    except psycopg.Error:
+        return _error_response(status_code=503, code="service_unavailable")
+
+
+def _handle_probe_status(*, deps: ProbeStatusDeps) -> HttpResponse:
+    try:
+        return _dto_response(status_code=200, payload=handle_probe_status(deps=deps))
+    except psycopg.Error:
+        return _error_response(status_code=503, code="service_unavailable")
+
+
+def _handle_refill_window(channel_id: str, request: HttpRequest, deps: RefillWindowDeps) -> HttpResponse:
+    try:
+        payload = RefillWindowRequest.model_validate_json(request.body)
+    except ValidationError:
+        return _error_response(status_code=400, code="bad_request")
+    try:
+        status_code, message, run_id = handle_refill_window(
+            channel_id,
+            payload.oldest,
+            payload.latest,
+            request.headers,
+            deps=deps,
+        )
+    except psycopg.Error:
+        return _error_response(status_code=503, code="service_unavailable")
+    return _dto_response(
+        status_code=status_code,
+        payload=RefillWindowResponse(status=message, run_id=run_id),
+    )
 
 
 def _handle_snapshot(stream: str, *, at: int, since: int | None, deps: SnapshotDeps) -> HttpResponse:
@@ -700,6 +782,16 @@ def _blocked_channel_from_path(path: str) -> str | None:
 def _backfill_channel_from_path(path: str) -> str | None:
     parts = path.split("/")
     if len(parts) != 3 or parts[1] != "backfill-channel":
+        return None
+    encoded = parts[2]
+    if not encoded:
+        return None
+    return unquote(encoded) or None
+
+
+def _refill_window_from_path(path: str) -> str | None:
+    parts = path.split("/")
+    if len(parts) != 3 or parts[1] != "refill-window":
         return None
     encoded = parts[2]
     if not encoded:

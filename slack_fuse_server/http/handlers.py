@@ -17,10 +17,12 @@ from slack_fuse_server.blocked_channels import (
     unblock_channel,
 )
 from slack_fuse_server.http.dto import (
+    GapDetectionRow,
     HealthResponse,
     MetricsResponse,
     PermalinkRequest,
     PermalinkResponse,
+    ProbeStatusResponse,
     ResolveRequest,
     ResolveResponse,
 )
@@ -134,12 +136,32 @@ class ProbeTrigger(Protocol):
         ...
 
 
+class RefillWindowTrigger(Protocol):
+    """``POST /refill-window/{channel_id}`` queues a bounded refill run."""
+
+    def request_window(self, channel_id: str, oldest: float, latest: float) -> str | None:
+        """Queue a refill-window run.
+
+        Returns the accepted ``run_id``. ``None`` means the consumer is already
+        busy and the endpoint should respond 409.
+        """
+        ...
+
+
 @dataclass(frozen=True, slots=True)
 class ProbeDeps:
     """Dependencies for ``POST /probe-sweep``."""
 
     shared_secret: str | None
     trigger: ProbeTrigger
+
+
+@dataclass(frozen=True, slots=True)
+class ProbeStatusDeps:
+    """Dependencies for ``GET /probe-status``."""
+
+    database_url: str
+    alert_threshold_seconds: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,6 +179,15 @@ class BackfillDeps:
     shared_secret: str | None
     database_url: str
     trigger: BackfillTrigger
+
+
+@dataclass(frozen=True, slots=True)
+class RefillWindowDeps:
+    """Dependencies for ``POST /refill-window/{channel_id}``."""
+
+    shared_secret: str | None
+    database_url: str
+    trigger: RefillWindowTrigger
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,6 +298,22 @@ def handle_workspace_gaps(*, deps: GapsDeps) -> bytes:
         return render_workspace_gaps(conn)
 
 
+def handle_gap_detection(*, deps: GapsDeps) -> list[GapDetectionRow]:
+    """``GET /gap-candidates`` — JSON day-presence refill candidates."""
+    from slack_fuse_server.gap_detection import detect_day_presence_gaps  # noqa: PLC0415
+
+    with psycopg.connect(deps.database_url, autocommit=True) as conn:
+        return detect_day_presence_gaps(conn)
+
+
+def handle_probe_status(*, deps: ProbeStatusDeps) -> ProbeStatusResponse:
+    """``GET /probe-status`` — latest probe-sweep liveness summary."""
+    from slack_fuse_server.gap_detection import fetch_probe_status  # noqa: PLC0415
+
+    with psycopg.connect(deps.database_url, autocommit=True) as conn:
+        return fetch_probe_status(conn, alert_threshold_seconds=deps.alert_threshold_seconds)
+
+
 def handle_refresh_channels(
     headers: Sequence[tuple[bytes, bytes]],
     *,
@@ -363,6 +410,30 @@ def handle_backfill_channel(
     if deps.trigger.request_channel(channel_id):
         return 202, f"backfill queued for {channel_id}"
     return 409, "backfill already in progress"
+
+
+def handle_refill_window(
+    channel_id: str,
+    oldest: float,
+    latest: float,
+    headers: Sequence[tuple[bytes, bytes]],
+    *,
+    deps: RefillWindowDeps,
+) -> tuple[int, str, str | None]:
+    """``POST /refill-window/{channel_id}`` — queue one bounded refill."""
+    if not is_http_authorized(headers, deps.shared_secret):
+        return 401, "unauthorized", None
+    if latest <= oldest or oldest < 0.0 or latest < 0.0:
+        return 400, "bad_request", None
+    from slack_fuse_server.gap_detection import refill_window_in_flight  # noqa: PLC0415
+
+    with psycopg.connect(deps.database_url, autocommit=True) as conn:
+        if refill_window_in_flight(conn, channel_id=channel_id, oldest=oldest, latest=latest):
+            return 409, "refill already in progress", None
+    run_id = deps.trigger.request_window(channel_id, oldest, latest)
+    if run_id is None:
+        return 409, "refill already in progress", None
+    return 202, "refill queued", run_id
 
 
 def handle_probe_sweep(

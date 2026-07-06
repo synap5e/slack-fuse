@@ -29,7 +29,10 @@ from slack_fuse.projector.block_fetch import (
     post_backfill_channel,
     post_block_channel,
 )
+from slack_fuse.projector.gaps_fetch import fetch_gaps_tsv_bytes
 from slack_fuse.projector.probe_fetch import post_probe_sweep
+from slack_fuse.projector.probes_fetch import fetch_probes_bytes
+from slack_fuse.projector.refill_fetch import trigger_refill
 from slack_fuse.projector.refresh_fetch import post_refresh_channel, post_refresh_channels
 from tests.fuse_v2.conftest import seed_channel
 
@@ -57,6 +60,9 @@ def _make_control_ops(  # noqa: PLR0913 — test-injection knobs for each contro
     unblock_fn: Callable[[str], int] | None = None,
     backfill_fn: Callable[[str], tuple[int, str | None]] | None = None,
     probe_fn: Callable[[str | None, str | None], tuple[int, str | None]] | None = None,
+    gaps_read_fn: Callable[[], bytes] | None = None,
+    probes_read_fn: Callable[[], bytes] | None = None,
+    refill_fn: Callable[[str, float, float], str] | None = None,
     rerender_fn: Callable[[str], bool] | None = None,
     state: ControlState | None = None,
 ) -> tuple[SlackFuseOpsV2, ControlState]:
@@ -74,6 +80,9 @@ def _make_control_ops(  # noqa: PLR0913 — test-injection knobs for each contro
         control_unblock_channel=unblock_fn,
         control_backfill_channel=backfill_fn,
         control_probe_sweep=probe_fn,
+        control_gaps_read=gaps_read_fn,
+        control_probes_read=probes_read_fn,
+        control_refill_gap=refill_fn,
         control_rerender_channel=rerender_fn,
     )
     return ops, control_state
@@ -107,6 +116,7 @@ def test_control_state_render_empty_and_recorded() -> None:
         "last_unblock": None,
         "last_backfill": None,
         "last_probe_sweep": None,
+        "last_refill_gap": None,
     }
 
     state.record_workspace("queued")
@@ -116,6 +126,7 @@ def test_control_state_render_empty_and_recorded() -> None:
     state.record_unblock("CBLK", "unblocked")
     state.record_backfill("CBLK", "queued")
     state.record_probe_sweep("queued", job_id="channel_newest_message", target="C123")
+    state.record_refill_gap("CREFILL", "queued", oldest_ts=1783036800.0, latest_ts=1783123199.999999)
     payload = json.loads(state.render())
     assert payload["last_workspace_refresh"] == {"at": "2026-06-27T11:00:00Z", "result": "queued"}
     assert payload["last_channel_refresh"] == {
@@ -140,6 +151,13 @@ def test_control_state_render_empty_and_recorded() -> None:
         "verb": "queued",
         "requested": {"job_id": "channel_newest_message", "target": "C123"},
     }
+    assert payload["last_refill_gap"] == {
+        "at": "2026-06-27T11:00:00Z",
+        "channel_id": "CREFILL",
+        "oldest_ts": 1783036800.0,
+        "latest_ts": 1783123199.999999,
+        "result": "queued",
+    }
 
 
 # ============================================================================
@@ -152,10 +170,13 @@ def test_control_dir_listed_when_enabled(client_conn: Connection[TupleRow], utc_
     assert ("_control", True) in ops.list_dir_for_test("/")
     contents = dict(ops.list_dir_for_test("/_control"))
     assert set(contents) == {
+        "gaps",
+        "probes",
         "refresh_channels",
         "refresh_channel",
         "blocked_channels",
         "backfill_channel",
+        "refill_gap",
         "probe_sweep",
         "probe_sweep_job",
         "probe_sweep_target",
@@ -189,6 +210,7 @@ def test_control_file_modes(client_conn: Connection[TupleRow], utc_tz: ZoneInfo)
         "refresh_channels",
         "refresh_channel",
         "backfill_channel",
+        "refill_gap",
         "probe_sweep",
         "probe_sweep_job",
         "probe_sweep_target",
@@ -204,6 +226,14 @@ def test_control_file_modes(client_conn: Connection[TupleRow], utc_tz: ZoneInfo)
     assert stat.S_IMODE(blocked_attr.st_mode) == 0o644
     assert blocked_attr.st_size > 0
 
+    gaps_attr = ops.control_file_attr_for_test("/_control/gaps", 13)
+    assert gaps_attr is not None
+    assert stat.S_IMODE(gaps_attr.st_mode) == 0o444
+
+    probes_attr = ops.control_file_attr_for_test("/_control/probes", 14)
+    assert probes_attr is not None
+    assert stat.S_IMODE(probes_attr.st_mode) == 0o444
+
 
 # ============================================================================
 # Reads
@@ -216,6 +246,7 @@ def test_control_read_bytes(client_conn: Connection[TupleRow], utc_tz: ZoneInfo)
     assert ops.control_read_for_test("/_control/refresh_channels") == b""
     assert ops.control_read_for_test("/_control/refresh_channel") == b""
     assert ops.control_read_for_test("/_control/backfill_channel") == b""
+    assert ops.control_read_for_test("/_control/refill_gap") == b""
     assert ops.control_read_for_test("/_control/probe_sweep") == b""
     assert ops.control_read_for_test("/_control/probe_sweep_job") == b""
     assert ops.control_read_for_test("/_control/probe_sweep_target") == b""
@@ -233,6 +264,7 @@ def test_control_read_bytes(client_conn: Connection[TupleRow], utc_tz: ZoneInfo)
         "last_unblock": None,
         "last_backfill": None,
         "last_probe_sweep": None,
+        "last_refill_gap": None,
     }
     # not a control file.
     assert ops.control_read_for_test("/channels/general/channel.md") is None
@@ -252,6 +284,7 @@ async def test_cat_status_via_read_callback(client_conn: Connection[TupleRow], u
         "last_unblock": None,
         "last_backfill": None,
         "last_probe_sweep": None,
+        "last_refill_gap": None,
     }
 
 
@@ -269,9 +302,7 @@ async def test_cat_refresh_trigger_returns_empty(client_conn: Connection[TupleRo
 
 
 @pytest.mark.trio
-async def test_write_refresh_channels_fires_workspace(
-    client_conn: Connection[TupleRow], utc_tz: ZoneInfo
-) -> None:
+async def test_write_refresh_channels_fires_workspace(client_conn: Connection[TupleRow], utc_tz: ZoneInfo) -> None:
     calls: list[str] = []
 
     def workspace_fn() -> int:
@@ -292,9 +323,7 @@ async def test_write_refresh_channels_fires_workspace(
 
 
 @pytest.mark.trio
-async def test_write_blocked_channels_by_id_posts_block(
-    client_conn: Connection[TupleRow], utc_tz: ZoneInfo
-) -> None:
+async def test_write_blocked_channels_by_id_posts_block(client_conn: Connection[TupleRow], utc_tz: ZoneInfo) -> None:
     posts: list[tuple[str, str | None]] = []
 
     ops, _ = _make_control_ops(
@@ -316,9 +345,7 @@ async def test_write_blocked_channels_by_id_posts_block(
 
 
 @pytest.mark.trio
-async def test_write_blocked_channels_again_deletes(
-    client_conn: Connection[TupleRow], utc_tz: ZoneInfo
-) -> None:
+async def test_write_blocked_channels_again_deletes(client_conn: Connection[TupleRow], utc_tz: ZoneInfo) -> None:
     deletes: list[str] = []
 
     ops, _ = _make_control_ops(
@@ -349,6 +376,18 @@ def test_blocked_channels_read_returns_fetcher_bytes(client_conn: Connection[Tup
     }
 
 
+def test_control_gaps_and_probes_read_return_fetcher_bytes(client_conn: Connection[TupleRow], utc_tz: ZoneInfo) -> None:
+    gaps_body = b"C123\t2026-07-05\t1783036800.000000\t1783123199.999999\t1783036801.000000\tat\tday_presence\n"
+    ops, _ = _make_control_ops(
+        client_conn,
+        utc_tz,
+        gaps_read_fn=lambda: gaps_body,
+        probes_read_fn=lambda: b'{"last_sweep_completed_at":null}\n',
+    )
+    assert ops.control_read_for_test("/_control/gaps") == gaps_body
+    assert json.loads(ops.control_read_for_test("/_control/probes") or b"{}") == {"last_sweep_completed_at": None}
+
+
 @pytest.mark.trio
 async def test_write_backfill_channel_records_blocked_outcome(
     client_conn: Connection[TupleRow], utc_tz: ZoneInfo
@@ -370,6 +409,117 @@ async def test_write_backfill_channel_records_blocked_outcome(
     status = json.loads(ops.control_read_for_test("/_control/status") or b"{}")
     assert status["last_backfill"]["result"] == "blocked"
     assert status["last_backfill"]["channel"] == "C0BLOCK"
+
+
+@pytest.mark.trio
+async def test_write_refill_gap_resolves_slug_and_posts_window(
+    client_conn: Connection[TupleRow], utc_tz: ZoneInfo
+) -> None:
+    seed_channel(client_conn, "C0REFILL", "proj-cloud")
+    seen: list[tuple[str, float, float]] = []
+
+    ops, _ = _make_control_ops(
+        client_conn,
+        utc_tz,
+        refill_fn=lambda cid, oldest, latest: seen.append((cid, oldest, latest)) or "queued",
+    )
+    inode = ops.inodes.get_or_create("/_control/refill_gap")
+    fi = await ops.open(inode, os.O_WRONLY, pyfuse3.RequestContext())
+    await ops.write(fi.fh, 0, b"proj-cloud 1783036800.000000 1783123199.999999\n")
+    await ops.release(fi.fh)
+
+    assert seen == [("C0REFILL", 1783036800.0, 1783123199.999999)]
+    status = json.loads(ops.control_read_for_test("/_control/status") or b"{}")
+    assert status["last_refill_gap"] == {
+        **status["last_refill_gap"],
+        "channel_id": "C0REFILL",
+        "oldest_ts": 1783036800.0,
+        "latest_ts": 1783123199.999999,
+        "result": "queued",
+    }
+    assert ops.control_write_buffer_count() == 0
+
+
+@pytest.mark.trio
+async def test_write_refill_gap_multiple_lines_last_status_wins(
+    client_conn: Connection[TupleRow], utc_tz: ZoneInfo
+) -> None:
+    seed_channel(client_conn, "C1", "alpha")
+    seed_channel(client_conn, "C2", "beta")
+    seen: list[str] = []
+
+    ops, _ = _make_control_ops(
+        client_conn,
+        utc_tz,
+        refill_fn=lambda cid, _oldest, _latest: seen.append(cid) or ("busy" if cid == "C2" else "queued"),
+    )
+    inode = ops.inodes.get_or_create("/_control/refill_gap")
+    fi = await ops.open(inode, os.O_WRONLY, pyfuse3.RequestContext())
+    await ops.write(
+        fi.fh,
+        0,
+        b"# comment\n\nalpha 1.000000 2.000000\nbeta 3.000000 4.000000\n",
+    )
+    await ops.release(fi.fh)
+
+    assert seen == ["C1", "C2"]
+    status = json.loads(ops.control_read_for_test("/_control/status") or b"{}")
+    assert status["last_refill_gap"]["channel_id"] == "C2"
+    assert status["last_refill_gap"]["result"] == "busy"
+
+
+@pytest.mark.trio
+async def test_write_refill_gap_parse_error_does_not_post(client_conn: Connection[TupleRow], utc_tz: ZoneInfo) -> None:
+    seen: list[str] = []
+    ops, _ = _make_control_ops(
+        client_conn,
+        utc_tz,
+        refill_fn=lambda cid, _oldest, _latest: seen.append(cid) or "queued",
+    )
+    inode = ops.inodes.get_or_create("/_control/refill_gap")
+    fi = await ops.open(inode, os.O_WRONLY, pyfuse3.RequestContext())
+    await ops.write(fi.fh, 0, b"missing_latest 1.000000\n")
+    await ops.release(fi.fh)
+
+    assert seen == []
+    status = json.loads(ops.control_read_for_test("/_control/status") or b"{}")
+    assert status["last_refill_gap"]["result"] == "bad_request"
+    assert status["last_refill_gap"]["channel_id"] == "missing_latest"
+
+
+@pytest.mark.trio
+async def test_write_refill_gap_unknown_slug_does_not_post(client_conn: Connection[TupleRow], utc_tz: ZoneInfo) -> None:
+    seen: list[str] = []
+    ops, _ = _make_control_ops(
+        client_conn,
+        utc_tz,
+        refill_fn=lambda cid, _oldest, _latest: seen.append(cid) or "queued",
+    )
+    inode = ops.inodes.get_or_create("/_control/refill_gap")
+    fi = await ops.open(inode, os.O_WRONLY, pyfuse3.RequestContext())
+    await ops.write(fi.fh, 0, b"does-not-exist 1.000000 2.000000\n")
+    await ops.release(fi.fh)
+
+    assert seen == []
+    status = json.loads(ops.control_read_for_test("/_control/status") or b"{}")
+    assert status["last_refill_gap"]["result"] == "unknown_channel"
+    assert status["last_refill_gap"]["channel_id"] == "does-not-exist"
+
+
+@pytest.mark.trio
+async def test_write_refill_gap_missing_fetcher_records_unavailable(
+    client_conn: Connection[TupleRow], utc_tz: ZoneInfo
+) -> None:
+    seed_channel(client_conn, "C0REFILL", "proj-cloud")
+    ops, _ = _make_control_ops(client_conn, utc_tz)
+    inode = ops.inodes.get_or_create("/_control/refill_gap")
+    fi = await ops.open(inode, os.O_WRONLY, pyfuse3.RequestContext())
+    await ops.write(fi.fh, 0, b"proj-cloud 1.000000 2.000000\n")
+    await ops.release(fi.fh)
+
+    status = json.loads(ops.control_read_for_test("/_control/status") or b"{}")
+    assert status["last_refill_gap"]["result"] == "server_unavailable"
+    assert status["last_refill_gap"]["channel_id"] == "C0REFILL"
 
 
 @pytest.mark.trio
@@ -419,9 +569,7 @@ async def test_write_probe_sweep_job_fires_job(client_conn: Connection[TupleRow]
 
 
 @pytest.mark.trio
-async def test_write_probe_sweep_target_fires_job_target(
-    client_conn: Connection[TupleRow], utc_tz: ZoneInfo
-) -> None:
+async def test_write_probe_sweep_target_fires_job_target(client_conn: Connection[TupleRow], utc_tz: ZoneInfo) -> None:
     seen: list[tuple[str | None, str | None]] = []
 
     ops, _ = _make_control_ops(
@@ -548,9 +696,7 @@ async def test_write_refresh_channel_by_slug(client_conn: Connection[TupleRow], 
 
 
 @pytest.mark.trio
-async def test_write_refresh_channel_unknown_slug(
-    client_conn: Connection[TupleRow], utc_tz: ZoneInfo
-) -> None:
+async def test_write_refresh_channel_unknown_slug(client_conn: Connection[TupleRow], utc_tz: ZoneInfo) -> None:
     seen: list[str] = []
 
     def channel_fn(channel_id: str) -> int:
@@ -571,9 +717,7 @@ async def test_write_refresh_channel_unknown_slug(
 
 
 @pytest.mark.trio
-async def test_write_buffers_isolated_between_handles(
-    client_conn: Connection[TupleRow], utc_tz: ZoneInfo
-) -> None:
+async def test_write_buffers_isolated_between_handles(client_conn: Connection[TupleRow], utc_tz: ZoneInfo) -> None:
     seen: list[str] = []
 
     def channel_fn(channel_id: str) -> int:
@@ -604,9 +748,7 @@ async def test_write_buffers_isolated_between_handles(
 
 
 @pytest.mark.trio
-async def test_write_rerender_channel_enqueues_resolved_id(
-    client_conn: Connection[TupleRow], utc_tz: ZoneInfo
-) -> None:
+async def test_write_rerender_channel_enqueues_resolved_id(client_conn: Connection[TupleRow], utc_tz: ZoneInfo) -> None:
     """A slug write resolves to the channel id and is handed to the consumer;
     the status records ``queued`` (the consumer overwrites it when it finishes)."""
     seed_channel(client_conn, "C0ALLT6Q3SQ", "proj-cloud")
@@ -633,9 +775,7 @@ async def test_write_rerender_channel_by_id(client_conn: Connection[TupleRow], u
     seed_channel(client_conn, "C0ALLT6Q3SQ", "proj-cloud")
     enqueued: list[str] = []
 
-    ops, _ = _make_control_ops(
-        client_conn, utc_tz, rerender_fn=lambda cid: bool(enqueued.append(cid)) or True
-    )
+    ops, _ = _make_control_ops(client_conn, utc_tz, rerender_fn=lambda cid: bool(enqueued.append(cid)) or True)
     inode = ops.inodes.get_or_create("/_control/rerender_channel")
     fi = await ops.open(inode, os.O_WRONLY, pyfuse3.RequestContext())
     await ops.write(fi.fh, 0, b"C0ALLT6Q3SQ\n")
@@ -667,9 +807,7 @@ async def test_write_rerender_channel_unknown_slug_does_not_enqueue(
 
 
 @pytest.mark.trio
-async def test_write_rerender_channel_full_queue_is_busy(
-    client_conn: Connection[TupleRow], utc_tz: ZoneInfo
-) -> None:
+async def test_write_rerender_channel_full_queue_is_busy(client_conn: Connection[TupleRow], utc_tz: ZoneInfo) -> None:
     seed_channel(client_conn, "C0ALLT6Q3SQ", "proj-cloud")
 
     # The consumer's queue is full → enqueue rejects → status is ``busy``.
@@ -699,9 +837,7 @@ async def test_rerender_open_write_allocates_handle(client_conn: Connection[Tupl
 
 
 @pytest.mark.trio
-async def test_write_open_on_normal_file_is_erofs(
-    client_conn: Connection[TupleRow], utc_tz: ZoneInfo
-) -> None:
+async def test_write_open_on_normal_file_is_erofs(client_conn: Connection[TupleRow], utc_tz: ZoneInfo) -> None:
     ops, _ = _make_control_ops(client_conn, utc_tz)
     inode = ops.inodes.get_or_create("/channels/general/channel.md")
     with pytest.raises(pyfuse3.FUSEError) as excinfo:
@@ -719,9 +855,7 @@ async def test_write_open_on_status_is_erofs(client_conn: Connection[TupleRow], 
 
 
 @pytest.mark.trio
-async def test_setattr_truncate_accepted_on_trigger(
-    client_conn: Connection[TupleRow], utc_tz: ZoneInfo
-) -> None:
+async def test_setattr_truncate_accepted_on_trigger(client_conn: Connection[TupleRow], utc_tz: ZoneInfo) -> None:
     ops, _ = _make_control_ops(client_conn, utc_tz)
     inode = ops.inodes.get_or_create("/_control/refresh_channels")
     attr = pyfuse3.EntryAttributes()
@@ -731,9 +865,7 @@ async def test_setattr_truncate_accepted_on_trigger(
 
 
 @pytest.mark.trio
-async def test_setattr_on_normal_file_is_erofs(
-    client_conn: Connection[TupleRow], utc_tz: ZoneInfo
-) -> None:
+async def test_setattr_on_normal_file_is_erofs(client_conn: Connection[TupleRow], utc_tz: ZoneInfo) -> None:
     ops, _ = _make_control_ops(client_conn, utc_tz)
     inode = ops.inodes.get_or_create("/channels/general/channel.md")
     attr = pyfuse3.EntryAttributes()
@@ -867,3 +999,63 @@ def test_block_http_helpers_paths_and_payloads() -> None:
     assert captured[2].url.path == "/blocked-channels/C123"
     assert captured[3].url.path == "/backfill-channel/C123"
     assert all(req.headers["authorization"] == "Bearer sek" for req in captured)
+
+
+def test_gap_probe_and_refill_http_helpers() -> None:
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        if request.url.path == "/gap-candidates":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "channel_id": "C123",
+                        "day": "2026-07-05",
+                        "oldest_ts": 1783036800.0,
+                        "latest_ts": 1783123199.999999,
+                        "slack_sample_ts": "1783036801.000000",
+                        "sampled_at": "2026-07-06T01:02:03Z",
+                        "gap_type": "day_presence",
+                    }
+                ],
+            )
+        if request.url.path == "/probe-status":
+            return httpx.Response(
+                200,
+                json={
+                    "last_sweep_completed_at": "2026-07-06T01:02:03Z",
+                    "age_seconds": 42,
+                    "channels_covered_last_sweep": 2,
+                    "days_covered_last_sweep": 1,
+                    "alert_threshold_seconds": 7200,
+                },
+            )
+        if request.url.path == "/refill-window/C123":
+            return httpx.Response(202, json={"status": "refill queued", "run_id": "01RUN"})
+        raise AssertionError(request.url.path)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    assert fetch_gaps_tsv_bytes(client, "http://srv") == (
+        b"C123\t2026-07-05\t1783036800.000000\t1783123199.999999\t"
+        b"1783036801.000000\t2026-07-06T01:02:03+00:00\tday_presence\n"
+    )
+    assert json.loads(fetch_probes_bytes(client, "http://srv", shared_secret="sek")) == {
+        "last_sweep_completed_at": "2026-07-06T01:02:03Z",
+        "age_seconds": 42,
+        "channels_covered_last_sweep": 2,
+        "days_covered_last_sweep": 1,
+        "alert_threshold_seconds": 7200,
+    }
+    assert trigger_refill(client, "http://srv", "C123", 1.0, 2.0, shared_secret="sek").model_dump() == {
+        "result": "queued",
+        "status_code": 202,
+        "run_id": "01RUN",
+    }
+
+    assert [request.url.path for request in captured] == ["/gap-candidates", "/probe-status", "/refill-window/C123"]
+    assert captured[1].headers["authorization"] == "Bearer sek"
+    assert captured[2].headers["authorization"] == "Bearer sek"
+    assert json.loads(captured[2].content) == {"oldest": 1.0, "latest": 2.0}

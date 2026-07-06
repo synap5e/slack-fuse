@@ -212,8 +212,7 @@ async def test_gaps_endpoint_forwards_deps_through_dispatch(
     # the route handler ran with deps, NOT that it returned 503 because
     # the dispatch dropped the kwarg.
     assert response.status_code == 200, (
-        f"got {response.status_code}; dispatch wiring likely dropped gaps_deps. "
-        f"body={response.text[:200]}"
+        f"got {response.status_code}; dispatch wiring likely dropped gaps_deps. body={response.text[:200]}"
     )
     assert response.headers["content-type"].startswith("text/markdown")
 

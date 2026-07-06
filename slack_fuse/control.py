@@ -77,6 +77,29 @@ class ProbeSweepOutcome:
         return {"at": self.at, "verb": self.verb, "requested": requested}
 
 
+@dataclass(frozen=True, slots=True)
+class RefillGapOutcome:
+    """One recorded ``_control/refill_gap`` result."""
+
+    at: str
+    channel_id: str
+    result: str
+    oldest_ts: float | None = None
+    latest_ts: float | None = None
+
+    def to_json(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "at": self.at,
+            "channel_id": self.channel_id,
+            "result": self.result,
+        }
+        if self.oldest_ts is not None:
+            payload["oldest_ts"] = self.oldest_ts
+        if self.latest_ts is not None:
+            payload["latest_ts"] = self.latest_ts
+        return payload
+
+
 class ControlState:
     """Thread-safe holder for the last workspace / per-channel refresh outcome."""
 
@@ -90,6 +113,7 @@ class ControlState:
         self._unblock: RefreshOutcome | None = None
         self._backfill: RefreshOutcome | None = None
         self._probe_sweep: ProbeSweepOutcome | None = None
+        self._refill_gap: RefillGapOutcome | None = None
 
     def _stamp(self) -> str:
         return self._now_fn().astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -127,6 +151,23 @@ class ControlState:
                 target=target,
             )
 
+    def record_refill_gap(
+        self,
+        channel_id: str,
+        result: str,
+        *,
+        oldest_ts: float | None = None,
+        latest_ts: float | None = None,
+    ) -> None:
+        with self._lock:
+            self._refill_gap = RefillGapOutcome(
+                at=self._stamp(),
+                channel_id=channel_id,
+                oldest_ts=oldest_ts,
+                latest_ts=latest_ts,
+                result=result,
+            )
+
     def render(self) -> bytes:
         """Serialize the current state to the ``status`` file body."""
         with self._lock:
@@ -137,6 +178,7 @@ class ControlState:
             unblock = self._unblock
             backfill = self._backfill
             probe_sweep = self._probe_sweep
+            refill_gap = self._refill_gap
         payload: dict[str, object] = {
             "last_workspace_refresh": workspace.to_json() if workspace is not None else None,
             "last_channel_refresh": channel.to_json() if channel is not None else None,
@@ -145,8 +187,9 @@ class ControlState:
             "last_unblock": unblock.to_json() if unblock is not None else None,
             "last_backfill": backfill.to_json() if backfill is not None else None,
             "last_probe_sweep": probe_sweep.to_json() if probe_sweep is not None else None,
+            "last_refill_gap": refill_gap.to_json() if refill_gap is not None else None,
         }
         return (json.dumps(payload, indent=2) + "\n").encode()
 
 
-__all__ = ["ControlState", "ProbeSweepOutcome", "RefreshOutcome", "result_for_status"]
+__all__ = ["ControlState", "ProbeSweepOutcome", "RefillGapOutcome", "RefreshOutcome", "result_for_status"]

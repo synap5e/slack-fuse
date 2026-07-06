@@ -91,6 +91,9 @@ CONTROL_REFRESH_CHANNELS: Final = "refresh_channels"
 CONTROL_REFRESH_CHANNEL: Final = "refresh_channel"
 CONTROL_BLOCKED_CHANNELS: Final = "blocked_channels"
 CONTROL_BACKFILL_CHANNEL: Final = "backfill_channel"
+CONTROL_GAPS: Final = "gaps"
+CONTROL_PROBES: Final = "probes"
+CONTROL_REFILL_GAP: Final = "refill_gap"
 CONTROL_PROBE_SWEEP: Final = "probe_sweep"
 CONTROL_PROBE_SWEEP_JOB: Final = "probe_sweep_job"
 CONTROL_PROBE_SWEEP_TARGET: Final = "probe_sweep_target"
@@ -101,18 +104,17 @@ CONTROL_RERENDER_CHANNEL: Final = "rerender_channel"
 CONTROL_STATUS: Final = "status"
 #: The write-to-trigger control files (everything else under ``_control`` is
 #: read-only).
-CONTROL_WRITABLE: Final[frozenset[str]] = frozenset(
-    {
-        CONTROL_REFRESH_CHANNELS,
-        CONTROL_REFRESH_CHANNEL,
-        CONTROL_BLOCKED_CHANNELS,
-        CONTROL_BACKFILL_CHANNEL,
-        CONTROL_PROBE_SWEEP,
-        CONTROL_PROBE_SWEEP_JOB,
-        CONTROL_PROBE_SWEEP_TARGET,
-        CONTROL_RERENDER_CHANNEL,
-    }
-)
+CONTROL_WRITABLE: Final[frozenset[str]] = frozenset({
+    CONTROL_REFRESH_CHANNELS,
+    CONTROL_REFRESH_CHANNEL,
+    CONTROL_BLOCKED_CHANNELS,
+    CONTROL_BACKFILL_CHANNEL,
+    CONTROL_REFILL_GAP,
+    CONTROL_PROBE_SWEEP,
+    CONTROL_PROBE_SWEEP_JOB,
+    CONTROL_PROBE_SWEEP_TARGET,
+    CONTROL_RERENDER_CHANNEL,
+})
 
 # The `channel-list` stream is the staleness stream for channel-metadata
 # (``channel.md``) reads — channel inventory/rename/archive flow over it.
@@ -128,9 +130,7 @@ CHANNEL_LIST_STREAM: Final = "channel-list"
 #: ``None`` means "pool mode is off" — the legacy conn-only-with-limiter
 #: shape used by tests and the original v1 startup. In that case, callers
 #: fall back to their own dedicated connection.
-borrowed_fuse_conn: ContextVar[Connection[TupleRow] | None] = ContextVar(
-    "borrowed_fuse_conn", default=None
-)
+borrowed_fuse_conn: ContextVar[Connection[TupleRow] | None] = ContextVar("borrowed_fuse_conn", default=None)
 
 
 # ============================================================================
