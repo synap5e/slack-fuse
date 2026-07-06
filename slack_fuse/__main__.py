@@ -730,23 +730,6 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
             with contextlib.suppress(Exception):
                 rerender_sink_conn.close()
 
-    async def _run_control_reads_prewarm() -> None:
-        """Keep the _control/gaps + _control/probes fetch caches warm.
-
-        The day-presence SQL behind /gap-candidates takes ~2s at prod scale,
-        which busts the FUSE 1s per-callback budget on any cold-cache read.
-        This task refreshes the TTL cache below its 30s expiry so operator
-        reads on _control/gaps and _control/probes are always served from
-        cache (single fetch every 25s regardless of read frequency).
-        """
-        while True:
-            try:
-                await trio.to_thread.run_sync(_control_gaps_read)
-                await trio.to_thread.run_sync(_control_probes_read)
-            except Exception:
-                log.warning("control-reads prewarm cycle failed", exc_info=True)
-            await trio.sleep(25.0)
-
     async def _run_block_sync() -> None:
         from slack_fuse.projector.block_sync import sync_blocked_channels_periodically
 
@@ -769,7 +752,6 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
                 nursery.start_soon(_run_projector)
                 nursery.start_soon(pg_health.run)
                 nursery.start_soon(_run_gaps_warmer)
-                nursery.start_soon(_run_control_reads_prewarm)
                 nursery.start_soon(_run_rerender_consumer)
                 nursery.start_soon(_run_block_sync)
                 await pyfuse3.main()

@@ -120,6 +120,15 @@ if TYPE_CHECKING:
 #: separate dispatcher.
 DEFAULT_CALLBACK_TIMEOUT_S: Final = 1.0
 
+#: Looser per-callback budget for ``_control/*`` paths. Operator triggers +
+#: liveness reads have expensive backing queries (e.g. ``/gap-candidates``
+#: runs a ~2s SQL at prod scale) — the normal 1s budget was tuned for the
+#: hot browsing path, not the control surface. A cold ``cat _control/gaps``
+#: cannot service the fetch under 1s, and clamping it EIOs the operator
+#: for no operational reason. 15s comfortably fits the slowest known query
+#: while still guarding against wedges.
+CONTROL_CALLBACK_TIMEOUT_S: Final = 15.0
+
 #: Generic for ``_run_sync``: the worker's return type flows through to the
 #: caller so each callback gets the right narrowed type.
 _TSync = TypeVar("_TSync")
@@ -785,14 +794,19 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         callback either succeed or surface EIO within
         ``callback_timeout_s``, no matter which stage stalls).
         """
+        budget = (
+            CONTROL_CALLBACK_TIMEOUT_S
+            if path is not None and path.startswith(f"/{CONTROL_DIR}/")
+            else self._callback_timeout_s
+        )
         with fuse_op(op, inode=inode, path=path):
             try:
-                with trio.fail_after(self._callback_timeout_s):
+                with trio.fail_after(budget):
                     yield
             except pyfuse3.FUSEError:
                 raise
             except trio.TooSlowError:
-                log.warning("callback exceeded %.1fs budget; returning EIO", self._callback_timeout_s)
+                log.warning("callback exceeded %.1fs budget; returning EIO", budget)
                 raise pyfuse3.FUSEError(errno.EIO) from None
             except psycopg.OperationalError as exc:
                 # Pre-``_run_sync`` PG access (e.g. inode lookup on cache miss)
