@@ -794,9 +794,14 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         callback either succeed or surface EIO within
         ``callback_timeout_s``, no matter which stage stalls).
         """
+        resolved_path = path
+        if resolved_path is None and inode is not None:
+            # Callers usually pass just inode; look up the path to keep the
+            # per-path budget check working. Cheap in-memory dict lookup.
+            resolved_path = self._inodes.get_path(inode)
         budget = (
             CONTROL_CALLBACK_TIMEOUT_S
-            if path is not None and path.startswith(f"/{CONTROL_DIR}/")
+            if resolved_path is not None and resolved_path.startswith(f"/{CONTROL_DIR}/")
             else self._callback_timeout_s
         )
         with fuse_op(op, inode=inode, path=path):
