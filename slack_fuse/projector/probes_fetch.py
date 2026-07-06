@@ -8,8 +8,14 @@ from datetime import datetime
 import httpx
 from pydantic import BaseModel, ConfigDict
 
+from slack_fuse.projector._control_cache import TTLCache
 from slack_fuse.projector.gaps_fetch import DEFAULT_CONTROL_TIMEOUT_S
 from slack_fuse.projector.refresh_fetch import TRANSPORT_ERROR_CODE
+
+# Same TTL as gap-candidates for the same reason: FUSE cascades. The endpoint
+# itself is fast, but the getattr amplification still burns a request per stat.
+_PROBE_STATUS_TTL_S = 30.0
+_probe_status_cache: TTLCache[bytes] = TTLCache(ttl_s=_PROBE_STATUS_TTL_S)
 
 
 class ProbeStatus(BaseModel):
@@ -56,6 +62,9 @@ def fetch_probes_bytes(
     shared_secret: str | None = None,
     timeout_s: float = DEFAULT_CONTROL_TIMEOUT_S,
 ) -> bytes:
+    cached = _probe_status_cache.get()
+    if cached is not None:
+        return cached
     status, payload = fetch_probes(
         http_client,
         base_http_url,
@@ -63,7 +72,9 @@ def fetch_probes_bytes(
         timeout_s=timeout_s,
     )
     if status == 200 and payload is not None:
-        return (payload.model_dump_json(indent=2) + "\n").encode()
+        body = (payload.model_dump_json(indent=2) + "\n").encode()
+        _probe_status_cache.set(body)
+        return body
     return (json.dumps({"error": "server_unavailable" if status == 0 else f"http_{status}"}) + "\n").encode()
 
 

@@ -18,10 +18,20 @@ from datetime import UTC, date, datetime
 import httpx
 from pydantic import BaseModel, ConfigDict, TypeAdapter
 
+from slack_fuse.projector._control_cache import TTLCache
 from slack_fuse.projector.refresh_fetch import TRANSPORT_ERROR_CODE
 
 DEFAULT_FETCH_TIMEOUT_S = 5.0
-DEFAULT_CONTROL_TIMEOUT_S = 0.9
+# Sized for the day-presence query's baseline at prod scale (~2s, occasionally
+# longer under DB contention). Anything under this timed out even under normal
+# conditions — the 0.9s value was tuned for the fast blocked-channels endpoint.
+DEFAULT_CONTROL_TIMEOUT_S = 5.0
+
+# Short client-side TTL so the FUSE getattr/lookup/read cascade shares one
+# response instead of firing 5+ concurrent slow queries per `cat`. Operator
+# observability is not real-time; a ~30s freshness window is fine.
+_GAP_CANDIDATES_TTL_S = 30.0
+_gap_candidates_cache: TTLCache[bytes] = TTLCache(ttl_s=_GAP_CANDIDATES_TTL_S)
 
 
 class GapRow(BaseModel):
@@ -92,6 +102,9 @@ def fetch_gaps_tsv_bytes(
     *,
     timeout_s: float = DEFAULT_CONTROL_TIMEOUT_S,
 ) -> bytes:
+    cached = _gap_candidates_cache.get()
+    if cached is not None:
+        return cached
     status, rows = fetch_gap_candidates(http_client, base_http_url, timeout_s=timeout_s)
     if status != 200:
         error = "server_unavailable" if status == TRANSPORT_ERROR_CODE else f"http_{status}"
@@ -108,7 +121,9 @@ def fetch_gaps_tsv_bytes(
         ))
         for row in rows
     ]
-    return ("\n".join(lines) + ("\n" if lines else "")).encode()
+    body = ("\n".join(lines) + ("\n" if lines else "")).encode()
+    _gap_candidates_cache.set(body)
+    return body
 
 
 def _format_sampled_at(value: datetime) -> str:
