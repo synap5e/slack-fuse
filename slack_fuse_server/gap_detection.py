@@ -34,16 +34,21 @@ def detect_day_presence_gaps(conn: Connection[TupleRow]) -> list[GapDetectionRow
 
 
 def fetch_probe_status(conn: Connection[TupleRow], *, alert_threshold_seconds: int) -> ProbeStatusResponse:
-    """Summarize the latest completed probe sweep and its day-presence coverage."""
+    """Summarize the latest completed probe sweep and its day-presence coverage.
+
+    Join semantics: the two event kinds carry different ``source.run_id``
+    (``probe_sweep_completed`` is per-sweep, ``conversations_history_sampled``
+    is task-lifetime), so an equality check on run_id never matches. We use
+    the sweep's payload ``started_at``/``ended_at`` window instead — that's
+    the design-intent identity of "samples belonging to this sweep".
+    """
     with conn.cursor() as cur:
         cur.execute(
             """
             WITH latest AS (
               SELECT
-                  id,
                   created_at,
-                  source->>'run_id' AS run_id,
-                  NULLIF(payload->>'started_at', '')::timestamptz AS started_at,
+                  COALESCE(NULLIF(payload->>'started_at', '')::timestamptz, created_at) AS started_at,
                   COALESCE(NULLIF(payload->>'ended_at', '')::timestamptz, created_at) AS ended_at
               FROM events
               WHERE stream = 'slurper-health'
@@ -59,14 +64,8 @@ def fetch_probe_status(conn: Connection[TupleRow], *, alert_threshold_seconds: i
                 AND e.kind = 'conversations_history_sampled'
                 AND e.payload->'call_params' ? 'oldest'
                 AND e.payload->'call_params' ? 'latest'
-                AND (
-                  (l.run_id IS NOT NULL AND e.source->>'run_id' = l.run_id)
-                  OR (
-                    l.run_id IS NULL
-                    AND e.created_at >= COALESCE(l.started_at, l.created_at)
-                    AND e.created_at <= l.ended_at
-                  )
-                )
+                AND e.created_at >= l.started_at
+                AND e.created_at <= l.ended_at
             )
             SELECT
                 l.created_at,

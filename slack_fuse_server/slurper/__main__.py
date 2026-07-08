@@ -120,7 +120,6 @@ if TYPE_CHECKING:
     from slack_fuse.models import ConversationsHistoryResponse, ConversationsRepliesResponse
 
 _MIGRATIONS_DIR = Path(server_migrations.__file__).parent
-_LEGACY_AUTO_BACKFILL_ENV = "SLACK_FUSE_SERVER_BACKFILL"
 _BACKFILL_SOURCES = ("slack-api", "legacy-cache")
 type BackfillSource = Literal["slack-api", "legacy-cache"]
 
@@ -474,7 +473,6 @@ async def _serve(config: ServerConfig, boot: BootContext) -> None:
     status = SocketModeStatus()
     wire_server = WireServer(config.database_url, shared_secret=config.shared_secret or None)
     metrics = _build_metrics_aggregator(config, status, wire_server, datetime.now(UTC))
-    _warn_legacy_auto_backfill_env()
 
     try:
         async with trio.open_nursery() as nursery:
@@ -607,15 +605,6 @@ async def _serve(config: ServerConfig, boot: BootContext) -> None:
         client.close()
         writer.close()
         snapshot_conn.close()
-
-
-def _warn_legacy_auto_backfill_env() -> None:
-    if _LEGACY_AUTO_BACKFILL_ENV not in os.environ:
-        return
-    log.warning(
-        "%s is deprecated and ignored; startup catchup is gated only by catchup_enabled",
-        _LEGACY_AUTO_BACKFILL_ENV,
-    )
 
 
 async def _run_socket_mode_with_users_task(  # noqa: PLR0913, PLR0917 - socket task needs its full dep set

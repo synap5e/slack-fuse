@@ -157,13 +157,17 @@ def test_get_probes_summarizes_latest_sweep(server_conn: psycopg.Connection[Tupl
             "response": {"messages": []},
         },
     )
+    # Span a wide window that brackets the samples' actual insert time. Prod
+    # source events arrive during the sweep, so payload.started_at <
+    # sample.created_at < payload.ended_at is the natural case; the test
+    # inserts all rows synchronously so we just widen the window.
     _insert_event(
         server_conn,
         stream="slurper-health",
         offset=3,
         kind="probe_sweep_completed",
         source=source,
-        payload={"started_at": "2026-07-06T01:00:00Z", "ended_at": "2026-07-06T01:00:01Z"},
+        payload={"started_at": "1970-01-01T00:00:00Z", "ended_at": "2100-01-01T00:00:00Z"},
     )
 
     response = route_request(
