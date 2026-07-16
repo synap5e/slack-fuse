@@ -636,19 +636,30 @@ def fetch_thread_chunks(
     The ``content_md`` list contains the parent first then replies ordered by
     ``reply_ts``. ``reply_count`` is read off the parent ``chunks`` row so the
     frontmatter agrees with how the day file rendered the parent.
+
+    Parent rendering: the ``thread_chunks`` schema allows ``role='parent'``
+    rows, but the current projector only writes replies. Read the parent
+    from the ``chunks`` day-table (``message_ts = thread_ts``) and prepend
+    it so ``thread.md`` isn't headless.
     """
     with conn.cursor() as cur:
         _ = cur.execute(
-            "SELECT content_md FROM thread_chunks WHERE channel_id = %s AND thread_ts = %s ORDER BY reply_ts",
+            "SELECT content_md, reply_count FROM chunks WHERE channel_id = %s AND message_ts = %s",
             (channel_id, thread_ts),
         )
-        contents = [str(r[0]) for r in cur.fetchall()]
+        parent_row = cur.fetchone()
         _ = cur.execute(
-            "SELECT reply_count FROM chunks WHERE channel_id = %s AND message_ts = %s",
+            "SELECT content_md FROM thread_chunks "
+            "WHERE channel_id = %s AND thread_ts = %s AND reply_ts <> thread_ts "
+            "ORDER BY reply_ts",
             (channel_id, thread_ts),
         )
-        row = cur.fetchone()
-    reply_count = int(row[0]) if row is not None else 0
+        replies = [str(r[0]) for r in cur.fetchall()]
+    contents: list[str] = []
+    if parent_row is not None:
+        contents.append(str(parent_row[0]))
+    contents.extend(replies)
+    reply_count = int(parent_row[1]) if parent_row is not None else 0
     return contents, reply_count
 
 

@@ -173,9 +173,64 @@ def test_smoke_thread_md_bytes(populated_ops: SlackFuseOpsV2) -> None:
     text = content.decode()
     assert "thread_ts:" in text
     assert "reply_count: 1" in text
+    # Parent (spawn message) MUST render — chunks has it even when the projector
+    # didn't write a role='parent' row to thread_chunks. Regression pin.
+    assert "double check the deploy" in text
+    assert text.index("double check the deploy") < text.index("On it now")
     assert "On it now" in text
     assert "@alice" in text
     assert "@bob" in text
+
+
+def test_thread_md_renders_parent_when_thread_chunks_has_only_replies(
+    client_conn: Connection[TupleRow],
+    fake_pyfuse3: FakePyfuse3,
+) -> None:
+    """Regression: projector currently never writes ``role='parent'`` rows to
+    ``thread_chunks`` (schema allows it, code skips it). ``thread.md`` was
+    rendering headless replies-only. Renderer now reads the parent from
+    ``chunks`` where ``message_ts == thread_ts`` and prepends it.
+    """
+    seed_channel(client_conn, "C-GEN", "general", tier="hot")
+    seed_user(client_conn, "UALICE", "alice")
+    seed_user(client_conn, "UBOB", "bob")
+    parent_ts = _ts(datetime(2026, 6, 8, 9, 5, tzinfo=UTC))
+    seed_chunk(
+        client_conn,
+        "C-GEN",
+        parent_ts,
+        "## 09:05 <@UBOB>\n\nSpawn message body\n",
+        reply_count=1,
+        mentioned_user_ids=["UBOB"],
+    )
+    # No role='parent' row — mirrors what prod projector actually writes.
+    seed_thread_chunk(
+        client_conn,
+        "C-GEN",
+        parent_ts,
+        _ts(datetime(2026, 6, 8, 9, 8, tzinfo=UTC)),
+        "reply",
+        "## 09:08 <@UALICE>\n\nOn it now\n",
+    )
+    set_connection_state(client_conn, last_slurper_health="healthy", last_frame_at_offset_s=1.0)
+    mark_stream_caught_up(client_conn, "channel:C-GEN", at_offset=100)
+    mark_stream_caught_up(client_conn, "channel-list", at_offset=100)
+    ops = SlackFuseOpsV2(
+        conn=client_conn,
+        local_tz=ZoneInfo("UTC"),
+        limiter=trio.CapacityLimiter(1),
+        notify_store=fake_pyfuse3.notify_store,
+        invalidate_inode=fake_pyfuse3.invalidate_inode,
+    )
+    entries = ops.list_dir_for_test("/channels/general/2026-06/08")
+    thread_dir = next(name for name, is_dir in entries if is_dir)
+    resolved = ops.resolve_content_for_test(f"/channels/general/2026-06/08/{thread_dir}/thread.md")
+    assert resolved is not None
+    text = resolved[0].decode()
+    assert "Spawn message body" in text
+    assert "On it now" in text
+    assert text.index("Spawn message body") < text.index("On it now")
+    assert "reply_count: 1" in text
 
 
 def test_smoke_channel_meta_md(populated_ops: SlackFuseOpsV2) -> None:
