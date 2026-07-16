@@ -144,25 +144,60 @@ def _migrate_legacy_always_blocked(
     shared_secret: str | None,
     log: logging.Logger,
 ) -> None:
-    """Idempotently copy legacy client config blocks into the server SSOT."""
+    """Deprecated. Log the state of the config-driven block list; do NOT re-push.
+
+    Previous behaviour re-POSTed every config entry to the server on every
+    startup. That silently reversed any operator DELETE via
+    ``_control/blocked_channels`` — an ID unblocked at runtime got re-blocked
+    the next time the mount started.
+
+    New behaviour is inert with respect to server state: read the current
+    server-side block list (SSOT), classify each config entry as either
+    already-blocked (safe to drop from config) or orphan (server thinks it's
+    unblocked — either the operator unblocked it deliberately, or it was
+    never migrated), and log an actionable warning for each. The server-side
+    ``_control/blocked_channels`` write side is the only path that mutates
+    blocks now.
+    """
     if not channel_ids:
         return
-    from slack_fuse.projector.block_fetch import post_block_channel
+    from slack_fuse.projector.block_fetch import get_blocked_channels
 
-    log.warning(
-        "ClientConfig.always_blocked_channel_ids is deprecated; migrating %d id(s) to server blocked_channels",
-        len(channel_ids),
-    )
-    for channel_id in sorted(channel_ids):
-        status = post_block_channel(
-            http_client,
-            base_http_url,
-            channel_id,
-            reason="migrated from always_blocked_channel_ids config",
-            shared_secret=shared_secret,
+    status, body = get_blocked_channels(http_client, base_http_url, shared_secret=shared_secret)
+    if status != 200:
+        log.warning(
+            "always_blocked_channel_ids: cannot classify config entries (server /blocked-channels returned %s); "
+            "leaving them alone. Fix and re-check on next start.",
+            status,
         )
-        if status != 200:
-            log.warning("legacy block migration for %s returned HTTP %s", channel_id, status)
+        return
+    raw = body.get("blocked_channels")
+    server_blocked_ids: set[str] = set()
+    if isinstance(raw, list):
+        for entry in cast("list[object]", raw):
+            if not isinstance(entry, dict):
+                continue
+            cid = cast("dict[str, object]", entry).get("channel_id")
+            if isinstance(cid, str):
+                server_blocked_ids.add(cid)
+    already_server_blocked = sorted(channel_ids & server_blocked_ids)
+    orphan_config_only = sorted(channel_ids - server_blocked_ids)
+    if already_server_blocked:
+        log.warning(
+            "always_blocked_channel_ids is deprecated. These %d id(s) are already server-side blocked "
+            "(SSOT) and can be removed from config.toml: %s",
+            len(already_server_blocked),
+            already_server_blocked,
+        )
+    if orphan_config_only:
+        log.warning(
+            "always_blocked_channel_ids is deprecated. These %d id(s) are in config.toml but NOT server-side "
+            "blocked — likely you unblocked them via _control/blocked_channels. This code no longer re-adds "
+            "them on startup; either drop them from config.toml, or re-block via `echo <id> > "
+            "/views/slack-split/_control/blocked_channels`: %s",
+            len(orphan_config_only),
+            orphan_config_only,
+        )
 
 
 def _mount_mode(args: argparse.Namespace) -> str:
