@@ -82,6 +82,73 @@ def test_applier_applies_events_and_advances_cursor(client_conn_factory: ClientC
     assert len(sink.chunks) == 5
 
 
+def test_health_seconds_since_last_apply(
+    client_conn_factory: ClientConnFactory,
+) -> None:
+    """``StreamHealth.seconds_since_last_apply`` is ``None`` before the first apply
+    and non-``None`` after — the primary signal the straggler watchdog reads.
+    """
+    pool = ConnectionPool(client_conn_factory)
+
+    async def body() -> None:
+        applier = StreamApplier("channel:CTIMER", pool)
+        assert applier.health().seconds_since_last_apply is None
+        async with trio.open_nursery() as nursery:
+            await nursery.start(applier.serve)
+            await applier.enqueue(next(iter(channel_message_events("CTIMER", 1, start_offset=1))).to_frame())
+            with trio.fail_after(5.0):
+                while applier.health().applied_offset < 1:
+                    await trio.sleep(0.01)
+            idle_immediately = applier.health().seconds_since_last_apply
+            assert idle_immediately is not None
+            assert idle_immediately >= 0.0
+            await trio.sleep(0.1)
+            idle_later = applier.health().seconds_since_last_apply
+            assert idle_later is not None
+            assert idle_later > idle_immediately, "seconds_since_last_apply must grow while idle"
+            await applier.close()
+        await pool.aclose()
+
+    trio.run(body)
+
+
+def test_slow_apply_logs_warning_with_split_timing(
+    client_conn_factory: ClientConnFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A single event apply that breaches SLOW_APPLY_S logs a WARN with the
+    per-phase breakdown (acquire_ms + sync_ms) so post-hoc the operator can
+    tell pool contention from SQL/render cost.
+
+    Set SLOW_APPLY_S to ~0 so any real apply trips it. The test doesn't care
+    about the ABSOLUTE timing, just that the log line carries the split.
+    """
+    monkeypatch.setattr(per_stream_module, "SLOW_APPLY_S", 0.0)
+    pool = ConnectionPool(client_conn_factory)
+    caplog.set_level("WARNING", logger="slack_fuse.projector.per_stream")
+
+    async def body() -> None:
+        applier = StreamApplier("channel:CSLOW", pool)
+        async with trio.open_nursery() as nursery:
+            await nursery.start(applier.serve)
+            await applier.enqueue(next(iter(channel_message_events("CSLOW", 1, start_offset=1))).to_frame())
+            with trio.fail_after(5.0):
+                while applier.health().applied_offset < 1:
+                    await trio.sleep(0.01)
+            await applier.close()
+        await pool.aclose()
+
+    trio.run(body)
+    messages = [rec.getMessage() for rec in caplog.records if "slow apply" in rec.getMessage()]
+    assert messages, "expected one slow-apply warning"
+    text = messages[0]
+    assert "channel:CSLOW" in text
+    assert "acquire_ms=" in text
+    assert "sync_ms=" in text
+    assert "kind=" in text
+
+
 def test_caught_up_frame_inserts_stream_caught_up(client_conn_factory: ClientConnFactory) -> None:
     """A `CaughtUpFrame` enqueued on the applier results in `stream_caught_up` insert."""
     pool = ConnectionPool(client_conn_factory)

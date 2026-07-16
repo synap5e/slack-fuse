@@ -66,6 +66,14 @@ SINGLETON_STREAMS: Final[tuple[str, ...]] = ("channel-list", "users", "slurper-h
 _HEARTBEAT_INTERVAL_S: Final = 30.0
 _CONNECTION_TIMEOUT_S: Final = 90.0
 
+#: Straggler watchdog cadence. Every N seconds, log any applier whose queue
+#: is non-empty AND that hasn't applied an event in the last STRAGGLER_IDLE_S.
+#: Set at 30s so a genuine stall surfaces inside two ticks (see the
+#: 2026-07-16 chat.md thread on the metrics-channel refill stall — cursor
+#: stuck 5 minutes with no signal beyond the raw applied_offset).
+_STRAGGLER_POLL_S: Final = 30.0
+_STRAGGLER_IDLE_S: Final = 20.0
+
 
 @dataclass(frozen=True, slots=True)
 class WSClientOptions:
@@ -128,6 +136,7 @@ class WSClient:
                         since = await trio.to_thread.run_sync(self._read_cursor_sync, stream)
                         await self._send_frame(SubscribeFrame(stream=stream, since=since))
                     nursery.start_soon(self._heartbeat_loop)
+                    nursery.start_soon(self._straggler_watchdog)
                     task_status.started()
                     await self._receive_loop()
                     nursery.cancel_scope.cancel()
@@ -281,6 +290,40 @@ class WSClient:
                 await self._send_frame(PingFrame())
             except trio_websocket.ConnectionClosed:
                 return
+
+    async def _straggler_watchdog(self) -> None:
+        """Log any per-stream applier that's sitting on undrained work.
+
+        Fires every ``_STRAGGLER_POLL_S`` seconds. An applier is a straggler
+        when its queue is non-empty AND the last apply is older than
+        ``_STRAGGLER_IDLE_S`` (or no apply has happened yet AND the queue is
+        non-empty — e.g. after subscribe but before the first event lands
+        atomically via snapshot). Made visible-only, never mutates state.
+
+        This exists because the WSClient's only prior stall signal was the
+        raw ``cursors.applied_offset`` in the local DB — an operator had to
+        poll it themselves to know something wasn't moving. The 2026-07-16
+        metrics-refill stall (5 min stuck at offset 169) surfaced nothing in
+        the journal at INFO, so this watchdog is the missing first-line
+        signal.
+        """
+        while True:
+            await trio.sleep(_STRAGGLER_POLL_S)
+            for applier in self._appliers.values():
+                health = applier.health()
+                if health.queue_depth == 0:
+                    continue
+                idle_s = health.seconds_since_last_apply
+                if idle_s is None or idle_s >= _STRAGGLER_IDLE_S:
+                    log.warning(
+                        "applier %s: straggler queue_depth=%d last_routed=%d applied=%d "
+                        "seconds_since_last_apply=%s",
+                        health.stream,
+                        health.queue_depth,
+                        health.last_routed_offset,
+                        health.applied_offset,
+                        "never" if idle_s is None else f"{idle_s:.0f}",
+                    )
 
 
 def _build_headers(shared_secret: str | None) -> list[tuple[bytes, bytes]]:

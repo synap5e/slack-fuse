@@ -59,6 +59,11 @@ log = logging.getLogger(__name__)
 #: applier shows up in the logs/metrics instead of silently growing memory.
 DEFAULT_QUEUE_SOFT_CAP: Final = 256
 
+#: A single event apply that takes longer than this logs at WARN. Legit-slow
+#: applies (e.g. large channel_added with mention-index rebuild) can breach
+#: this; noise is the trade for catching a stalled applier while it's stuck.
+SLOW_APPLY_S: Final = 5.0
+
 
 #: A pre-event or pre-catchup message routed to a per-stream applier.
 type ProjectorMessage = EventFrame | CaughtUpFrame
@@ -103,6 +108,11 @@ class StreamHealth:
     last_routed_offset: int
     applied_offset: int
     caught_up_at_offset: int | None
+    #: Seconds since the last successful ``apply_event``. ``None`` before the
+    #: first apply on this applier. Non-``None`` and monotonically growing
+    #: while the applier is stalled — the primary signal the periodic straggler
+    #: watchdog reads.
+    seconds_since_last_apply: float | None
 
 
 class StreamApplier:
@@ -139,6 +149,10 @@ class StreamApplier:
         self._last_routed_offset = 0
         self._applied_offset = 0
         self._caught_up_at: int | None = None
+        # Monotonic clock reading at the completion of the last successful
+        # apply. ``None`` before the first apply. Straggler watchdog reads
+        # ``trio.current_time() - self._last_apply_at`` to detect stalls.
+        self._last_apply_at: float | None = None
         # Optional hook (tests): awaited before each event apply. Used to
         # simulate slow appliers without touching the SQL path.
         self._before_apply = before_apply
@@ -148,12 +162,16 @@ class StreamApplier:
         return self._send.statistics().current_buffer_used
 
     def health(self) -> StreamHealth:
+        seconds_since_last_apply = (
+            None if self._last_apply_at is None else trio.current_time() - self._last_apply_at
+        )
         return StreamHealth(
             stream=self.stream,
             queue_depth=self.queue_depth,
             last_routed_offset=self._last_routed_offset,
             applied_offset=self._applied_offset,
             caught_up_at_offset=self._caught_up_at,
+            seconds_since_last_apply=seconds_since_last_apply,
         )
 
     async def enqueue(self, message: ProjectorMessage) -> None:
@@ -197,7 +215,12 @@ class StreamApplier:
             await self._record_caught_up_frame(message)
 
     async def _apply_event_frame(self, message: EventFrame) -> None:
+        # Split the timing into pool-wait and sync-apply so a slow apply log
+        # tells us where the time went: pool contention vs. SQL/render cost.
+        acquire_start = trio.current_time()
         conn = await self._pool.acquire()
+        acquire_ms = int((trio.current_time() - acquire_start) * 1000)
+        sync_start = trio.current_time()
         try:
             result = await trio.to_thread.run_sync(
                 functools.partial(apply_event, conn, message, always_blocked=self._always_blocked)
@@ -217,6 +240,21 @@ class StreamApplier:
             await self._pool.release(conn, discard=True)
             raise
         await self._pool.release(conn)
+        sync_ms = int((trio.current_time() - sync_start) * 1000)
+        total_s = (trio.current_time() - acquire_start)
+        if total_s >= SLOW_APPLY_S:
+            log.warning(
+                "applier %s: slow apply offset=%d kind=%s total=%.1fs acquire_ms=%d sync_ms=%d "
+                "(SLOW_APPLY_S=%.1f)",
+                self.stream,
+                message.offset,
+                message.kind,
+                total_s,
+                acquire_ms,
+                sync_ms,
+                SLOW_APPLY_S,
+            )
+        self._last_apply_at = trio.current_time()
         self._applied_offset = max(self._applied_offset, message.offset)
         # Invalidations call ``pyfuse3.invalidate_inode`` which can block on
         # writeback. Calling it from the trio event-loop thread can deadlock
