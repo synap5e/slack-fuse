@@ -291,6 +291,33 @@ class WSClient:
             except trio_websocket.ConnectionClosed:
                 return
 
+    async def subscribe_channels(self, channel_ids: frozenset[str]) -> None:
+        """Add appliers + send SubscribeFrame for newly-visible channels.
+
+        Called by block-sync after a server-side unblock cycle so the WS
+        stream picks up the previously-suppressed traffic without a mount
+        restart. Idempotent — subscribing a channel already in
+        ``self._appliers`` is a no-op. Silently skips if the WS connection
+        is not currently established (mid-reconnect, or shutdown in
+        progress); the next mount startup will pick it up from
+        ``initial_streams``.
+        """
+        if not channel_ids or self._ws is None or self._nursery is None:
+            return
+        for channel_id in sorted(channel_ids):
+            stream = f"channel:{channel_id}"
+            if stream in self._appliers:
+                continue
+            await self._ensure_applier(stream)
+            since = await trio.to_thread.run_sync(self._read_cursor_sync, stream)
+            log.info("subscribe_channels: %s at since=%d (dynamic subscribe from block-sync)", stream, since)
+            try:
+                await self._send_frame(SubscribeFrame(stream=stream, since=since))
+            except trio_websocket.ConnectionClosed:
+                # Reconnect will pick this up via initial_streams (subscribed=TRUE
+                # in the channels table now). Nothing to recover here.
+                return
+
     async def _straggler_watchdog(self) -> None:
         """Log any per-stream applier that's sitting on undrained work.
 

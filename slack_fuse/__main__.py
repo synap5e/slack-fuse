@@ -630,6 +630,12 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
         fuse_options.add("debug")
     pyfuse3.init(ops, str(mountpoint), fuse_options)
 
+    # Single-slot holder for the current WSClient so block-sync can call
+    # ``subscribe_channels`` on it after a server unblock. ``_run_projector``
+    # writes the slot before ``client.run`` and clears it on exit; block-sync
+    # reads it and skips the notification if unset (mid-reconnect).
+    current_ws_client: list[WSClient | None] = [None]
+
     async def _run_projector() -> None:
         """Supervise the WSClient: reconnect with backoff if it exits.
 
@@ -644,6 +650,7 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
         max_backoff = 300.0
         while True:
             client = WSClient(ws_options, _open_conn, state_conn, sink=sink)
+            current_ws_client[0] = client
             try:
                 with state_conn.cursor() as cur:
                     cur.execute("SELECT channel_id FROM channels WHERE subscribed = TRUE")
@@ -658,6 +665,8 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
                 # Clean exit (connection closed): retry promptly, reset backoff.
                 backoff = 2.0
                 await trio.sleep(1.0)
+            finally:
+                current_ws_client[0] = None
 
     async def _run_health_subscriber() -> None:
         """Supervised wrapper around ``watch_health``.
@@ -771,6 +780,16 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
         def _make_http_client() -> httpx.Client:
             return httpx.Client(timeout=httpx.Timeout(connect=2.0, read=5.0, write=2.0, pool=5.0))
 
+        async def _on_newly_subscribed(ids: frozenset[str]) -> None:
+            client = current_ws_client[0]
+            if client is None:
+                # Projector is between runs (reconnect backoff). The initial
+                # streams query on the next ``client.run`` will include the
+                # unblocked rows because block-sync has already updated the
+                # channels table, so nothing is lost.
+                return
+            await client.subscribe_channels(ids)
+
         await sync_blocked_channels_periodically(
             _make_http_client,
             ghost_base_http_url,
@@ -778,6 +797,7 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
             shared_secret=config.shared_secret,
             interval_s=config.block_sync_interval_s,
             limiter=store_limiter,
+            on_newly_subscribed=_on_newly_subscribed,
         )
 
     async def _run() -> None:

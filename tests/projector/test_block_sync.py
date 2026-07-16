@@ -74,3 +74,43 @@ def test_block_sync_does_not_demote_untracked_local_manual_block(
     apply_blocked_channel_sync(client_conn, set())
 
     assert _channel_row(client_conn, "CLOCAL") == ("blocked", "manual", False)
+
+
+def test_apply_returns_newly_subscribed_channel_ids(
+    client_conn: psycopg.Connection[TupleRow],
+) -> None:
+    """The WSClient consumes this set to send SubscribeFrame dynamically —
+    without it, unblocking via ``_control/blocked_channels`` required a full
+    mount restart before the applier/subscription woke up (2026-07-16)."""
+    _seed_channel(client_conn, "CA")
+    _seed_channel(client_conn, "CB")
+    _seed_channel(client_conn, "CC")
+
+    # Initial sync: all three blocked. No transitions yet (they weren't
+    # previously synced), so the returned set is empty.
+    transitions_1 = apply_blocked_channel_sync(client_conn, {"CA", "CB", "CC"})
+    assert transitions_1 == frozenset()
+
+    # Second sync: CA and CB unblocked. Those are the transitions.
+    transitions_2 = apply_blocked_channel_sync(client_conn, {"CC"})
+    assert transitions_2 == frozenset({"CA", "CB"})
+    assert _channel_row(client_conn, "CA")[0] == "hot"
+    assert _channel_row(client_conn, "CB")[0] == "hot"
+    assert _channel_row(client_conn, "CC")[0] == "blocked"
+
+    # Third sync: nothing changes. Empty transition set.
+    transitions_3 = apply_blocked_channel_sync(client_conn, {"CC"})
+    assert transitions_3 == frozenset()
+
+
+def test_apply_omits_channels_that_stay_blocked_by_local_manual(
+    client_conn: psycopg.Connection[TupleRow],
+) -> None:
+    """A row still marked blocked/manual by the local operator after the server
+    unblock isn't a "transition" — subscribing it would fight the operator."""
+    _seed_channel(client_conn, "CLOCAL", tier="blocked", tier_source="manual")
+
+    transitions = apply_blocked_channel_sync(client_conn, set())
+
+    assert transitions == frozenset()
+    assert _channel_row(client_conn, "CLOCAL")[0] == "blocked"
