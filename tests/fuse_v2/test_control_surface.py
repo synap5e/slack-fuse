@@ -93,6 +93,35 @@ def _make_control_ops(  # noqa: PLR0913 — test-injection knobs for each contro
 # ============================================================================
 
 
+def test_resolve_control_channel_name_fallback_finds_blocked_channels(
+    client_conn: Connection[TupleRow],
+    utc_tz: ZoneInfo,
+) -> None:
+    """The slug loop skips blocked rows by design (assign_conv_root_slugs
+    filters to tier IN ('hot','hidden')). Without the name-fallback, an
+    operator writing ``echo metrics > _control/blocked_channels`` to UNblock
+    a currently-blocked channel got ``unknown_channel`` — the exact bug
+    that surfaced when unblocking metrics on 2026-07-15/16.
+    """
+    seed_channel(client_conn, "CBLK", "metrics", tier="blocked")
+    ops, _ = _make_control_ops(client_conn, utc_tz)
+    # pyright: ignore is fine — this is a test seam into a private helper.
+    assert ops._resolve_control_channel("metrics") == "CBLK"  # pyright: ignore[reportPrivateUsage]
+
+
+def test_resolve_control_channel_slug_still_wins_over_name(
+    client_conn: Connection[TupleRow],
+    utc_tz: ZoneInfo,
+) -> None:
+    """When both slug and name match, the slug loop resolves first so the
+    hot-channel path (the common case) keeps its short-circuit."""
+    seed_channel(client_conn, "CHOT", "shared-name", tier="hot")
+    seed_channel(client_conn, "CBLK", "shared-name", tier="blocked")
+    ops, _ = _make_control_ops(client_conn, utc_tz)
+    # Both channels are named "shared-name". The hot row wins via slug loop.
+    assert ops._resolve_control_channel("shared-name") == "CHOT"  # pyright: ignore[reportPrivateUsage]
+
+
 def test_result_for_status_mapping() -> None:
     assert result_for_status(202) == "queued"
     assert result_for_status(409) == "busy"

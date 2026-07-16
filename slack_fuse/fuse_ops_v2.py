@@ -1221,11 +1221,16 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         return _ControlResult(result="queued" if accepted else "busy", channel=channel_id)
 
     def _resolve_control_channel(self, token: str) -> str | None:
-        """Resolve a written token (channel id or slug) to a channel id.
+        """Resolve a written token (channel id or slug or name) to a channel id.
 
-        A literal channel id wins (exact match in ``channels``); otherwise the
+        A literal channel id wins (exact match in ``channels``). Otherwise the
         token is tried as a slug across every conv-root (hidden allowed, so a
-        hidden channel can still be force-refreshed by its known slug).
+        hidden channel is still resolvable by its known slug — ``blocked`` is
+        excluded from slug assignment by design). Finally, as a fallback, the
+        token is matched against ``channels.name`` across all tiers — so the
+        operator can address a currently-blocked channel by its name (the
+        motivating case: ``echo metrics > _control/blocked_channels`` to
+        UNblock a channel whose slug was suppressed because it was blocked).
         """
         conn = self._conn
         with conn.cursor() as cur:
@@ -1236,6 +1241,16 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             row = fetch_channel_by_slug(conn, conv_root, token, allow_hidden=True)
             if row is not None:
                 return row.channel_id
+        # Name-match fallback (blocked-channel-friendly). Slug assignment
+        # skips blocked rows so the loop above can't reach them, but the
+        # underlying ``channels.name`` is still present. Unique-name
+        # collisions here are ambiguous by construction — first-by-id wins,
+        # matching the ordering the slug loop would use.
+        with conn.cursor() as cur:
+            _ = cur.execute("SELECT channel_id FROM channels WHERE name = %s ORDER BY channel_id LIMIT 1", (token,))
+            row = cur.fetchone()
+            if row is not None:
+                return str(row[0])
         return None
 
     def _resolve_control_channel_or_literal_id(self, token: str) -> str | None:
@@ -2008,8 +2023,26 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         # Fire the control action. Any failure is recorded as
         # ``server_unavailable`` inside ``_fire_control``; a release must never
         # raise (the write already succeeded at the kernel level).
+        #
+        # Wrap in ``_callback_guard`` so the ContextVar-published control
+        # budget (15s) applies. Without this, the guard never runs for
+        # release()'s fh — the inode-to-path map has no entry for control
+        # write fhs (they live above ``_CONTROL_FH_BASE``) so ``_run_sync``'s
+        # inner ``trio.fail_after`` fell back to the default 1s and killed
+        # the mid-flight HTTP call, which then landed in
+        # ``_control_action_or_unavailable`` as ``server_unavailable`` even
+        # though the request succeeded server-side (200) moments later.
         try:
-            await self._fire_control(entry)
+            with self._callback_guard("release", path=entry.path):
+                await self._fire_control(entry)
+        except pyfuse3.FUSEError:
+            # ``_callback_guard`` converts unexpected exceptions to EIO for
+            # the FUSE-level release. That's fine — the write already
+            # returned success at the kernel level, and any operational
+            # verb was recorded inside ``_fire_control`` before the guard's
+            # timeout could fire (the control action stamps status per
+            # sub-step). We swallow the EIO so pyfuse3 doesn't propagate it.
+            log.debug("control release for %s hit callback guard", entry.path)
         except Exception:
             log.exception("control action failed on release for %s", entry.path)
 
