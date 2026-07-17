@@ -17,7 +17,11 @@ _SERVER_DIR = Path(server_migrations.__file__).parent
 
 def test_discover_client_migrations() -> None:
     found = discover_migrations(_CLIENT_DIR)
-    assert [name for _, name, _ in found] == ["0001_init.sql", "0002_block_sync.sql"]
+    assert [name for _, name, _ in found] == [
+        "0001_init.sql",
+        "0002_block_sync.sql",
+        "0003_server_block_sync_prior_tier.sql",
+    ]
     assert found[0][0] == 1
 
 
@@ -115,7 +119,11 @@ def test_apply_server_migrations_idempotent(pg_conn: psycopg.Connection[TupleRow
 
 
 def test_apply_client_migrations_idempotent(pg_conn: psycopg.Connection[TupleRow]) -> None:
-    assert apply_migrations(pg_conn, _CLIENT_DIR) == ["0001_init.sql", "0002_block_sync.sql"]
+    assert apply_migrations(pg_conn, _CLIENT_DIR) == [
+        "0001_init.sql",
+        "0002_block_sync.sql",
+        "0003_server_block_sync_prior_tier.sql",
+    ]
     assert _table_exists(pg_conn, "chunks")
     assert _table_exists(pg_conn, "thread_chunks")
     assert _table_exists(pg_conn, "chunk_mentions")

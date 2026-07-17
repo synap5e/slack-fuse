@@ -414,8 +414,8 @@ async def _serve(config: ServerConfig, boot: BootContext) -> None:
         users=users,
         workspace_url=os.environ.get("SLACK_WORKSPACE_URL"),
     )
-    snapshot_deps = SnapshotDeps(database_url=config.database_url)
-    originals_deps = OriginalsDeps(database_url=config.database_url)
+    snapshot_deps = SnapshotDeps(database_url=config.database_url, shared_secret=config.shared_secret)
+    originals_deps = OriginalsDeps(database_url=config.database_url, shared_secret=config.shared_secret)
     gaps_deps = GapsDeps(database_url=config.database_url)
     probe_status_deps = ProbeStatusDeps(
         database_url=config.database_url,

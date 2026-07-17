@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import partial
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -170,7 +171,7 @@ def route_request(  # noqa: C901, PLR0913 - endpoint routing dispatch hub.
             at, since = _parse_snapshot_query(request.target)
         except ValueError:
             return _error_response(status_code=400, code="bad_request")
-        return _handle_snapshot(snapshot_stream, at=at, since=since, deps=snapshot_deps)
+        return _handle_snapshot(snapshot_stream, request.headers, at=at, since=since, deps=snapshot_deps)
 
     originals_channel = _originals_channel_from_path(request.path)
     if originals_channel is not None:
@@ -182,7 +183,9 @@ def route_request(  # noqa: C901, PLR0913 - endpoint routing dispatch hub.
             from_epoch, to_epoch = _parse_originals_query(request.target)
         except ValueError:
             return _error_response(status_code=400, code="bad_request")
-        return _handle_originals(originals_channel, from_epoch=from_epoch, to_epoch=to_epoch, deps=originals_deps)
+        return _handle_originals(
+            originals_channel, request.headers, from_epoch=from_epoch, to_epoch=to_epoch, deps=originals_deps
+        )
 
     if request.path == "/gap-candidates":
         if request.method != "GET":
@@ -649,18 +652,29 @@ def _handle_refill_window(channel_id: str, request: HttpRequest, deps: RefillWin
     )
 
 
-def _handle_snapshot(stream: str, *, at: int, since: int | None, deps: SnapshotDeps) -> HttpResponse:
+def _handle_snapshot(
+    stream: str,
+    headers: Sequence[tuple[bytes, bytes]],
+    *,
+    at: int,
+    since: int | None,
+    deps: SnapshotDeps,
+) -> HttpResponse:
     try:
-        payload = handle_snapshot(stream, at=at, since=since, deps=deps)
+        result = handle_snapshot(stream, headers, at=at, since=since, deps=deps)
     except SnapshotNotFoundError:
         return _error_response(status_code=404, code="not_found")
     except ValueError:
         return _error_response(status_code=400, code="bad_request")
     except psycopg.Error:
         return _error_response(status_code=503, code="service_unavailable")
+    if isinstance(result, tuple):
+        # (401, "unauthorized") from the auth gate — FINDING-11.
+        status_code, message = result
+        return HttpResponse(status_code=status_code, body=message.encode(), content_type="text/plain")
     return HttpResponse(
         status_code=200,
-        body=payload.body,
+        body=result.body,
         content_type=SNAPSHOT_CONTENT_TYPE,
         headers=(("content-encoding", SNAPSHOT_CONTENT_ENCODING),),
     )
@@ -733,16 +747,21 @@ def _parse_originals_query(target: str) -> tuple[float, float]:
 
 def _handle_originals(
     channel_id: str,
+    headers: Sequence[tuple[bytes, bytes]],
     *,
     from_epoch: float,
     to_epoch: float,
     deps: OriginalsDeps,
 ) -> HttpResponse:
     try:
-        body = handle_originals(channel_id, from_epoch=from_epoch, to_epoch=to_epoch, deps=deps)
+        result = handle_originals(channel_id, headers, from_epoch=from_epoch, to_epoch=to_epoch, deps=deps)
     except psycopg.Error:
         return _error_response(status_code=503, code="service_unavailable")
-    return HttpResponse(status_code=200, body=body, content_type="text/markdown; charset=utf-8")
+    if isinstance(result, tuple):
+        # (401, "unauthorized") from the auth gate — FINDING-11.
+        status_code, message = result
+        return HttpResponse(status_code=status_code, body=message.encode(), content_type="text/plain")
+    return HttpResponse(status_code=200, body=result, content_type="text/markdown; charset=utf-8")
 
 
 def _gaps_channel_from_path(path: str) -> str | None:

@@ -114,3 +114,40 @@ def test_apply_omits_channels_that_stay_blocked_by_local_manual(
 
     assert transitions == frozenset()
     assert _channel_row(client_conn, "CLOCAL")[0] == "blocked"
+
+
+def test_finding_14_operator_hot_pin_survives_server_block_unblock(
+    client_conn: psycopg.Connection[TupleRow],
+) -> None:
+    """Regression for FINDING-14 (2026-07-17): an operator's manual tier='hot'
+    pin must survive a server block/unblock cycle. Pre-fix, unblock reset
+    tier_source to 'auto' — the pin was silently lost."""
+    _seed_channel(client_conn, "CPIN", tier="hot", tier_source="manual")
+
+    # Server blocks CPIN — snapshot the pre-block (tier, tier_source) into
+    # server_block_sync.
+    _ = apply_blocked_channel_sync(client_conn, {"CPIN"})
+    assert _channel_row(client_conn, "CPIN") == ("blocked", "manual", False)
+
+    # Server unblocks CPIN — must restore ('hot', 'manual'), not reset to auto.
+    transitions = apply_blocked_channel_sync(client_conn, set())
+
+    assert transitions == frozenset({"CPIN"})
+    assert _channel_row(client_conn, "CPIN") == ("hot", "manual", True), (
+        "operator pin lost — pre-fix behavior; must be preserved."
+    )
+
+
+def test_finding_14_first_time_seen_channel_falls_back_to_auto(
+    client_conn: psycopg.Connection[TupleRow],
+) -> None:
+    """A channel first seen via server block (no local row before) has no
+    prior tier to restore — fall back to the auto default on unblock."""
+    _seed_channel(client_conn, "CFRESH")  # tier='hot', tier_source='auto'
+
+    _ = apply_blocked_channel_sync(client_conn, {"CFRESH"})
+    transitions = apply_blocked_channel_sync(client_conn, set())
+
+    # Auto row restored (would_be tier for public+member) is 'hot'.
+    assert transitions == frozenset({"CFRESH"})
+    assert _channel_row(client_conn, "CFRESH") == ("hot", "auto", True)

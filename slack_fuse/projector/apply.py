@@ -136,20 +136,16 @@ def require_autocommit(conn: Connection[TupleRow]) -> None:
 def apply_event(
     conn: Connection[TupleRow],
     frame: EventFrame,
-    *,
-    always_blocked: frozenset[str] = frozenset(),
 ) -> ApplyResult:
     """Apply one event in a single transaction. Returns post-commit work.
 
-    ``always_blocked`` is the operator-maintained "planned ignore" list — any
-    channel id in this set is forced to ``tier='blocked', tier_source='manual',
-    subscribed=FALSE`` on every ``channel_added`` / ``channel_archived`` /
-    ``channel_unarchived`` / ``channel_member_changed`` event, regardless of
-    what Slack says about the channel. Sourced from
-    ``ClientConfig.always_blocked_channel_ids``.
+    Note: the ``always_blocked_channel_ids`` config field is deprecated and
+    inert — see FINDING-17 (2026-07-17 review). Block enforcement lives in
+    ``block_sync.apply_blocked_channel_sync`` which is the sole caller of
+    ``_force_blocked_manual`` now.
     """
     with conn.transaction(), conn.cursor() as cur:
-        result = _dispatch(cur, frame, always_blocked)
+        result = _dispatch(cur, frame)
         advance_cursor(cur, frame.stream, frame.offset)
     return result
 
@@ -190,7 +186,7 @@ def record_caught_up(conn: Connection[TupleRow], stream: str, at_offset: int) ->
 # === Event dispatch ===
 
 
-def _dispatch(cur: Cursor[TupleRow], frame: EventFrame, always_blocked: frozenset[str]) -> ApplyResult:
+def _dispatch(cur: Cursor[TupleRow], frame: EventFrame) -> ApplyResult:
     """Route an event to its kind-specific handler. Stream-prefix scopes:
 
     - `channel:<id>` → message/reaction/edit/delete on that channel
@@ -205,7 +201,7 @@ def _dispatch(cur: Cursor[TupleRow], frame: EventFrame, always_blocked: frozense
         channel_id = stream.removeprefix("channel:")
         return _dispatch_channel_event(cur, channel_id, kind, payload)
     if stream == "channel-list":
-        return _dispatch_channel_list_event(cur, kind, payload, always_blocked)
+        return _dispatch_channel_list_event(cur, kind, payload)
     if stream == "users":
         return _dispatch_users_event(cur, kind, payload)
     if stream == "slurper-health":
@@ -513,10 +509,9 @@ def _dispatch_channel_list_event(
     cur: Cursor[TupleRow],
     kind: str,
     payload: JsonObject,
-    always_blocked: frozenset[str],
 ) -> ApplyResult:
     if kind == "channel_added":
-        return _apply_channel_added(cur, payload, always_blocked)
+        return _apply_channel_added(cur, payload)
     if kind == "channel_info_refreshed":
         # Same shape as channel_added — a fresh ``conversations.info``
         # response carrying full channel metadata. The
@@ -524,23 +519,23 @@ def _dispatch_channel_list_event(
         # the upsert; auto-tier re-evaluates against current is_member /
         # is_archived so a "we just joined" refresh promotes hidden →
         # hot, and a "we left" refresh demotes hot → hidden.
-        return _apply_channel_added(cur, payload, always_blocked)
+        return _apply_channel_added(cur, payload)
     if kind == "channel_renamed":
         return _apply_channel_renamed(cur, payload)
     if kind == "channel_archived":
-        return _apply_channel_archived(cur, payload, always_blocked)
+        return _apply_channel_archived(cur, payload)
     if kind == "channel_unarchived":
-        return _apply_channel_unarchived(cur, payload, always_blocked)
+        return _apply_channel_unarchived(cur, payload)
     if kind == "channel_member_changed":
-        return _apply_channel_member_changed(cur, payload, always_blocked)
+        return _apply_channel_member_changed(cur, payload)
     log.warning("apply: unknown channel-list kind %r", kind)
     return ApplyResult()
 
 
-def _force_blocked_manual(cur: Cursor[TupleRow], channel_id: str) -> None:
+def _force_blocked_manual(cur: Cursor[TupleRow], channel_id: str) -> None:  # pyright: ignore[reportUnusedFunction]
     """Pin a channel to ``tier='blocked', tier_source='manual', subscribed=FALSE``
     unconditionally — wins over auto re-evaluation AND any prior CLI override.
-    Used to enforce ``ClientConfig.always_blocked_channel_ids`` on every
+    Used by ``block_sync.apply_blocked_channel_sync`` to enforce operator server-side block policy on every
     channel-list event that could re-tier the row.
     """
     cur.execute(
@@ -577,9 +572,7 @@ def _default_tier(*, is_archived: bool, is_im: bool, is_mpim: bool, is_member: b
     return "hidden"
 
 
-def _apply_channel_added(
-    cur: Cursor[TupleRow], payload: JsonObject, always_blocked: frozenset[str]
-) -> ApplyResult:
+def _apply_channel_added(cur: Cursor[TupleRow], payload: JsonObject) -> ApplyResult:
     channel_id = payload.get("id")
     if not isinstance(channel_id, str):
         log.warning("apply: channel_added missing id")
@@ -612,12 +605,6 @@ def _apply_channel_added(
         "  updated_at = now()",
         (channel_id, name, is_im, is_mpim, is_member, is_archived, im_user_id, topic, purpose, tier, tier != "blocked"),
     )
-    # Config-driven planned-ignore list (ClientConfig.always_blocked_channel_ids)
-    # wins over both auto-tier and any prior CLI manual override. Applied after
-    # the upsert so the row's metadata (name, is_archived, etc.) is fresh, then
-    # tier-fields are pinned. Re-ingesting channel_added always re-blocks.
-    if channel_id in always_blocked:
-        _force_blocked_manual(cur, channel_id)
     # Cross-stream race (same shape as user_added): a `message` referencing
     # `<#C…>` can arrive before this `channel_added`, leaving chunks rendered
     # with the CID-literal fallback. The lookup runs in this SAME TX as the
@@ -650,9 +637,7 @@ def _apply_channel_renamed(cur: Cursor[TupleRow], payload: JsonObject) -> ApplyR
     return ApplyResult(chunks=refs, thread_chunks=thread_refs, channel_list_changed=True)
 
 
-def _apply_channel_archived(
-    cur: Cursor[TupleRow], payload: JsonObject, always_blocked: frozenset[str]
-) -> ApplyResult:
+def _apply_channel_archived(cur: Cursor[TupleRow], payload: JsonObject) -> ApplyResult:
     channel_id = payload.get("channel_id")
     if not isinstance(channel_id, str):
         return ApplyResult()
@@ -668,14 +653,10 @@ def _apply_channel_archived(
         "WHERE channel_id = %s",
         (channel_id,),
     )
-    if channel_id in always_blocked:
-        _force_blocked_manual(cur, channel_id)
     return ApplyResult(channel_list_changed=True)
 
 
-def _apply_channel_unarchived(
-    cur: Cursor[TupleRow], payload: JsonObject, always_blocked: frozenset[str]
-) -> ApplyResult:
+def _apply_channel_unarchived(cur: Cursor[TupleRow], payload: JsonObject) -> ApplyResult:
     channel_id = payload.get("channel_id")
     if not isinstance(channel_id, str):
         return ApplyResult()
@@ -683,16 +664,11 @@ def _apply_channel_unarchived(
         "UPDATE channels SET is_archived = FALSE, updated_at = now() WHERE channel_id = %s",
         (channel_id,),
     )
-    if channel_id in always_blocked:
-        _force_blocked_manual(cur, channel_id)
-    else:
-        _reevaluate_auto_tier(cur, channel_id)
+    _reevaluate_auto_tier(cur, channel_id)
     return ApplyResult(channel_list_changed=True)
 
 
-def _apply_channel_member_changed(
-    cur: Cursor[TupleRow], payload: JsonObject, always_blocked: frozenset[str]
-) -> ApplyResult:
+def _apply_channel_member_changed(cur: Cursor[TupleRow], payload: JsonObject) -> ApplyResult:
     channel_id = payload.get("channel_id")
     is_member = payload.get("is_member")
     if not isinstance(channel_id, str) or not isinstance(is_member, bool):
@@ -701,10 +677,7 @@ def _apply_channel_member_changed(
         "UPDATE channels SET is_member = %s, updated_at = now() WHERE channel_id = %s",
         (is_member, channel_id),
     )
-    if channel_id in always_blocked:
-        _force_blocked_manual(cur, channel_id)
-    else:
-        _reevaluate_auto_tier(cur, channel_id)
+    _reevaluate_auto_tier(cur, channel_id)
     return ApplyResult(channel_list_changed=True)
 
 

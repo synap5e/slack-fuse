@@ -64,17 +64,15 @@ class ClientConfig(BaseSettings):
     # Server blocked_channels SSOT sync interval.
     block_sync_interval_s: float = 30.0
 
-    # Channel IDs the operator never wants surfaced in split mode. The projector
-    # forces ``tier='blocked'``, ``tier_source='manual'``, ``subscribed=FALSE``
-    # on every ``channel_added`` (and re-evaluation) for any id in this list,
-    # regardless of what Slack says about the channel. This wins over the
-    # ``slack-fuse tier <slug>`` CLI: re-ingesting a ``channel_added`` event
-    # for a config-blocked channel re-blocks it. To un-block, remove the id
-    # from this list and restart the mount.
-    #
-    # DEPRECATED 2026-06-27: use the server-side blocked_channels table via
-    # POST /blocked-channels. Split-mode startup still migrates this legacy list
-    # idempotently for one release cycle.
+    # DEPRECATED 2026-06-27, chain fully removed 2026-07-17 (FINDING-17).
+    # This field is accepted for config-file backwards compatibility but has
+    # no effect: the applier-side enforcement (WSClient → StreamApplier →
+    # apply_event) was removed because the parameter was never wired into
+    # cmd_mount_split, and b0dcff2 removed the startup migration. Use the
+    # server-side blocked_channels table via ``_control/blocked_channels``
+    # or ``POST /blocked-channels``. Non-empty entries on startup log a
+    # warning classifying each id vs server SSOT (see
+    # ``_migrate_legacy_always_blocked``).
     always_blocked_channel_ids: list[str] = []
 
     @classmethod

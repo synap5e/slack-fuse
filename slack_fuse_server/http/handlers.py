@@ -56,21 +56,33 @@ class ResolvePermalinkDeps:
 
 @dataclass(frozen=True, slots=True)
 class SnapshotDeps:
-    """Dependencies required by `GET /streams/<id>/snapshot`."""
+    """Dependencies required by `GET /streams/<id>/snapshot`.
+
+    Carries the shared secret so the endpoint gates access to full channel
+    message payloads. FINDING-11 (2026-07-17): pre-fix, /snapshot leaked all
+    channel content to any peer that could reach the port, AND wrote a
+    per-request ``snapshot_uses`` INSERT unauthenticated.
+    """
 
     database_url: str
+    shared_secret: str | None
 
 
 @dataclass(frozen=True, slots=True)
 class OriginalsDeps:
     """Dependencies required by ``GET /originals/{channel_id}``.
 
-    Holds the database URL only — the events replay opens its own connection
-    per request so it doesn't contend with the long-lived snapshot / dispatch
-    connections (the originals view is a low-rate forensic read).
+    Carries the shared secret — the originals view replays raw message text
+    and must be gated for the same reason as the WS + snapshot endpoints
+    (FINDING-11, 2026-07-17).
+
+    Holds the database URL only otherwise — the events replay opens its own
+    connection per request so it doesn't contend with the long-lived snapshot
+    / dispatch connections (the originals view is a low-rate forensic read).
     """
 
     database_url: str
+    shared_secret: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,12 +276,19 @@ def handle_permalink(request: PermalinkRequest, deps: ResolvePermalinkDeps) -> P
 
 def handle_snapshot(
     stream: str,
+    headers: Sequence[tuple[bytes, bytes]],
     *,
     at: int,
     since: int | None,
     deps: SnapshotDeps,
-) -> SnapshotPayload:
-    """`GET /streams/<id>/snapshot?at=<offset>[&since=<offset>]`."""
+) -> SnapshotPayload | tuple[int, str]:
+    """`GET /streams/<id>/snapshot?at=<offset>[&since=<offset>]`.
+
+    FINDING-11 (2026-07-17): shared-secret gate. Snapshot payloads carry
+    full channel message content — parity with /ws and the mutations.
+    """
+    if not is_http_authorized(headers, deps.shared_secret):
+        return 401, "unauthorized"
     return fetch_snapshot_payload(
         deps.database_url,
         stream=stream,
@@ -504,12 +523,16 @@ def is_http_authorized(
 
 def handle_originals(
     channel_id: str,
+    headers: Sequence[tuple[bytes, bytes]],
     *,
     from_epoch: float,
     to_epoch: float,
     deps: OriginalsDeps,
-) -> bytes:
+) -> bytes | tuple[int, str]:
     """``GET /originals/{channel_id}?from=<epoch>&to=<epoch>``.
+
+    FINDING-11 (2026-07-17): shared-secret gate. The originals view replays
+    raw Slack message text — same sensitivity as /snapshot; must be gated.
 
     Replays the events table for ``channel:{channel_id}`` over the UTC epoch
     range and returns markdown with unresolved ``<@U…>`` / ``<#C…>``
@@ -519,6 +542,8 @@ def handle_originals(
 
     Empty body when no messages exist in the range.
     """
+    if not is_http_authorized(headers, deps.shared_secret):
+        return 401, "unauthorized"
     # Lazy import so the http package doesn't pull in psycopg unless this
     # endpoint is wired.
     import psycopg  # noqa: PLC0415

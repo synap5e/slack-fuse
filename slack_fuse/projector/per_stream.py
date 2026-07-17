@@ -128,7 +128,7 @@ class StreamApplier:
             await applier.close()
     """
 
-    def __init__(  # noqa: PLR0913  (keyword-only config + test-injection knobs)
+    def __init__(
         self,
         stream: str,
         pool: ConnectionLease,
@@ -136,12 +136,10 @@ class StreamApplier:
         *,
         queue_soft_cap: int = DEFAULT_QUEUE_SOFT_CAP,
         before_apply: Callable[[ProjectorMessage], Awaitable[None]] | None = None,
-        always_blocked: frozenset[str] = frozenset(),
     ) -> None:
         self.stream = stream
         self._pool = pool
         self._sink: InvalidationSink = sink if sink is not None else NullInvalidationSink()
-        self._always_blocked = always_blocked
         # Unbounded queue (P1-E): send_nowait never blocks the WS receive loop.
         self._send, self._receive = trio.open_memory_channel[ProjectorMessage](math.inf)
         self._soft_cap = queue_soft_cap
@@ -223,7 +221,7 @@ class StreamApplier:
         sync_start = trio.current_time()
         try:
             result = await trio.to_thread.run_sync(
-                functools.partial(apply_event, conn, message, always_blocked=self._always_blocked)
+                functools.partial(apply_event, conn, message)
             )
         except Exception as exc:
             await self._pool.release(conn, discard=True)

@@ -191,7 +191,7 @@ def test_snapshot_route_returns_gzip_jsonl_and_records_snapshot_use(server_conn_
             target=f"/streams/{quote(stream, safe='')}/snapshot?at={snapshot.at_offset}&since=1",
         ),
         metrics_source=cast(MetricsSource, _StaticMetricsSource(_sample_metrics())),
-        snapshot_deps=SnapshotDeps(database_url=_database_url_for_conn(server_conn)),
+        snapshot_deps=SnapshotDeps(database_url=_database_url_for_conn(server_conn), shared_secret=None),
     )
 
     assert response.status_code == 200
@@ -226,7 +226,7 @@ def test_snapshot_route_rounds_down_to_latest_snapshot(server_conn_factory: Serv
             target=f"/streams/{quote(stream, safe='')}/snapshot?at=3&since=0",
         ),
         metrics_source=cast(MetricsSource, _StaticMetricsSource(_sample_metrics())),
-        snapshot_deps=SnapshotDeps(database_url=_database_url_for_conn(server_conn)),
+        snapshot_deps=SnapshotDeps(database_url=_database_url_for_conn(server_conn), shared_secret=None),
     )
     assert response.status_code == 200
 
@@ -253,7 +253,7 @@ def test_snapshot_route_returns_404_when_no_snapshot_at_or_before_at(
             target=f"/streams/{quote(stream, safe='')}/snapshot?at=0",
         ),
         metrics_source=cast(MetricsSource, _StaticMetricsSource(_sample_metrics())),
-        snapshot_deps=SnapshotDeps(database_url=_database_url_for_conn(server_conn)),
+        snapshot_deps=SnapshotDeps(database_url=_database_url_for_conn(server_conn), shared_secret=None),
     )
     assert response.status_code == 404
     assert response.body == b'{"error":"not_found"}'
@@ -272,7 +272,7 @@ async def test_snapshot_endpoint_integrates_with_projector_fetch(
     _write_message(server_conn, stream, "400.000003", "three")
     snapshot = _must_generate_snapshot(server_conn, stream)
 
-    snapshot_deps = SnapshotDeps(database_url=_database_url_for_conn(server_conn))
+    snapshot_deps = SnapshotDeps(database_url=_database_url_for_conn(server_conn), shared_secret=None)
     redirect = SnapshotRedirect(
         stream=stream,
         at_offset=snapshot.at_offset,

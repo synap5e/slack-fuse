@@ -295,16 +295,11 @@ def test_applier_failure_poisons_stream_without_skipping_offset(
     """
     real_apply = per_stream_module.apply_event
 
-    def failing_apply(
-        conn: psycopg.Connection[TupleRow],
-        frame: EventFrame,
-        *,
-        always_blocked: frozenset[str] = frozenset(),
-    ):
+    def failing_apply(conn: psycopg.Connection[TupleRow], frame: EventFrame):
         if frame.offset == 42:
             msg = "simulated transient apply failure"
             raise RuntimeError(msg)
-        return real_apply(conn, frame, always_blocked=always_blocked)
+        return real_apply(conn, frame)
 
     monkeypatch.setattr(per_stream_module, "apply_event", failing_apply)
 

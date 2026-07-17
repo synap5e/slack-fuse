@@ -890,18 +890,34 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             return len(self._control_write_buffers)
 
     def invalidate_all_primed(self) -> int:
-        """Drop every primed inode from the kernel page cache.
+        """Drop every materialized inode from the kernel page cache on a
+        health transition.
 
         Called by the health subscriber on any ``connection_state`` field
         change and on every ``stream_caught_up`` insert. Returns the number
-        of inodes invalidated (test introspection).
+        of inodes invalidated.
+
+        FINDING-08 (2026-07-17): sweeps the FULL ``inodes`` table
+        (materialized set), not just the primed subset. ``keep_cache=True``
+        in ``open()`` means the kernel caches whatever ``read()`` returns
+        for ANY file, including trailer-bearing bytes read during a degraded
+        window. Only clean+hot reads entered ``_primed_inodes``, so if a
+        channel was read while the trailer said "Content may be stale", the
+        primed set at the stale→healthy transition was EMPTY and the
+        outage-era bytes survived in the kernel cache forever (until an
+        event happened to touch the exact chunk). Broad sweep matches the
+        ``channel_list_changed`` pattern already in-repo, documented there
+        as "acceptable for v1" — same trade-off applies here (health
+        transitions are rare).
         """
+        with self._inode_conn.cursor() as cur:
+            _ = cur.execute("SELECT inode FROM inodes")
+            materialized = [int(r[0]) for r in cur.fetchall()]
         with self._primed_lock:
-            snapshot = list(self._primed_inodes)
             self._primed_inodes.clear()
-        for inode in snapshot:
+        for inode in materialized:
             self._invalidate_inode(inode)
-        return len(snapshot)
+        return len(materialized)
 
     def _track_primed(self, inode: int) -> None:
         with self._primed_lock:

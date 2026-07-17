@@ -33,6 +33,17 @@ def apply_blocked_channel_sync(conn: psycopg.Connection[TupleRow], blocked_ids: 
     dynamically add appliers + send SubscribeFrame for the newly-visible
     streams (fix for "unblock via _control/blocked_channels needs mount
     restart to take effect", 2026-07-16).
+
+    FINDING-14 (2026-07-17): preserve local tier state across a server
+    block/unblock cycle. When a server block first applies (row not
+    previously in ``server_block_sync``), snapshot the channel's current
+    ``(tier, tier_source)`` into ``prior_tier`` / ``prior_tier_source``
+    on the ``server_block_sync`` row. On unblock, restore that pair
+    instead of resetting to auto/default. Otherwise:
+      * an operator-pinned ``tier='hot'`` channel would come out ``auto``
+        (pin lost);
+      * a locally CLI-blocked channel that the server also blocks then
+        unblocks would come out unblocked (local block silently removed).
     """
     newly_subscribed: set[str] = set()
     with conn.transaction(), conn.cursor() as cur:
@@ -40,34 +51,70 @@ def apply_blocked_channel_sync(conn: psycopg.Connection[TupleRow], blocked_ids: 
         previously_synced = {str(row[0]) for row in cur.fetchall()}
 
         for channel_id in sorted(blocked_ids):
-            cur.execute(
-                """
-                INSERT INTO server_block_sync (channel_id, synced_at)
-                VALUES (%s, now())
-                ON CONFLICT (channel_id) DO UPDATE SET synced_at = EXCLUDED.synced_at
-                """,
-                (channel_id,),
-            )
+            if channel_id in previously_synced:
+                # Already server-blocked — refresh the synced_at heartbeat.
+                cur.execute(
+                    "UPDATE server_block_sync SET synced_at = now() WHERE channel_id = %s",
+                    (channel_id,),
+                )
+            else:
+                # First application of server block — snapshot the CURRENT
+                # local (tier, tier_source) so the eventual unblock can
+                # restore it. NULLs on brand-new channels the client has
+                # never seen; the unblock branch then falls back to auto.
+                cur.execute(
+                    "SELECT tier, tier_source FROM channels WHERE channel_id = %s",
+                    (channel_id,),
+                )
+                snapshot_row = cur.fetchone()
+                prior_tier = str(snapshot_row[0]) if snapshot_row is not None else None
+                prior_tier_source = str(snapshot_row[1]) if snapshot_row is not None else None
+                cur.execute(
+                    """
+                    INSERT INTO server_block_sync (channel_id, synced_at, prior_tier, prior_tier_source)
+                    VALUES (%s, now(), %s, %s)
+                    ON CONFLICT (channel_id) DO UPDATE SET
+                        synced_at = EXCLUDED.synced_at,
+                        prior_tier = COALESCE(server_block_sync.prior_tier, EXCLUDED.prior_tier),
+                        prior_tier_source = COALESCE(
+                            server_block_sync.prior_tier_source, EXCLUDED.prior_tier_source
+                        )
+                    """,
+                    (channel_id, prior_tier, prior_tier_source),
+                )
             _force_blocked_manual(cur, channel_id)
 
         for channel_id in sorted(previously_synced - blocked_ids):
             cur.execute(
-                "SELECT is_im, is_mpim, is_member, is_archived, tier, tier_source "
-                "FROM channels WHERE channel_id = %s",
+                "SELECT c.is_im, c.is_mpim, c.is_member, c.is_archived, c.tier, c.tier_source, "
+                "  s.prior_tier, s.prior_tier_source "
+                "FROM channels c LEFT JOIN server_block_sync s ON s.channel_id = c.channel_id "
+                "WHERE c.channel_id = %s",
                 (channel_id,),
             )
             row = cur.fetchone()
             if row is not None and str(row[4]) == "blocked" and str(row[5]) == "manual":
-                tier = _default_tier(
-                    is_im=bool(row[0]),
-                    is_mpim=bool(row[1]),
-                    is_member=bool(row[2]),
-                    is_archived=bool(row[3]),
-                )
+                prior_tier = str(row[6]) if row[6] is not None else None
+                prior_tier_source = str(row[7]) if row[7] is not None else None
+                # FINDING-14: if we recorded the pre-block state, restore it —
+                # unless it was itself 'blocked' from before (e.g. locally-CLI-
+                # blocked channel that the server ALSO blocked; the local
+                # block was authoritative before, still is).
+                if prior_tier is not None and prior_tier_source is not None:
+                    tier = prior_tier
+                    tier_source = prior_tier_source
+                else:
+                    tier = _default_tier(
+                        is_im=bool(row[0]),
+                        is_mpim=bool(row[1]),
+                        is_member=bool(row[2]),
+                        is_archived=bool(row[3]),
+                    )
+                    tier_source = "auto"
                 cur.execute(
-                    "UPDATE channels SET tier = %s, tier_source = 'auto', subscribed = %s, "
+                    "UPDATE channels SET tier = %s, tier_source = %s, subscribed = %s, "
                     "updated_at = now() WHERE channel_id = %s",
-                    (tier, tier != "blocked", channel_id),
+                    (tier, tier_source, tier != "blocked", channel_id),
                 )
                 if tier != "blocked":
                     newly_subscribed.add(channel_id)
