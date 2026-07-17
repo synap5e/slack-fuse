@@ -311,7 +311,7 @@ def _apply_message_deleted(cur: Cursor[TupleRow], channel_id: str, payload: Json
         "DELETE FROM thread_chunks WHERE channel_id = %s AND thread_ts = %s AND reply_ts = %s",
         (channel_id, thread_ts, deleted_ts),
     )
-    _refresh_parent_reply_count(cur, channel_id, thread_ts)
+    _refresh_parent_reply_count(cur, channel_id, thread_ts, allow_downgrade=True)
     return ApplyResult(
         chunks=(ChunkRef(channel_id, thread_ts),),
         thread_chunks=(ThreadChunkRef(channel_id, thread_ts, deleted_ts),),
@@ -387,14 +387,20 @@ def _delete_thread_chunk(cur: Cursor[TupleRow], channel_id: str, prev_msg: Messa
         "DELETE FROM thread_chunks WHERE channel_id = %s AND thread_ts = %s AND reply_ts = %s",
         (channel_id, thread_ts, reply_ts),
     )
-    _refresh_parent_reply_count(cur, channel_id, thread_ts)
+    _refresh_parent_reply_count(cur, channel_id, thread_ts, allow_downgrade=True)
     return ApplyResult(
         thread_chunks=(ThreadChunkRef(channel_id, thread_ts, reply_ts),),
         chunks=(ChunkRef(channel_id, thread_ts),),
     )
 
 
-def _refresh_parent_reply_count(cur: Cursor[TupleRow], channel_id: str, thread_ts: Decimal) -> bool:
+def _refresh_parent_reply_count(
+    cur: Cursor[TupleRow],
+    channel_id: str,
+    thread_ts: Decimal,
+    *,
+    allow_downgrade: bool = False,
+) -> bool:
     """Recompute the parent chunk's `reply_count` from `thread_chunks`.
 
     Idempotent on replay: derived from `COUNT(*)`, not `+= 1`. The parent's
@@ -405,13 +411,25 @@ def _refresh_parent_reply_count(cur: Cursor[TupleRow], channel_id: str, thread_t
     with the column; absent the indicator (parent rendered with reply_count=0
     initially) we synthesize one. Returns whether the parent chunk row was
     modified.
+
+    ``allow_downgrade`` (FINDING-15, 2026-07-17): default False protects an
+    already-stored, Slack-authoritative ``reply_count`` from being clobbered
+    by a lower local count. ``chunks.reply_count`` may have been written
+    from Slack's ``reply_count`` on the parent Message (authoritative for
+    how many replies exist); the local ``thread_chunks`` count only
+    reflects replies we have *materialized*. On a partially-backfilled
+    channel the local count is legitimately lower — GREATEST protects
+    that. Callers on the DELETE path (``message_deleted``, thread reply
+    deletion via ``message_changed``) pass ``allow_downgrade=True`` so a
+    legitimate decrement (the only reply just got deleted) can walk the
+    count back to zero.
     """
     cur.execute(
         "SELECT COUNT(*) FROM thread_chunks WHERE channel_id = %s AND thread_ts = %s AND role = 'reply'",
         (channel_id, thread_ts),
     )
     row = cur.fetchone()
-    new_count = int(row[0]) if row is not None else 0
+    local_replies = int(row[0]) if row is not None else 0
     cur.execute(
         "SELECT content_md, reply_count FROM chunks WHERE channel_id = %s AND message_ts = %s",
         (channel_id, thread_ts),
@@ -421,6 +439,7 @@ def _refresh_parent_reply_count(cur: Cursor[TupleRow], channel_id: str, thread_t
         return False
     current_md = cast(str, parent[0])
     current_count = int(parent[1])
+    new_count = local_replies if allow_downgrade else max(local_replies, current_count)
     new_md = _patch_thread_indicator(current_md, new_count)
     if new_md == current_md and new_count == current_count:
         return False

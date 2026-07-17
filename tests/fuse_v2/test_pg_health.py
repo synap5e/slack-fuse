@@ -320,6 +320,45 @@ async def test_callback_guard_marks_pg_down_on_operational_error(
 
 
 @pytest.mark.trio
+async def test_run_sync_shields_release_from_outer_cancel(
+    client_conn: Connection[TupleRow],
+    client_conn_factory: ClientConnFactory,
+    local_tz: ZoneInfo,
+) -> None:
+    """Regression pin for FINDING-01 (2026-07-17 adversarial review, CRITICAL).
+
+    ``_callback_guard`` opens an outer ``trio.fail_after`` and ``_run_sync``
+    opens an inner one. Because the outer scope starts first its deadline
+    always fires first, delivering ``trio.Cancelled`` — not ``TooSlowError``
+    — at the ``to_thread.run_sync`` await. The inner ``except TooSlowError``
+    handler that frees the slot is dead code in production; control falls to
+    the ``finally``, and without a shield ``await pool.release()`` sees the
+    outer cancellation at its first checkpoint. Semaphore never runs its
+    ``release()``, slot leaks. Four such leaks (max_size=4) wedge the mount.
+
+    This test simulates the outer-cancel-during-worker-body path against a
+    ``max_size=1`` pool. The invariant: a second ``acquire`` after the
+    cancelled ``_run_sync`` must succeed.
+    """
+    pool = ConnectionPool(client_conn_factory, max_size=1)
+    ops = _ops(client_conn, local_tz, pool=pool, timeout_s=5.0)
+
+    # Simulate an outer callback-guard budget of 100ms wrapped around a
+    # sync body that takes 500ms. Outer deadline fires while the worker is
+    # still running → Cancelled propagates through the finally.
+    with pytest.raises(BaseException):  # noqa: B017  — trio.Cancelled by design
+        with trio.fail_after(0.1):
+            _ = await ops._run_sync(lambda: _time.sleep(0.5))  # pyright: ignore[reportPrivateUsage]
+
+    # The pool slot must be recoverable now — before the fix, this would
+    # block forever.
+    with trio.fail_after(1.0):
+        conn = await pool.acquire()
+    assert conn is not None
+    await pool.release(conn)
+
+
+@pytest.mark.trio
 async def test_pool_acquire_also_obeys_callback_timeout(
     client_conn: Connection[TupleRow],
     client_conn_factory: ClientConnFactory,

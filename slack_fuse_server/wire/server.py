@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -25,6 +26,8 @@ from slack_fuse_server.wire.frames import (
 )
 from slack_fuse_server.wire.subscriptions import ConnectionSubscriptions
 from slack_fuse_server.wire.tail import DEFAULT_MAX_REPLAY_EVENTS, EventTailer
+
+log = logging.getLogger(__name__)
 
 _DEFAULT_HEARTBEAT_INTERVAL_S = 30.0
 _DEFAULT_CLIENT_TIMEOUT_S = 90.0
@@ -192,6 +195,25 @@ class _ConnectionHandler:
             # server process. (Observed: 10 cluster restarts over 1 week
             # correlated 1:1 with local mount restarts.)
             pass
+        except* Exception as eg:
+            # FINDING-04 (2026-07-17 adversarial review, HIGH): the
+            # ``ConnectionClosed`` fix above pinned the OBSERVED symptom, not
+            # the class. Anything else raising out of the per-connection
+            # nursery — psycopg.OperationalError on PG restart mid-replay,
+            # InvalidEventPayloadError on a poisoned row, a validation edge
+            # case in _dispatch_frame — takes the whole server down (and with
+            # it every other WS client + the same-port HTTP surface). Under
+            # the production dispatch path (``dispatch.serve_dispatch`` →
+            # ``trio.serve_tcp`` → ``_serve_websocket``) there is no outer
+            # isolation. Log + close the socket with 1011 (internal error);
+            # the reconnect will replay from the client's durable cursor.
+            first = next(iter(eg.exceptions))
+            log.warning(
+                "wire: per-connection nursery raised %s; closing this WS with 1011 "
+                "(other connections + HTTP surface remain up)",
+                type(first).__name__,
+                exc_info=first,
+            )
         finally:
             await self._ws.aclose()
 

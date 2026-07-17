@@ -357,7 +357,14 @@ def _channel_added_write(channel_raw: JsonObject) -> EventRecord:
     full rationale — Pydantic ``model_dump`` reshapes nested fields and
     silently drops anything we haven't declared, so we keep the wire dict.
     """
-    return EventRecord(stream="channel-list", kind="channel_added", ts=None, payload=channel_raw)
+    # ``dedup=True`` matches every other structural socket writer + the
+    # ``events_channels_added_dedup`` unique index shipped in migration 0003.
+    # Without it, a Slack Socket Mode redelivery (or a race with startup
+    # ``populate_channels_once``) turns a benign replay into a UniqueViolation
+    # that tears down the slurper. Nothing catches UniqueViolation; on
+    # restart Slack redelivers → crash loop. Pinned by
+    # ``test_channel_added_dedup_survives_redelivery`` (FINDING-03).
+    return EventRecord(stream="channel-list", kind="channel_added", ts=None, payload=channel_raw, dedup=True)
 
 
 def _channel_id_changed_write(raw_event: JsonObject) -> EventRecord | None:

@@ -161,7 +161,7 @@ def _migrate_legacy_always_blocked(
     """
     if not channel_ids:
         return
-    from slack_fuse.projector.block_fetch import get_blocked_channels
+    from slack_fuse.projector.block_fetch import blocked_channel_ids_from_payload, get_blocked_channels
 
     status, body = get_blocked_channels(http_client, base_http_url, shared_secret=shared_secret)
     if status != 200:
@@ -171,15 +171,13 @@ def _migrate_legacy_always_blocked(
             status,
         )
         return
-    raw = body.get("blocked_channels")
-    server_blocked_ids: set[str] = set()
-    if isinstance(raw, list):
-        for entry in cast("list[object]", raw):
-            if not isinstance(entry, dict):
-                continue
-            cid = cast("dict[str, object]", entry).get("channel_id")
-            if isinstance(cid, str):
-                server_blocked_ids.add(cid)
+    # Reuse the canonical payload parser (FINDING-13, 2026-07-17 adversarial
+    # review). The prior inline code read ``body.get("blocked_channels")``
+    # while the server returns ``{"blocked": [...]}`` — server_blocked_ids
+    # was always empty, so every config entry was classified "orphan" and
+    # the "already blocked, safe to drop from config" branch never fired.
+    # Bug landed in b0dcff2 with a fixture engineered to match it.
+    server_blocked_ids = blocked_channel_ids_from_payload(body)
     already_server_blocked = sorted(channel_ids & server_blocked_ids)
     orphan_config_only = sorted(channel_ids - server_blocked_ids)
     if already_server_blocked:

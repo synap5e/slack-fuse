@@ -134,7 +134,15 @@ async def fetch_and_apply_snapshot(
     invalidations = await trio.to_thread.run_sync(
         _apply_snapshot_sync, conn, redirect.stream, redirect.at_offset, tuple(lines)
     )
-    _fire_invalidations(sink_or_default, invalidations)
+    # Dispatch the sink call to a worker thread. ``pyfuse3.invalidate_inode``
+    # can block on kernel writeback and (on a busy mount) deadlock against
+    # in-flight FUSE reads — the 2026-06-24 folio_wait_bit_common wedge
+    # (per_stream.py:222 already moved its own sink call for exactly this
+    # reason). A large snapshot can produce hundreds of refs, each with
+    # per-ref DB work; running that on the event loop starves WS heartbeats
+    # (server kills at 90s silent) and re-triggers the very reconnect+snapshot
+    # loop that landed us here. FINDING-09 (2026-07-17 review).
+    await trio.to_thread.run_sync(_fire_invalidations, sink_or_default, invalidations)
     return SnapshotResult(stream=redirect.stream, at_offset=redirect.at_offset, records_applied=len(lines))
 
 

@@ -101,6 +101,16 @@ def _latest_unfinished_full_run(conn: Connection[TupleRow], channel_id: str) -> 
             FROM latest_state
             WHERE finished = false AND has_pages = true
             UNION ALL
+            -- Prior dangling run fallback (FINDING-05, 2026-07-17). Only
+            -- reachable when the very latest ``run_started`` has no committed
+            -- pages yet — the normal state at decision time, before page 0.
+            -- Extra gate over the original code: the prior started must be
+            -- NEWER than the channel's latest ``backfill_run_finished``.
+            -- Without it, a crash→resume-under-fresh-run-id→re-backfill cycle
+            -- leaves the crashed run's ``run_started`` permanently anchor-able
+            -- (its own resumed run terminates under a DIFFERENT run_id), so a
+            -- much-later operator re-backfill would silently resume from the
+            -- ancient crashed run's Slack cursor.
             SELECT prior.payload->>'run_id'
             FROM latest_state
             JOIN LATERAL (
@@ -110,6 +120,13 @@ def _latest_unfinished_full_run(conn: Connection[TupleRow], channel_id: str) -> 
                   AND prior_started.kind = 'backfill_run_started'
                   AND prior_started.id < latest_state.id
                   AND NOT (COALESCE(prior_started.payload->'params', '{}'::jsonb) ? 'since_ts')
+                  AND prior_started.id > COALESCE(
+                      (SELECT MAX(finished.id)
+                       FROM events finished
+                       WHERE finished.stream = prior_started.stream
+                         AND finished.kind = 'backfill_run_finished'),
+                      0
+                  )
                   AND EXISTS (
                       SELECT 1
                       FROM events page

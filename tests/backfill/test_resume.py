@@ -209,6 +209,61 @@ def test_terminal_abort_gates_out_aborted_runs(server_conn: psycopg.Connection[T
     assert find_resume_plan(server_conn, _CHANNEL) is None
 
 
+def test_dangling_crashed_run_older_than_latest_finish_is_ignored(
+    server_conn: psycopg.Connection[TupleRow],
+) -> None:
+    """Regression pin for FINDING-05 (2026-07-17 adversarial review, HIGH).
+
+    Scenario: a crash → resume-under-fresh-run-id → later re-backfill cycle.
+    The crashed run A's ``backfill_run_started`` + ``backfill_page_committed``
+    rows are never terminated (its resumed successor B terminates under a
+    different run_id). A later operator-triggered re-backfill C starts fresh
+    (no pages yet at decision time). Pre-fix, ``_latest_unfinished_full_run``
+    would see C has no pages, dig into the second UNION-ALL branch, find A
+    (has pages, unfinished by run_id), and anchor C on A's stale Slack cursor
+    — silently handing Slack an expired cursor from many runs ago.
+
+    Fix: the second branch also requires the prior started to be NEWER than
+    the channel's latest ``backfill_run_finished``. Since B's finish is
+    NEWER than A's start, A is filtered out. Result: no resume plan, C
+    walks from Slack's newest as intended.
+    """
+    # Crashed run A: started + one page committed, no finish. Simulates the
+    # zero-pages-at-decision-time state by writing only the started for A
+    # first, then seeding a page via the shared helper (which itself writes
+    # a matching started at the same run_id).
+    _seed_message(
+        server_conn,
+        "1700000100.000100",
+        source=_history_source(cursor="cursor_A_stale", page_index=0, final=False, run_id="RUN_A_CRASHED"),
+    )
+    # Finished run B: started + one page + finished. Newer than A.
+    _seed_message(
+        server_conn,
+        "1700000200.000100",
+        source=_history_source(cursor="", page_index=0, final=True, run_id="RUN_B_FINISHED"),
+    )
+    _seed_terminal(server_conn, "backfill_completed", run_id="RUN_B_FINISHED")
+    # Fresh run C: only a run_started, no pages. Written directly to bypass
+    # the seed helper (which writes a page).
+    _ = write_event(
+        server_conn,
+        EventRecord(
+            stream=_RUN_STREAM,
+            kind="backfill_run_started",
+            ts=None,
+            payload={"run_id": "RUN_C_FRESH", "params": {}, "triggered_by": "admin-cli"},
+            dedup=True,
+        ),
+    )
+
+    plan = find_resume_plan(server_conn, _CHANNEL)
+    assert plan is None, (
+        "C must walk from Slack's newest — anchoring on A's stale cursor would "
+        "silently hand Slack an expired cursor across the crash→resume→re-backfill boundary."
+    )
+
+
 def test_rows_after_terminal_are_resume_state(server_conn: psycopg.Connection[TupleRow]) -> None:
     _seed_message(server_conn, "1700000300.000100", source=_history_source(cursor="old", page_index=0, final=True))
     _seed_terminal(server_conn, "backfill_completed")

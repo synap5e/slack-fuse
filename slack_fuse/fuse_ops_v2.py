@@ -736,8 +736,9 @@ class SlackFuseOpsV2(pyfuse3.Operations):
                 "FUSE callback exceeded %.1fs timeout — returning EIO and discarding the borrowed conn",
                 budget,
             )
-            await self._pool.release(conn, discard=True)
             released = True
+            with trio.CancelScope(shield=True):
+                await self._pool.release(conn, discard=True)
             raise pyfuse3.FUSEError(errno.EIO) from None
         except pyfuse3.FUSEError:
             # Intentional FS-level error code from sync_fn — let through, but
@@ -747,8 +748,9 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             # PG socket vanished mid-query. Mark down so subsequent callbacks
             # fast-fail; discard the bad conn (don't return it to the pool).
             self._maybe_mark_pg_down(exc)
-            await self._pool.release(conn, discard=True)
             released = True
+            with trio.CancelScope(shield=True):
+                await self._pool.release(conn, discard=True)
             raise pyfuse3.FUSEError(errno.EIO) from None
         except Exception:
             # Catch-all: any unhandled exception in the FUSE callback should
@@ -756,13 +758,25 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             # have been left in an inconsistent state (open cursor, half-
             # processed result) so discard rather than risk reusing it.
             log.exception("FUSE callback raised unexpected error; returning EIO")
-            await self._pool.release(conn, discard=True)
             released = True
+            with trio.CancelScope(shield=True):
+                await self._pool.release(conn, discard=True)
             raise pyfuse3.FUSEError(errno.EIO) from None
         finally:
             borrowed_fuse_conn.reset(token)
             if not released:
-                await self._pool.release(conn)
+                # SHIELD the release: an outer ``_callback_guard`` fail_after
+                # (which always starts strictly before the inner fail_after so
+                # its deadline fires first, review 2026-07-17) delivers
+                # ``trio.Cancelled`` — not ``TooSlowError`` — at whatever await
+                # follows. Without the shield, that Cancelled preempts
+                # ``pool.release`` at its first checkpoint, the semaphore never
+                # runs release(), and the slot is permanently leaked. Four
+                # such leaks (max_size=4) wedge the whole mount with no log
+                # line. Repro pinned by
+                # ``test_run_sync_shields_release_from_outer_cancel``.
+                with trio.CancelScope(shield=True):
+                    await self._pool.release(conn)
 
     def _maybe_mark_pg_down(self, exc: BaseException) -> None:
         """Tell ``PgHealth`` PG is down (if wired)."""
@@ -2142,11 +2156,17 @@ class V2InvalidationSink:
     --------------------------------------------------------------------------
     Threading
     --------------------------------------------------------------------------
-    Called synchronously from ``StreamApplier._fire_invalidations`` on the trio
-    event-loop thread *after* the applier's TX commits. Owns a dedicated psycopg
-    connection so its reads never race the FUSE callbacks' connection (which run
-    on worker threads). ``invalidate_inode`` defaults to the same pyfuse3
-    wrapper ``SlackFuseOpsV2`` uses for the health-subscriber path.
+    Called from a worker thread via ``trio.to_thread.run_sync`` from both the
+    live apply path (``StreamApplier._fire_invalidations``) and the snapshot
+    fetch path (``snapshot_fetch.fetch_and_apply_snapshot``) — never on the
+    event loop. Running on the loop can deadlock against in-flight FUSE reads
+    (``pyfuse3.invalidate_inode`` blocks on kernel writeback, kernel writeback
+    is holding a lock the FUSE read is waiting on, the read needs the event
+    loop — folio_wait_bit_common wedge, 2026-06-24). Both callers moved their
+    dispatch off the loop; do not "helpfully" undo that from a caller you
+    add. Owns a dedicated psycopg connection so its reads never race the
+    FUSE callbacks' connection. ``invalidate_inode`` defaults to the same
+    pyfuse3 wrapper ``SlackFuseOpsV2`` uses for the health-subscriber path.
 
     --------------------------------------------------------------------------
     Why materialized, not only notify_store-primed
