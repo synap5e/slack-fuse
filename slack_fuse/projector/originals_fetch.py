@@ -22,6 +22,7 @@ def fetch_originals(  # noqa: PLR0913 — sync HTTP call needs the client + url 
     *,
     from_epoch: float,
     to_epoch: float,
+    shared_secret: str | None = None,
     timeout_s: float = DEFAULT_FETCH_TIMEOUT_S,
 ) -> bytes:
     """``GET {base}/originals/{channel_id}?from=&to=`` → response body.
@@ -29,9 +30,14 @@ def fetch_originals(  # noqa: PLR0913 — sync HTTP call needs the client + url 
     Raises :class:`httpx.HTTPError` on any transport / non-2xx outcome; the
     caller (FUSE read) converts to ``EIO`` via the standard ``_callback_guard``
     exception path so the user sees a normal IO error rather than a hang.
+
+    ``shared_secret`` (FINDING-11, 2026-07-17) is sent as
+    ``x-slack-fuse-secret`` for parity with the WS handshake auth path. The
+    server gates ``/originals`` because the endpoint replays raw message text.
     """
     query = urlencode({"from": f"{from_epoch:.6f}", "to": f"{to_epoch:.6f}"})
     url = f"{base_http_url.rstrip('/')}/originals/{channel_id}?{query}"
-    response = http_client.get(url, timeout=timeout_s)
+    headers = {"x-slack-fuse-secret": shared_secret} if shared_secret else {}
+    response = http_client.get(url, timeout=timeout_s, headers=headers)
     response.raise_for_status()
     return response.content

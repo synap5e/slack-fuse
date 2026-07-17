@@ -455,6 +455,7 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
             channel_id,
             from_epoch=from_epoch,
             to_epoch=to_epoch,
+            shared_secret=config.shared_secret,
         )
 
     def _channel_gaps_fetch_sync(channel_id: str) -> bytes:

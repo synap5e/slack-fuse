@@ -119,7 +119,16 @@ class WSClient:
         owned_http: httpx.AsyncClient | None = None
         if self._http is None:
             base = self._options.base_http_url or _derive_http_base(self._options.server_url)
-            owned_http = httpx.AsyncClient(base_url=base, timeout=60.0)
+            # Pass the shared secret to snapshot fetches. FINDING-11 (2026-07-17)
+            # gated /streams/<id>/snapshot server-side; without this header the
+            # server 401s, ``fetch_and_apply_snapshot`` raises HTTPStatusError,
+            # and the projector reconnects in a growing-backoff loop with the
+            # stream never draining. Sent as ``x-slack-fuse-secret`` for parity
+            # with the WS handshake auth path.
+            default_headers: dict[str, str] = {}
+            if self._options.shared_secret:
+                default_headers["x-slack-fuse-secret"] = self._options.shared_secret
+            owned_http = httpx.AsyncClient(base_url=base, timeout=60.0, headers=default_headers)
             self._http = owned_http
         try:
             async with trio.open_nursery() as nursery:
