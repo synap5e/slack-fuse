@@ -56,7 +56,8 @@ from slack_fuse.models import (
     SocketEventPayload,
 )
 from slack_fuse_server._json import JsonObject
-from slack_fuse_server.slurper.api import SlackAPIError, SlackClient, Validated
+from slack_fuse_server.slurper.api import FatalAPIError, SlackAPIError, SlackClient, Validated
+from slack_fuse_server.slurper.channels import ensure_channel_added_from_info
 from slack_fuse_server.slurper.health import HealthEmitter, HealthKind, SlackDegradedTracker
 from slack_fuse_server.slurper.ingestion import make_source
 from slack_fuse_server.slurper.limiters import SlurperLimiters
@@ -120,11 +121,17 @@ class SocketModeOptions:
     each time a connection re-establishes after a disconnect (never on the
     first connect). The slurper wires it to the reconnect-catchup trigger; left
     `None` in tests and when catchup is disabled.
+
+    `on_self_join` queues history backfill after the channel inventory has
+    been seeded. `self_user_id` is a test seam; production discovers it with
+    `auth.test` before opening the first Socket Mode connection.
     """
 
     degraded_min_duration_s: float = DEFAULT_DEGRADED_MIN_DURATION_S
     status: SocketModeStatus | None = None
     on_reconnect: Callable[[float], None] | None = None
+    on_self_join: Callable[[str], bool] | None = None
+    self_user_id: str | None = None
 
 
 def _classify_open_failure(exc: BaseException) -> str:
@@ -449,6 +456,13 @@ class SocketModeRunner:
         self._degraded = SlackDegradedTracker(health, options.degraded_min_duration_s)
         self._status = options.status if options.status is not None else SocketModeStatus()
         self._on_reconnect = options.on_reconnect
+        self._on_self_join = options.on_self_join
+        self._self_user_id = options.self_user_id
+
+    @property
+    def self_user_id(self) -> str | None:
+        """Slack user id represented by the user token, once identified."""
+        return self._self_user_id
 
     async def run(self) -> None:
         """Keep a Socket Mode connection open for the lifetime of the nursery."""
@@ -495,6 +509,13 @@ class SocketModeRunner:
 
     def _open_socket(self) -> str:
         """Sync: POST apps.connections.open, return the websocket URL."""
+        if self._self_user_id is None:
+            try:
+                self._self_user_id = self._client.auth_test()
+            except FatalAPIError as exc:
+                raise _AuthFailed(str(exc)) from exc
+            except SlackAPIError as exc:
+                raise ValueError(f"auth.test failed: {exc}") from exc
         resp = self._client.http.post(
             _OPEN_URL,
             headers={"Authorization": f"Bearer {self._app_token}"},
@@ -675,6 +696,13 @@ class SocketModeRunner:
         if event.channel:
             extra["channel_id"] = event.channel
         async with span(op="slurper.socket.handle_structural_event", task="socket", extra=extra) as structural_span:
+            if event.type in _MEMBER_EVENTS:
+                return await self._handle_member_event(
+                    event,
+                    raw_event,
+                    parent_span=parent_span,
+                    structural_span=structural_span,
+                )
             raw_write = _raw_channel_list_write(event, raw_event)
             wrote_any = False
             if raw_write is not None:
@@ -697,6 +725,102 @@ class SocketModeRunner:
             if not wrote:
                 structural_span.mark_timeout()
             return wrote_any or wrote
+
+    async def _handle_member_event(
+        self,
+        event: SocketEventPayload,
+        raw_event: JsonObject,
+        *,
+        parent_span: SpanRecorder | None,
+        structural_span: SpanRecorder,
+    ) -> bool:
+        """Handle user membership facts, specializing only this token's user.
+
+        Other people's joins/leaves are recorded as membership facts without a
+        metadata lookup. A self-join first seeds the channel inventory and
+        queues newest-first backfill; a self-leave marks our membership false
+        while retaining every historical event.
+        """
+        membership_write = _member_event_write(event, raw_event)
+        if membership_write is None:
+            structural_span.mark_skipped()
+            return False
+
+        user_id = membership_write.payload.get("user_id")
+        is_self = isinstance(user_id, str) and user_id == self._self_user_id
+        wrote_any = False
+        if is_self and event.type == "member_joined_channel":
+            wrote_any = await self._handle_self_join(
+                event,
+                raw_event,
+                parent_span=parent_span,
+                structural_span=structural_span,
+            )
+
+        membership_wrote = await self._write_event_or_drop_timeout(membership_write, parent_span=parent_span)
+        wrote_any = wrote_any or membership_wrote
+        if not membership_wrote:
+            structural_span.mark_timeout()
+            return wrote_any
+
+        if is_self and event.type == "member_left_channel":
+            changed = EventRecord(
+                stream="channel-list",
+                kind="channel_member_changed",
+                ts=None,
+                payload={"channel_id": event.channel, "is_member": False},
+                source=make_source(slack_event_ts=_event_ts(raw_event)),
+            )
+            changed_wrote = await self._write_event_or_drop_timeout(changed, parent_span=parent_span)
+            wrote_any = wrote_any or changed_wrote
+            if not changed_wrote:
+                structural_span.mark_timeout()
+        return wrote_any
+
+    async def _handle_self_join(
+        self,
+        event: SocketEventPayload,
+        raw_event: JsonObject,
+        *,
+        parent_span: SpanRecorder | None,
+        structural_span: SpanRecorder,
+    ) -> bool:
+        channel_id = event.channel
+        validated = await self._fetch_channel(channel_id, span=structural_span, failure_log_level=logging.INFO)
+        if validated is None:
+            return False
+        try:
+            inserted = await ensure_channel_added_from_info(
+                self._writer,
+                validated,
+                source=make_source(triggered_by="self-join", slack_event_ts=_event_ts(raw_event)),
+            )
+        except PG_TIMEOUT_EXCEPTIONS as exc:
+            timeout_type = type(exc).__name__
+            structural_span.mark_timeout(timeout_type)
+            if parent_span is not None:
+                parent_span.mark_timeout(timeout_type)
+            log.warning(
+                "socket-mode: could not seed self-joined channel after PostgreSQL timeout channel_id=%s",
+                channel_id,
+                exc_info=True,
+            )
+            return False
+        structural_span.set("channel_added", inserted)
+        self._queue_self_join_backfill(channel_id)
+        return inserted
+
+    def _queue_self_join_backfill(self, channel_id: str) -> None:
+        callback = self._on_self_join
+        if callback is None:
+            return
+        try:
+            accepted = callback(channel_id)
+        except Exception:
+            log.info("socket-mode: failed to queue self-join backfill for %s", channel_id, exc_info=True)
+            return
+        if not accepted:
+            log.info("socket-mode: self-join backfill already in progress for %s", channel_id)
 
     async def _build_structural_write(
         self,
@@ -727,9 +851,6 @@ class SocketModeRunner:
         if etype in _RENAME_EVENTS:
             payload = {"channel_id": channel_id, "new_name": channel.name}
             return EventRecord(stream="channel-list", kind="channel_renamed", ts=None, payload=payload)
-        if etype in _MEMBER_EVENTS:
-            payload = {"channel_id": channel_id, "is_member": channel.is_member}
-            return EventRecord(stream="channel-list", kind="channel_member_changed", ts=None, payload=payload)
         log.debug("socket-mode: no structural translation for %s", etype)
         return None
 
@@ -738,6 +859,7 @@ class SocketModeRunner:
         channel_id: str,
         *,
         span: SpanRecorder | None = None,
+        failure_log_level: int = logging.WARNING,
     ) -> Validated[Channel] | None:
         try:
             return await run_sync_with_span(
@@ -746,7 +868,7 @@ class SocketModeRunner:
                 span=span,
             )
         except (SlackAPIError, httpx.HTTPError):
-            log.warning("socket-mode: conversations.info failed for %s", channel_id, exc_info=True)
+            log.log(failure_log_level, "socket-mode: conversations.info failed for %s", channel_id, exc_info=True)
             return None
 
 

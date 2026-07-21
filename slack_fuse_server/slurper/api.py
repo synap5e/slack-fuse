@@ -23,6 +23,7 @@ import httpx
 from pydantic import BaseModel
 
 from slack_fuse.models import (
+    AuthTestResponse,
     Channel,
     ChatGetPermalinkResponse,
     ConversationsHistoryResponse,
@@ -143,6 +144,13 @@ class SlackClient:
     def close(self) -> None:
         """Close the underlying HTTP client."""
         self._http.close()
+
+    def auth_test(self) -> str:
+        """Return the Slack user id represented by this client's token."""
+        response = self._get("auth.test", None, AuthTestResponse)
+        if not response.user_id:
+            raise SlackAPIError("auth.test returned no user_id")
+        return response.user_id
 
     def _get_raw(
         self,

@@ -351,6 +351,12 @@ class AppsConnectionsOpenResponse(_SlackResponse):
     url: str = ""
 
 
+class AuthTestResponse(_SlackResponse):
+    """auth.test — identifies the user represented by the slurper token."""
+
+    user_id: str = ""
+
+
 # === Socket Mode envelopes + event payload ===
 
 

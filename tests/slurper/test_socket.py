@@ -446,7 +446,7 @@ def test_handle_structural_event_enriches_via_conversations_info(
     assert payload == {"channel_id": "C0001", "new_name": "general"}
 
 
-def test_handle_member_joined_channel_writes_user_membership_and_existing_membership(
+def test_handle_member_joined_channel_for_unknown_self_only_writes_user_membership(
     server_conn: psycopg.Connection[TupleRow],
     fake_slack_http: httpx.Client,
 ) -> None:
@@ -465,7 +465,6 @@ def test_handle_member_joined_channel_writes_user_membership_and_existing_member
 
     rows = _rows(server_conn, "channel-list")
     joined = [payload for kind, payload in rows if kind == "channel_member_joined"]
-    changed = [payload for kind, payload in rows if kind == "channel_member_changed"]
     assert len(joined) == 1
     assert joined[0] == {
         "channel_id": "C0001",
@@ -473,7 +472,7 @@ def test_handle_member_joined_channel_writes_user_membership_and_existing_member
         "inviter_id": "UINVITER",
         "event_ts": "1700000000.000100",
     }
-    assert changed == [{"channel_id": "C0001", "is_member": True}, {"channel_id": "C0001", "is_member": True}]
+    assert [kind for kind, _ in rows] == ["channel_member_joined"]
 
 
 def test_handle_member_left_channel_writes_user_membership(

@@ -45,6 +45,7 @@ class BackfillRunTrigger(StrEnum):
     CONTROL_SURFACE = "control-surface"
     REFILL_WINDOW = "refill-window"
     PROBE_REFILL = "probe-refill"
+    SELF_JOIN = "self-join"
 
 
 class BackfillRunOutcome(StrEnum):

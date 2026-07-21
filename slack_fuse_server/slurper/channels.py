@@ -1,12 +1,14 @@
 """Channel-list startup populate for the slurper.
 
 Mirrors `slack_fuse_server.slurper.users.populate_users_once`: the slurper emits
-`channel-list` `channel_added` events from two sources.
+`channel-list` `channel_added` events from three sources.
 
 - Startup: one `channel_added` event per conversation the user can see, from a
   one-shot `conversations.list` pass (this module). Idempotent on restart.
 - Live: `channel_created` / `im_created` socket events translate to the same
   `channel_added` wire kind via `slack_fuse_server.slurper.socket`.
+- Self-join: `member_joined_channel` fetches `conversations.info` and reuses
+  the idempotent insertion helper in this module.
 
 Why the startup pass matters: a split-mode client subscribes to per-channel
 streams only for channels present in its local `channels` table, which it
@@ -16,9 +18,9 @@ event — which never fires for channels the user is already a member of. The
 users-stream equivalent already shipped (Sprint 1E); this closes the same gap
 for channels.
 
-The emitted payload is `Channel.model_dump(mode="json")`, byte-identical to the
-shape the live socket-mode path writes (`socket._channel_added_write`), so the
-client projector's `apply_event` processes startup and live events identically.
+Every source persists the raw Slack channel object, so the client projector's
+`apply_event` processes startup and live events identically without discarding
+fields the current `Channel` model does not declare.
 """
 
 from __future__ import annotations
@@ -77,7 +79,12 @@ def _channel_added_exists(cur: Cursor[TupleRow], channel_id: str) -> bool:
     return cur.fetchone() is not None
 
 
-def _insert_channel_added(cur: Cursor[TupleRow], channel_raw: JsonObject) -> int:
+def _insert_channel_added(
+    cur: Cursor[TupleRow],
+    channel_raw: JsonObject,
+    *,
+    source: JsonObject | None = None,
+) -> int:
     """Persist the RAW channel dict as the payload, not ``model_dump`` output.
 
     Pydantic ``model_dump`` reshapes nested fields (our ``topic`` is the
@@ -86,7 +93,13 @@ def _insert_channel_added(cur: Cursor[TupleRow], channel_raw: JsonObject) -> int
     the lossless source of truth, so we store what Slack actually sent.
     """
     offset = assign_offset(cur, _CHANNEL_LIST_STREAM)
-    record = EventRecord(stream=_CHANNEL_LIST_STREAM, kind="channel_added", ts=None, payload=channel_raw)
+    record = EventRecord(
+        stream=_CHANNEL_LIST_STREAM,
+        kind="channel_added",
+        ts=None,
+        payload=channel_raw,
+        source=source,
+    )
     insert_event(cur, offset, record)
     return offset
 
@@ -147,6 +160,7 @@ def _insert_channel_added_if_missing_sync(
     conn: Connection[TupleRow],
     channel_id: str,
     channel_raw: JsonObject,
+    source: JsonObject | None = None,
 ) -> bool:
     """Transaction-only body of :func:`ensure_channel_added`.
 
@@ -158,8 +172,31 @@ def _insert_channel_added_if_missing_sync(
         _lock_channel_list_stream(cur)
         if _channel_added_exists(cur, channel_id):
             return False
-        _ = _insert_channel_added(cur, channel_raw)
+        _ = _insert_channel_added(cur, channel_raw, source=source)
         return True
+
+
+async def ensure_channel_added_from_info(
+    writer: OffsetWriter,
+    validated: Validated[Channel],
+    *,
+    source: JsonObject | None = None,
+) -> bool:
+    """Persist an already-fetched channel through the idempotent add path.
+
+    Socket-mode self-join handling fetches ``conversations.info`` before it
+    enters the channel-list transaction. Reusing this helper avoids a second
+    Slack API call while preserving the same stream lock + existence check as
+    :func:`ensure_channel_added`.
+    """
+    return await writer.run_transaction(
+        lambda conn: _insert_channel_added_if_missing_sync(
+            conn,
+            validated.model.id,
+            validated.raw,
+            source,
+        )
+    )
 
 
 async def ensure_channel_added(
@@ -194,6 +231,4 @@ async def ensure_channel_added(
         lambda: client.get_channel_info(channel_id),
         limiter=limiters.slack_api,
     )
-    return await writer.run_transaction(
-        lambda conn: _insert_channel_added_if_missing_sync(conn, channel_id, validated.raw)
-    )
+    return await ensure_channel_added_from_info(writer, validated)

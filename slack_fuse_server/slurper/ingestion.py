@@ -45,7 +45,7 @@ _COMMIT_ENV = "GIT_COMMIT"
 _IMAGE_DIGEST_ENV = "SLACK_FUSE_SERVER_IMAGE_DIGEST"
 
 #: Allowed `triggered_by` values (documentation; not enforced at runtime).
-TRIGGERED_BY_VALUES = frozenset({"startup", "scheduled", "reconnect", "control-surface", "admin-cli"})
+TRIGGERED_BY_VALUES = frozenset({"startup", "scheduled", "reconnect", "control-surface", "admin-cli", "self-join"})
 
 
 def new_ulid() -> str:
@@ -190,6 +190,7 @@ def ingesting_run(
 def make_source(  # noqa: PLR0913 - a keyword-only field bag; a dataclass here would just rename the problem.
     *,
     producer: str | None = None,
+    triggered_by: str | None = None,
     slack_cursor: str | None = None,
     prior_cursor: str | None = None,
     page_index: int | None = None,
@@ -212,6 +213,7 @@ def make_source(  # noqa: PLR0913 - a keyword-only field bag; a dataclass here w
     """
     fields: dict[str, JsonValue] = {
         "producer": producer,
+        "triggered_by": triggered_by,
         "slack_cursor": slack_cursor,
         "prior_cursor": prior_cursor,
         "page_index": page_index,

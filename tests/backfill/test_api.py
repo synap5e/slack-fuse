@@ -30,7 +30,12 @@ from slack_fuse_server.backfill.api import (
     backfill_channel,
     write_backfill_batch_with_retry,
 )
-from slack_fuse_server.backfill.types import BackfillAbortReason, MessageBatch, MessageBatchOrigin
+from slack_fuse_server.backfill.types import (
+    BackfillAbortReason,
+    BackfillRunTrigger,
+    MessageBatch,
+    MessageBatchOrigin,
+)
 from slack_fuse_server.slurper.api import RateLimitedError, SlackClient, Validated
 from slack_fuse_server.slurper.health import HealthEmitter, HealthKind
 from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter, write_event
@@ -552,6 +557,26 @@ def test_backfill_channel_writes_events_and_emits_health(server_conn: psycopg.Co
         "backfill_run_finished",
     ]
     assert rows[-1][1]["outcome"] == "completed"
+
+
+def test_self_join_backfill_records_lifecycle_trigger(server_conn: psycopg.Connection[TupleRow]) -> None:
+    writer = make_test_writer(server_conn)
+    health = HealthEmitter(writer)
+    ctx = BackfillContext(writer=writer, health=health, limiters=make_test_limiters(), warn_at=1000, abort_at=20000)
+
+    async def run() -> None:
+        _ = await backfill_channel(
+            _StubBackfiller(1),
+            ChannelId("C_SELF"),
+            ctx,
+            triggered_by=BackfillRunTrigger.SELF_JOIN,
+        )
+
+    trio.run(run)
+
+    rows = _backfill_run_rows(server_conn, "C_SELF")
+    assert rows[0][0] == "backfill_run_started"
+    assert rows[0][1]["triggered_by"] == "self-join"
 
 
 def test_backfill_channel_write_batch_span_shape(

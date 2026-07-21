@@ -491,6 +491,7 @@ async def _serve(config: ServerConfig, boot: BootContext) -> None:
                     config,
                     status,
                     catchup_trigger,
+                    backfill_trigger,
                     limiters,
                     supervisor,
                 )
@@ -614,6 +615,7 @@ async def _run_socket_mode_with_users_task(  # noqa: PLR0913, PLR0917 - socket t
     config: ServerConfig,
     status: SocketModeStatus,
     catchup_trigger: CatchupTrigger | None,
+    backfill_trigger: ManualBackfillTrigger,
     limiters: SlurperLimiters,
     supervisor: TaskSupervisor,
 ) -> None:
@@ -621,6 +623,10 @@ async def _run_socket_mode_with_users_task(  # noqa: PLR0913, PLR0917 - socket t
         degraded_min_duration_s=config.slack_degraded_min_duration_s,
         status=status,
         on_reconnect=_make_on_reconnect(catchup_trigger, config.catchup_gap_threshold_s),
+        on_self_join=lambda channel_id: backfill_trigger.request_channel(
+            channel_id,
+            triggered_by=BackfillRunTrigger.SELF_JOIN,
+        ),
     )
     await run_socket_mode_with_users(
         writer,
@@ -986,6 +992,7 @@ async def _run_backfill(  # noqa: PLR0913 — thin CLI thunk; bundling into opti
     max_messages: int | None,
     source: BackfillSource,
     since_ts: float | None = None,
+    triggered_by: BackfillRunTrigger | None = None,
 ) -> None:
     limiters = _make_limiters(config)
     writer = OffsetWriter(
@@ -1023,7 +1030,13 @@ async def _run_backfill(  # noqa: PLR0913 — thin CLI thunk; bundling into opti
             abort_at=abort_at,
         )
         if await writer.run_read(lambda conn: is_channel_blocked(conn, channel_id), limiter=limiters.admin_read):
-            result = await backfill_channel(backfiller, ChannelId(channel_id), ctx, since_ts=since_ts)
+            result = await backfill_channel(
+                backfiller,
+                ChannelId(channel_id),
+                ctx,
+                since_ts=since_ts,
+                triggered_by=triggered_by,
+            )
         else:
             # Bring the channel under the projector's normal model BEFORE we write
             # any per-channel events. A channel the user token can't describe
@@ -1044,7 +1057,13 @@ async def _run_backfill(  # noqa: PLR0913 — thin CLI thunk; bundling into opti
                 raise
             if emitted:
                 log.info("backfill: emitted synthetic channel_added for %s", channel_id)
-            result = await backfill_channel(backfiller, ChannelId(channel_id), ctx, since_ts=since_ts)
+            result = await backfill_channel(
+                backfiller,
+                ChannelId(channel_id),
+                ctx,
+                since_ts=since_ts,
+                triggered_by=triggered_by,
+            )
     finally:
         if client is not None:
             client.close()
@@ -1067,15 +1086,26 @@ async def _run_backfill(  # noqa: PLR0913 — thin CLI thunk; bundling into opti
 # === CLI ===
 
 
+@dataclass(frozen=True, slots=True)
+class ManualBackfillRequest:
+    channel_id: str
+    triggered_by: BackfillRunTrigger
+
+
 class ManualBackfillTrigger:
-    """Rendezvous trigger for HTTP-requested manual channel backfills."""
+    """Rendezvous trigger for control-surface and self-join backfills."""
 
     def __init__(self) -> None:
-        self._send, self._recv = trio.open_memory_channel[str](max_buffer_size=0)
+        self._send, self._recv = trio.open_memory_channel[ManualBackfillRequest](max_buffer_size=0)
 
-    def request_channel(self, channel_id: str) -> bool:
+    def request_channel(
+        self,
+        channel_id: str,
+        *,
+        triggered_by: BackfillRunTrigger = BackfillRunTrigger.CONTROL_SURFACE,
+    ) -> bool:
         try:
-            self._send.send_nowait(channel_id)
+            self._send.send_nowait(ManualBackfillRequest(channel_id=channel_id, triggered_by=triggered_by))
         except trio.WouldBlock:
             return False
         return True
@@ -1085,37 +1115,39 @@ class ManualBackfillTrigger:
             if supervisor is not None:
                 supervisor.declare("backfill-trigger", "waiting_for_trigger", deadline_s=None)
             try:
-                channel_id = await self._recv.receive()
+                request = await self._recv.receive()
             except trio.EndOfChannel:
                 return
             try:
                 if supervisor is None:
                     await _run_backfill(
                         config,
-                        channel_id,
+                        request.channel_id,
                         allow_large=False,
                         max_messages=None,
                         source="slack-api",
+                        triggered_by=request.triggered_by,
                     )
                 else:
                     async with phase(
                         supervisor,
                         "backfill-trigger",
                         "running",
-                        details={"channel_id": channel_id},
+                        details={"channel_id": request.channel_id},
                         deadline_s=config.backfill_abort_at * 0.5,
                     ):
                         await _run_backfill(
                             config,
-                            channel_id,
+                            request.channel_id,
                             allow_large=False,
                             max_messages=None,
                             source="slack-api",
+                            triggered_by=request.triggered_by,
                         )
             except BlockedChannelError:
-                log.info("backfill: HTTP-triggered run for %s rejected: blocked", channel_id)
+                log.info("backfill: triggered run for %s rejected: blocked", request.channel_id)
             except Exception:
-                log.exception("backfill: HTTP-triggered run for %s failed", channel_id)
+                log.exception("backfill: triggered run for %s failed", request.channel_id)
 
 
 @dataclass(frozen=True, slots=True)
