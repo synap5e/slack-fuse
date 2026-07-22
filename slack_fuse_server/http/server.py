@@ -486,12 +486,14 @@ async def _serve_connection(  # noqa: PLR0913 - HTTP wiring needs explicit deps.
             refill_window_deps=refill_window_deps,
             livez_deps=livez_deps,
         )
-        await _send_response(conn, stream, response)
+        await _send_response(conn, stream, response, request_method=request.method)
     except h11.RemoteProtocolError:
         if conn.our_state is not h11.ERROR:
             # Client may already have hung up while we try to send the 400.
             with contextlib.suppress(trio.BrokenResourceError, trio.ClosedResourceError):
-                await _send_response(conn, stream, _error_response(status_code=400, code="bad_request"))
+                await _send_response(
+                    conn, stream, _error_response(status_code=400, code="bad_request"), request_method="GET"
+                )
     except h11.LocalProtocolError as exc:
         # Serialization bug on our side (e.g. body byte count != declared
         # Content-Length; observed 2026-07-23 in the wire snapshot path). A
@@ -542,19 +544,28 @@ async def _read_request(conn: h11.Connection, stream: trio.abc.Stream) -> HttpRe
             return None
 
 
-async def _send_response(conn: h11.Connection, stream: trio.abc.Stream, response: HttpResponse) -> None:
+async def _send_response(
+    conn: h11.Connection,
+    stream: trio.abc.Stream,
+    response: HttpResponse,
+    *,
+    request_method: str,
+) -> None:
     header_tuples: list[tuple[bytes, bytes]] = [
         (b"content-type", response.content_type.encode("ascii")),
         (b"content-length", str(len(response.body)).encode("ascii")),
         (b"connection", b"close"),
     ]
     header_tuples.extend((name.encode("ascii"), value.encode("ascii")) for name, value in response.headers)
-    encoded = b"".join((
-        conn.send(h11.Response(status_code=response.status_code, headers=header_tuples)),
-        conn.send(h11.Data(data=response.body)),
-        conn.send(h11.EndOfMessage()),
-    ))
-    await stream.send_all(encoded)
+    # HEAD responses carry all the same headers as GET but MUST NOT include a
+    # body (RFC 9110 §9.3.2). h11 enforces this by tracking the client's method
+    # and raising LocalProtocolError("Too much data for declared Content-Length")
+    # if we try to send Data after a HEAD request. Skip the Data event on HEAD.
+    parts = [conn.send(h11.Response(status_code=response.status_code, headers=header_tuples))]
+    if request_method.upper() != "HEAD" and response.body:
+        parts.append(conn.send(h11.Data(data=response.body)))
+    parts.append(conn.send(h11.EndOfMessage()))
+    await stream.send_all(b"".join(parts))
 
 
 def _dto_response(*, status_code: int, payload: BaseModel) -> HttpResponse:

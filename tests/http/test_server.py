@@ -403,6 +403,57 @@ async def test_serve_connection_swallows_client_hangup(
 
 
 @pytest.mark.trio
+async def test_head_request_returns_headers_only_no_body() -> None:
+    """HEAD responses carry the same headers as GET but MUST NOT include a
+    body (RFC 9110 §9.3.2). h11 enforces this and would raise
+    ``LocalProtocolError('Too much data for declared Content-Length')`` if
+    we sent the body — which we did until 2026-07-23. Root cause of the
+    prod crash-loop; containment landed same day.
+    """
+    request = b"HEAD /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+
+    class _Capture(trio.abc.Stream):
+        def __init__(self) -> None:
+            self.sent = bytearray()
+            self._req = request
+            self.closed = False
+
+        async def send_all(self, data: bytes | bytearray | memoryview) -> None:
+            self.sent.extend(bytes(data))
+
+        async def wait_send_all_might_not_block(self) -> None:  # pragma: no cover
+            return None
+
+        async def receive_some(self, max_bytes: int | None = None) -> bytes:
+            if not self._req:
+                return b""
+            chunk = self._req if max_bytes is None else self._req[:max_bytes]
+            self._req = self._req[len(chunk):]
+            return chunk
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    stream = _Capture()
+    # Must not raise. The old code raised LocalProtocolError inside
+    # _send_response for any HEAD request because it always sent Data.
+    await serve_http_connection(stream, metrics_source=StaticMetricsSource(_sample_metrics()))
+    assert stream.closed
+    text = bytes(stream.sent).decode("ascii", errors="replace")
+    # A response status line is present (routing sees HEAD as non-GET → 405
+    # today; whether we later relax that is a routing-side concern. Body-less
+    # is the invariant this test pins).
+    assert text.startswith("HTTP/1.1 ")
+    # Content-Length reflects what a GET would have returned, per RFC.
+    assert "content-length: " in text.lower()
+    # And the response body itself MUST NOT appear (RFC 9110 §9.3.2).
+    header_end = text.find("\r\n\r\n")
+    assert header_end > 0
+    body_bytes = text[header_end + 4:]
+    assert body_bytes == "", f"HEAD response must have no body, got {body_bytes!r}"
+
+
+@pytest.mark.trio
 async def test_serve_connection_swallows_local_protocol_error(
     caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
