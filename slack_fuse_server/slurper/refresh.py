@@ -36,6 +36,7 @@ from psycopg import Connection
 
 from slack_fuse_server._json import JsonObject
 from slack_fuse_server.slurper.api import ChannelNotFoundError, SlackAPIError, SlackClient
+from slack_fuse_server.slurper.channels import populate_channels_once
 from slack_fuse_server.slurper.ingestion import ingesting_run
 from slack_fuse_server.slurper.limiters import SlurperLimiters
 from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter, assign_offset, insert_event
@@ -112,6 +113,24 @@ async def _refresh_all_once_run(
     *,
     task_name: str = "refresh",
 ) -> None:
+    async with span(op="slurper.refresh.discover_channels", task=task_name) as discover_span:
+        before_count = await writer.run_read(
+            _count_channel_added_ids,
+            limiter=limiters.admin_read,
+            span=discover_span,
+        )
+        # Reuse the startup inventory import: it preserves raw Slack payloads,
+        # serializes channel-list offsets, and skips ids that already have a
+        # channel_added fact. It also catches list/API failures so the known-id
+        # refresh below still runs when discovery is temporarily unavailable.
+        await populate_channels_once(writer, client, limiters)
+        after_count = await writer.run_read(
+            _count_channel_added_ids,
+            limiter=limiters.admin_read,
+            span=discover_span,
+        )
+        discover_span.set("newly_added_count", max(after_count - before_count, 0))
+
     async with span(op="slurper.refresh.list_known_channels", task=task_name) as list_span:
         if supervisor is None:
             channel_ids = await writer.run_read(_list_known_channel_ids, limiter=limiters.admin_read, span=list_span)
@@ -157,6 +176,22 @@ async def _refresh_all_once_run(
         not_found,
         errors,
     )
+
+
+def _count_channel_added_ids(conn: psycopg.Connection[TupleRow]) -> int:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT count(DISTINCT payload->>'id')
+            FROM events
+            WHERE stream = %s
+              AND kind = 'channel_added'
+              AND payload->>'id' IS NOT NULL
+            """,
+            (_CHANNEL_LIST_STREAM,),
+        )
+        row = cur.fetchone()
+    return 0 if row is None else int(row[0])
 
 
 async def _refresh_channel_with_span(  # noqa: PLR0913 - mirrors _refresh_one with span/phase metadata.

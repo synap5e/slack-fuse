@@ -34,6 +34,18 @@ if TYPE_CHECKING:
     from psycopg.rows import TupleRow
 
 
+@pytest.fixture(autouse=True)
+def _isolate_info_refresh_from_inventory_discovery(  # pyright: ignore[reportUnusedFunction]
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Discovery has dedicated integration tests; keep these info-diff tests focused."""
+
+    async def skip_discovery(*_args: object, **_kwargs: object) -> None:
+        await trio.lowlevel.checkpoint()
+
+    monkeypatch.setattr("slack_fuse_server.slurper.refresh.populate_channels_once", skip_discovery)
+
+
 def _fake_client(http: httpx.Client) -> SlackClient:
     client = SlackClient("xoxp-test")
     client._http = http  # pyright: ignore[reportPrivateUsage]

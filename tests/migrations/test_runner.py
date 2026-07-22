@@ -23,6 +23,12 @@ def _normalize_ddl(sql: str) -> str:
     return " ".join(without_idempotency.split())
 
 
+def _channels_view_definition(sql: str) -> str:
+    match = re.search(r"CREATE(?: OR REPLACE)? VIEW channels AS\s+(.*?);", sql, flags=re.DOTALL)
+    assert match is not None
+    return _normalize_ddl(match.group(1))
+
+
 def test_discover_client_migrations() -> None:
     found = discover_migrations(_CLIENT_DIR)
     assert [name for _, name, _ in found] == [
@@ -48,6 +54,7 @@ def test_discover_server_migrations() -> None:
         "0010_thread_parent_hint_idx.sql",
         "0011_backfill_run_stream.sql",
         "0012_slack_event_inbox.sql",
+        "0013_channels_view_fold_drift.sql",
     ]
 
 
@@ -58,6 +65,13 @@ def test_schema_sql_mirrors_slack_event_inbox_migration() -> None:
     for statement in migration.split(";"):
         if statement:
             assert statement in schema
+
+
+def test_schema_sql_mirrors_channels_view_fold_migration() -> None:
+    migration = (_SERVER_DIR / "0013_channels_view_fold_drift.sql").read_text()
+    schema = _SERVER_SCHEMA.read_text()
+
+    assert _channels_view_definition(schema) == _channels_view_definition(migration)
 
 
 def _relkind(conn: psycopg.Connection[TupleRow], name: str) -> str | None:
@@ -91,6 +105,7 @@ def test_apply_server_migrations_idempotent(pg_conn: psycopg.Connection[TupleRow
         "0010_thread_parent_hint_idx.sql",
         "0011_backfill_run_stream.sql",
         "0012_slack_event_inbox.sql",
+        "0013_channels_view_fold_drift.sql",
     ]
     assert _table_exists(pg_conn, "events")
     assert _table_exists(pg_conn, "snapshots")
@@ -138,6 +153,23 @@ def test_apply_server_migrations_idempotent(pg_conn: psycopg.Connection[TupleRow
         assert row is not None and row[0] is not None
     # Second run applies nothing.
     assert apply_migrations(pg_conn, _SERVER_DIR) == []
+
+
+def test_channels_view_fold_migration_is_directly_idempotent(
+    server_conn: psycopg.Connection[TupleRow],
+) -> None:
+    migration = (_SERVER_DIR / "0013_channels_view_fold_drift.sql").read_text()
+    with server_conn.cursor() as cur:
+        cur.execute("SELECT pg_get_viewdef('channels'::regclass, true)")
+        before = cur.fetchone()
+        cur.execute(migration)  # pyright: ignore[reportArgumentType, reportCallIssue]
+        cur.execute(migration)  # pyright: ignore[reportArgumentType, reportCallIssue]
+        cur.execute("SELECT pg_get_viewdef('channels'::regclass, true)")
+        after = cur.fetchone()
+
+    assert before is not None
+    assert after == before
+    assert _relkind(server_conn, "channels") == "v"
 
 
 def test_apply_client_migrations_idempotent(pg_conn: psycopg.Connection[TupleRow]) -> None:
