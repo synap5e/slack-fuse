@@ -88,10 +88,56 @@ async def test_same_event_id_across_socket_and_http_writes_once(
 
     with server_conn.cursor() as cur:
         cur.execute(
-            "SELECT kind, source->>'slack_event_id' FROM events WHERE stream = 'channel:C1' ORDER BY id"
+            "SELECT kind, source->>'slack_event_id', source->>'transport' "
+            "FROM events WHERE stream = 'channel:C1' ORDER BY id"
         )
         rows = cur.fetchall()
-    assert rows == [("message", "EvCrossTransport")]
+    # Dedup keeps only the first delivery (socket); transport label reflects
+    # which transport actually won the write, not the last one attempted.
+    assert rows == [("message", "EvCrossTransport", "socket")]
+
+
+@pytest.mark.trio
+async def test_transport_label_stamped_per_dispatch(
+    server_conn: psycopg.Connection[TupleRow],
+    fake_slack_http: httpx.Client,
+) -> None:
+    """Each dispatch stamps its own transport into every emitted row's source."""
+    dispatcher = _dispatcher(server_conn, fake_slack_http)
+    raw_socket: JsonObject = {
+        "type": "message",
+        "channel": "C1",
+        "ts": "1700000001.000001",
+        "event_ts": "1700000001.000002",
+        "text": "via socket",
+    }
+    raw_http: JsonObject = {
+        "type": "message",
+        "channel": "C1",
+        "ts": "1700000002.000001",
+        "event_ts": "1700000002.000002",
+        "text": "via webhook",
+    }
+    await _dispatch(
+        dispatcher,
+        EventsApiPayload(event_id="EvSocket1", event=SocketEventPayload.model_validate(raw_socket)),
+        raw_socket,
+        transport="socket",
+    )
+    await _dispatch(
+        dispatcher,
+        EventsApiPayload(event_id="EvHttp1", event=SocketEventPayload.model_validate(raw_http)),
+        raw_http,
+        transport="http",
+    )
+
+    with server_conn.cursor() as cur:
+        cur.execute(
+            "SELECT source->>'slack_event_id', source->>'transport' "
+            "FROM events WHERE stream = 'channel:C1' ORDER BY id"
+        )
+        rows = cur.fetchall()
+    assert rows == [("EvSocket1", "socket"), ("EvHttp1", "http")]
 
 
 @pytest.mark.trio

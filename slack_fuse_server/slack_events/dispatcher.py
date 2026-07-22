@@ -90,7 +90,7 @@ class SlackEventDispatcher:
         event_id = source_ctx.event_id or payload.event_id
         if not event_id:
             raise DispatchPermanentError(DispatchErrorCode.MALFORMED_PAYLOAD)
-        with dispatching_slack_event(event_id):
+        with dispatching_slack_event(event_id, source_ctx.transport):
             await self._dispatch_event(event, raw_event, span=span)
 
     async def _dispatch_event(

@@ -103,15 +103,24 @@ CURRENT_SPAN_ID: ContextVar[str | None] = ContextVar("slack_fuse_current_span_id
 #: crash/retry-safe deduplication at ``insert_event``.
 slack_event_id: ContextVar[str | None] = ContextVar("slack_event_id", default=None)
 
+#: Which transport (``"socket"`` or ``"http"``) delivered the dispatch currently
+#: running on this task. Stamped into every emitted event's ``source`` via
+#: ``compose_source`` so post-hoc queries can distinguish socket-mode from
+#: webhook-derived rows (e.g. rollback validation, per-transport metrics).
+slack_transport: ContextVar[str | None] = ContextVar("slack_transport", default=None)
+
 
 @contextmanager
-def dispatching_slack_event(event_id: str | None) -> Iterator[None]:
-    """Scope a Slack ``event_id`` across every event write in one dispatch."""
-    token = slack_event_id.set(event_id or None)
+def dispatching_slack_event(event_id: str | None, transport: str | None = None) -> Iterator[None]:
+    """Scope a Slack ``event_id`` (+ optional transport label) across every
+    event write in one dispatch."""
+    event_token = slack_event_id.set(event_id or None)
+    transport_token = slack_transport.set(transport or None)
     try:
         yield
     finally:
-        slack_event_id.reset(token)
+        slack_transport.reset(transport_token)
+        slack_event_id.reset(event_token)
 
 
 def current_ingestion_context() -> IngestionContext | None:
@@ -267,4 +276,7 @@ def compose_source(record_source: JsonObject | None) -> JsonObject | None:
     event_id = slack_event_id.get()
     if event_id is not None:
         merged["slack_event_id"] = event_id
+    transport = slack_transport.get()
+    if transport is not None:
+        merged["transport"] = transport
     return merged if merged else None
