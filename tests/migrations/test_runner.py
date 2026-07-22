@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import psycopg
@@ -13,6 +14,13 @@ from slack_fuse.migrations.runner import apply_migrations, discover_migrations
 
 _CLIENT_DIR = Path(client_migrations.__file__).parent
 _SERVER_DIR = Path(server_migrations.__file__).parent
+_SERVER_SCHEMA = _SERVER_DIR.parent / "schema.sql"
+
+
+def _normalize_ddl(sql: str) -> str:
+    without_comments = re.sub(r"--[^\n]*", "", sql)
+    without_idempotency = without_comments.replace("IF NOT EXISTS ", "")
+    return " ".join(without_idempotency.split())
 
 
 def test_discover_client_migrations() -> None:
@@ -39,7 +47,17 @@ def test_discover_server_migrations() -> None:
         "0009_events_source_column.sql",
         "0010_thread_parent_hint_idx.sql",
         "0011_backfill_run_stream.sql",
+        "0012_slack_event_inbox.sql",
     ]
+
+
+def test_schema_sql_mirrors_slack_event_inbox_migration() -> None:
+    migration = _normalize_ddl((_SERVER_DIR / "0012_slack_event_inbox.sql").read_text())
+    schema = _normalize_ddl(_SERVER_SCHEMA.read_text())
+
+    for statement in migration.split(";"):
+        if statement:
+            assert statement in schema
 
 
 def _relkind(conn: psycopg.Connection[TupleRow], name: str) -> str | None:
@@ -72,11 +90,13 @@ def test_apply_server_migrations_idempotent(pg_conn: psycopg.Connection[TupleRow
         "0009_events_source_column.sql",
         "0010_thread_parent_hint_idx.sql",
         "0011_backfill_run_stream.sql",
+        "0012_slack_event_inbox.sql",
     ]
     assert _table_exists(pg_conn, "events")
     assert _table_exists(pg_conn, "snapshots")
     assert _table_exists(pg_conn, "backfill_overrides")
     assert _table_exists(pg_conn, "blocked_channels")
+    assert _table_exists(pg_conn, "slack_event_inbox")
     # 0004 / 0005 replaced the empty `channels` / `health_log` tables with
     # VIEWs over the events log (ES-clean: one source of truth, no dual write).
     assert _relkind(pg_conn, "channels") == "v"
@@ -95,6 +115,8 @@ def test_apply_server_migrations_idempotent(pg_conn: psycopg.Connection[TupleRow
         "events_channel_history_changed_dedup",
         "events_channel_member_user_dedup",
         "events_tokens_revoked_dedup",
+        "events_slack_event_id_dedup",
+        "slack_event_inbox_pending",
         "events_message_changed_target_idx",
         "events_message_deleted_target_idx",
         "events_parent_replied_target_idx",

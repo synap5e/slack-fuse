@@ -35,7 +35,8 @@ import json
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Protocol, cast
+from uuid import uuid4
 
 import httpx
 import trio
@@ -48,20 +49,24 @@ from trio_websocket import (
 )
 
 from slack_fuse.models import (
-    CHANNEL_LIST_EVENT_TYPES,
     GRACEFUL_DISCONNECT_REASONS,
     AppsConnectionsOpenResponse,
-    Channel,
+    EventsApiPayload,
     SocketEnvelope,
     SocketEventPayload,
 )
 from slack_fuse_server._json import JsonObject
-from slack_fuse_server.slurper.api import FatalAPIError, SlackAPIError, SlackClient, Validated
-from slack_fuse_server.slurper.channels import ensure_channel_added_from_info
+from slack_fuse_server.slack_events.types import (
+    DispatchErrorCode,
+    DispatchPermanentError,
+    DispatchTransientError,
+    SlackEventSource,
+)
+from slack_fuse_server.slurper.api import FatalAPIError, SlackAPIError, SlackClient
 from slack_fuse_server.slurper.health import HealthEmitter, HealthKind, SlackDegradedTracker
 from slack_fuse_server.slurper.ingestion import make_source
 from slack_fuse_server.slurper.limiters import SlurperLimiters
-from slack_fuse_server.slurper.offsets import PG_TIMEOUT_EXCEPTIONS, EventRecord, OffsetWriter
+from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter
 from slack_fuse_server.slurper.spans import run_sync_with_span, span
 from slack_fuse_server.slurper.supervisor import TaskSupervisor, phase
 
@@ -96,6 +101,16 @@ _TOKEN_REVOKED_EVENT = "tokens_revoked"
 
 class _AuthFailed(Exception):
     """apps.connections.open reported a bad app token."""
+
+
+class SlackEventDispatcherProtocol(Protocol):
+    async def dispatch(
+        self,
+        payload: EventsApiPayload,
+        raw_event: JsonObject,
+        source_ctx: SlackEventSource,
+        span: SpanRecorder | None = None,
+    ) -> None: ...
 
 
 @dataclass(slots=True)
@@ -358,7 +373,7 @@ def extract_raw_event(raw_envelope: JsonObject) -> JsonObject:
     return {}
 
 
-def _channel_added_write(channel_raw: JsonObject) -> EventRecord:
+def channel_added_write(channel_raw: JsonObject) -> EventRecord:
     """Persist the RAW channel dict (lossless). See the
     ``_insert_channel_added`` docstring in ``slurper/channels.py`` for the
     full rationale — Pydantic ``model_dump`` reshapes nested fields and
@@ -414,19 +429,12 @@ def _member_event_write(event: SocketEventPayload, raw_event: JsonObject) -> Eve
     return EventRecord(stream="channel-list", kind=kind, ts=None, payload=payload, dedup=True)
 
 
-def _raw_channel_list_write(event: SocketEventPayload, raw_event: JsonObject) -> EventRecord | None:
+def raw_channel_list_write(event: SocketEventPayload, raw_event: JsonObject) -> EventRecord | None:
     if event.type == "channel_id_changed":
         return _channel_id_changed_write(raw_event)
     if event.type == "channel_history_changed":
         return _channel_history_changed_write(event, raw_event)
     return _member_event_write(event, raw_event)
-
-
-def _record_channel_id(record: EventRecord) -> str | None:
-    if record.stream.startswith("channel:"):
-        return record.stream.removeprefix("channel:")
-    channel_id = record.payload.get("channel_id")
-    return channel_id if isinstance(channel_id, str) else None
 
 
 class SocketModeRunner:
@@ -440,6 +448,7 @@ class SocketModeRunner:
         app_token: str,
         *,
         limiters: SlurperLimiters,
+        dispatcher: SlackEventDispatcherProtocol | None = None,
         options: SocketModeOptions | None = None,
         supervisor: TaskSupervisor | None = None,
     ) -> None:
@@ -458,6 +467,20 @@ class SocketModeRunner:
         self._on_reconnect = options.on_reconnect
         self._on_self_join = options.on_self_join
         self._self_user_id = options.self_user_id
+        if dispatcher is None:
+            # Compatibility for direct runner unit tests. Production discovers
+            # self identity at boot and injects one shared dispatcher.
+            from slack_fuse_server.slack_events.dispatcher import SlackEventDispatcher  # noqa: PLC0415
+
+            dispatcher = SlackEventDispatcher(
+                writer,
+                client,
+                options.self_user_id or "unknown-self-user",
+                limiters,
+                health,
+                options.on_self_join,
+            )
+        self._dispatcher = dispatcher
 
     @property
     def self_user_id(self) -> str | None:
@@ -578,12 +601,27 @@ class SocketModeRunner:
                     # Pull the raw per-event dict alongside the validated
                     # model so message persistence is lossless.
                     raw_event = extract_raw_event(raw_envelope)
-                    await self._handle_event(envelope.payload.event, raw_event)
+                    await self._handle_event(envelope.payload, raw_event)
         except ConnectionClosed:
             return False
 
-    async def _handle_event(self, event: SocketEventPayload, raw_event: JsonObject) -> None:
-        """Translate one socket event and write the resulting wire events."""
+    async def _handle_event(
+        self,
+        payload_or_event: EventsApiPayload | SocketEventPayload,
+        raw_event: JsonObject,
+    ) -> None:
+        """Attach Socket Mode span/phase state and delegate event routing."""
+        if isinstance(payload_or_event, SocketEventPayload):
+            event = payload_or_event
+            # Direct legacy test/caller invocations have no outer Slack
+            # envelope. Production always passes EventsApiPayload.event_id.
+            payload = EventsApiPayload(event_id=f"legacy-call:{uuid4()}", event=event)
+        else:
+            payload = payload_or_event
+            event = payload.event
+            if event is None:
+                log.warning("socket-mode: ignored events_api envelope without inner event")
+                return
         extra: JsonObject = {"kind": event.type}
         if event.channel:
             extra["channel_id"] = event.channel
@@ -597,279 +635,44 @@ class SocketModeRunner:
                 deadline_s=10,
             ),
         ):
-            if event.type == "message":
-                write = translate_message_event(event, raw_event)
-                if write is None:
-                    event_span.mark_skipped()
-                    return
-                await self._write_event_or_drop_timeout(write, parent_span=event_span)
-                return
-            if event.type == _TOKEN_REVOKED_EVENT:
-                wrote = await self._handle_tokens_revoked(raw_event, parent_span=event_span)
-                if not wrote and event_span.result == "ok":
-                    event_span.mark_skipped()
-                return
-            if event.type in CHANNEL_LIST_EVENT_TYPES:
-                wrote = await self._handle_structural_event(event, raw_event, parent_span=event_span)
-                if not wrote and event_span.result == "ok":
-                    event_span.mark_skipped()
-                return
-            log.debug("socket-mode: ignoring event type %s", event.type)
-            event_span.mark_skipped()
-
-    async def _write_event_or_drop_timeout(
-        self,
-        record: EventRecord,
-        *,
-        parent_span: SpanRecorder | None = None,
-    ) -> bool:
-        channel_id = _record_channel_id(record)
-        async with span(
-            op="slurper.socket.write_event_or_drop",
-            task="socket",
-            extra={"stream": record.stream, "kind": record.kind, "channel_id": channel_id},
-        ) as write_span:
             try:
-                offset = await self._writer.write_event(record, span=write_span)
-            except PG_TIMEOUT_EXCEPTIONS as exc:
-                timeout_type = type(exc).__name__
-                write_span.mark_timeout(timeout_type)
-                if parent_span is not None:
-                    parent_span.mark_timeout(timeout_type)
-                log.warning(
-                    "socket-mode: dropped event after PostgreSQL timeout stream=%s kind=%s channel_id=%s",
-                    record.stream,
-                    record.kind,
-                    channel_id,
-                    exc_info=True,
-                )
-                return False
-            write_span.set("events_written", 1 if offset is not None else 0)
-            if offset is not None:
-                write_span.set("offset", offset)
-            return True
-
-    async def _handle_tokens_revoked(
-        self,
-        raw_event: JsonObject,
-        *,
-        parent_span: SpanRecorder | None = None,
-    ) -> bool:
-        """Capture Slack's direct token-revocation signal and mark auth failed.
-
-        The raw `tokens_revoked` event is stored separately from the existing
-        `auth_token_invalid` health transition so operators can see both the
-        precise Slack revocation payload and the coarse health state that
-        clients already understand.
-        """
-        write = EventRecord(
-            stream="slurper-health",
-            kind=_TOKEN_REVOKED_EVENT,
-            ts=None,
-            payload=raw_event,
-            dedup=True,
-        )
-        wrote = await self._write_event_or_drop_timeout(write, parent_span=parent_span)
-        try:
-            await self._health.emit(HealthKind.AUTH_TOKEN_INVALID, {"reason": _TOKEN_REVOKED_EVENT})
-        except PG_TIMEOUT_EXCEPTIONS as exc:
-            if parent_span is not None:
-                parent_span.mark_timeout(type(exc).__name__)
-            log.warning("socket-mode: dropped auth health after tokens_revoked PostgreSQL timeout", exc_info=True)
-            return False
-        return wrote
-
-    async def _handle_structural_event(
-        self,
-        event: SocketEventPayload,
-        raw_event: JsonObject,
-        *,
-        parent_span: SpanRecorder | None = None,
-    ) -> bool:
-        """Translate a channel-structure event to a `channel-list` write.
-
-        Enriches via `conversations.info` where the wire kind needs the channel
-        object / name / membership. A failed enrichment skips the event (logged)
-        rather than crashing the loop.
-        """
-        extra: JsonObject = {"kind": event.type}
-        if event.channel:
-            extra["channel_id"] = event.channel
-        async with span(op="slurper.socket.handle_structural_event", task="socket", extra=extra) as structural_span:
-            if event.type in _MEMBER_EVENTS:
-                return await self._handle_member_event(
-                    event,
+                await self._dispatcher.dispatch(
+                    payload,
                     raw_event,
-                    parent_span=parent_span,
-                    structural_span=structural_span,
+                    SlackEventSource(transport="socket", event_id=payload.event_id),
+                    span=event_span,
                 )
-            raw_write = _raw_channel_list_write(event, raw_event)
-            wrote_any = False
-            if raw_write is not None:
-                raw_wrote = await self._write_event_or_drop_timeout(raw_write, parent_span=parent_span)
-                wrote_any = wrote_any or raw_wrote
-                if not raw_wrote:
-                    structural_span.mark_timeout()
-                    return wrote_any
-            if event.type in _RAW_CHANNEL_LIST_EVENTS:
-                return wrote_any
-            channel_id = event.channel
-            if not channel_id:
-                structural_span.mark_skipped()
-                return wrote_any
-            write = await self._build_structural_write(event, channel_id, span=structural_span)
-            if write is None:
-                structural_span.mark_skipped()
-                return wrote_any
-            wrote = await self._write_event_or_drop_timeout(write, parent_span=parent_span)
-            if not wrote:
-                structural_span.mark_timeout()
-            return wrote_any or wrote
-
-    async def _handle_member_event(
-        self,
-        event: SocketEventPayload,
-        raw_event: JsonObject,
-        *,
-        parent_span: SpanRecorder | None,
-        structural_span: SpanRecorder,
-    ) -> bool:
-        """Handle user membership facts, specializing only this token's user.
-
-        Other people's joins/leaves are recorded as membership facts without a
-        metadata lookup. A self-join first seeds the channel inventory and
-        queues newest-first backfill; a self-leave marks our membership false
-        while retaining every historical event.
-        """
-        membership_write = _member_event_write(event, raw_event)
-        if membership_write is None:
-            structural_span.mark_skipped()
-            return False
-
-        user_id = membership_write.payload.get("user_id")
-        is_self = isinstance(user_id, str) and user_id == self._self_user_id
-        wrote_any = False
-        if is_self and event.type == "member_joined_channel":
-            wrote_any = await self._handle_self_join(
-                event,
-                raw_event,
-                parent_span=parent_span,
-                structural_span=structural_span,
-            )
-
-        membership_wrote = await self._write_event_or_drop_timeout(membership_write, parent_span=parent_span)
-        wrote_any = wrote_any or membership_wrote
-        if not membership_wrote:
-            structural_span.mark_timeout()
-            return wrote_any
-
-        if is_self and event.type == "member_left_channel":
-            changed = EventRecord(
-                stream="channel-list",
-                kind="channel_member_changed",
-                ts=None,
-                payload={"channel_id": event.channel, "is_member": False},
-                source=make_source(slack_event_ts=_event_ts(raw_event)),
-            )
-            changed_wrote = await self._write_event_or_drop_timeout(changed, parent_span=parent_span)
-            wrote_any = wrote_any or changed_wrote
-            if not changed_wrote:
-                structural_span.mark_timeout()
-        return wrote_any
-
-    async def _handle_self_join(
-        self,
-        event: SocketEventPayload,
-        raw_event: JsonObject,
-        *,
-        parent_span: SpanRecorder | None,
-        structural_span: SpanRecorder,
-    ) -> bool:
-        channel_id = event.channel
-        validated = await self._fetch_channel(channel_id, span=structural_span, failure_log_level=logging.INFO)
-        if validated is None:
-            return False
-        try:
-            inserted = await ensure_channel_added_from_info(
-                self._writer,
-                validated,
-                source=make_source(triggered_by="self-join", slack_event_ts=_event_ts(raw_event)),
-            )
-        except PG_TIMEOUT_EXCEPTIONS as exc:
-            timeout_type = type(exc).__name__
-            structural_span.mark_timeout(timeout_type)
-            if parent_span is not None:
-                parent_span.mark_timeout(timeout_type)
-            log.warning(
-                "socket-mode: could not seed self-joined channel after PostgreSQL timeout channel_id=%s",
-                channel_id,
-                exc_info=True,
-            )
-            return False
-        structural_span.set("channel_added", inserted)
-        self._queue_self_join_backfill(channel_id)
-        return inserted
-
-    def _queue_self_join_backfill(self, channel_id: str) -> None:
-        callback = self._on_self_join
-        if callback is None:
-            return
-        try:
-            accepted = callback(channel_id)
-        except Exception:
-            log.info("socket-mode: failed to queue self-join backfill for %s", channel_id, exc_info=True)
-            return
-        if not accepted:
-            log.info("socket-mode: self-join backfill already in progress for %s", channel_id)
-
-    async def _build_structural_write(
-        self,
-        event: SocketEventPayload,
-        channel_id: str,
-        *,
-        span: SpanRecorder | None = None,
-    ) -> EventRecord | None:
-        etype = event.type
-        if etype in _MEMBERSHIP_LOST_EVENTS:
-            payload: JsonObject = {"channel_id": channel_id, "is_member": False}
-            return EventRecord(stream="channel-list", kind="channel_member_changed", ts=None, payload=payload)
-        if etype in _ARCHIVE_EVENTS:
-            return EventRecord(
-                stream="channel-list", kind="channel_archived", ts=None, payload={"channel_id": channel_id}
-            )
-        if etype in _UNARCHIVE_EVENTS:
-            return EventRecord(
-                stream="channel-list", kind="channel_unarchived", ts=None, payload={"channel_id": channel_id}
-            )
-
-        validated = await self._fetch_channel(channel_id, span=span)
-        if validated is None:
-            return None
-        channel = validated.model
-        if etype in _CREATE_EVENTS:
-            return _channel_added_write(validated.raw)
-        if etype in _RENAME_EVENTS:
-            payload = {"channel_id": channel_id, "new_name": channel.name}
-            return EventRecord(stream="channel-list", kind="channel_renamed", ts=None, payload=payload)
-        log.debug("socket-mode: no structural translation for %s", etype)
-        return None
-
-    async def _fetch_channel(
-        self,
-        channel_id: str,
-        *,
-        span: SpanRecorder | None = None,
-        failure_log_level: int = logging.WARNING,
-    ) -> Validated[Channel] | None:
-        try:
-            return await run_sync_with_span(
-                lambda: self._client.get_channel_info(channel_id),
-                limiter=self._limiters.slack_api,
-                span=span,
-            )
-        except (SlackAPIError, httpx.HTTPError):
-            log.log(failure_log_level, "socket-mode: conversations.info failed for %s", channel_id, exc_info=True)
-            return None
+            except DispatchTransientError as exc:
+                if exc.code is DispatchErrorCode.PG_TIMEOUT:
+                    event_span.mark_timeout()
+                    log.warning(
+                        "socket-mode: dropped event after PostgreSQL timeout stream=%s kind=%s channel_id=%s code=%s",
+                        f"channel:{event.channel}" if event.type == "message" and event.channel else "unknown",
+                        event.type,
+                        event.channel or None,
+                        exc.code.value,
+                    )
+                    return
+                if exc.code is DispatchErrorCode.CONVERSATIONS_INFO_FAILED:
+                    log.warning(
+                        "socket-mode: conversations.info failed for %s; dropped event code=%s",
+                        event.channel or "unknown-channel",
+                        exc.code.value,
+                    )
+                    return
+                log.warning(
+                    "socket-mode: dropped event after dispatch failure kind=%s channel_id=%s code=%s",
+                    event.type,
+                    event.channel or None,
+                    exc.code.value,
+                )
+            except DispatchPermanentError as exc:
+                log.error(
+                    "socket-mode: rejected event kind=%s channel_id=%s code=%s",
+                    event.type,
+                    event.channel or None,
+                    exc.code.value,
+                )
 
 
 def _normalize_message_event(envelope: JsonObject) -> JsonObject:
@@ -919,7 +722,7 @@ def _parse_envelope(message: str | bytes) -> tuple[SocketEnvelope, JsonObject] |
     try:
         return SocketEnvelope.model_validate(normalized), normalized
     except ValidationError as exc:
-        log.warning("socket-mode: envelope parse error: %s", exc)
+        log.warning("socket-mode: envelope validation failed exception_type=%s", type(exc).__name__)
         return None
 
 
@@ -934,6 +737,7 @@ async def run_socket_mode(  # noqa: PLR0913 - public wrapper mirrors runner depe
     app_token: str,
     *,
     limiters: SlurperLimiters,
+    dispatcher: SlackEventDispatcherProtocol | None = None,
     options: SocketModeOptions | None = None,
     supervisor: TaskSupervisor | None = None,
 ) -> None:
@@ -944,6 +748,7 @@ async def run_socket_mode(  # noqa: PLR0913 - public wrapper mirrors runner depe
         client,
         app_token,
         limiters=limiters,
+        dispatcher=dispatcher,
         options=options,
         supervisor=supervisor,
     ).run()

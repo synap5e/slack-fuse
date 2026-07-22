@@ -12,8 +12,9 @@ Use `load_server_config(toml_path=...)` to point at a non-default TOML file
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Self
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -34,8 +35,14 @@ class ServerConfig(BaseSettings):
 
     # Slack credentials (required at runtime; the bot token need only exist).
     slack_user_token: str
-    slack_app_token: str
+    slack_app_token: str = ""
     slack_bot_token: str = ""
+
+    # Slack event sources. ``webhook_port=0`` is the sole disabled value;
+    # Socket Mode remains enabled by default for the staged cutover.
+    webhook_port: int = Field(default=0, ge=0, le=65535)
+    signing_secret: str = ""
+    socket_mode_enabled: bool = True
 
     # Postgres.
     database_url: str = "postgresql:///slack_fuse_server"
@@ -92,6 +99,19 @@ class ServerConfig(BaseSettings):
     probe_channel_inventory_cadence_s: float = 86400.0
     probe_workspace_user_count_cadence_s: float = 86400.0
     probe_channel_day_presence_cadence_s: float = 7 * 86400.0
+
+    @model_validator(mode="after")
+    def _validate_event_sources(self) -> Self:
+        if self.webhook_port > 0 and not self.signing_secret:
+            msg = "signing_secret is required when webhook_port is enabled"
+            raise ValueError(msg)
+        if self.socket_mode_enabled and not self.slack_app_token:
+            msg = "slack_app_token is required when socket_mode_enabled is true"
+            raise ValueError(msg)
+        if not self.socket_mode_enabled and self.webhook_port == 0:
+            msg = "no Slack event source enabled"
+            raise ValueError(msg)
+        return self
 
     @classmethod
     def settings_customise_sources(

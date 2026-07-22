@@ -123,9 +123,12 @@ async def _message_loop(
                 continue
             await ws.send_message(_ack(envelope.envelope_id))
             if envelope.type == "events_api" and envelope.payload is not None:
+                event = envelope.payload.event
+                if event is None:
+                    continue
                 await trio.to_thread.run_sync(
                     store.apply_event,
-                    envelope.payload.event,
+                    event,
                     limiter=limiter,
                 )
     except ConnectionClosed:

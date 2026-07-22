@@ -33,6 +33,29 @@ CREATE INDEX events_source_commit_idx ON events ((source->>'commit')) WHERE sour
 CREATE INDEX events_source_boot_idx ON events ((source->>'boot_id')) WHERE source IS NOT NULL;
 CREATE INDEX events_source_span_idx ON events ((source->>'span_id')) WHERE source IS NOT NULL;
 
+-- Universal Slack Events API delivery dedup (0012). Every row emitted inside
+-- one dispatcher call inherits the event id via the ingestion ContextVar.
+CREATE UNIQUE INDEX events_slack_event_id_dedup
+    ON events (stream, kind, (source->>'slack_event_id'))
+    WHERE source ? 'slack_event_id';
+
+-- Durable HTTPS Events API inbox (0012). Callback envelopes are committed
+-- here before Slack receives a 200 acknowledgement.
+CREATE TABLE slack_event_inbox (
+    event_id         TEXT        PRIMARY KEY,
+    envelope         JSONB       NOT NULL,
+    received_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    processed_at     TIMESTAMPTZ,
+    attempt_count    INTEGER     NOT NULL DEFAULT 0,
+    last_attempt_at  TIMESTAMPTZ,
+    next_attempt_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    dispatch_error   TEXT,
+    dead_lettered_at TIMESTAMPTZ
+);
+CREATE INDEX slack_event_inbox_pending
+    ON slack_event_inbox (next_attempt_at, received_at)
+    WHERE processed_at IS NULL AND dead_lettered_at IS NULL;
+
 -- Backfill dedup: same Slack ts = same message. Keyed by (stream, ts) and
 -- scoped to message events only, so re-running either backfiller is a no-op
 -- while non-message event kinds may legitimately repeat. (RFC §Backfill →

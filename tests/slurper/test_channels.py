@@ -15,7 +15,7 @@ from psycopg.rows import TupleRow
 import slack_fuse_server.slurper.channels as channels_module
 from slack_fuse_server.slurper.api import ChannelNotFoundError, SlackAPIError, SlackClient
 from slack_fuse_server.slurper.channels import ensure_channel_added, populate_channels_once
-from slack_fuse_server.slurper.socket import _channel_added_write
+from slack_fuse_server.slurper.socket import channel_added_write
 from tests._fake_slack import load_fixtures, make_fake_slack_transport
 from tests.conftest import make_test_limiters, make_test_writer
 
@@ -106,7 +106,7 @@ def test_populate_payload_matches_live_socket_mode_shape(
 
     # Build the live-path payload for the same channels and compare.
     for validated in client.list_conversations():
-        live_record = _channel_added_write(validated.raw)
+        live_record = channel_added_write(validated.raw)
         assert live_record.kind == "channel_added"
         assert live_record.stream == "channel-list"
         assert populated[validated.model.id] == live_record.payload

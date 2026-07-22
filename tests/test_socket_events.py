@@ -104,6 +104,7 @@ def test_envelope_events_api_round_trip() -> None:
     assert env.envelope_id == "env-1"
     assert env.payload is not None
     inner = env.payload.event
+    assert inner is not None
     assert inner.type == "message"
     assert inner.channel == "C1"
     assert inner.ts == "1700000001.000001"
@@ -122,6 +123,7 @@ def test_envelope_channel_created_flattens_nested_channel_obj() -> None:
         },
     })
     assert env.payload is not None
+    assert env.payload.event is not None
     assert env.payload.event.channel == "C77"
 
 

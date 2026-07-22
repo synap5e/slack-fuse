@@ -59,6 +59,15 @@ class HealthKind(StrEnum):
     BACKFILL_ABORTED = "backfill_aborted"
     BACKFILL_SKIPPED = "backfill_skipped"
     BACKFILL_WARN_LARGE = "backfill_warn_large"
+    WEBHOOK_DISPATCH_FAILED = "webhook_dispatch_failed"
+    WEBHOOK_DEAD_LETTER = "webhook_dead_letter"
+    WEBHOOK_INBOX_DEPTH = "webhook_inbox_depth"
+    WEBHOOK_INBOX_OLDEST_PENDING_AGE_S = "webhook_inbox_oldest_pending_age_s"
+    WEBHOOK_CONSUMER_ALIVE = "webhook_consumer_alive"
+
+
+class _DuplicateHealthSkip(Exception):
+    """Rollback a ContextVar-deduped health write without consuming offset."""
 
 
 class HealthEmitter:
@@ -80,14 +89,21 @@ class HealthEmitter:
         record = EventRecord(stream=_HEALTH_STREAM, kind=str(kind), ts=None, payload=payload)
         with conn.cursor() as cur:
             offset = assign_offset(cur, _HEALTH_STREAM)
-            insert_event(cur, offset, record)
+            if not insert_event(cur, offset, record):
+                raise _DuplicateHealthSkip
         return offset
 
     async def emit(self, kind: HealthKind, payload: JsonObject | None = None) -> int:
         """Emit one health transition. Returns the assigned `slurper-health` offset."""
         body: JsonObject = payload if payload is not None else {}
         async with span(op="slurper.health.emit", task="health", extra={"kind": str(kind)}) as recorder:
-            offset = await self._writer.run_transaction(lambda conn: self._emit_sync(conn, kind, body), span=recorder)
+            try:
+                offset = await self._writer.run_transaction(
+                    lambda conn: self._emit_sync(conn, kind, body), span=recorder
+                )
+            except _DuplicateHealthSkip:
+                recorder.mark_skipped()
+                return 0
             recorder.set("offset", offset)
         log.info("slurper-health: %s %s (offset=%d)", kind, body, offset)
         return offset

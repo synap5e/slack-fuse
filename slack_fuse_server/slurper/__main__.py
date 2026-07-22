@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Literal, cast
 import psycopg
 import trio
 from psycopg.rows import TupleRow
+from pydantic import ValidationError
 
 import slack_fuse_server.migrations as server_migrations
 from slack_fuse.migrations.runner import apply_migrations
@@ -86,6 +87,15 @@ from slack_fuse_server.http.handlers import (
     SnapshotDeps,
 )
 from slack_fuse_server.http.metrics import MetricsAggregator, SubscriberSnapshot
+from slack_fuse_server.http.slack_webhook import SlackWebhookDeps, serve_slack_webhook
+from slack_fuse_server.slack_events.dispatcher import SlackEventDispatcher
+from slack_fuse_server.slack_events.inbox import (
+    InboxWriter,
+    consume as consume_inbox,
+    emit_telemetry as emit_inbox_telemetry,
+    ensure_consumer_never_returns,
+    run_retention as run_inbox_retention,
+)
 from slack_fuse_server.slurper.api import ChannelNotFoundError, SlackAPIError, SlackClient, Validated
 from slack_fuse_server.slurper.catchup import (
     CatchupConfig,
@@ -388,7 +398,22 @@ def _log_slurper_started() -> None:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _EventSourcePlan:
+    socket_mode: bool
+    webhook: bool
+
+
+def _event_source_plan(config: ServerConfig) -> _EventSourcePlan:
+    """Return the boot-time source selection used by task wiring."""
+    return _EventSourcePlan(
+        socket_mode=config.socket_mode_enabled,
+        webhook=config.webhook_port > 0,
+    )
+
+
 async def _serve(config: ServerConfig, boot: BootContext) -> None:
+    source_plan = _event_source_plan(config)
     slack_api_limiter = trio.CapacityLimiter(2)
     writer_limiter = trio.CapacityLimiter(config.slurper_writer_pool_size)
     snapshot_limiter = trio.CapacityLimiter(1)
@@ -407,6 +432,13 @@ async def _serve(config: ServerConfig, boot: BootContext) -> None:
         acquire_timeout_s=config.slurper_writer_pool_acquire_timeout_s,
     )
     client = SlackClient(config.slack_user_token)
+    try:
+        self_user_id = await trio.to_thread.run_sync(client.auth_test, limiter=limiters.slack_api)
+    except Exception as exc:
+        log.critical("fatal: Slack auth.test failed exception_type=%s", type(exc).__name__)
+        client.close()
+        writer.close()
+        raise SystemExit(1) from exc
     users = UserCache(client.http)
     users.populate()
     resolve_permalink_deps = ResolvePermalinkDeps(
@@ -470,9 +502,33 @@ async def _serve(config: ServerConfig, boot: BootContext) -> None:
         limiter=limiters.snapshot,
     )
 
-    status = SocketModeStatus()
+    status = SocketModeStatus(state="connecting" if source_plan.socket_mode else "disabled")
     wire_server = WireServer(config.database_url, shared_secret=config.shared_secret or None)
     metrics = _build_metrics_aggregator(config, status, wire_server, datetime.now(UTC))
+
+    dispatcher = SlackEventDispatcher(
+        writer,
+        client,
+        self_user_id,
+        limiters,
+        health,
+        lambda channel_id: backfill_trigger.request_channel(
+            channel_id,
+            triggered_by=BackfillRunTrigger.SELF_JOIN,
+        ),
+    )
+    inbox_writer_conn: psycopg.Connection[TupleRow] | None = None
+    inbox_consumer_conn: psycopg.Connection[TupleRow] | None = None
+    webhook_deps: SlackWebhookDeps | None = None
+    if source_plan.webhook:
+        inbox_writer_conn = _connect_server_connection(config)
+        _set_runtime_timeouts(inbox_writer_conn, config)
+        inbox_consumer_conn = _connect_server_connection(config)
+        _set_runtime_timeouts(inbox_consumer_conn, config)
+        webhook_deps = SlackWebhookDeps(
+            signing_secret=config.signing_secret,
+            inbox=InboxWriter(inbox_writer_conn),
+        )
 
     try:
         async with trio.open_nursery() as nursery:
@@ -481,21 +537,23 @@ async def _serve(config: ServerConfig, boot: BootContext) -> None:
             # writes carry the source envelope (producer/boot/task ids —
             # see slurper/ingestion.py). Dispatch/snapshot/wire tasks write no
             # events and stay unwrapped.
-            nursery.start_soon(
-                _ingesting_task(
-                    boot.task_context("socket-mode"),
-                    _run_socket_mode_with_users_task,
-                    writer,
-                    health,
-                    client,
-                    config,
-                    status,
-                    catchup_trigger,
-                    backfill_trigger,
-                    limiters,
-                    supervisor,
+            if source_plan.socket_mode:
+                nursery.start_soon(
+                    _ingesting_task(
+                        boot.task_context("socket-mode"),
+                        _run_socket_mode_with_users_task,
+                        writer,
+                        health,
+                        client,
+                        config,
+                        status,
+                        catchup_trigger,
+                        limiters,
+                        supervisor,
+                        dispatcher,
+                        self_user_id,
+                    )
                 )
-            )
             nursery.start_soon(
                 _ingesting_task(
                     boot.task_context("populate-users-list", triggered_by="startup"),
@@ -506,6 +564,29 @@ async def _serve(config: ServerConfig, boot: BootContext) -> None:
                     supervisor,
                 )
             )
+            if webhook_deps is not None and inbox_consumer_conn is not None:
+                nursery.start_soon(serve_slack_webhook, "0.0.0.0", config.webhook_port, webhook_deps)
+                nursery.start_soon(
+                    _ingesting_task(
+                        boot.task_context("webhook-events"),
+                        _run_inbox_consumer,
+                        inbox_consumer_conn,
+                        dispatcher,
+                        health,
+                        supervisor,
+                    )
+                )
+                nursery.start_soon(_run_inbox_retention_task, config)
+                nursery.start_soon(
+                    _ingesting_task(
+                        boot.task_context("webhook-telemetry"),
+                        emit_inbox_telemetry,
+                        writer,
+                        health,
+                        limiters.admin_read,
+                        supervisor,
+                    )
+                )
             nursery.start_soon(
                 _ingesting_task(
                     boot.task_context("populate-channels-list", triggered_by="startup"),
@@ -606,6 +687,10 @@ async def _serve(config: ServerConfig, boot: BootContext) -> None:
         client.close()
         writer.close()
         snapshot_conn.close()
+        if inbox_writer_conn is not None:
+            inbox_writer_conn.close()
+        if inbox_consumer_conn is not None:
+            inbox_consumer_conn.close()
 
 
 async def _run_socket_mode_with_users_task(  # noqa: PLR0913, PLR0917 - socket task needs its full dep set
@@ -615,18 +700,16 @@ async def _run_socket_mode_with_users_task(  # noqa: PLR0913, PLR0917 - socket t
     config: ServerConfig,
     status: SocketModeStatus,
     catchup_trigger: CatchupTrigger | None,
-    backfill_trigger: ManualBackfillTrigger,
     limiters: SlurperLimiters,
     supervisor: TaskSupervisor,
+    dispatcher: SlackEventDispatcher,
+    self_user_id: str,
 ) -> None:
     options = SocketModeOptions(
         degraded_min_duration_s=config.slack_degraded_min_duration_s,
         status=status,
         on_reconnect=_make_on_reconnect(catchup_trigger, config.catchup_gap_threshold_s),
-        on_self_join=lambda channel_id: backfill_trigger.request_channel(
-            channel_id,
-            triggered_by=BackfillRunTrigger.SELF_JOIN,
-        ),
+        self_user_id=self_user_id,
     )
     await run_socket_mode_with_users(
         writer,
@@ -634,9 +717,28 @@ async def _run_socket_mode_with_users_task(  # noqa: PLR0913, PLR0917 - socket t
         client,
         config.slack_app_token,
         limiters=limiters,
+        dispatcher=dispatcher,
         options=options,
         supervisor=supervisor,
     )
+
+
+async def _run_inbox_consumer(
+    conn: psycopg.Connection[TupleRow],
+    dispatcher: SlackEventDispatcher,
+    health: HealthEmitter,
+    supervisor: TaskSupervisor,
+) -> None:
+    await ensure_consumer_never_returns(lambda: consume_inbox(conn, dispatcher, health, supervisor))
+
+
+async def _run_inbox_retention_task(config: ServerConfig) -> None:
+    def _connect() -> psycopg.Connection[TupleRow]:
+        conn = _connect_server_connection(config)
+        _set_runtime_timeouts(conn, config)
+        return conn
+
+    await run_inbox_retention(_connect)
 
 
 def _make_on_reconnect(
@@ -1296,7 +1398,15 @@ def _build_parser() -> argparse.ArgumentParser:
 def main() -> None:  # noqa: C901 - CLI command dispatch stays flat and explicit.
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     args = _build_parser().parse_args()
-    config = load_server_config()
+    try:
+        config = load_server_config()
+    except ValidationError as exc:
+        problems = "; ".join(
+            f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}"
+            for error in exc.errors(include_url=False, include_context=False, include_input=False)
+        )
+        log.critical("invalid server configuration: %s", problems)
+        raise SystemExit(1) from exc
     configure_span_thresholds_from_config(config)
     # Process-level ingestion identity: one boot_id per serve loop / CLI
     # invocation, commit + image digest read once from the environment.

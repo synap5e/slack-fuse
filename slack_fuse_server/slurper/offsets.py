@@ -126,6 +126,7 @@ def insert_event(cur: Cursor[TupleRow], offset: int, record: EventRecord) -> boo
     server's tail loop wakes; a deduped no-op fires no NOTIFY.
     """
     source = compose_source(record.source)
+    effective_dedup = record.dedup or (source is not None and "slack_event_id" in source)
     values = (
         record.stream,
         offset,
@@ -134,7 +135,7 @@ def insert_event(cur: Cursor[TupleRow], offset: int, record: EventRecord) -> boo
         Jsonb(record.payload),
         Jsonb(source) if source is not None else None,
     )
-    if record.dedup:
+    if effective_dedup:
         cur.execute(
             "INSERT INTO events (stream, offset_in_stream, kind, ts, payload, source) "
             "VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING RETURNING offset_in_stream",

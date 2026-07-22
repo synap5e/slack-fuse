@@ -158,6 +158,7 @@ def test_parse_envelope_allows_user_change_payload_with_nested_user() -> None:
     assert parsed is not None
     envelope, _raw_env = parsed
     assert envelope.payload is not None
+    assert envelope.payload.event is not None
     assert envelope.payload.event.type == "user_change"
     assert envelope.payload.event.user == "U0001"
 
@@ -183,6 +184,7 @@ def test_parse_envelope_allows_team_join_payload_with_nested_user() -> None:
     assert parsed is not None
     envelope, raw_env = parsed
     assert envelope.payload is not None
+    assert envelope.payload.event is not None
     assert envelope.payload.event.type == "team_join"
     assert envelope.payload.event.user == "U0003"
     payload = raw_env["payload"]

@@ -9,7 +9,7 @@ import pytest
 from pydantic import ValidationError
 
 from slack_fuse.config import load_client_config
-from slack_fuse_server.config import load_server_config
+from slack_fuse_server.config import ServerConfig, load_server_config
 
 _SERVER_TOML = """\
 slack_user_token = "xoxp-user"
@@ -100,3 +100,39 @@ def test_missing_required_field_raises(tmp_path: Path) -> None:
     incomplete = _write(tmp_path, "server.toml", 'slack_user_token = "x"\n')  # no app token / secret
     with pytest.raises(ValidationError):
         load_server_config(incomplete)
+
+
+def _server_config(**overrides: object) -> ServerConfig:
+    values: dict[str, object] = {
+        "slack_user_token": "xoxp-user",
+        "slack_app_token": "xapp-app",
+        "shared_secret": "shared",
+    }
+    values.update(overrides)
+    return ServerConfig.model_validate(values)
+
+
+def test_webhook_requires_signing_secret() -> None:
+    with pytest.raises(ValidationError, match="signing_secret is required"):
+        _server_config(webhook_port=18766, signing_secret="")
+
+
+def test_socket_mode_requires_app_token() -> None:
+    with pytest.raises(ValidationError, match="slack_app_token is required"):
+        _server_config(slack_app_token="", socket_mode_enabled=True)
+
+
+def test_at_least_one_event_source_is_required() -> None:
+    with pytest.raises(ValidationError, match="no Slack event source enabled"):
+        _server_config(socket_mode_enabled=False, webhook_port=0)
+
+
+def test_http_only_config_does_not_require_app_token() -> None:
+    cfg = _server_config(
+        slack_app_token="",
+        socket_mode_enabled=False,
+        webhook_port=18766,
+        signing_secret="signing",
+    )
+    assert cfg.socket_mode_enabled is False
+    assert cfg.slack_app_token == ""

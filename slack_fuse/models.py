@@ -393,17 +393,26 @@ class SocketEventPayload(_FrozenModel):
         if not isinstance(data, dict):
             return data
         d = cast("dict[str, object]", data)
+        normalized = dict(d)
         ch = d.get("channel")
         if isinstance(ch, dict):
             ch_id = cast("dict[str, object]", ch).get("id")
-            return {**d, "channel": ch_id if isinstance(ch_id, str) else ""}
-        return d
+            normalized["channel"] = ch_id if isinstance(ch_id, str) else ""
+        user = d.get("user")
+        if isinstance(user, dict):
+            user_id = cast("dict[str, object]", user).get("id")
+            normalized["user"] = user_id if isinstance(user_id, str) else ""
+        return normalized
 
 
 class EventsApiPayload(_FrozenModel):
-    """The `payload` field of an events_api envelope."""
+    """Slack Events API envelope, nested by Socket Mode and direct over HTTP."""
 
-    event: SocketEventPayload
+    type: str = "event_callback"
+    event_id: str = ""
+    event_time: int | None = None
+    challenge: str | None = None
+    event: SocketEventPayload | None = None
 
 
 class SocketEnvelope(_FrozenModel):

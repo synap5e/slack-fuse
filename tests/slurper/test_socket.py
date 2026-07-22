@@ -185,6 +185,7 @@ def test_translate_message_payload_matches_backfill_shape() -> None:
     assert parsed is not None
     envelope, raw_env = parsed
     assert envelope.payload is not None
+    assert envelope.payload.event is not None
 
     payload_dict = raw_env["payload"]
     assert isinstance(payload_dict, dict)

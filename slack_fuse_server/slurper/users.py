@@ -21,10 +21,8 @@ import trio
 from psycopg import Connection, Cursor
 from psycopg.rows import TupleRow
 from pydantic import ValidationError
-from trio_websocket import ConnectionClosed, WebSocketConnection
 
 from slack_fuse.models import (
-    GRACEFUL_DISCONNECT_REASONS,
     SlackUser,
     SocketEnvelope,
     SocketEventPayload,
@@ -42,8 +40,12 @@ from slack_fuse_server.slurper.offsets import (
     assign_offset,
     insert_event,
 )
-from slack_fuse_server.slurper.socket import SocketModeOptions, SocketModeRunner, extract_raw_event
-from slack_fuse_server.slurper.supervisor import TaskSupervisor, phase
+from slack_fuse_server.slurper.socket import (
+    SlackEventDispatcherProtocol,
+    SocketModeOptions,
+    SocketModeRunner,
+)
+from slack_fuse_server.slurper.supervisor import TaskSupervisor
 
 log = logging.getLogger(__name__)
 
@@ -289,19 +291,12 @@ async def apply_user_change_event(
         return
     user_id = event.user
     if not user_id:
-        log.debug("users: ignoring user_change without user id")
-        return
-    try:
-        validated = await trio.to_thread.run_sync(lambda: _fetch_user(client, user_id), limiter=limiters.slack_api)
-        added, renamed, profile_changed = await writer.run_transaction(
-            lambda conn: _apply_user_change_sync(conn, validated, user_id)
-        )
-    except PG_TIMEOUT_EXCEPTIONS:
-        log.warning("users: dropped user_change after PostgreSQL timeout for %s", user_id, exc_info=True)
-        return
-    except (httpx.HTTPError, SlackAPIError, ValueError):
-        log.warning("users: failed to apply user_change for %s", user_id, exc_info=True)
-        return
+        msg = "user_change missing user id"
+        raise ValueError(msg)
+    validated = await trio.to_thread.run_sync(lambda: _fetch_user(client, user_id), limiter=limiters.slack_api)
+    added, renamed, profile_changed = await writer.run_transaction(
+        lambda conn: _apply_user_change_sync(conn, validated, user_id)
+    )
     if added:
         log.info("users: user_change inserted missing user_added for %s", user_id)
         return
@@ -324,18 +319,11 @@ async def apply_team_join_event(
         return
     raw_user = raw_event.get("user")
     if not isinstance(raw_user, dict):
-        log.debug("users: ignoring team_join without user payload")
-        return
-    try:
-        user_raw = cast(JsonObject, raw_user)
-        user = SlackUser.model_validate(user_raw)
-        inserted = await writer.run_transaction(lambda conn: _apply_team_join_sync(conn, Validated(user_raw, user)))
-    except ValidationError:
-        log.warning("users: rejecting malformed team_join user payload", exc_info=True)
-        return
-    except PG_TIMEOUT_EXCEPTIONS:
-        log.warning("users: dropped team_join after PostgreSQL timeout", exc_info=True)
-        return
+        msg = "team_join missing user payload"
+        raise ValueError(msg)
+    user_raw = cast(JsonObject, raw_user)
+    user = SlackUser.model_validate(user_raw)
+    inserted = await writer.run_transaction(lambda conn: _apply_team_join_sync(conn, Validated(user_raw, user)))
     if inserted:
         log.info("users: team_join inserted user_added for %s", user.id)
 
@@ -373,7 +361,7 @@ def _normalize_user_change_envelope(message: str | bytes) -> JsonObject | None:
     return cast(JsonObject, normalized)
 
 
-def _parse_envelope_allow_user_change(
+def parse_envelope_allow_user_change(
     message: str | bytes,
 ) -> tuple[SocketEnvelope, JsonObject] | None:
     """Validate + return paired (possibly normalized model, original raw dict).
@@ -394,85 +382,21 @@ def _parse_envelope_allow_user_change(
     except ValidationError as exc:
         normalized = _normalize_user_change_envelope(message)
         if normalized is None:
-            log.warning("socket-mode: envelope parse error: %s", exc)
+            log.warning("socket-mode: envelope validation failed exception_type=%s", type(exc).__name__)
             return None
         try:
             return SocketEnvelope.model_validate(normalized), raw_envelope
         except ValidationError as fallback_exc:
-            log.warning("socket-mode: envelope parse error: %s", fallback_exc)
+            log.warning(
+                "socket-mode: normalized envelope validation failed exception_type=%s",
+                type(fallback_exc).__name__,
+            )
             return None
 
 
-def _ack(envelope_id: str) -> str:
-    return json.dumps({"envelope_id": envelope_id})
-
-
-class UsersSocketModeRunner(SocketModeRunner):
-    """Socket-mode runner that adds `user_change` handling to Sprint-1A logic."""
-
-    def __init__(  # noqa: PLR0913 - mirrors SocketModeRunner plus user-change dependencies.
-        self,
-        writer: OffsetWriter,
-        health: HealthEmitter,
-        client: SlackClient,
-        app_token: str,
-        *,
-        limiters: SlurperLimiters,
-        options: SocketModeOptions | None = None,
-        supervisor: TaskSupervisor | None = None,
-    ) -> None:
-        super().__init__(writer, health, client, app_token, limiters=limiters, options=options, supervisor=supervisor)
-        self._users_writer = writer
-        self._users_client = client
-        self._users_limiters = limiters
-
-    async def _handle_event(self, event: SocketEventPayload, raw_event: JsonObject) -> None:
-        if event.type == "team_join":
-            async with phase(
-                self._supervisor,
-                "socket",
-                "handling_event",
-                details={"kind": event.type},
-                deadline_s=10,
-            ):
-                await apply_team_join_event(self._users_writer, event, raw_event)
-            return
-        if event.type == "user_change":
-            async with phase(
-                self._supervisor,
-                "socket",
-                "handling_event",
-                details={"kind": event.type},
-                deadline_s=10,
-            ):
-                await apply_user_change_event(self._users_writer, self._users_client, event, self._users_limiters)
-            return
-        await super()._handle_event(event, raw_event)
-
-    async def _message_loop(self, ws: WebSocketConnection) -> bool:
-        """Base loop with user-change envelope normalization."""
-        try:
-            while True:
-                self._supervisor.declare("socket", "connected_waiting_for_frame", deadline_s=None)
-                message = await ws.get_message()
-                parsed = _parse_envelope_allow_user_change(message)
-                if parsed is None:
-                    continue
-                envelope, raw_envelope = parsed
-                if envelope.type == "hello":
-                    log.info("socket-mode: hello (num_connections=%d)", envelope.num_connections)
-                    await self._on_hello()
-                    continue
-                if envelope.type == "disconnect":
-                    return envelope.reason in GRACEFUL_DISCONNECT_REASONS
-                if envelope.envelope_id is None:
-                    continue
-                await ws.send_message(_ack(envelope.envelope_id))
-                if envelope.type == "events_api" and envelope.payload is not None:
-                    raw_event = extract_raw_event(raw_envelope)
-                    await self._handle_event(envelope.payload.event, raw_event)
-        except ConnectionClosed:
-            return False
+# Compatibility alias for tests/callers predating common nested-user model
+# normalization. New transport code uses SocketEventPayload directly.
+_parse_envelope_allow_user_change = parse_envelope_allow_user_change
 
 
 async def run_socket_mode_with_users(  # noqa: PLR0913 - public wrapper mirrors runner dependencies.
@@ -482,16 +406,21 @@ async def run_socket_mode_with_users(  # noqa: PLR0913 - public wrapper mirrors 
     app_token: str,
     *,
     limiters: SlurperLimiters,
+    dispatcher: SlackEventDispatcherProtocol | None = None,
     options: SocketModeOptions | None = None,
     supervisor: TaskSupervisor | None = None,
 ) -> None:
     """Entry point: Socket Mode with message/channel + user-change writes."""
-    await UsersSocketModeRunner(
+    # Nested user objects are normalized by SocketEventPayload while the raw
+    # event remains lossless, so user events now flow through the same shared
+    # dispatcher as every other event family.
+    await SocketModeRunner(
         writer,
         health,
         client,
         app_token,
         limiters=limiters,
+        dispatcher=dispatcher,
         options=options,
         supervisor=supervisor,
     ).run()

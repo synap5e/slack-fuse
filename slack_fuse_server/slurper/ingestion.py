@@ -97,6 +97,22 @@ _INGESTION_CTX: ContextVar[IngestionContext | None] = ContextVar("slack_fuse_ing
 #: `spans` imports `offsets`, `offsets` imports this module.
 CURRENT_SPAN_ID: ContextVar[str | None] = ContextVar("slack_fuse_current_span_id", default=None)
 
+#: Slack's globally unique Events API delivery id for the dispatch currently
+#: running on this task. The dispatcher scopes this around its entire handler
+#: tree, so even legacy EventRecord sites that do not call ``make_source`` get
+#: crash/retry-safe deduplication at ``insert_event``.
+slack_event_id: ContextVar[str | None] = ContextVar("slack_event_id", default=None)
+
+
+@contextmanager
+def dispatching_slack_event(event_id: str | None) -> Iterator[None]:
+    """Scope a Slack ``event_id`` across every event write in one dispatch."""
+    token = slack_event_id.set(event_id or None)
+    try:
+        yield
+    finally:
+        slack_event_id.reset(token)
+
 
 def current_ingestion_context() -> IngestionContext | None:
     return _INGESTION_CTX.get()
@@ -245,4 +261,10 @@ def compose_source(record_source: JsonObject | None) -> JsonObject | None:
         merged["span_id"] = span_id
     if record_source:
         merged.update(record_source)
+    # Delivery identity is an ambient fact owned by the dispatcher, not a
+    # per-write override. Stamp it last so an arbitrary explicit source cannot
+    # accidentally defeat universal retry deduplication.
+    event_id = slack_event_id.get()
+    if event_id is not None:
+        merged["slack_event_id"] = event_id
     return merged if merged else None
