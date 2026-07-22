@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import cast
 
+import h11
 import httpx
 import pytest
 import trio
@@ -399,3 +400,58 @@ async def test_serve_connection_swallows_client_hangup(
     assert any("connection dropped by peer" in rec.message for rec in caplog.records), (
         "expected an INFO log record noting the peer hangup"
     )
+
+
+@pytest.mark.trio
+async def test_serve_connection_swallows_local_protocol_error(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A per-response serialization bug (h11 LocalProtocolError) must not
+    escape ``_serve_connection`` — it would take down the trio nursery and
+    kill the whole process, including slurper/socket/webhook siblings.
+
+    Regression: 2026-07-23 saw the pod crash-loop after a wire ``/streams/*/
+    snapshot`` response tripped ``h11._util.LocalProtocolError: Too much data
+    for declared Content-Length``. That serialization bug is real and worth
+    fixing on its own; but the containment invariant (one bad request must
+    never nuke the process) is orthogonal, and this is what pins it.
+    """
+    async def raising_send(*_args: object, **_kwargs: object) -> None:  # noqa: RUF029 - matches the async signature of _send_response
+        raise h11.LocalProtocolError("Too much data for declared Content-Length")
+
+    monkeypatch.setattr("slack_fuse_server.http.server._send_response", raising_send)
+
+    request = b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n"
+    stream = _CapturingStream(request_bytes=request)
+
+    with caplog.at_level("ERROR", logger="slack_fuse_server.http.server"):
+        await serve_http_connection(stream, metrics_source=StaticMetricsSource(_sample_metrics()))
+
+    assert stream.closed, "stream should be closed even when send raises"
+    assert any(
+        "serialization protocol error" in rec.message and "/health" in rec.message for rec in caplog.records
+    ), "expected an ERROR log naming the request target"
+
+
+class _CapturingStream(trio.abc.Stream):
+    """Stream that hands back a fixed request; send_all is a no-op sink."""
+
+    def __init__(self, *, request_bytes: bytes) -> None:
+        self._request_bytes = request_bytes
+        self.closed = False
+
+    async def send_all(self, data: bytes | bytearray | memoryview) -> None:
+        return None
+
+    async def wait_send_all_might_not_block(self) -> None:  # pragma: no cover - unused
+        return None
+
+    async def receive_some(self, max_bytes: int | None = None) -> bytes:
+        if not self._request_bytes:
+            return b""
+        chunk = self._request_bytes if max_bytes is None else self._request_bytes[:max_bytes]
+        self._request_bytes = self._request_bytes[len(chunk):]
+        return chunk
+
+    async def aclose(self) -> None:
+        self.closed = True

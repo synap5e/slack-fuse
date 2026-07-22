@@ -466,6 +466,7 @@ async def _serve_connection(  # noqa: PLR0913 - HTTP wiring needs explicit deps.
     livez_deps: LivezDeps | None = None,
 ) -> None:
     conn = h11.Connection(h11.SERVER)
+    request: HttpRequest | None = None
     try:
         request = await _read_request(conn, stream)
         if request is None:
@@ -491,6 +492,15 @@ async def _serve_connection(  # noqa: PLR0913 - HTTP wiring needs explicit deps.
             # Client may already have hung up while we try to send the 400.
             with contextlib.suppress(trio.BrokenResourceError, trio.ClosedResourceError):
                 await _send_response(conn, stream, _error_response(status_code=400, code="bad_request"))
+    except h11.LocalProtocolError as exc:
+        # Serialization bug on our side (e.g. body byte count != declared
+        # Content-Length; observed 2026-07-23 in the wire snapshot path). A
+        # per-request serialization failure must NEVER kill the process — the
+        # exception would propagate to the trio nursery and take down every
+        # sibling task (slurper, socket-mode, webhook consumer, dispatch). Log
+        # loud, abort this one connection, keep the server up.
+        target = "<unknown>" if request is None else request.target
+        log.error("http: serialization protocol error for target=%s: %s", target, exc, exc_info=True)
     except (trio.BrokenResourceError, trio.ClosedResourceError) as exc:
         # Client disconnected mid-request or mid-response. Normal HTTP behaviour
         # (kubelet probes give up under load; curl aborts; projector times out
