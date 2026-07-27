@@ -24,6 +24,7 @@ both ``oldest`` and ``latest``. Due checks and detection SQL rely on this.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
 from collections.abc import Awaitable, Callable, Sequence
@@ -38,7 +39,7 @@ from psycopg import Connection
 from psycopg.rows import TupleRow
 
 from slack_fuse_server._json import JsonObject
-from slack_fuse_server.slurper.api import SlackAPIError, SlackClient
+from slack_fuse_server.slurper.api import ChannelNotFoundError, SlackAPIError, SlackClient
 from slack_fuse_server.slurper.ingestion import ingesting_run
 from slack_fuse_server.slurper.limiters import SlurperLimiters
 from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter
@@ -394,7 +395,7 @@ def _select_probe_descriptors(
     return tuple(descriptor for descriptor in registry if descriptor.job_id == requested.job_id)
 
 
-async def _run_probe_descriptor(  # noqa: PLR0913 - common scheduled/manual runner keeps knobs explicit.
+async def _run_probe_descriptor(  # noqa: PLR0913, C901 - common scheduled/manual runner keeps knobs explicit.
     writer: OffsetWriter,
     client: SlackClient,
     limiters: SlurperLimiters,
@@ -427,6 +428,31 @@ async def _run_probe_descriptor(  # noqa: PLR0913 - common scheduled/manual runn
         async with span(op=descriptor.op, task="probe-sweep", extra=extra) as probe_span:
             try:
                 wrote = await descriptor.run(writer, client, limiters, target, probe_span)
+            except ChannelNotFoundError:
+                # Channel deleted, archived-and-purged, or the token was
+                # removed from it. Slack has forgotten the id; there is no
+                # value in probing it again. Emit ``channel_archived`` so the
+                # next ``_channel_targets`` fold drops it from the poll set
+                # (probe target selector filters on !is_archived). Log INFO,
+                # one line, no traceback — reported 2026-07-28 as ~172 stack
+                # traces per 24h in Loki (k8s-homelab-owner triage).
+                log.info(
+                    "probe job %s: channel %s no longer accessible (channel_not_found); evicting",
+                    descriptor.job_id,
+                    target.value,
+                )
+                if target.payload_field == "channel_id":
+                    with contextlib.suppress(Exception):
+                        await writer.write_event(
+                            EventRecord(
+                                stream="channel-list",
+                                kind="channel_archived",
+                                ts=None,
+                                payload={"channel_id": target.value},
+                            ),
+                            span=probe_span,
+                        )
+                counts["failed"] += 1
             except (SlackAPIError, httpx.HTTPError, ValueError):
                 log.warning("probe job %s failed on %s", descriptor.job_id, target.value, exc_info=True)
                 counts["failed"] += 1

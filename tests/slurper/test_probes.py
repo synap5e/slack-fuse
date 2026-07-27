@@ -38,6 +38,7 @@ from slack_fuse_server.slurper.probes import (
     build_probe_registry,
     probe_sweep,
 )
+from tests._fake_slack import make_fake_slack_transport
 from tests.conftest import RecordingSupervisor, make_test_limiters, make_test_writer
 
 if TYPE_CHECKING:
@@ -406,3 +407,56 @@ def test_manual_probe_trigger_bypasses_due_and_emits_manual_heartbeat(
     assert completions[1]["requested"] == {"job_id": JOB_CHANNEL_NEWEST_MESSAGE, "target": "C0001"}
     counts = cast(JsonObject, completions[1]["probes"])
     assert counts[JOB_CHANNEL_NEWEST_MESSAGE] == {"succeeded": 1, "failed": 0, "skipped": 0}
+
+
+def test_probe_channel_not_found_evicts_and_logs_info_no_traceback(
+    server_conn: psycopg.Connection[TupleRow],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A dead channel: probe hits ``channel_not_found`` → INFO log (no
+    traceback), a ``channel_archived`` event is written to ``channel-list``
+    so the next fold drops the id from the poll set. Reported 2026-07-28 as
+    ~172 unhandled-looking tracebacks/24h in Loki.
+    """
+    _seed_channel(server_conn, "C_DEAD")
+    _seed_message(server_conn, "C_DEAD", "1700000000.000100")
+    caplog.set_level("INFO", logger="slack_fuse_server.slurper.probes")
+
+    transport = make_fake_slack_transport(
+        overrides={"conversations.history": {"ok": False, "error": "channel_not_found"}},
+    )
+    with httpx.Client(base_url="https://slack.com/api", transport=transport) as http:
+
+        async def body() -> None:
+            writer = make_test_writer(server_conn)
+            client = _fake_client(http)
+            limiters = make_test_limiters()
+            await probe_sweep(writer, client, limiters, RecordingSupervisor(), _ProbeConfig(), run_once=True)
+
+        trio.run(body)
+
+    # No traceback anywhere in the captured probes log records.
+    for rec in caplog.records:
+        if rec.name != "slack_fuse_server.slurper.probes":
+            continue
+        assert rec.exc_info is None, (
+            f"expected no traceback on channel_not_found, got: {rec.exc_info}"
+        )
+
+    # INFO log line names the eviction.
+    assert any(
+        "no longer accessible (channel_not_found)" in rec.message and "evicting" in rec.message
+        for rec in caplog.records
+    ), f"expected INFO eviction log; records: {[r.message for r in caplog.records]}"
+
+    # channel_archived event was written for the dead channel.
+    with server_conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT payload->>'channel_id' AS channel_id
+            FROM events
+            WHERE stream = 'channel-list' AND kind = 'channel_archived'
+            """
+        )
+        archived_ids = [row[0] for row in cur.fetchall()]
+    assert "C_DEAD" in archived_ids, f"expected C_DEAD in channel_archived events; got {archived_ids}"
