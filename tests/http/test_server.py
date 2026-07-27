@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import tracemalloc
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -13,6 +14,7 @@ import httpx
 import pytest
 import trio
 
+from slack_fuse_server.http.debug import DebugHeapDeps
 from slack_fuse_server.http.dto import (
     BackfillMetrics,
     MetricsResponse,
@@ -400,6 +402,89 @@ async def test_serve_connection_swallows_client_hangup(
     assert any("connection dropped by peer" in rec.message for rec in caplog.records), (
         "expected an INFO log record noting the peer hangup"
     )
+
+
+@pytest.mark.trio
+async def test_debug_heap_returns_503_when_tracemalloc_disabled() -> None:
+    """/debug/heap returns 503 tracemalloc_disabled when tracing is off."""
+    was_tracing = tracemalloc.is_tracing()
+    if was_tracing:
+        tracemalloc.stop()
+    try:
+        request_body = b"GET /debug/heap HTTP/1.1\r\nHost: x\r\nx-slack-fuse-secret: s3cret\r\n\r\n"
+
+        class _Capture(trio.abc.Stream):
+            def __init__(self) -> None:
+                self.sent = bytearray()
+                self._req = request_body
+                self.closed = False
+
+            async def send_all(self, data: bytes | bytearray | memoryview) -> None:
+                self.sent.extend(bytes(data))
+
+            async def wait_send_all_might_not_block(self) -> None:  # pragma: no cover
+                return None
+
+            async def receive_some(self, max_bytes: int | None = None) -> bytes:
+                if not self._req:
+                    return b""
+                chunk = self._req if max_bytes is None else self._req[:max_bytes]
+                self._req = self._req[len(chunk):]
+                return chunk
+
+            async def aclose(self) -> None:
+                self.closed = True
+
+        stream = _Capture()
+        await serve_http_connection(
+            stream,
+            metrics_source=StaticMetricsSource(_sample_metrics()),
+            debug_heap_deps=DebugHeapDeps(shared_secret="s3cret"),
+        )
+        text = bytes(stream.sent).decode("ascii", errors="replace")
+        assert "503" in text
+        assert "tracemalloc_disabled" in text
+    finally:
+        if was_tracing:
+            tracemalloc.start()
+
+
+@pytest.mark.trio
+async def test_debug_heap_returns_401_without_secret() -> None:
+    """/debug/heap rejects unauthenticated callers."""
+    request_body = b"GET /debug/heap HTTP/1.1\r\nHost: x\r\n\r\n"
+
+    class _Capture(trio.abc.Stream):
+        def __init__(self) -> None:
+            self.sent = bytearray()
+            self._req = request_body
+            self.closed = False
+
+        async def send_all(self, data: bytes | bytearray | memoryview) -> None:
+            self.sent.extend(bytes(data))
+
+        async def wait_send_all_might_not_block(self) -> None:  # pragma: no cover
+            return None
+
+        async def receive_some(self, max_bytes: int | None = None) -> bytes:
+            if not self._req:
+                return b""
+            chunk = self._req if max_bytes is None else self._req[:max_bytes]
+            self._req = self._req[len(chunk):]
+            return chunk
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    stream = _Capture()
+    await serve_http_connection(
+        stream,
+        metrics_source=StaticMetricsSource(_sample_metrics()),
+        debug_heap_deps=DebugHeapDeps(shared_secret="s3cret"),
+    )
+    text = bytes(stream.sent).decode("ascii", errors="replace")
+    assert "401" in text
+    assert "unauthorized" in text
 
 
 @pytest.mark.trio

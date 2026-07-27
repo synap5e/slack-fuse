@@ -15,6 +15,7 @@ import psycopg
 import trio
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
+from slack_fuse_server.http.debug import DebugHeapDeps, capture_heap_snapshot
 from slack_fuse_server.http.dto import (
     SNAPSHOT_CONTENT_ENCODING,
     SNAPSHOT_CONTENT_TYPE,
@@ -55,6 +56,7 @@ from slack_fuse_server.http.handlers import (
     handle_snapshot,
     handle_unblock_channel,
     handle_workspace_gaps,
+    is_http_authorized,
 )
 from slack_fuse_server.http.metrics import MetricsSource
 from slack_fuse_server.http.snapshot import SnapshotNotFoundError
@@ -127,12 +129,22 @@ def route_request(  # noqa: C901, PLR0913 - endpoint routing dispatch hub.
     probe_status_deps: ProbeStatusDeps | None = None,
     refill_window_deps: RefillWindowDeps | None = None,
     livez_deps: LivezDeps | None = None,
+    debug_heap_deps: DebugHeapDeps | None = None,
 ) -> HttpResponse:
     """Pure routing table for supported HTTP endpoints."""
     if request.path == "/health":
         if request.method != "GET":
             return _error_response(status_code=405, code="method_not_allowed")
         return _dto_response(status_code=200, payload=handle_health())
+
+    if request.path == "/debug/heap":
+        if request.method != "GET":
+            return _error_response(status_code=405, code="method_not_allowed")
+        if debug_heap_deps is None:
+            return _error_response(status_code=503, code="service_unavailable")
+        if not is_http_authorized(request.headers, debug_heap_deps.shared_secret):
+            return HttpResponse(status_code=401, body=b"unauthorized", content_type="text/plain")
+        return _handle_debug_heap()
 
     if request.path == "/livez":
         if request.method != "GET":
@@ -320,6 +332,7 @@ async def serve_http(  # noqa: PLR0913 - HTTP wiring needs explicit deps.
     probe_status_deps: ProbeStatusDeps | None = None,
     refill_window_deps: RefillWindowDeps | None = None,
     livez_deps: LivezDeps | None = None,
+    debug_heap_deps: DebugHeapDeps | None = None,
 ) -> None:
     """Serve HTTP endpoints on the given host/port."""
     handler = partial(
@@ -336,6 +349,7 @@ async def serve_http(  # noqa: PLR0913 - HTTP wiring needs explicit deps.
         probe_status_deps=probe_status_deps,
         refill_window_deps=refill_window_deps,
         livez_deps=livez_deps,
+        debug_heap_deps=debug_heap_deps,
     )
     await trio.serve_tcp(handler, port=port, host=host)
 
@@ -354,6 +368,7 @@ async def serve_http_on_listeners(  # noqa: PLR0913, PLR0917 - HTTP wiring needs
     probe_status_deps: ProbeStatusDeps | None = None,
     refill_window_deps: RefillWindowDeps | None = None,
     livez_deps: LivezDeps | None = None,
+    debug_heap_deps: DebugHeapDeps | None = None,
 ) -> None:
     """Serve on already-open listeners (useful for tests and shared-port setups)."""
     handler = partial(
@@ -370,6 +385,7 @@ async def serve_http_on_listeners(  # noqa: PLR0913, PLR0917 - HTTP wiring needs
         probe_status_deps=probe_status_deps,
         refill_window_deps=refill_window_deps,
         livez_deps=livez_deps,
+        debug_heap_deps=debug_heap_deps,
     )
     await trio.serve_listeners(handler, listeners)
 
@@ -389,6 +405,7 @@ async def serve_http_from_listen_addr(  # noqa: PLR0913 - HTTP wiring needs expl
     probe_status_deps: ProbeStatusDeps | None = None,
     refill_window_deps: RefillWindowDeps | None = None,
     livez_deps: LivezDeps | None = None,
+    debug_heap_deps: DebugHeapDeps | None = None,
 ) -> None:
     """Serve HTTP endpoints using an RFC-style `listen_addr` string."""
     host, port = parse_listen_addr(listen_addr)
@@ -407,6 +424,7 @@ async def serve_http_from_listen_addr(  # noqa: PLR0913 - HTTP wiring needs expl
         probe_status_deps=probe_status_deps,
         refill_window_deps=refill_window_deps,
         livez_deps=livez_deps,
+        debug_heap_deps=debug_heap_deps,
     )
 
 
@@ -425,6 +443,7 @@ async def serve_http_connection(  # noqa: PLR0913 - HTTP wiring needs explicit d
     probe_status_deps: ProbeStatusDeps | None = None,
     refill_window_deps: RefillWindowDeps | None = None,
     livez_deps: LivezDeps | None = None,
+    debug_heap_deps: DebugHeapDeps | None = None,
 ) -> None:
     """Serve a single already-accepted connection as HTTP.
 
@@ -446,6 +465,7 @@ async def serve_http_connection(  # noqa: PLR0913 - HTTP wiring needs explicit d
         probe_status_deps=probe_status_deps,
         refill_window_deps=refill_window_deps,
         livez_deps=livez_deps,
+        debug_heap_deps=debug_heap_deps,
     )
 
 
@@ -464,6 +484,7 @@ async def _serve_connection(  # noqa: PLR0913 - HTTP wiring needs explicit deps.
     probe_status_deps: ProbeStatusDeps | None = None,
     refill_window_deps: RefillWindowDeps | None = None,
     livez_deps: LivezDeps | None = None,
+    debug_heap_deps: DebugHeapDeps | None = None,
 ) -> None:
     conn = h11.Connection(h11.SERVER)
     request: HttpRequest | None = None
@@ -485,6 +506,7 @@ async def _serve_connection(  # noqa: PLR0913 - HTTP wiring needs explicit deps.
             probe_status_deps=probe_status_deps,
             refill_window_deps=refill_window_deps,
             livez_deps=livez_deps,
+            debug_heap_deps=debug_heap_deps,
         )
         await _send_response(conn, stream, response, request_method=request.method)
     except h11.RemoteProtocolError:
@@ -636,6 +658,23 @@ def _handle_blocked_channels_post(request: HttpRequest, deps: BlockedChannelsDep
         deps=deps,
     )
     return _json_response(status_code=status_code, payload=response)
+
+
+def _handle_debug_heap() -> HttpResponse:
+    """Return a tracemalloc snapshot as JSON. 503 if tracemalloc is not tracing."""
+    snapshot = capture_heap_snapshot()
+    if not snapshot.tracemalloc_enabled:
+        return _error_response(status_code=503, code="tracemalloc_disabled")
+    body = json.dumps({
+        "tracemalloc_enabled": True,
+        "total_traced_bytes": snapshot.total_traced_bytes,
+        "peak_traced_bytes": snapshot.peak_traced_bytes,
+        "entries": [
+            {"traceback": list(entry.traceback), "size_bytes": entry.size_bytes, "count": entry.count}
+            for entry in snapshot.entries
+        ],
+    }).encode("utf-8")
+    return HttpResponse(status_code=200, body=body)
 
 
 def _handle_gap_detection(*, deps: GapsDeps) -> HttpResponse:

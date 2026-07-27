@@ -73,6 +73,7 @@ from slack_fuse_server.blocked_channels import (
 )
 from slack_fuse_server.config import ServerConfig, load_server_config
 from slack_fuse_server.dispatch import serve_dispatch
+from slack_fuse_server.http.debug import DebugHeapDeps
 from slack_fuse_server.http.handlers import (
     BackfillDeps,
     BlockedChannelsDeps,
@@ -413,6 +414,17 @@ def _event_source_plan(config: ServerConfig) -> _EventSourcePlan:
 
 
 async def _serve(config: ServerConfig, boot: BootContext) -> None:
+    # Diagnostic-only: enable tracemalloc when SLACK_FUSE_SERVER_TRACEMALLOC=1
+    # so /debug/heap can return traceback-grouped allocations. ~30% overhead
+    # while tracing so this is opt-in via env var, not config field. Started
+    # BEFORE any other imports/allocations in this function so the first
+    # frames captured are meaningful.
+    if os.environ.get("SLACK_FUSE_SERVER_TRACEMALLOC") == "1":
+        import tracemalloc  # noqa: PLC0415 — deferred to keep the cold-boot import DAG light.
+
+        tracemalloc.start(15)  # 15 frames — enough to walk through nursery + trio.run wrappers
+        log.info("tracemalloc: tracing enabled (15 frames)")
+
     source_plan = _event_source_plan(config)
     slack_api_limiter = trio.CapacityLimiter(2)
     writer_limiter = trio.CapacityLimiter(config.slurper_writer_pool_size)
@@ -454,6 +466,12 @@ async def _serve(config: ServerConfig, boot: BootContext) -> None:
         alert_threshold_seconds=int(config.probe_sweep_interval_s * 2),
     )
     livez_deps = LivezDeps(supervisor=supervisor)
+    # /debug/heap is a diagnostic-only endpoint. Gate on the shared secret so
+    # tracemalloc frames (which reveal object/file layouts of the running
+    # process) can't be scraped by an unauthenticated caller. Tracing itself
+    # is started in ``_serve`` on the SLACK_FUSE_SERVER_TRACEMALLOC toggle
+    # to avoid paying the ~30% overhead in prod when not diagnosing.
+    debug_heap_deps = DebugHeapDeps(shared_secret=config.shared_secret)
     # Trigger for ``POST /refresh-channels`` — request() rendezvous against
     # the consumer task spawned below. Auth lives at the HTTP layer (shared
     # secret); the trigger itself is just a one-in-flight dispatcher.
@@ -613,6 +631,7 @@ async def _serve(config: ServerConfig, boot: BootContext) -> None:
                 probe_status_deps,
                 refill_window_deps,
                 livez_deps,
+                debug_heap_deps,
             )
             nursery.start_soon(snapshot_scheduler.run, supervisor)
             # Periodic ``conversations.info`` refresh: backfills lossy
@@ -775,6 +794,7 @@ async def _serve_dispatch_task(  # noqa: PLR0913, PLR0917 - dispatch wiring need
     probe_status_deps: ProbeStatusDeps,
     refill_window_deps: RefillWindowDeps,
     livez_deps: LivezDeps,
+    debug_heap_deps: DebugHeapDeps,
 ) -> None:
     await serve_dispatch(
         listen_addr=listen_addr,
@@ -791,6 +811,7 @@ async def _serve_dispatch_task(  # noqa: PLR0913, PLR0917 - dispatch wiring need
         probe_status_deps=probe_status_deps,
         refill_window_deps=refill_window_deps,
         livez_deps=livez_deps,
+        debug_heap_deps=debug_heap_deps,
     )
 
 

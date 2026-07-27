@@ -30,6 +30,7 @@ import h11
 import trio
 from trio_websocket import wrap_server_stream
 
+from slack_fuse_server.http.debug import DebugHeapDeps
 from slack_fuse_server.http.handlers import (
     BackfillDeps,
     BlockedChannelsDeps,
@@ -177,6 +178,7 @@ async def serve_connection(  # noqa: PLR0913 - dispatch wiring needs explicit de
     probe_status_deps: ProbeStatusDeps | None = None,
     refill_window_deps: RefillWindowDeps | None = None,
     livez_deps: LivezDeps | None = None,
+    debug_heap_deps: DebugHeapDeps | None = None,
 ) -> None:
     """Classify one accepted connection and route it to WS or HTTP."""
     raw, peeked = await _peek(stream)
@@ -198,6 +200,7 @@ async def serve_connection(  # noqa: PLR0913 - dispatch wiring needs explicit de
             probe_status_deps=probe_status_deps,
             refill_window_deps=refill_window_deps,
             livez_deps=livez_deps,
+            debug_heap_deps=debug_heap_deps,
         )
 
 
@@ -217,6 +220,7 @@ async def serve_dispatch(  # noqa: PLR0913 - dispatch wiring needs explicit deps
     probe_status_deps: ProbeStatusDeps | None = None,
     refill_window_deps: RefillWindowDeps | None = None,
     livez_deps: LivezDeps | None = None,
+    debug_heap_deps: DebugHeapDeps | None = None,
     task_status: trio.TaskStatus[list[trio.SocketListener]] = trio.TASK_STATUS_IGNORED,
 ) -> None:
     """Bind `listen_addr` and serve HTTP + WS on the one port."""
@@ -236,6 +240,7 @@ async def serve_dispatch(  # noqa: PLR0913 - dispatch wiring needs explicit deps
         probe_status_deps=probe_status_deps,
         refill_window_deps=refill_window_deps,
         livez_deps=livez_deps,
+        debug_heap_deps=debug_heap_deps,
     )
     await trio.serve_tcp(handler, port=port, host=host, task_status=task_status)
 
@@ -256,6 +261,7 @@ async def serve_dispatch_on_listeners(  # noqa: PLR0913 - dispatch wiring needs 
     probe_status_deps: ProbeStatusDeps | None = None,
     refill_window_deps: RefillWindowDeps | None = None,
     livez_deps: LivezDeps | None = None,
+    debug_heap_deps: DebugHeapDeps | None = None,
 ) -> None:
     """Serve on already-open listeners (tests bind port 0 and read the port back)."""
     handler = partial(
@@ -273,5 +279,6 @@ async def serve_dispatch_on_listeners(  # noqa: PLR0913 - dispatch wiring needs 
         probe_status_deps=probe_status_deps,
         refill_window_deps=refill_window_deps,
         livez_deps=livez_deps,
+        debug_heap_deps=debug_heap_deps,
     )
     await trio.serve_listeners(handler, listeners)
