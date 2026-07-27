@@ -415,15 +415,22 @@ def _event_source_plan(config: ServerConfig) -> _EventSourcePlan:
 
 async def _serve(config: ServerConfig, boot: BootContext) -> None:
     # Diagnostic-only: enable tracemalloc when SLACK_FUSE_SERVER_TRACEMALLOC=1
-    # so /debug/heap can return traceback-grouped allocations. ~30% overhead
-    # while tracing so this is opt-in via env var, not config field. Started
-    # BEFORE any other imports/allocations in this function so the first
-    # frames captured are meaningful.
+    # so /debug/heap can return traceback-grouped allocations. Started BEFORE
+    # any other imports/allocations in this function so the first frames
+    # captured are meaningful.
+    #
+    # nframes=1 was chosen after 2026-07-27's prod crash-loop under nframes=15
+    # (liveness probe timeouts). Local bench measured p99 overhead per
+    # allocation-heavy call: nframes=1 → 1.14x, nframes=5 → 10.2x,
+    # nframes=15 → 18.3x. 1 frame gives the immediate call site only — enough
+    # to identify the top allocators over 24h aggregation, but not the caller
+    # chain. If the 1-frame data is too coarse, we can raise to 5 with a
+    # separate deploy after validating on the pod's specific load pattern.
     if os.environ.get("SLACK_FUSE_SERVER_TRACEMALLOC") == "1":
         import tracemalloc  # noqa: PLC0415 — deferred to keep the cold-boot import DAG light.
 
-        tracemalloc.start(15)  # 15 frames — enough to walk through nursery + trio.run wrappers
-        log.info("tracemalloc: tracing enabled (15 frames)")
+        tracemalloc.start(1)
+        log.info("tracemalloc: tracing enabled (1 frame)")
 
     source_plan = _event_source_plan(config)
     slack_api_limiter = trio.CapacityLimiter(2)
