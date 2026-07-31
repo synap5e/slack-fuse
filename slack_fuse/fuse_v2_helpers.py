@@ -340,16 +340,39 @@ def derive_thread_slug(content_md: str, message_ts: Decimal) -> str:
     return base
 
 
-def dedup_thread_slug_map(parents: list[tuple[Decimal, str]]) -> dict[str, Decimal]:
+def dedup_thread_slug_map(
+    parents: list[tuple[Decimal, str]],
+    conn: Connection[TupleRow] | None = None,
+) -> dict[str, Decimal]:
     """Build ``{thread_slug: thread_ts}`` from ordered (ts, content_md) parents.
 
     Order parents by ``message_ts`` ascending before calling so the dedup
     counter is stable across reads.
+
+    ``conn`` is optional — when provided, ``<@U…>``/``<#C…>`` placeholders in
+    each parent's ``content_md`` are resolved against the live ``users`` /
+    ``channels`` tables before slugification, so a thread whose parent starts
+    with ``<@U0A5DUG43RQ> ptal at …`` becomes ``claude-ptal-at-…`` instead of
+    ``u0a5dug43rq-ptal-at-…``. Matches the legacy ``build_thread_slug_map``
+    behavior (2026-07-31). When ``conn`` is None, the raw content_md is
+    slugified (kept for pure unit tests + callers that don't have a live
+    connection).
     """
+    users_resolver: UserResolver | None
+    channels_resolver: ChannelResolver | None
+    if conn is not None:
+        users_resolver, channels_resolver = sql_resolvers_for(conn)
+    else:
+        users_resolver = None
+        channels_resolver = None
+
     counts: dict[str, int] = {}
     out: dict[str, Decimal] = {}
     for ts, content_md in parents:
-        base = derive_thread_slug(content_md, ts)
+        body = content_md
+        if users_resolver is not None and channels_resolver is not None:
+            body = resolve_mentions(content_md, users_resolver, channels_resolver)
+        base = derive_thread_slug(body, ts)
         count = counts.get(base, 0)
         counts[base] = count + 1
         slug = base if count == 0 else f"{base}-{count + 1}"

@@ -1415,7 +1415,7 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             # cannot render, so don't pretend it exists.
             if for_lookup and self._originals_fetch is not None:
                 result.append((CHANNEL_ORIGINAL_MD, False))
-            for slug in dedup_thread_slug_map(parents):
+            for slug in dedup_thread_slug_map(parents, self._conn):
                 result.append((slug, True))
             return result
 
@@ -1569,7 +1569,7 @@ class SlackFuseOpsV2(pyfuse3.Operations):
 
     def _resolve_thread_ts(self, channel_id: str, day: date, thread_slug: str) -> Decimal | None:
         parents = fetch_day_thread_parents(self._conn, channel_id, day, self._tz)
-        slug_map = dedup_thread_slug_map(parents)
+        slug_map = dedup_thread_slug_map(parents, self._conn)
         # If the slug map missed (no thread by that name yet under this day),
         # no thread file exists.
         return slug_map.get(thread_slug)
@@ -2283,7 +2283,7 @@ class V2InvalidationSink:
 
     def _thread_slug(self, channel_id: str, day: date, thread_ts: Decimal) -> str | None:
         parents = fetch_day_thread_parents(self._conn, channel_id, day, self._tz)
-        for slug, ts in dedup_thread_slug_map(parents).items():
+        for slug, ts in dedup_thread_slug_map(parents, self._conn).items():
             if ts == thread_ts:
                 return slug
         return None

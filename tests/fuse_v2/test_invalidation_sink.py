@@ -28,6 +28,7 @@ from tests.fuse_v2.conftest import (
     mark_stream_caught_up,
     seed_channel,
     seed_chunk,
+    seed_user,
     set_connection_state,
 )
 
@@ -145,6 +146,45 @@ def test_thread_chunk_changed_invalidates_thread_file_inode(
     sink.thread_chunk_changed(ThreadChunkRef("C1", parent_ts, reply_ts))
 
     assert fake_pyfuse3.invalidate_calls == [inode]
+
+
+def test_dedup_thread_slug_map_resolves_user_mentions_via_conn(
+    client_conn: Connection[TupleRow],
+) -> None:
+    """A thread parent whose body starts with ``<@U0A5DUG43RQ>`` should
+    slugify to ``claude-…``, not ``u0a5dug43rq-…`` — matches legacy behavior
+    (see slack_fuse/_slug_helpers.py:140). Reported 2026-07-31: split mount
+    was showing raw uid slugs while legacy /views/slack showed resolved names,
+    breaking Simon's muscle-memory paths after retiring the legacy service.
+    """
+    seed_channel(client_conn, "C1", "simon-yells-at-bots", tier="hot")
+    seed_user(client_conn, "U0A5DUG43RQ", "claude")
+    parent_ts = _ts(datetime(2026, 7, 31, 10, 0, tzinfo=UTC))
+    # Same content shape render_message_structural emits: author is a <@U…>
+    # placeholder, body includes another <@U…> mention.
+    content_md = (
+        "## 10:00 <@U0A5DUG43RQ>\n"
+        "\n"
+        "<@U0A5DUG43RQ> ptal at comfyui-frontend and find a PR reviewed\n"
+        "\n"
+        "> Thread: 3 replies\n"
+    )
+    seed_chunk(client_conn, "C1", parent_ts, content_md, reply_count=3)
+
+    parents = fetch_day_thread_parents(client_conn, "C1", datetime(2026, 7, 31).date(), ZoneInfo("UTC"))
+    # WITHOUT conn: raw uid leaks into slug (the pre-fix behavior).
+    unresolved = list(dedup_thread_slug_map(parents))
+    assert unresolved[0].startswith("u0a5dug43rq"), (
+        f"pre-fix behavior: raw uid in slug; got {unresolved!r}"
+    )
+    # WITH conn: mentions resolve, slug starts with the user's display name.
+    resolved = list(dedup_thread_slug_map(parents, client_conn))
+    assert resolved[0].startswith("claude"), (
+        f"expected resolved slug to start with 'claude'; got {resolved!r}"
+    )
+    assert "u0a5dug43rq" not in resolved[0].lower(), (
+        f"resolved slug still contains raw uid: {resolved!r}"
+    )
 
 
 def test_thread_chunk_changed_unknown_thread_is_noop(

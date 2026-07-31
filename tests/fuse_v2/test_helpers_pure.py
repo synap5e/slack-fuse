@@ -217,6 +217,28 @@ def test_derive_thread_slug_fallback_for_empty_body() -> None:
     assert out == "ts-1700000000.000"
 
 
+def test_dedup_thread_slug_map_no_conn_leaves_body_mentions_raw() -> None:
+    """Backward compat: when ``conn`` is not passed, ``<@U…>`` mentions in the
+    body stay raw. This is the shape that produced Simon's morning report of
+    ``u0a5dug43rq-ptal-…`` slugs on the split mount.
+
+    The ``## HH:MM <@U…>`` header is stripped by ``_strip_structural_header``
+    before slugification, so header-only mentions don't leak into the slug —
+    but BODY mentions do (that's what this test pins).
+    """
+    content = (
+        "## 09:00 <@U0A5DUG43RQ>\n"
+        "\n"
+        "<@U0A5DUG43RQ> ptal at foo\n"
+        "\n"
+        "> Thread: 1 replies\n"
+    )
+    parents = [(Decimal("1700000000.000"), content)]
+    slug_map = dedup_thread_slug_map(parents)  # no conn arg
+    slug = next(iter(slug_map))
+    assert slug.startswith("u0a5dug43rq"), f"expected raw-id slug prefix; got {slug!r}"
+
+
 def test_dedup_thread_slug_map_orders_by_ts() -> None:
     parents = [
         (Decimal("1700000000"), "## 14:30 <@U1>\n\nDeploy update\n"),
