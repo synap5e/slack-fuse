@@ -60,6 +60,10 @@ def _make_file_attr(inode: int, size: int) -> pyfuse3.EntryAttributes:
     entry.st_mode = stat.S_IFREG | 0o444
     entry.st_nlink = 1
     entry.st_size = size
+    # ``du`` / ``dust`` compute usage from st_blocks, not st_size, so leaving
+    # this at the default 0 makes every file report as 0B. Report the natural
+    # 512-byte ceiling; matches BACKLOG.md "FUSE getattr st_blocks=0".
+    entry.st_blocks = (size + 511) // 512
     now_ns = int(time.time() * 1e9)
     entry.st_atime_ns = now_ns
     entry.st_mtime_ns = now_ns

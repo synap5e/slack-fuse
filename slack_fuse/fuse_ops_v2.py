@@ -338,6 +338,13 @@ def _make_file_attr(
     entry.st_mode = mode
     entry.st_nlink = 1
     entry.st_size = size
+    # st_blocks is the file's disk-usage as 512-byte blocks. Setting it to 0
+    # (the default) makes ``du`` / ``dust`` report every file as 0B because
+    # they compute usage from st_blocks, not st_size. Report the natural
+    # ceiling — same shape a real ext4/btrfs file would show for equivalent
+    # bytes. Cosmetic-but-load-bearing for anyone piping the mount through
+    # disk-usage tooling. See BACKLOG.md "FUSE getattr st_blocks=0".
+    entry.st_blocks = (size + 511) // 512
     entry.st_atime_ns = entry.st_mtime_ns = entry.st_ctime_ns = int(time.time() * 1e9)
     entry.st_uid = os.getuid()
     entry.st_gid = os.getgid()
