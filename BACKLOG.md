@@ -13,32 +13,16 @@ When an item ships, move it into **Resolved** with the commit hashes and date. W
 
 # Ratified
 
-## FUSE mount wedge — host-level condition
-
-**Status**: architectural fix landed (`87487d0`). Per-callback connection
-pool + 30s trio timeout + 25s PG ``statement_timeout``. Concurrent
-callbacks no longer serialize behind one limiter slot; a slow SQL aborts
-at the PG layer and surfaces as ``FUSEError(EIO)``; a pure-Python hang
-times out at the trio layer with the same result. 4 regression tests
-pin the new behaviour. Recovery watchdog (`scripts/watchdog/`) shipped
-and live-verified against a 6h53m wedge on 2026-06-21: full recovery in
-under 5s, projection state preserved.
-
-**ADR (2026-08-02, `/tmp/claude/adr-fuse-mount-wedge.md`)**: keep landed
-fixes; retain the watchdog; add clean `game-mode` stop/start ordering.
-No kernel/zram tuning absent new evidence — the historical
-`folio_wait_bit_common` specimen was the now-fixed
-`FUSE_NOTIFY_STORE`-inside-`read()` deadlock, not folio pressure.
-
-**Prevention not yet implemented** — add `slack-fuse.service` to
-`game-mode`'s `GAME_MODE_STOP_SERVICES` so it gets cleanly stopped
-before `claude-hooks-postgres.service` is torn down, then restarted in
-`cmd_off`. Operator-side (`/home/simon/bin/game-mode`), not a slack-fuse
-code change.
-
----
+Ordered by priority (highest first). Each entry annotates **Effort**
+(order-of-magnitude estimate for a single-agent handoff) and **Autonomous**
+(whether I can drive it end-to-end without Simon's intervention — Yes /
+Yes after decisions / No).
 
 ## Skip thread-expansion when local thread is already caught up
+
+**Effort**: 2–3 eng-days. **Autonomous**: Yes after decisions — three
+small ADR follow-ups; a handoff can propose defaults for each and
+iterate if you disagree. Direct win, backed by fresh ADR, well-scoped.
 
 **Discovered**: 2026-06-30 watching proj-cloud's backfill spend ~9 hours
 in the thread-expansion phase writing rows that all dedup'd to no-ops.
@@ -53,49 +37,24 @@ Before each `conversations.replies` call, `COUNT(DISTINCT reply_ts)`
 plus `MAX(reply_ts)` from active (edit/delete-folded) message facts;
 skip only when both match the parent's `reply_count` and `latest_reply`.
 Nulls or mismatch fetch. Reclaims the 4,500-thread / 8+ hour no-op tail
-per channel. Estimated 2–3 engineer-days.
+per channel.
 
-**Open questions from the ADR**:
-1. Should the first release require a minimum parent age (e.g. 60s) to
-   reduce fresh-message race, or rely on mismatch + live delivery?
-2. Is the missed-delete-plus-missed-add set-substitution risk
-   acceptable, or should we also require a prior successful full-expansion
-   marker?
-3. Should skips become lifecycle events for crash-resume accounting, or
-   remain spans only and be cheaply re-evaluated after a crash?
-
-**Implementation**: not started. Well-scoped handoff candidate once the
-open questions land.
-
----
-
-## FUSE passthrough + coalesced disk projection
-
-**Discovered**: 2026-06-29 while benchmarking ripgrep throughput. Live
-mount serves ~18 files/sec (every file goes through FUSE round-trip);
-the archive on disk serves ~135,000 files/sec. ~7,500× gap.
-
-**ADR (2026-08-02, `/tmp/claude/adr-fuse-passthrough.md`)**:
-recommendation **O2** — **reject** privileged FUSE passthrough (requires
-`CAP_SYS_ADMIN`, no pyfuse3 binding, wouldn't fix the current
-attribute-path bottleneck). Instead **build a direct coalesced on-disk
-projection**: extend the archive concept into a searchable mirror,
-eager/coalesced for hot channels and background-filled for cold ones.
-FUSE stays as the exact-fresh interactive view. Estimated 5–8
-engineer-days.
-
-**Open questions from the ADR**:
-- Must the fast path retain the exact `/views/slack` pathname?
-- What maximum lag is acceptable for today's files (suggest 1s)?
-- Should hidden channels be materialized, or only hot channels?
-- Where should the 1–1.5 GB projection live on each host?
-- Would Simon ever accept `CAP_SYS_ADMIN` for the client daemon?
-
-**Implementation**: not started. Depends on the open questions.
+**Open questions from the ADR** (handoff can pick defaults):
+1. Minimum parent age gate (e.g. 60s) to reduce fresh-message race, or
+   rely on mismatch + live delivery?
+2. Also require a prior successful full-expansion marker to guard the
+   missed-delete-plus-missed-add set-substitution risk?
+3. Skips as lifecycle events for crash-resume accounting, or spans only
+   and cheaply re-evaluated after a crash?
 
 ---
 
 ## Workspace channel inventory view (`_workspace/channels.md`)
+
+**Effort**: 1–2 eng-days (~200–250 LoC + tests). **Autonomous**: Yes —
+prompt already drafted at
+`/home/simon/.agent-handoff/2026-06-27/workspace-channels-view/prompt.md`;
+self-contained server + client work; no design decisions blocking.
 
 **Discovered**: 2026-06-27 during the dump-and-reingest while wanting
 a real-time progress denominator. Slack's `search.messages` API exposes
@@ -153,18 +112,46 @@ tables (mutable operator intent).
 - Don't truncate the totals table on refresh — preserve last-known
   on error so the view stays useful
 
-**Estimated scope**: ~200-250 LoC + tests. Self-contained handoff;
-prompt already drafted at
-`/home/simon/.agent-handoff/2026-06-27/workspace-channels-view/prompt.md`
-(queued for after the current backfill cycle settles).
-
 **Impact**: changes the operational story from "ad-hoc SQL via kubectl"
 to "cat the file". Reusable for every future "how big is X / how
 complete are we" question.
 
 ---
 
+## FUSE passthrough + coalesced disk projection
+
+**Effort**: 5–8 eng-days. **Autonomous**: Yes after decisions — five
+open questions in the ADR (see below) need answers; some (projection
+location, hidden channels, path semantics) are ergonomic; one
+(`CAP_SYS_ADMIN` acceptance) is genuinely yours to call.
+
+**Discovered**: 2026-06-29 while benchmarking ripgrep throughput. Live
+mount serves ~18 files/sec (every file goes through FUSE round-trip);
+the archive on disk serves ~135,000 files/sec. ~7,500× gap.
+
+**ADR (2026-08-02, `/tmp/claude/adr-fuse-passthrough.md`)**:
+recommendation **O2** — **reject** privileged FUSE passthrough (requires
+`CAP_SYS_ADMIN`, no pyfuse3 binding, wouldn't fix the current
+attribute-path bottleneck). Instead **build a direct coalesced on-disk
+projection**: extend the archive concept into a searchable mirror,
+eager/coalesced for hot channels and background-filled for cold ones.
+FUSE stays as the exact-fresh interactive view.
+
+**Open questions from the ADR**:
+- Must the fast path retain the exact `/views/slack` pathname?
+- What maximum lag is acceptable for today's files (suggest 1s)?
+- Should hidden channels be materialized, or only hot channels?
+- Where should the 1–1.5 GB projection live on each host?
+- Would Simon ever accept `CAP_SYS_ADMIN` for the client daemon?
+
+---
+
 ## Probe-event pattern — channel message counts + wider pattern
+
+**Effort**: 3–5 eng-days (one-time design pass + first probe
+implementation). **Autonomous**: Yes after decisions — the design
+choices below (one sweep vs many, cadence per kind, tier budget
+accounting) benefit from your ratification before implementation.
 
 **Discovered**: 2026-06-28, post Wave 2 deploy. Triggered by the
 question "what's the % progress of the backfill?" — we have no
@@ -234,7 +221,12 @@ the proof. Other probes drop in cheaply afterward.
 
 ## Clean up repo — sprint/feat worktrees
 
-**Discovered**: 2026-06-28. Partially done 2026-08-02.
+**Effort**: 1–2 hours. **Autonomous**: Yes — read-only inspection per
+worktree (is the branch merged? are there uncommitted changes?), then
+mechanical `git worktree remove` + optional `git branch -D` for
+fully-merged branches.
+
+**Discovered**: 2026-06-28. Partially done 2026-08-02 (poc/*).
 
 Still to sweep:
 - ~30 `synap5e/feat/sprint*` and `synap5e/feat/*` worktrees under
@@ -246,6 +238,36 @@ Still to sweep:
   `v2-adversarial-review`, wave1/wave2 review, spec-review branches,
   etc.).
 - `.wt/server-split-rebuild` — likely shipped as the split server.
+
+---
+
+## FUSE mount wedge — host-level prevention (game-mode ordering)
+
+**Effort**: 15–30 min. **Autonomous**: No — the change lives in
+`/home/simon/bin/game-mode` (your personal operator script, not
+slack-fuse). I can propose the diff but shouldn't push it unilaterally.
+
+**Status**: architectural fix landed (`87487d0`). Per-callback connection
+pool + 30s trio timeout + 25s PG ``statement_timeout``. Concurrent
+callbacks no longer serialize behind one limiter slot; a slow SQL aborts
+at the PG layer and surfaces as ``FUSEError(EIO)``; a pure-Python hang
+times out at the trio layer with the same result. 4 regression tests
+pin the new behaviour. Recovery watchdog (`scripts/watchdog/`) shipped
+and live-verified against a 6h53m wedge on 2026-06-21: full recovery in
+under 5s, projection state preserved.
+
+**ADR (2026-08-02, `/tmp/claude/adr-fuse-mount-wedge.md`)**: keep landed
+fixes; retain the watchdog; add clean `game-mode` stop/start ordering.
+No kernel/zram tuning absent new evidence — the historical
+`folio_wait_bit_common` specimen was the now-fixed
+`FUSE_NOTIFY_STORE`-inside-`read()` deadlock, not folio pressure.
+
+**Prevention still outstanding** — add `slack-fuse.service` to
+`game-mode`'s `GAME_MODE_STOP_SERVICES` so it gets cleanly stopped
+before `claude-hooks-postgres.service` is torn down, then restarted in
+`cmd_off`. Priority is low because the watchdog already recovers in
+<5s; prevention just avoids the transient EIO during game-mode
+transitions.
 
 ---
 
