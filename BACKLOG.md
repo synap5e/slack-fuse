@@ -196,6 +196,17 @@ slack-fuse code change. Left as a follow-up for the operator.
 
 ### Trailer false-positives "server unreachable" on quiet streams
 
+**Status**: partial defensive fix landed as `9fa4b60` (2026-08-02).
+Classifier now uses `state.workspace_last_frame_at` for disconnect
+detection with regression tests pinning correct behaviour when the
+per-stream and workspace timestamps diverge. Caveat: with the current
+schema `fetch_staleness_state` populates both fields from the same
+`connection_state.last_frame_at` singleton — they only diverge in
+pure classifier tests. If the original 21ms symptom was `NULL`-at-mount
+rather than "singleton stale but health alive", it's a separate diagnosis
+(see docstring on `fetch_staleness_state`). Re-open with a fresh symptom
+capture if it recurs.
+
 **Discovered**: 2026-06-27 during dump-and-reingest. User read
 `/views/slack-split/channels/general/channel.md` (top-level metadata
 view); rendered fine in 21ms but appended:
