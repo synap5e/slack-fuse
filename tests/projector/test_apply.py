@@ -333,6 +333,61 @@ def test_channel_info_refreshed_upserts_membership_and_promotes_tier(
     assert rows_after == [("C001", "frontend-nightly", "hot", "auto")]
 
 
+def test_channel_member_joined_and_left_are_no_op_but_not_unknown(
+    client_conn: psycopg.Connection[TupleRow],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Server emits ``channel_member_joined`` / ``channel_member_left`` for
+    every user's membership change on channels this token can see (post
+    2026-07-22 self-join detection + FINDING-16). The server's channels view
+    folds these for aggregate counts; the client's ``channels`` table only
+    tracks THIS token's ``is_member`` (flipped via ``channel_added`` on
+    self-join, ``channel_member_changed`` on self-leave), so other-user
+    membership events are correctly a no-op for the client projection.
+
+    Regression: pre-fix the client logged ``apply: unknown channel-list kind
+    'channel_member_joined'`` per event (reported 2026-08-01 on
+    flow-crastinator, ~many hits per minute during backfill of a 3.7-day gap).
+    """
+    # Seed a channel so the events have somewhere plausible to land.
+    apply_event(
+        client_conn,
+        EventFrame(
+            stream="channel-list",
+            offset=1,
+            kind="channel_added",
+            ts=None,
+            payload=_payload(id="C001", name="general", is_member=True),
+        ),
+    )
+    rows_before = _channels(client_conn)
+
+    caplog.clear()
+    caplog.set_level("WARNING", logger="slack_fuse.projector.apply")
+    for offset, kind in ((2, "channel_member_joined"), (3, "channel_member_left")):
+        apply_event(
+            client_conn,
+            EventFrame(
+                stream="channel-list",
+                offset=offset,
+                kind=kind,
+                ts=None,
+                payload={"channel_id": "C001", "user_id": "U_OTHER"},
+            ),
+        )
+
+    # No projection change — client doesn't fold other-user membership.
+    assert _channels(client_conn) == rows_before
+    # And no "unknown channel-list kind" warning was emitted (that's the
+    # visible symptom this fix stops).
+    unknown_kind_warnings = [
+        rec for rec in caplog.records if "unknown channel-list kind" in rec.getMessage()
+    ]
+    assert unknown_kind_warnings == [], (
+        f"expected zero unknown-kind warnings; got: {[r.getMessage() for r in unknown_kind_warnings]}"
+    )
+
+
 def test_channel_info_refreshed_preserves_manual_tier_override(
     client_conn: psycopg.Connection[TupleRow],
 ) -> None:

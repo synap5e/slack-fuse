@@ -528,6 +528,17 @@ def _dispatch_channel_list_event(
         return _apply_channel_unarchived(cur, payload)
     if kind == "channel_member_changed":
         return _apply_channel_member_changed(cur, payload)
+    if kind in ("channel_member_joined", "channel_member_left"):
+        # Server-side facts about OTHER users' membership changes. The server's
+        # `channels` view folds these to compute member counts (post FINDING-16
+        # rewrite 2026-07-22). Client-side, the ``channels`` table only tracks
+        # this token's ``is_member`` — which flips via ``channel_added`` on
+        # self-join and ``channel_member_changed(is_member=false)`` on
+        # self-leave (both emitted by the server's socket + dispatcher paths).
+        # So other-user membership events are correctly a no-op for the client
+        # projection. Reported 2026-08-01 on flow-crastinator as recurring
+        # "unknown channel-list kind" warnings.
+        return ApplyResult()
     log.warning("apply: unknown channel-list kind %r", kind)
     return ApplyResult()
 
