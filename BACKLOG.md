@@ -39,13 +39,21 @@ skip only when both match the parent's `reply_count` and `latest_reply`.
 Nulls or mismatch fetch. Reclaims the 4,500-thread / 8+ hour no-op tail
 per channel.
 
-**Open questions from the ADR** (handoff can pick defaults):
-1. Minimum parent age gate (e.g. 60s) to reduce fresh-message race, or
-   rely on mismatch + live delivery?
-2. Also require a prior successful full-expansion marker to guard the
-   missed-delete-plus-missed-add set-substitution risk?
-3. Skips as lifecycle events for crash-resume accounting, or spans only
-   and cheaply re-evaluated after a crash?
+**Decisions ratified 2026-08-02** (handoff-ready):
+1. **No parent-age gate.** Trust the `(reply_count, MAX(reply_ts))`
+   match. Any concurrent-arrival race is self-healing via WS live
+   delivery + the next backfill loop. Skip predicate is just the two
+   equality checks against the parent metadata Slack already gave us.
+2. **No durable full-expansion marker.** Trust count+MAX plus the
+   existing periodic full backfill as the drift catcher. The
+   missed-delete-plus-missed-add double-miss window is vanishingly
+   rare with WS live delivery, and full backfill catches any actual
+   drift. No new `threads_expanded` table.
+3. **Spans only for skip observability, no events.** Emit
+   `slurper.backfill.thread_skip` spans (Loki-queryable for cost
+   visibility). No event row. Crash-resume re-evaluates the predicate
+   cheaply — one batched query per channel restart, no stale skip
+   state to reconcile against live events.
 
 ---
 
@@ -137,12 +145,35 @@ projection**: extend the archive concept into a searchable mirror,
 eager/coalesced for hot channels and background-filled for cold ones.
 FUSE stays as the exact-fresh interactive view.
 
-**Open questions from the ADR**:
-- Must the fast path retain the exact `/views/slack` pathname?
-- What maximum lag is acceptable for today's files (suggest 1s)?
-- Should hidden channels be materialized, or only hot channels?
-- Where should the 1–1.5 GB projection live on each host?
-- Would Simon ever accept `CAP_SYS_ADMIN` for the client daemon?
+**Decisions ratified 2026-08-02**:
+1. **Serve at the same `/views/slack` path via tier logic** — not a
+   separate `/views/slack-fast` mount. Consumers see one namespace;
+   the daemon arbitrates per-read between fresh-FUSE-render (dirty
+   paths) and disk-serve (clean paths). Implementation cost: per-read
+   dirty-check + strict invalidation ordering (disk write must land
+   before flip dirty→clean) so a clean read is provably byte-equal to
+   what JIT would produce.
+2. **5s lag budget for today's files.** Coalescer wakes every ~5s or
+   on batched WS frames. Interactive tail-following sees visible lag
+   on chatty channels; accepted for the cheaper coalescer cadence.
+3. **Hot channels only.** Hidden channels (`tier != 'hot'`) stay
+   FUSE-only; users needing them use `rg /views/slack/.hidden/` on
+   the live JIT path. Saves ~2–3× disk.
+4. **Projection lives at `~/.cache/slack-fuse/projection/`** —
+   alongside the existing archive, XDG cache convention, rebuildable.
+5. **`CAP_SYS_ADMIN` question is moot** since we're not doing
+   passthrough. Recorded here for the ADR trail.
+
+**Related design note (Simon, 2026-08-02, consider-only)**: sub-5s
+use cases (live tail, per-channel notify) belong in dedicated CLI
+tools, not in the mount. The coalesced projection intentionally
+optimizes for `rg`-style broad reads at ~5s lag; the mount stays
+exact-fresh for interactive `cat`; a future `slack-fuse notify
+<channel>` or `slack-fuse tail <channel>` (both direct WS
+subscribers) is the right home for the "surface every new message
+within 1s" workload. Not building either now — noted so the 5s
+projection lag doesn't get argued down for a workload it wasn't
+sized for.
 
 ---
 
@@ -192,30 +223,31 @@ parent's age, so they don't fit this pattern.)
 4. **`channel_bookmark_probed`** — no socket event exists. Some teams
    use bookmarks as canvas pointers.
 
-Design points to settle BEFORE writing any of them:
+**Decisions ratified 2026-08-02**:
+1. **Single sweep task + probe registry.** One supervisor entry, one
+   limiter, one task that walks a registry of probe kinds every N
+   seconds and dispatches each probe whose interval has elapsed. No
+   per-probe tasks / no nursery-slot proliferation.
+2. **Hardcoded cadence per probe kind** — `channel_message_count`
+   every 6h, `workspace_emoji` daily, `pins` weekly, etc. Baked into
+   the probe registry. No ServerConfig knob — one place to change,
+   never actually tuned per deployment.
 
-- **One probe-sweep task or per-probe tasks?** One sweep is simpler
-  (one supervisor entry, one limiter; the sweep walks a registry of
-  probe kinds with their own intervals). Per-probe scales the nursery
-  + supervisor surface unnecessarily.
-- **TTL + cadence per kind.** `channel_message_count` could refresh
-  every 6h; `workspace_emoji` daily; `pins` weekly. Make this part of
-  ServerConfig.
-- **Tier budget accounting.** `search.messages` (Tier 2, 60/min) for
-  N channels at interval T must respect the ceiling. Bake into the
-  sweep.
-- **Failure handling.** API failure = no event written. Last probe
-  stays as truth. Consumers shouldn't assume any cadence.
-- **Spans wrap probes.** Each probe emits `slurper.probe.<kind>`
-  spans for cost visibility — natural follow-on from Wave 2.C.
-- **Distinct from refreshes.** `channel_info_refreshed` fires on
-  diff; probes fire on period regardless. Two different consumers;
-  don't piggyback.
+**Settled by structure, not decisions to make**:
+- **Tier budget accounting** is baked into the sweep (`search.messages`
+  Tier 2 = 60/min; for N channels at interval T, the sweep respects
+  the ceiling via its limiter).
+- **Failure handling**: API failure = no event written. Last probe
+  stays as truth. Consumers must not assume any cadence.
+- **Spans wrap probes**: each probe emits `slurper.probe.<kind>`
+  spans for cost visibility (follows the Wave 2.C span pattern).
+- **Distinct from `channel_info_refreshed`**: refreshes fire on diff;
+  probes fire on period regardless. Two different consumers; do not
+  piggyback probes onto the refresh sweep.
 
-**Recommendation**: spec the probe-event shape (one sweep task,
-registry of probe kinds, per-kind TTL via config) as one design pass,
-then implement the first probe (`channel_message_count_probed`) as
-the proof. Other probes drop in cheaply afterward.
+**Implementation order**: build the sweep + registry as the framework
+in one pass, then land `channel_message_count_probed` as the first
+probe/proof. Other probes drop in cheaply afterward.
 
 ---
 
