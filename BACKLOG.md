@@ -569,12 +569,17 @@ the proof. Other probes drop in cheaply afterward.
 
 ---
 
-### Clean up repo
+### Clean up repo — sprint/feat worktrees
 
-**Discovered**: 2026-06-28.
+**Discovered**: 2026-06-28. Partially done 2026-08-02.
 
-Stale paths that should be deleted from main:
+Done 2026-08-02:
+- Removed `slack_fuse_poc_b/` (renderer-split POC; shipped as `slack_fuse_render/`).
+- Removed `.wt/synap5e/poc/a-events-to-postgres` worktree + branch (0 commits ahead of main).
+- Removed `.wt/synap5e/poc/b-renderer-split` worktree; retained branch (1 historical "byte-equivalence proof" commit — cheap to keep as ref).
+- POC-a report backed up to `~/tmp/claude-scripts/today/poc-reports-archive/poc-a.md`.
 
-- **`slack_fuse_poc_b/`** — POC B for the renderer-split byte-equivalence proof from June 9. The split shipped in `slack_fuse_render/`; the POC is leftover scratch (24K, two files + __pycache__).
-- **`.wt/synap5e/poc/a-events-to-postgres`** + **`.wt/synap5e/poc/b-renderer-split`** worktrees — early development POC branches still listed in `git worktree list`. Check for unmerged history before removing.
-- Any other `poc_*` / `sprint*` worktree branches that were created during early development and have since shipped or been abandoned.
+Still to sweep:
+- ~30 `synap5e/feat/sprint*` and `synap5e/feat/*` worktrees under `.wt/synap5e/feat/` (sprint0…sprint3, 2a-2f, 3a-3e, post-sprint3-fixes, slurper-channels-populate). Most shipped; needs one-by-one check.
+- `.wt/handoff/*` — a dozen completed handoff worktrees (`self-join-detection`, `finding-16-refresh-discovery`, `v2-adversarial-review`, wave1/wave2 review, spec-review branches, etc.) plus current in-flight ones.
+- `.wt/server-split-rebuild` — likely shipped as the split server.
