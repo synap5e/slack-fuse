@@ -1,270 +1,44 @@
 # Backlog
 
-Things explicitly deferred for later. Closed items are removed (not
-archived). "Closed pending image rollout" is not a backlog state —
-roll the image and clear the entry.
+Structure (Simon's convention, 2026-08-02):
+
+- **Ratified** — items Simon has asked for or blessed. Highest confidence.
+- **Agent-raised (needs human review)** — items an agent (usually Claude here) surfaced and validated, but Simon hasn't triaged yet.
+- **Agent-raised (unconfirmed origin)** — items another agent proposed that may not trace back to a human ask, or that couldn't be confirmed. Weakest signal; treat as suggestions.
+- **Resolved** — done items with the commits that closed them, most recent first. Not deleted, so the history reads back.
+
+When an item ships, move it into **Resolved** with the commit hashes and date. When a new item surfaces, add it to the appropriate section — never auto-append to Ratified without explicit user blessing.
 
 ---
 
-## Open
+# Ratified
 
-### Client reconnect-after-PG-bounce wedges fixed-conn tasks
-
-**Discovered**: 2026-08-01 by term-62a1 on flow-crastinator (live
-specimen, 3.7-day silent wedge).
-
-**Symptom**: local PG bounces (in flow's case, `postgres.service`
-restarted during a NixOS rebuild switch, 2026-07-27 23:32 PDT). ~43s
-later the projector nursery hits ``psycopg.OperationalError: the
-connection is lost``, logs ``projector exited; reconnecting in 300s``,
-and enters a permanent reconnect loop. ``block_sync.py:169`` fails
-every cycle with ``the connection is closed`` — the wedged conns are
-never rebuilt. Flow logged 165 reconnect messages in one day. Meanwhile
-gap probes to the k8s server still return 200 (event fetch alive; only
-projection to local PG + FUSE was dead). Systemd shows the unit
-``active`` throughout because the process didn't exit. Zero external
-signal that the mount was stale.
-
-**FINDING-06 lineage**: this is the exact class the 2026-07-17
-adversarial review named as "PG-restart survivability". The Tier 3
-plan (`/tmp/claude/v2-uplift-plan.md`) called for routing the five
-fixed conns — ``_inode_conn``, ``state_conn``, ``sink_conn``,
-``block_sync`` conn, ``rerender_consumer`` conns — through either the
-pooled path or a shared ``ReconnectingConnection`` wrapper that
-reopens on ``OperationalError``, plus moving initial connects INSIDE
-the supervised try (the `2026-06-22` comment in `health_subscriber`
-documents this pattern as previously fixed for the subscriber, but
-never propagated). Never landed.
-
-**Why this is worse than a crash**:
-
-- No liveness probe fails — ``/health`` still serves 200.
-- Systemd doesn't restart (no exit).
-- Kubelet-style crash-loop remediation doesn't apply.
-- Only visible via journal grep or a user noticing stale content
-  (flow's own maintainer noticed 3.7 days late).
-
-The failure mode fools every operational tool we have. This is what
-made yesterday's `/views/slack → slack-split` symlink risky — a wedged
-projector serves stale bytes forever, and every consumer trusts the
-mount is live.
-
-**Fix path** (from Tier 3 spec):
-
-1. Introduce a ``ReconnectingConnection`` wrapper. On any
-   ``psycopg.OperationalError``, close the socket + open a fresh conn
-   with the same DSN, retry the current statement once, propagate on
-   second failure. Mirrors ``health_subscriber``'s supervisor pattern.
-2. Route the five fixed conns through it: ``_inode_conn`` in
-   ``fuse_ops_v2``, ``state_conn`` (connection_state polling),
-   ``sink_conn`` (applier sink), ``block_sync``'s persistent conn,
-   ``_run_rerender_consumer``'s apply + sink conns.
-3. Move initial connect() calls INSIDE the supervised try in each
-   task (currently ``block_sync`` and ``rerender_consumer`` open their
-   conns at task-start OUTSIDE the try; PG down at that instant kills
-   the whole nursery).
-4. Applier sink dedicated conn: currently one long-lived conn per
-   WSClient nursery generation; same reconnect treatment.
-5. Emit a ``slurper-health.client_wedged`` observation when the
-   reconnect loop exceeds N minutes without success — so the trailer
-   or ``_control/status`` can surface it externally. This is the
-   observability primitive the current "silently wedged" mode lacks.
-
-**Test**: fault-injection — kill the local PG process mid-callback,
-assert mount recovers within N seconds without a systemd restart.
-Covers the ``NO_POSTGRES`` file's contract end-to-end.
-
-**Why deferred**: touches 5 modules, each with different lifecycle
-semantics (long-lived vs. per-nursery-generation vs. per-request);
-needs careful trio/threading reasoning; needs adversarial verification.
-Estimated 2-3 days of work. Handoff-shaped (Codex 5.6 Sol xhigh with
-worktree, spec builds on `/tmp/claude/v2-uplift-plan.md` Tier 3).
-
-**Not deferred forever, but not this session**: any host that bounces
-its local PG will silently stop projecting. This will bite the next
-time and the wedge won't be discovered for days.
-
----
-
-### FUSE mount wedge — host-level condition
+## FUSE mount wedge — host-level condition
 
 **Status**: architectural fix landed (`87487d0`). Per-callback connection
 pool + 30s trio timeout + 25s PG ``statement_timeout``. Concurrent
 callbacks no longer serialize behind one limiter slot; a slow SQL aborts
 at the PG layer and surfaces as ``FUSEError(EIO)``; a pure-Python hang
 times out at the trio layer with the same result. 4 regression tests
-pin the new behaviour.
+pin the new behaviour. Recovery watchdog (`scripts/watchdog/`) shipped
+and live-verified against a 6h53m wedge on 2026-06-21: full recovery in
+under 5s, projection state preserved.
 
-**Smoke test after deploy revealed a separate host-level issue.** With
-the fix running, two concurrent ``cat`` operations on different
-``channel.md`` files still wedged the mount: process went D-state on
-``folio_wait_bit_common`` (same wchan as the original report), but
-``VmSwap=0`` on the fresh process and the disk was idle — *not* a swap
-stall. Scanning the wider system found:
+**ADR (2026-08-02, `/tmp/claude/adr-fuse-mount-wedge.md`)**: keep landed
+fixes; retain the watchdog; add clean `game-mode` stop/start ordering.
+No kernel/zram tuning absent new evidence — the historical
+`folio_wait_bit_common` specimen was the now-fixed
+`FUSE_NOTIFY_STORE`-inside-`read()` deadlock, not folio pressure.
 
-- A `claude` process D-state on FUSE wchan for **2 days**
-- A `bat` process D-state on FUSE wchan for ~2.5 hours
-- Other long-lived D-states from before today's session
-
-So the host has an accumulating supply of FUSE-wedged processes
-unrelated to slack-fuse's architecture — possibly a kernel bug, a
-specific FUSE/pyfuse3 race, or a system condition (memory allocator
-pressure, cgroup, or zram interaction — system has 27 GB used in zram
-swap with 14-day uptime).
-
-**Reproduction shape on the new code**: open two concurrent reads on
-different channel.md files; slack-fuse goes D-state on
-``folio_wait_bit_common``; the cats D-state on ``fuse_s``. Recovery
-needs ``fusermount3 -uz`` + service restart.
-
-**Root cause (diagnosed via ``agent-sudo`` + ``/proc/<pid>/stack``)**:
-the wedged slack-fuse daemons have IDENTICAL kernel stacks:
-
-```
-folio_wait_bit_common
-__filemap_get_folio_mpol.cold
-fuse_dev_do_write
-fuse_dev_write
-do_iter_readv_writev
-do_writev
-```
-
-This is the kernel-side of ``write(fuse_dev_fd, response, ...)``. The
-daemon's Python code finished computing the response and called write
-to send it back; the kernel can't allocate a folio to receive it and
-sleeps on the folio's bit. Every downstream FUSE client (``cat``,
-``head``, ``bat``, ``claude``, ``stat``) is correctly waiting on
-``fuse_simple_request`` for that response. The wedge starts at the
-daemon's write path, not in slack-fuse Python.
-
-This is reproduced for non-slack-fuse FUSE workloads on the same host
-(``claude`` D-state on FUSE for 2 days; ``bat`` for 2.5 hours). The
-condition is host-level, not slack-fuse-specific.
-
-**Trigger identified (2026-06-22) — `game-mode on` tears down
-backing services that slack-fuse-split is in-flight against.**
-Evidence (none of it my inference; all grounded in operator's own
-documented experience):
-
-- ``/home/simon/bin/game-mode`` ``cmd_on`` comment, verbatim:
-  *"a session that's holding a FUSE handle or a postgres connection
-  when its backing service stops can end up in
-  ``__fuse_simple_request`` / connection-reset wedges that only
-  SIGKILL-after-FUSE-abort recovers from (see
-  lesson_fuse_orphan_recovery.md). Freezing first puts sessions in
-  cgroup-v2 TASK_FROZEN — they can't issue new requests, can't be
-  wedged."*
-- ``GAME_MODE_STOP_SERVICES`` includes ``claude-hooks-postgres.service``,
-  the local Postgres backing slack-fuse-split's projector. Its lesson
-  comment cites: *"stopping claude-hooks-postgres cascaded to
-  claude-hooksd → claude-session-fuse → /views/claude-sessions became
-  a stale mount."*
-- ``lesson_fuse_orphan_recovery.md`` documents the kernel stack we
-  observed (``fuse_s``, ``__fuse_simple_request``) and prescribes
-  ``echo 1 > /sys/fs/fuse/connections/<id>/abort`` as the only
-  always-works recovery primitive.
-- slack-fuse-split runs as a user systemd unit in ``app.slice``, NOT
-  in tmux. ``game-mode --freeze`` only freezes tmux sessions
-  (``session-freeze``), so slack-fuse-split stays runnable while its
-  PG socket disappears. It's the workflow event, not any system-wide
-  config, that triggers the wedge.
-- Timing: client crash logs show ``psycopg.OperationalError:
-  connection is bad: connection to server on socket
-  /run/user/1000/local-postgres/...`` exactly matching game-mode-on
-  events.
-
-**Defenses shipped:**
-
-1. **Recovery watchdog** (``scripts/watchdog/``): systemd timer-driven
-   detection via ``/proc/<pid>/stat`` (never touches the FUSE path);
-   threshold default 90s. Recovery follows the lesson_fuse_orphan_
-   recovery sequence: ``echo 1 > /sys/fs/fuse/connections/<id>/abort``
-   (the only always-works primitive — pure sysfs write, no FUSE
-   traffic) → ``fusermount3 -uz`` → ``systemctl restart``. Live-verified
-   against the 6h53m wedge on 2026-06-21: full recovery in under 5s,
-   projection state preserved. Bounds impact to ~120s worst case.
-
-**Prevention not yet implemented** — add
-``slack-fuse-split.service`` to ``game-mode``'s
-``GAME_MODE_STOP_SERVICES`` so it gets cleanly stopped before
-``claude-hooks-postgres.service`` is torn down, then restarted in
-``cmd_off``. Mirrors the protection tmux sessions get via ``--freeze``.
-This is operator-side (their ``/home/simon/bin/game-mode``), not a
-slack-fuse code change. Left as a follow-up for the operator.
+**Prevention not yet implemented** — add `slack-fuse.service` to
+`game-mode`'s `GAME_MODE_STOP_SERVICES` so it gets cleanly stopped
+before `claude-hooks-postgres.service` is torn down, then restarted in
+`cmd_off`. Operator-side (`/home/simon/bin/game-mode`), not a slack-fuse
+code change.
 
 ---
 
-### Trailer false-positives "server unreachable" on quiet streams
-
-**Status**: partial defensive fix landed as `9fa4b60` (2026-08-02).
-Classifier now uses `state.workspace_last_frame_at` for disconnect
-detection with regression tests pinning correct behaviour when the
-per-stream and workspace timestamps diverge. Caveat: with the current
-schema `fetch_staleness_state` populates both fields from the same
-`connection_state.last_frame_at` singleton — they only diverge in
-pure classifier tests. If the original 21ms symptom was `NULL`-at-mount
-rather than "singleton stale but health alive", it's a separate diagnosis
-(see docstring on `fetch_staleness_state`). Re-open with a fresh symptom
-capture if it recurs.
-
-**Discovered**: 2026-06-27 during dump-and-reingest. User read
-`/views/slack-split/channels/general/channel.md` (top-level metadata
-view); rendered fine in 21ms but appended:
-
-```
-> ⚠ Content may be stale. Last successful sync: never. Reason: server unreachable.
-```
-
-**Symptom**: false positive. The mount + server + WS connection are
-all healthy. `slurper-health` stream had a frame 1 minute ago; the
-projector's cursors are advancing actively across many channels; the
-HTTP server returns 200 in milliseconds.
-
-**Root cause**: `slack_fuse/projector/trailer.py::staleness_reason`
-uses **per-stream** ``last_frame_at`` as the WS-liveness signal:
-
-```python
-if state.last_frame_at is None or (now_real - state.last_frame_at) > timedelta(seconds=stale_after_s):
-    if not caught_up:
-        return "catching up after reconnect"
-    return "server unreachable"
-```
-
-For a stream that's naturally quiet — `channel-list` when no channel
-metadata is drifting, or a per-channel stream that's been backfilled
-and has no live messages — no frames arrive for >5min and the trailer
-fires. The threshold's intent was "WS disconnect", but it conflates
-"no traffic on this stream" with "no connectivity".
-
-**Current behaviour**: every read of a top-level `channel.md` (or any
-read whose freshness derives from `channel-list`) on a stable
-workspace appends a misleading "server unreachable" trailer with
-"Last successful sync: never". Users see the warning and reasonably
-conclude the daemon is broken.
-
-**Fix candidates**:
-1. **Use workspace-wide liveness signal**: track the last frame across
-   ANY stream and use that as the WS-disconnect proxy. `slurper-health`
-   is the natural heartbeat — it emits regularly for various reasons.
-2. **Explicit WS-state tracking**: tie staleness to the actual WS
-   connection state (e.g. `connection_state` table or socket
-   reconnect events) instead of inferring from data flow.
-3. **Per-stream threshold tuning**: bump `stale_after_s` for streams
-   that are known to be quiet (channel-list, users). Brittle.
-
-**Recommendation**: option 1. Cheapest fix, doesn't change the
-overall trailer architecture, and aligns with what `slurper-health`
-was designed for. The current `last_frame_at` parameter shape stays;
-it just gets sourced from a workspace-wide MAX instead of the
-queried stream.
-
-**Impact**: ergonomic — operators see the warning and don't know if
-it's real or noise. Doesn't affect data correctness, but every
-warning the user has to mentally filter erodes trust in the trailer.
-
----
-
-### Skip thread-expansion when local thread is already caught up
+## Skip thread-expansion when local thread is already caught up
 
 **Discovered**: 2026-06-30 watching proj-cloud's backfill spend ~9 hours
 in the thread-expansion phase writing rows that all dedup'd to no-ops.
@@ -273,177 +47,55 @@ were `conversations.replies` calls per thread parent, paying the 2-8s
 throttle per call, hitting the dedup index, inserting zero new rows.
 Socket-mode events had already filled the threads in.
 
-**Optimization**: in `backfill_channel`'s thread-expansion loop (in
-`slack_fuse_server/backfill/api.py`, where `_expand_threads` walks
-`thread_parents`), check local state before calling
-`conversations.replies`. Skip the fetch when both hold:
+**ADR (2026-08-02, `/tmp/claude/adr-skip-thread-expansion.md`)**:
+recommendation **O1** — server-side batched preflight per channel.
+Before each `conversations.replies` call, `COUNT(DISTINCT reply_ts)`
+plus `MAX(reply_ts)` from active (edit/delete-folded) message facts;
+skip only when both match the parent's `reply_count` and `latest_reply`.
+Nulls or mismatch fetch. Reclaims the 4,500-thread / 8+ hour no-op tail
+per channel. Estimated 2–3 engineer-days.
 
-1. We have a `message` event with `ts == parent.latest_reply`
-   (newest reply timestamp from the parent's payload), AND
-2. Count of locally-stored events with `thread_ts == parent.ts` equals
-   `parent.reply_count` (including the parent itself, or off-by-one
-   per Slack's convention — verify against `tests/_fake_slack/`).
+**Open questions from the ADR**:
+1. Should the first release require a minimum parent age (e.g. 60s) to
+   reduce fresh-message race, or rely on mismatch + live delivery?
+2. Is the missed-delete-plus-missed-add set-substitution risk
+   acceptable, or should we also require a prior successful full-expansion
+   marker?
+3. Should skips become lifecycle events for crash-resume accounting, or
+   remain spans only and be cheaply re-evaluated after a crash?
 
-If either fails, fetch normally.
-
-**Why it's safe**:
-- False negative (we fetch unnecessarily) is the worst-case if our
-  cached `reply_count` is stale; that's the status quo.
-- False positive (we skip a real gap) requires our local thread to
-  have the exact `latest_reply` ts but be missing intermediate
-  replies — Slack doesn't insert replies in the middle of a thread's
-  timeline retroactively, so this shape doesn't occur in practice.
-- The dedup index remains the correctness backstop: if we somehow
-  miss a reply, the next backfill re-walk catches it (no
-  `latest_reply` match → fetch).
-
-**Wins**:
-- Hours of API budget reclaimed on busy channels where socket-mode
-  already filled the threads.
-- Frees Tier 3 quota for actually-new work.
-- Auto-backfill cycle completes faster after restart — when combined
-  with skip-completed-channels (Wave 1 D), the only API work that
-  actually fires is for genuinely new gaps.
-
-**Where to wire the check**: emit a `slurper.backfill.thread_skip`
-span when the skip fires, so Loki can confirm in production how many
-threads the optimization actually saves. Per-channel run that wastes
-4500 thread fetches × 5s avg = 6+ hours saved on a single big channel.
-
-**Edge case**: huddle channels' transcript "threads" are a separate
-flow (`transcript.py`); this optimization doesn't apply. The
-predicate is on `reply_count` which the huddle path doesn't touch.
-
-**Distinct from**: skip-completed-channels (Wave 1 D), which avoids
-re-walking ENTIRE channels. This is a finer-grained per-thread skip
-within a channel that IS being walked.
+**Implementation**: not started. Well-scoped handoff candidate once the
+open questions land.
 
 ---
 
-### FUSE passthrough + dirty-set + coalesced disk projection
+## FUSE passthrough + coalesced disk projection
 
 **Discovered**: 2026-06-29 while benchmarking ripgrep throughput. Live
 mount serves ~18 files/sec (every file goes through FUSE round-trip);
-the archive on disk serves ~135,000 files/sec. ~7,500× gap. Kernel-push
-(`invalidate_inode`) doesn't help cold scans because each file is read
-once — no kernel cache to hit. The architectural fix is FUSE
-**passthrough**: Linux ≥ 6.9 + libfuse ≥ 3.16 (May/Sept 2024) let the
-daemon delegate `read()` directly to a backing fd. Kernel reads from
-disk; FUSE daemon is bypassed for the read path entirely.
+the archive on disk serves ~135,000 files/sec. ~7,500× gap.
 
-**Stack check** (already done): kernel 7.1.1 ✓, libfuse 3.18.2 ✓,
-pyfuse3 3.4.2 has NO passthrough bindings ✗. The Python binding gap
-is the only real blocker.
+**ADR (2026-08-02, `/tmp/claude/adr-fuse-passthrough.md`)**:
+recommendation **O2** — **reject** privileged FUSE passthrough (requires
+`CAP_SYS_ADMIN`, no pyfuse3 binding, wouldn't fix the current
+attribute-path bottleneck). Instead **build a direct coalesced on-disk
+projection**: extend the archive concept into a searchable mirror,
+eager/coalesced for hot channels and background-filled for cold ones.
+FUSE stays as the exact-fresh interactive view. Estimated 5–8
+engineer-days.
 
-**Why this is a natural fallout from v2 event-sourcing.** Without v2
-you'd be solving a cache-coherence problem; with v2 you're just adding
-a sink. v2 already gives:
+**Open questions from the ADR**:
+- Must the fast path retain the exact `/views/slack` pathname?
+- What maximum lag is acceptable for today's files (suggest 1s)?
+- Should hidden channels be materialized, or only hot channels?
+- Where should the 1–1.5 GB projection live on each host?
+- Would Simon ever accept `CAP_SYS_ADMIN` for the client daemon?
 
-- Deterministic renders (offset + chunk row → byte-identical output)
-- Per-key chunking matching the on-disk layout
-- Idempotent re-renders (atomic temp+rename is safe)
-- Existing `InvalidationSink` plumbing (one extra line to add disk write)
-- `stream_caught_up` + `applied_offset` for "is this chunk stable?"
-- In-memory render LRU already exists in `fuse_ops_v2.py` — just move
-  the storage backend to disk
-
-**Three-component design** (sharper than "stale tolerance contract"):
-
-```
-event arrives ─→ InvalidationSink
-                 - add path to dirty_set      (in-memory hash set)
-                 - invalidate_inode           (drops kernel page cache)
-
-coalescer ─────→ every stale_threshold:
-                 for path in dirty_set:
-                   render_to_disk_atomic     (temp + rename)
-                   remove from set
-                   invalidate_inode          (kernel re-asks → daemon
-                                              now returns passthrough)
-
-read(path) ────→ open():
-                   if path in dirty_set:  no FOPEN_PASSTHROUGH; read()
-                                          renders JIT (what v2 does today)
-                   else:                  FOPEN_PASSTHROUGH + backing fd;
-                                          kernel reads disk directly
-```
-
-**Why dirty-set is right over "stale tolerance" contract**: reads are
-always *fresh*. JIT path returns bytes computed from latest
-applied_offset; passthrough path only serves files byte-identical to
-JIT output (the set is the proof). Stale threshold controls disk
-write rate, NOT read freshness. Hot channels can fire 50 msgs/sec —
-one disk write per stale_threshold per key, not per event.
-
-**stale_threshold ladder** (mirrors v1's `_date_ttl` / `_thread_ttl`):
-
-| Key | Threshold | Why |
-|---|---|---|
-| Today, busy or quiet channel feed | 1s | Feels live to humans |
-| Today, active thread (< 1h) | 1s | Same |
-| Today, idle thread (> 24h) | 30s | Long-tail; readers tolerate slack |
-| Yesterday | ∞ until invalidate | Locked-in; only edits/deletes change it |
-| Older than 7d | ∞ | Effectively immutable |
-
-**Expected throughput gain**: ripgrep over live mount goes from ~18
-files/sec to **~50,000-100,000 files/sec** cold (limited by
-`getattr`/`lookup` round-trips, which the kernel attr-cache absorbs
-after first pass), approaching the archive's ~135K/sec on warm runs.
-
-**Subtle caveat to document**: `FOPEN_PASSTHROUGH` is per-open and
-persists for the life of the fd. Long-held fds reading a path that
-later transitions clean→dirty keep reading from the cached backing
-fd until close. Same edge case as today's `keep_cache=True`: rg/cat/
-modern editors re-open and self-correct; only processes holding fds
-indefinitely see drift. Document, accept.
-
-**Implementation plan** (four pieces, smaller than it sounds):
-
-1. **Disk-backed render output**. Extend the existing render path so
-   each render also atomically writes to a known on-disk location
-   (mirror the FUSE tree under `~/.cache/slack-fuse/projection/` or
-   similar). Pure I/O; ~30 lines.
-2. **Dirty set in `fuse_ops_v2.py`**. Add `_dirty_paths: set[str]`
-   plus the sink hook + coalescer task. ~50 lines + tests.
-3. **`open()` passthrough decision**. Check dirty set; return with or
-   without `FOPEN_PASSTHROUGH` + backing fd. Trivial once (4) lands.
-4. **pyfuse3 passthrough binding gap**. Two options:
-   - **Patch pyfuse3 upstream** — Cython bindings for
-     `fuse_passthrough_open()` and `FOPEN_PASSTHROUGH`. ~150 LoC plus
-     tests. Cleanest if upstream merges; pyfuse3 is barely maintained
-     so a vendored fork is plausible.
-   - **Small native extension** — ctypes/Cython wrapper that calls
-     `fuse_passthrough_open()` and returns the backing-id to pyfuse3's
-     `open()` callback. ~50 LoC of C plus a ctypes shim. More
-     surgical, no upstream dependency.
-
-   Lean toward option B (native extension) for the spike; option A
-   later if it's worth upstreaming.
-
-**Decision points before starting**:
-
-- Where does the projection live on disk? Single tree mirroring FUSE
-  layout, separate from archive? Same as archive but extended to today?
-- Coalescer task: one per-process trio task walking the dirty set, or
-  per-key timers? Per-process simpler.
-- Disk overhead: archive is 572MB today; projection covering today
-  too is probably 1-1.5GB. Trivial.
-- Crash recovery: on startup, treat all paths as dirty until the
-  projector has caught up. Re-flush on the first coalescer tick.
-
-**Why not now**: backfill ingest still has ~2h remaining; pyfuse3
-binding work benefits from a focused session not interleaved with
-other work; current performance is workable (archive for broad scans,
-live mount for "what did Alice say" interactive queries). Big win
-when done; nothing blocked on it.
-
-**Suggested order**: spike (4) first (the binding) — that's the only
-unknown. Once a 20-line test program proves passthrough works
-end-to-end on this stack, (1)-(3) drop in mechanically.
+**Implementation**: not started. Depends on the open questions.
 
 ---
 
-### Workspace channel inventory view (`_workspace/channels.md`)
+## Workspace channel inventory view (`_workspace/channels.md`)
 
 **Discovered**: 2026-06-27 during the dump-and-reingest while wanting
 a real-time progress denominator. Slack's `search.messages` API exposes
@@ -512,7 +164,7 @@ complete are we" question.
 
 ---
 
-### Probe-event pattern — channel message counts + wider pattern
+## Probe-event pattern — channel message counts + wider pattern
 
 **Discovered**: 2026-06-28, post Wave 2 deploy. Triggered by the
 question "what's the % progress of the backfill?" — we have no
@@ -580,17 +232,168 @@ the proof. Other probes drop in cheaply afterward.
 
 ---
 
-### Clean up repo — sprint/feat worktrees
+## Clean up repo — sprint/feat worktrees
 
 **Discovered**: 2026-06-28. Partially done 2026-08-02.
 
-Done 2026-08-02:
-- Removed `slack_fuse_poc_b/` (renderer-split POC; shipped as `slack_fuse_render/`).
-- Removed `.wt/synap5e/poc/a-events-to-postgres` worktree + branch (0 commits ahead of main).
-- Removed `.wt/synap5e/poc/b-renderer-split` worktree; retained branch (1 historical "byte-equivalence proof" commit — cheap to keep as ref).
-- POC-a report backed up to `~/tmp/claude-scripts/today/poc-reports-archive/poc-a.md`.
-
 Still to sweep:
-- ~30 `synap5e/feat/sprint*` and `synap5e/feat/*` worktrees under `.wt/synap5e/feat/` (sprint0…sprint3, 2a-2f, 3a-3e, post-sprint3-fixes, slurper-channels-populate). Most shipped; needs one-by-one check.
-- `.wt/handoff/*` — a dozen completed handoff worktrees (`self-join-detection`, `finding-16-refresh-discovery`, `v2-adversarial-review`, wave1/wave2 review, spec-review branches, etc.) plus current in-flight ones.
+- ~30 `synap5e/feat/sprint*` and `synap5e/feat/*` worktrees under
+  `.wt/synap5e/feat/` (sprint0…sprint3, 2a-2f, 3a-3e,
+  post-sprint3-fixes, slurper-channels-populate). Most shipped;
+  needs one-by-one check.
+- `.wt/handoff/*` — a dozen completed handoff worktrees
+  (`self-join-detection`, `finding-16-refresh-discovery`,
+  `v2-adversarial-review`, wave1/wave2 review, spec-review branches,
+  etc.).
 - `.wt/server-split-rebuild` — likely shipped as the split server.
+
+---
+
+# Agent-raised (needs human review)
+
+## Trailer FP: NULL-at-mount is a separate diagnosis
+
+**Raised**: 2026-08-02 during trailer-FP review. The defensive fix in
+`9fa4b60` (workspace_last_frame_at classifier semantics + regression
+tests) does NOT change production behaviour today — both
+`last_frame_at` and `workspace_last_frame_at` are populated from the
+same `connection_state.last_frame_at` singleton in `fetch_staleness_state`
+and only diverge in pure tests. If the original 2026-06-27 21ms
+`/general/channel.md` "server unreachable — last sync never" symptom was
+caused by `connection_state.last_frame_at` being `NULL` at read time
+(row exists as `INSERT id=1` with NULL until the first WS frame or
+first `apply.py` health update), the fix does not cure it. Both fields
+would still be `None` and the classifier still returns "server unreachable".
+
+**To investigate**: re-open with a fresh symptom capture. Candidate
+follow-ups if it recurs:
+1. Populate `connection_state.last_frame_at` at mount start (treat startup
+   as an implicit heartbeat) so the singleton is never NULL past first-boot.
+2. Change NULL semantics: treat `NULL last_frame_at` at mount startup as
+   "wait, not disconnected" for the first N seconds.
+3. Add a real per-stream `last_frame_at` column to `stream_caught_up` so
+   the two `StalenessState` fields actually diverge in production.
+
+---
+
+## `client_wedged` fan-out to per-conn events
+
+**Raised**: 2026-08-02 during reconnect impl review. The
+`ReconnectingConnection` wrapper emits `client_wedged`/`client_recovered`
+per-wrapper. A single PG bounce produces up to 5 event pairs (one per
+fixed conn: `inode`, `projector_state`, `projector_sink`, `block_sync`,
+`rerender`, `rerender_sink`). Also 6 if rerender was active.
+
+Operator surface for this fan-out isn't documented. Options:
+1. Document in operator notes: "a PG bounce produces N wedge/recovery
+   pairs named per-conn; N=5 total (6 if rerender is active)."
+2. Aggregate into a process-wide episode marker in `_control/status`
+   (single `client_bounce_episode` count instead of many named events).
+3. Leave as-is — the per-conn granularity is valuable for debugging
+   partial recoveries.
+
+Recommendation: (1) first; (2) only if operators find the per-conn
+noise confusing in practice.
+
+---
+
+## Migrate `slack-fuse permalink` off v1 island
+
+**Raised**: 2026-08-02 after `resolve` was migrated (commit `057883c`).
+`permalink` is the sole remaining consumer of `_slug_helpers.py`, which
+in turn holds the entire v1 module island alive:
+
+- `store.py`, `api.py`, `user_cache.py`, `disk_cache.py`, `renderer.py`,
+  `fuse_ops.py`, `backfill.py`, `archive.py`, `socket_mode.py`
+
+Migrating `permalink` unblocks deleting all nine modules (~several
+thousand LOC). Same shape as `resolve` migration:
+
+- Parse FUSE path → extract channel slug, date, thread slug
+- Reverse slug → channel_id via the local `channels` table
+  (assign_conv_root_slugs)
+- For a thread slug on a date, reuse `fetch_day_thread_parents` +
+  `dedup_thread_slug_map` to reverse
+- Then call the server's `chat.getPermalink` endpoint (still Slack API,
+  via the shared secret) for message-level permalinks
+- Channel-root permalinks still require `SLACK_WORKSPACE_URL`
+
+Estimated scope similar to resolve: ~150 LoC + ~250 LoC of tests
+against the migrated PG fixture. Handoff-shaped.
+
+---
+
+## 26 pre-existing repo-wide `ruff format` differences
+
+**Raised**: 2026-08-02 by the impl-resolve-migrate-v2 codex handoff
+during its audit pass. Files outside anything today's work touched
+would reformat under `ruff format .`. Not blocking anything; a
+one-off `ruff format .` sweep + single commit would clear it.
+
+---
+
+## Two flaky perf tests in `tests/backfill/test_resume.py`
+
+**Raised**: 2026-08-02 by multiple handoffs today. `test_resume_plan_fast_at_scale`
+uses a fixed `elapsed < 0.5s` wall-clock threshold and comes in at
+0.70–1.03s on the current dev host under load. Not a bug in the code
+under test — a load-based flake. Either:
+1. Bump the threshold and add a note that it's a smoke test, not a perf
+   test.
+2. Move to a proper micro-benchmark with `pytest-benchmark`.
+3. Skip in CI when the host is under load.
+
+---
+
+# Agent-raised (unconfirmed origin)
+
+_None currently._
+
+---
+
+# Resolved
+
+## 2026-08-02
+
+- **Migrate `slack-fuse resolve` to v2 projections store** — `057883c` +
+  docs `23d080d`. Fully local PG, no Slack API dependency. Composes
+  existing v2 helpers (`assign_conv_root_slugs`, `fetch_day_thread_parents`,
+  `dedup_thread_slug_map`). 20 focused tests via real migrated PG schema.
+- **Collapse `--mode split` into the sole mount mode** — `3688c92`. V1
+  `cmd_mount` dispatcher deleted; `cmd_mount_split` renamed to `cmd_mount`;
+  `--mode`, `SLACK_FUSE_MODE`, `_env_bool`, `signal` import all removed.
+  Pro's `slack-fuse-split.service` renamed to `slack-fuse.service` mounting
+  `/views/slack` (host-side changes: retire legacy `slack-fuse.service`,
+  retire dead `slack-fuse-server.service` bake-in, update watchdog
+  script/timer to new unit name). Flow updated + restarted.
+- **Client reconnect-after-PG-bounce (FINDING-06 shape)** — `80dc661…a6a0143`
+  (5 commits). Introduces `ReconnectingConnection` wrapper, migrates the 5
+  fixed conns (`_inode_conn`, `state_conn`, `sink_conn`, `block_sync`,
+  `rerender` apply + sink), moves initial connects inside the supervisor
+  try, emits `slurper-health.client_wedged`/`client_recovered` per wrapper.
+  Fault-injection test via `_BreakOnExecuteCursor` on a real migrated PG
+  schema. 468-line wrapper + 303 unit tests + 160 fault-injection tests.
+- **Trailer FP defensive fix on quiet streams (partial)** — `9fa4b60` +
+  BACKLOG note `7935199`. Classifier now uses `workspace_last_frame_at`
+  with regression tests pinning correct behaviour when per-stream and
+  workspace timestamps diverge. Caveat: NULL-at-mount is a separate
+  diagnosis (see Agent-raised section above).
+- **FUSE getattr `st_blocks=0`** — `83e79a1`. Both v1 and v2 helpers now
+  set `st_blocks = ceil(size / 512)` so `du`/`dust` report real usage
+  instead of 0B on every file. Parameterized boundary tests
+  (`tests/fuse_v2/test_stat_blocks.py`, 15 assertions).
+- **Drop shipped POC-B renderer-split scratch + POC worktrees** —
+  `438402d`. `slack_fuse_poc_b/` deleted (shipped as `slack_fuse_render/`),
+  `.wt/synap5e/poc/a-events-to-postgres` worktree + branch removed (0
+  commits ahead of main), `.wt/synap5e/poc/b-renderer-split` worktree
+  removed (branch retained — 1 historical commit).
+- **Drop dead `tests/test_equivalence.py`** — `e26e9a0`. Tested POC-B
+  vs. production single-pass; POC-B was deleted so the test file was
+  broken imports (23 basedpyright errors). Also file-level pyright-ignore
+  on `tests/fuse_v2/test_stat_blocks.py` for the intentional private
+  `_make_file_attr` import.
+
+## 2026-06-27+ (pre-restructure)
+
+Prior resolved items were deleted per the previous convention ("Closed
+items are removed"). Future closures accumulate here.
