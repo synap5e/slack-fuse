@@ -1,3 +1,4 @@
+# pyright: reportPrivateUsage=false
 """Regression: ``st_blocks`` on file EntryAttributes must reflect the file
 size in 512-byte blocks, not leave the default 0.
 
