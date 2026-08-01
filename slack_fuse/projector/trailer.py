@@ -53,6 +53,11 @@ FALLBACK_CHANNEL_REASON: Final = "unresolved-channel-mention"
 class StalenessState:
     """Per-RFC §Offline behaviour → Source of truth for staleness.
 
+    ``workspace_last_frame_at`` is the last frame received on the workspace's
+    WebSocket connection, regardless of stream. It is deliberately distinct
+    from the per-stream ``last_frame_at``: a quiet stream can be old while the
+    connection is healthy and carrying frames for other streams.
+
     ``caught_up_offset`` is optional (default ``None``) and is recorded for the
     JSONL decision log only — the classifier itself keys off the boolean
     ``initial_catch_up_done_for_stream`` ("does a ``stream_caught_up`` row
@@ -65,6 +70,7 @@ class StalenessState:
     """
 
     last_frame_at: datetime | None
+    workspace_last_frame_at: datetime | None
     last_slurper_health: str
     last_health_update_at: datetime | None
     initial_catch_up_done_for_stream: bool
@@ -110,9 +116,12 @@ def staleness_reason(
     # heartbeat. The boolean is what protects against silent partial-data reads.
     caught_up = state.initial_catch_up_done_for_stream
 
-    # WS disconnect detection — last_frame_at older than the threshold
-    # indicates we are reconnecting unsuccessfully.
-    if state.last_frame_at is None or (now_real - state.last_frame_at) > timedelta(seconds=stale_after_s):
+    # WS disconnect detection is workspace-wide. A per-stream timestamp can be
+    # arbitrarily old during healthy operation when that stream is naturally
+    # quiet; only silence across the shared connection indicates that the
+    # server may be unreachable.
+    workspace_last_frame_at = state.workspace_last_frame_at
+    if workspace_last_frame_at is None or (now_real - workspace_last_frame_at) > timedelta(seconds=stale_after_s):
         # No frame in the window: be conservative and trail. The
         # belt-and-suspenders invalidation invariant means this stops the
         # moment a frame arrives.
@@ -187,8 +196,10 @@ def classify_trailer(
     Pure: no DB, no I/O. ``fallback_reasons`` is the (possibly empty) set of
     unresolved-mention reasons the renderer reported for this read;
     ``staleness_reason`` is recomputed here from ``state`` so the classifier is
-    the single source of truth for ``kind``. The ``inode`` is stamped by the
-    read path via :func:`dataclasses.replace` once it's known.
+    the single source of truth for ``kind``. ``last_frame_at`` remains the
+    stream timestamp in the stable decision-log shape; the workspace timestamp
+    is only the liveness input to ``staleness_reason``. The ``inode`` is stamped
+    by the read path via :func:`dataclasses.replace` once it's known.
     """
     reason = staleness_reason(state, now=now, stale_after_s=stale_after_s)
     if reason is not None:

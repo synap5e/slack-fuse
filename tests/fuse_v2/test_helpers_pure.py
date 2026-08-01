@@ -276,8 +276,10 @@ def _state(
     caught_up: bool = True,
 ) -> StalenessState:
     now = datetime(2026, 6, 8, 12, 0, tzinfo=UTC)
+    last_frame_at = now - timedelta(seconds=frame_seconds_ago)
     return StalenessState(
-        last_frame_at=now - timedelta(seconds=frame_seconds_ago),
+        last_frame_at=last_frame_at,
+        workspace_last_frame_at=last_frame_at,
         last_slurper_health=health,
         last_health_update_at=now,
         initial_catch_up_done_for_stream=caught_up,

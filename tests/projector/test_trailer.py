@@ -43,8 +43,10 @@ def _state(
     caught_up_offset: int | None = 42,
 ) -> StalenessState:
     """Build a ``StalenessState`` relative to ``_NOW``."""
+    last_frame_at = _NOW - timedelta(seconds=frame_seconds_ago)
     return StalenessState(
-        last_frame_at=_NOW - timedelta(seconds=frame_seconds_ago),
+        last_frame_at=last_frame_at,
+        workspace_last_frame_at=last_frame_at,
         last_slurper_health=health,
         last_health_update_at=_NOW,
         initial_catch_up_done_for_stream=caught_up,

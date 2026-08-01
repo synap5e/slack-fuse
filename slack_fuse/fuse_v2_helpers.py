@@ -913,7 +913,19 @@ def fetch_staleness_state(
     conn: Connection[TupleRow],
     stream: str,
 ) -> StalenessState:
-    """SELECT ``connection_state`` + ``stream_caught_up`` for ``stream``.
+    """SELECT workspace connection state + catch-up state for ``stream``.
+
+    ``connection_state.last_frame_at`` is the workspace-wide liveness signal:
+    the WS receive loop updates the singleton row for every frame, independent
+    of which stream carried it. Reuse that existing primitive for disconnect
+    detection rather than inferring connectivity from activity on ``stream``.
+
+    The current schema has no separate per-stream frame timestamp, so this
+    loader intentionally populates both ``last_frame_at`` (the stable
+    decision-log field) and ``workspace_last_frame_at`` from the singleton.
+    They can diverge in pure classifier tests, which pins the intended boundary
+    for a future per-stream source. A ``NULL`` singleton retains the existing
+    "server unreachable" semantics; this change does not redefine startup.
 
     The ``stream_caught_up`` row's ``at_offset`` is recorded on the decision
     so the bake-in log can correlate a trailer to the stream head it was
@@ -940,6 +952,7 @@ def fetch_staleness_state(
         caught_up_offset = None if caught_up_row[0] is None else int(caught_up_row[0])
     return StalenessState(
         last_frame_at=last_frame_at,
+        workspace_last_frame_at=last_frame_at,
         last_slurper_health=last_slurper_health,
         last_health_update_at=last_health_update_at,
         initial_catch_up_done_for_stream=caught_up_row is not None,

@@ -517,6 +517,7 @@ def test_invariant_5_hot_priming_gated_on_tier(
 def test_trailer_format_matches_rfc_template() -> None:
     state = StalenessState(
         last_frame_at=datetime(2026, 5, 26, 9, 42, 11, tzinfo=UTC),
+        workspace_last_frame_at=datetime(2026, 5, 26, 9, 42, 11, tzinfo=UTC),
         last_slurper_health="disconnected",
         last_health_update_at=datetime(2026, 5, 26, 9, 42, 11, tzinfo=UTC),
         initial_catch_up_done_for_stream=True,
