@@ -738,7 +738,10 @@ def cmd_unmount(args: argparse.Namespace) -> None:
 
 def cmd_resolve(args: argparse.Namespace) -> None:
     """Resolve a Slack permalink to a FUSE path."""
-    mountpoint = os.path.expanduser(args.mountpoint)
+    from slack_fuse.config import load_client_config
+
+    config = load_client_config() if args.mountpoint is None else None
+    mountpoint = os.path.expanduser(config.mountpoint if config is not None else args.mountpoint)
     if args.server_url:
         try:
             payload = _post_server_json(args.server_url, "/resolve", {"url": args.url})
@@ -752,29 +755,27 @@ def cmd_resolve(args: argparse.Namespace) -> None:
             sys.exit(1)
         return
 
-    from .api import SlackAPIError, SlackClient
-    from .auth import load_tokens
+    import psycopg
+    from psycopg.rows import TupleRow
+
     from .resolve import PermalinkResolutionError, resolve_permalink
-    from .user_cache import UserCache
 
-    tokens = load_tokens()
-    client = SlackClient(tokens.user_token)
-    users = UserCache(client.http)
-
+    if config is None:
+        config = load_client_config()
+    conn: psycopg.Connection[TupleRow] | None = None
     try:
-        path = resolve_permalink(args.url, mountpoint, client, users)
+        conn = psycopg.connect(config.database_url)
+        path = resolve_permalink(args.url, mountpoint, conn)
         print(path)
     except PermalinkResolutionError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(2)
-    except ValueError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
-    except SlackAPIError as e:
+    except (ValueError, psycopg.Error) as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
     finally:
-        client.close()
+        if conn is not None:
+            conn.close()
 
 
 def cmd_permalink(args: argparse.Namespace) -> None:
@@ -864,8 +865,8 @@ def build_parser() -> argparse.ArgumentParser:
     resolve_parser.add_argument("url", help="Slack permalink URL")
     resolve_parser.add_argument(
         "--mountpoint",
-        default=_default_mountpoint(),
-        help=f"Mount point (default: {_default_mountpoint()})",
+        default=None,
+        help="Mount point (default: ClientConfig.mountpoint)",
     )
     resolve_parser.add_argument(
         "--server-url",

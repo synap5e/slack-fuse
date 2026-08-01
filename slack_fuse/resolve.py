@@ -2,24 +2,34 @@
 
 from __future__ import annotations
 
+from datetime import date
+from decimal import Decimal
+from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urlparse
 
-from ._slug_helpers import (
-    conv_root as _conv_root,
-    find_channel as _find_channel,
-    find_thread_slug as _find_thread_slug,
-    ts_to_local_date as _ts_to_local_date,
+from .__main__ import _resolve_local_zoneinfo  # pyright: ignore[reportPrivateUsage]
+from .fuse_v2_helpers import (
+    ChannelRow,
+    assign_conv_root_slugs,
+    conv_root_for,
+    dedup_thread_slug_map,
+    fetch_day_thread_parents,
+    ts_to_local_date,
 )
-from .api import SlackClient
-from .user_cache import UserCache
+
+if TYPE_CHECKING:
+    from zoneinfo import ZoneInfo
+
+    from psycopg import Connection
+    from psycopg.rows import TupleRow
 
 
 class PermalinkResolutionError(LookupError):
     """Raised when a permalink can't be mapped to a specific FUSE path.
 
     Distinct from ``ValueError`` (unparseable URL): the URL parsed fine
-    but the target (a thread, typically) isn't reachable from current
-    cache state. Callers that care about thread-vs-channel distinctions
+    but the target (a thread, typically) isn't reachable from the local
+    projection state. Callers that care about thread-vs-channel distinctions
     should treat this as a hard miss rather than silently accepting a
     channel-level fallback.
     """
@@ -65,45 +75,86 @@ def parse_permalink(url: str) -> tuple[str, str | None, str | None]:
 def resolve_permalink(
     url: str,
     mountpoint: str,
-    client: SlackClient,
-    users: UserCache,
+    conn: Connection[TupleRow],
 ) -> str:
-    """Resolve a Slack permalink to the corresponding FUSE path."""
+    """Resolve a Slack permalink against the local v2 projections store."""
     channel_id, message_ts, thread_ts = parse_permalink(url)
-    channel, channel_slug = _find_channel(channel_id, client, users)
-    root = _conv_root(channel)
+    root, channel_slug = _resolve_channel_location(conn, channel_id)
 
     # Channel-only URL (no message ts) → channel directory
     if message_ts is None and thread_ts is None:
         return f"{mountpoint}/{root}/{channel_slug}"
 
-    if thread_ts:
-        # Thread reply: directory is under the parent's date. Use the
-        # thread_ts's date regardless of the reply's own ts — a reply
-        # sent on a later date still lives under the parent's day dir.
-        month, day = _ts_to_local_date(thread_ts)
-        date_str = f"{month}-{day}"
-        slug = _find_thread_slug(channel_id, thread_ts, date_str, client, users)
-        if slug:
-            return f"{mountpoint}/{root}/{channel_slug}/{month}/{day}/{slug}/thread.md"
+    target_ts_text = thread_ts if thread_ts is not None else message_ts
+    assert target_ts_text is not None  # narrowed by the channel-only return above
+    target_ts = Decimal(target_ts_text)
+    local_tz = _resolve_local_zoneinfo()
+    target_day = ts_to_local_date(target_ts, local_tz)
+    thread_slug = _find_thread_slug(conn, channel_id, target_ts, target_day, local_tz)
+    if thread_slug is not None:
+        return f"{mountpoint}/{root}/{channel_slug}/{target_day:%Y-%m}/{target_day:%d}/{thread_slug}/thread.md"
+
+    if thread_ts is not None:
         # The URL explicitly named a thread (?thread_ts=...) but our
-        # cached view of the parent's day doesn't show it as a thread
-        # parent. Most likely the day cache is stale (replies arrived
-        # after first fetch). Surface the miss instead of silently
+        # projected view of the parent's day doesn't show it as a thread
+        # parent. Surface the miss instead of silently
         # returning the day's channel.md — the caller asked for a
         # specific thread and a channel-level fallback hides the bug.
-        msg = (
-            f"thread {thread_ts} not found in {channel_slug} on {date_str}; "
-            f"cached parent may be stale"
-        )
+        msg = f"thread {thread_ts} not found in {channel_slug} on {target_day:%Y-%m-%d}; local projection may be stale"
         raise PermalinkResolutionError(msg)
 
-    # message_ts is set, thread_ts is None: check if message is itself a thread parent
-    assert message_ts is not None  # narrowed by the channel-only check above
-    month, day = _ts_to_local_date(message_ts)
-    date_str = f"{month}-{day}"
-    slug = _find_thread_slug(channel_id, message_ts, date_str, client, users)
-    if slug:
-        return f"{mountpoint}/{root}/{channel_slug}/{month}/{day}/{slug}/thread.md"
+    return f"{mountpoint}/{root}/{channel_slug}/{target_day:%Y-%m}/{target_day:%d}/channel.md"
 
-    return f"{mountpoint}/{root}/{channel_slug}/{month}/{day}/channel.md"
+
+def _resolve_channel_location(conn: Connection[TupleRow], channel_id: str) -> tuple[str, str]:
+    """Return the mount's conv-root and stable slug for a projected channel."""
+    channel = _fetch_channel(conn, channel_id)
+    if channel is None:
+        msg = f"channel {channel_id} not found in local channels projection"
+        raise PermalinkResolutionError(msg)
+
+    root = conv_root_for(channel)
+    for candidate, slug in assign_conv_root_slugs(conn, root):
+        if candidate.channel_id == channel_id:
+            return root, slug
+
+    msg = f"channel {channel_id} is not reachable in the mounted projection"
+    raise PermalinkResolutionError(msg)
+
+
+def _fetch_channel(conn: Connection[TupleRow], channel_id: str) -> ChannelRow | None:
+    """Load the channel columns needed for mount-compatible slug assignment."""
+    with conn.cursor() as cur:
+        _ = cur.execute(
+            "SELECT channel_id, name, is_im, is_mpim, is_member, is_archived, im_user_id, tier "
+            "FROM channels WHERE channel_id = %s",
+            (channel_id,),
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    return ChannelRow(
+        channel_id=str(row[0]),
+        name="" if row[1] is None else str(row[1]),
+        is_im=bool(row[2]),
+        is_mpim=bool(row[3]),
+        is_member=bool(row[4]),
+        is_archived=bool(row[5]),
+        im_user_id=None if row[6] is None else str(row[6]),
+        tier=str(row[7]),
+    )
+
+
+def _find_thread_slug(
+    conn: Connection[TupleRow],
+    channel_id: str,
+    thread_ts: Decimal,
+    thread_day: date,
+    local_tz: ZoneInfo,
+) -> str | None:
+    """Return the mount's stable, mention-resolved slug for a thread parent."""
+    parents = fetch_day_thread_parents(conn, channel_id, thread_day, local_tz)
+    for slug, parent_ts in dedup_thread_slug_map(parents, conn).items():
+        if parent_ts == thread_ts:
+            return slug
+    return None
