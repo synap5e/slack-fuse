@@ -343,6 +343,7 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
     from slack_fuse.pg_health import PgHealth
     from slack_fuse.projector.health_subscriber import watch_health
     from slack_fuse.projector.pool import ConnectionPool as ProjectorConnectionPool
+    from slack_fuse.projector.reconnecting_conn import ReconnectingConnection
     from slack_fuse.projector.trailer_log import TrailerLog
     from slack_fuse.projector.ws_client import SINGLETON_STREAMS, WSClient, WSClientOptions
 
@@ -391,6 +392,15 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
             _ = cur.execute("SET statement_timeout = '25s'")
         return conn
 
+    def _open_durable_conn(name: str) -> ReconnectingConnection:
+        """One fixed client connection that replaces a dead PG socket."""
+
+        return ReconnectingConnection(
+            config.database_url,
+            autocommit=True,
+            on_reconnect=lambda reason: log.info("%s postgres connection recovered: %s", name, reason),
+        )
+
     # One-time migrations so the projections schema exists.
     migrate_conn = _open_conn()
     try:
@@ -405,9 +415,9 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
     # projector bookkeeping, and the invalidation sink would race.
     # (health subscriber opens its own conn inside `_run_health_subscriber`
     # so we can reconnect cleanly after a closed-connection event.)
-    fuse_conn = _open_conn()  # dedicated inode-map conn (fallback for non-pool callers)
-    state_conn = _open_conn()
-    sink_conn = _open_conn()
+    fuse_conn = _open_durable_conn("inode")  # fallback for non-pool callers
+    state_conn = _open_durable_conn("projector_state")
+    sink_conn = _open_durable_conn("projector_sink")
 
     # Bounded pool for the FUSE read path. Each callback borrows a conn,
     # runs its SQL under PG ``statement_timeout``, returns it. Replaces the
@@ -744,21 +754,25 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
         """
         from slack_fuse.projector.rerender import rerender_channel
 
-        rerender_conn = _open_conn()
-        rerender_sink_conn = _open_conn()
-        rerender_sink = V2InvalidationSink(rerender_sink_conn, tz)
-
-        def _rerender_one(channel_id: str) -> str:
-            return rerender_channel(
-                ghost_http_client,
-                ghost_base_http_url,
-                rerender_conn,
-                channel_id,
-                shared_secret=config.shared_secret,
-                sink=rerender_sink,
-            ).status
-
+        rerender_conn: ReconnectingConnection | None = None
+        rerender_sink_conn: ReconnectingConnection | None = None
         try:
+            # Creation is supervised so PG-down at consumer startup cannot
+            # escape the mount nursery. Connections themselves open lazily.
+            rerender_conn = _open_durable_conn("rerender_apply")
+            rerender_sink_conn = _open_durable_conn("rerender_sink")
+            rerender_sink = V2InvalidationSink(rerender_sink_conn, tz)
+
+            def _rerender_one(channel_id: str) -> str:
+                return rerender_channel(
+                    ghost_http_client,
+                    ghost_base_http_url,
+                    rerender_conn,
+                    channel_id,
+                    shared_secret=config.shared_secret,
+                    sink=rerender_sink,
+                ).status
+
             async for channel_id in rerender_recv:
                 control_state.record_rerender(channel_id, "in_progress")
                 try:
@@ -768,10 +782,12 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
                     status = "failed"
                 control_state.record_rerender(channel_id, status)
         finally:
-            with contextlib.suppress(Exception):
-                rerender_conn.close()
-            with contextlib.suppress(Exception):
-                rerender_sink_conn.close()
+            if rerender_conn is not None:
+                with contextlib.suppress(Exception):
+                    rerender_conn.close()
+            if rerender_sink_conn is not None:
+                with contextlib.suppress(Exception):
+                    rerender_sink_conn.close()
 
     async def _run_block_sync() -> None:
         from slack_fuse.projector.block_sync import sync_blocked_channels_periodically
@@ -792,7 +808,7 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
         await sync_blocked_channels_periodically(
             _make_http_client,
             ghost_base_http_url,
-            _open_conn,
+            lambda: _open_durable_conn("block_sync"),
             shared_secret=config.shared_secret,
             interval_s=config.block_sync_interval_s,
             limiter=store_limiter,

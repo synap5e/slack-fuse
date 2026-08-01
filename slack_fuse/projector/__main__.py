@@ -25,6 +25,7 @@ from psycopg.rows import TupleRow
 import slack_fuse.migrations as client_migrations
 from slack_fuse.config import ClientConfig, load_client_config
 from slack_fuse.migrations.runner import apply_migrations
+from slack_fuse.projector.reconnecting_conn import ReconnectingConnection
 from slack_fuse.projector.ws_client import SINGLETON_STREAMS, WSClient, WSClientOptions
 
 log = logging.getLogger(__name__)
@@ -32,16 +33,24 @@ log = logging.getLogger(__name__)
 _MIGRATIONS_DIR = Path(client_migrations.__file__).parent
 
 
-def _open_state_conn(database_url: str) -> psycopg.Connection[TupleRow]:
+def _open_raw_conn(database_url: str) -> psycopg.Connection[TupleRow]:
+    conn: psycopg.Connection[TupleRow] = psycopg.connect(database_url)
+    conn.autocommit = True
+    return conn
+
+
+def _open_state_conn(database_url: str) -> ReconnectingConnection:
     """A bookkeeping connection: cursors reads + `connection_state` bumps.
 
     Autocommit because the projector's TX shape relies on every
     `with conn.transaction()` being a real BEGIN/COMMIT (RFC §Flow control →
     Idempotent re-apply).
     """
-    conn: psycopg.Connection[TupleRow] = psycopg.connect(database_url)
-    conn.autocommit = True
-    return conn
+    return ReconnectingConnection(
+        database_url,
+        autocommit=True,
+        on_reconnect=lambda reason: log.info("projector state postgres connection recovered: %s", reason),
+    )
 
 
 def _make_connection_factory(database_url: str):
@@ -56,7 +65,7 @@ def _make_connection_factory(database_url: str):
 
 
 async def _run(config: ClientConfig) -> None:
-    setup = _open_state_conn(config.database_url)
+    setup = _open_raw_conn(config.database_url)
     try:
         applied = apply_migrations(setup, _MIGRATIONS_DIR)
     finally:

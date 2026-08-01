@@ -35,7 +35,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
-from typing import TYPE_CHECKING, Final, TypeVar
+from typing import TYPE_CHECKING, Final, TypeVar, cast
 from zoneinfo import ZoneInfo
 
 import psycopg
@@ -105,6 +105,7 @@ if TYPE_CHECKING:
     from slack_fuse.pg_health import PgHealth
     from slack_fuse.projector.apply import ChunkRef, ThreadChunkRef
     from slack_fuse.projector.pool import ConnectionPool
+    from slack_fuse.projector.reconnecting_conn import ReconnectingConnection
     from slack_fuse.projector.trailer_log import TrailerLog
 
 
@@ -527,7 +528,7 @@ class SlackFuseOpsV2(pyfuse3.Operations):
 
     def __init__(  # noqa: PLR0913  (keyword-only config + test-injection knobs)
         self,
-        conn: Connection[TupleRow],
+        conn: Connection[TupleRow] | ReconnectingConnection,
         local_tz: ZoneInfo,
         limiter: trio.CapacityLimiter,
         *,
@@ -563,7 +564,10 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         # legacy conn-only mode (no pool — test fixtures), every callback runs
         # serially against ``conn`` via ``self._limiter``. The ``self._conn``
         # property resolves to the right one per call.
-        self._inode_conn = conn
+        # Production passes a ``ReconnectingConnection`` so a Postgres bounce
+        # cannot permanently poison the inode-map fallback connection. The
+        # wrapper retains the same cursor surface used below.
+        self._inode_conn = cast("Connection[TupleRow]", conn)
         self._pool = pool
         self._callback_timeout_s = callback_timeout_s
         # When set, surfaces ``/NO_POSTGRES`` while PG is down and lets
@@ -585,7 +589,7 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         self._trailer_enabled = trailer_enabled
         self._trailer_log = trailer_log
         self._now_fn = now_fn
-        self._inodes = PersistentInodeMap(conn)
+        self._inodes = PersistentInodeMap(self._conn)
         self._primed_inodes: set[int] = set()
         self._primed_lock = threading.Lock()
         # Per-opendir snapshots so readdir pagination tokens stay stable even
@@ -2205,14 +2209,16 @@ class V2InvalidationSink:
 
     def __init__(
         self,
-        conn: Connection[TupleRow],
+        conn: Connection[TupleRow] | ReconnectingConnection,
         local_tz: ZoneInfo,
         *,
         invalidate_inode: InvalidateInodeFn | None = None,
     ) -> None:
-        self._conn = conn
+        # The live sink is shared by worker threads; its reconnecting wrapper
+        # serializes this dedicated read session while swapping dead sockets.
+        self._conn = cast("Connection[TupleRow]", conn)
         self._tz = local_tz
-        self._inodes = PersistentInodeMap(conn)
+        self._inodes = PersistentInodeMap(self._conn)
         self._invalidate_inode: InvalidateInodeFn = (
             invalidate_inode if invalidate_inode is not None else _default_invalidate_inode
         )

@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING
 
 import httpx
 import trio
@@ -15,17 +14,14 @@ from slack_fuse.projector.apply import (  # pyright: ignore[reportPrivateUsage]
     _force_blocked_manual,
 )
 from slack_fuse.projector.block_fetch import blocked_channel_ids_from_payload, get_blocked_channels
-
-if TYPE_CHECKING:
-    import psycopg
-    from psycopg.rows import TupleRow
+from slack_fuse.projector.reconnecting_conn import TupleConnection
 
 log = logging.getLogger(__name__)
 
 DEFAULT_BLOCK_SYNC_INTERVAL_S = 30.0
 
 
-def apply_blocked_channel_sync(conn: psycopg.Connection[TupleRow], blocked_ids: set[str]) -> frozenset[str]:
+def apply_blocked_channel_sync(conn: TupleConnection, blocked_ids: set[str]) -> frozenset[str]:
     """Apply one server block-list snapshot to the client ``channels`` table.
 
     Returns the ``frozenset`` of channel_ids that transitioned from blocked to
@@ -125,7 +121,7 @@ def apply_blocked_channel_sync(conn: psycopg.Connection[TupleRow], blocked_ids: 
 def sync_blocked_channels_once(
     http_client: httpx.Client,
     base_http_url: str,
-    conn: psycopg.Connection[TupleRow],
+    conn: TupleConnection,
     *,
     shared_secret: str | None = None,
 ) -> frozenset[str] | None:
@@ -146,7 +142,7 @@ def sync_blocked_channels_once(
 async def sync_blocked_channels_periodically(  # noqa: PLR0913 - process wiring needs explicit factories/knobs.
     make_http_client: Callable[[], httpx.Client],
     base_http_url: str,
-    open_conn: Callable[[], psycopg.Connection[TupleRow]],
+    open_conn: Callable[[], TupleConnection],
     *,
     shared_secret: str | None = None,
     interval_s: float = DEFAULT_BLOCK_SYNC_INTERVAL_S,
@@ -162,15 +158,21 @@ async def sync_blocked_channels_periodically(  # noqa: PLR0913 - process wiring 
     restart.
     """
     http_client = make_http_client()
-    conn = open_conn()
+    conn: TupleConnection | None = None
     try:
         while True:
             try:
+                # Initial construction/connect belongs under this supervisor:
+                # PG-down at task start must become a retryable cycle failure,
+                # not an exception that tears down the process nursery.
+                if conn is None:
+                    conn = open_conn()
+                cycle_conn = conn
                 newly_subscribed = await trio.to_thread.run_sync(
-                    lambda: sync_blocked_channels_once(
+                    lambda cycle_conn=cycle_conn: sync_blocked_channels_once(
                         http_client,
                         base_http_url,
-                        conn,
+                        cycle_conn,
                         shared_secret=shared_secret,
                     ),
                     limiter=limiter,
@@ -186,7 +188,8 @@ async def sync_blocked_channels_periodically(  # noqa: PLR0913 - process wiring 
             await trio.sleep(interval_s)
     finally:
         http_client.close()
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 __all__ = [

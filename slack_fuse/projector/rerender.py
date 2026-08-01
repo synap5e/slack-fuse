@@ -60,8 +60,6 @@ from typing import cast
 from urllib.parse import quote
 
 import httpx
-from psycopg import Connection
-from psycopg.rows import TupleRow
 
 from slack_fuse.models import JsonObject
 from slack_fuse.projector.apply import (
@@ -72,6 +70,7 @@ from slack_fuse.projector.apply import (
     require_autocommit,
 )
 from slack_fuse.projector.cursor import read_cursor
+from slack_fuse.projector.reconnecting_conn import TupleConnection
 
 log = logging.getLogger(__name__)
 
@@ -128,7 +127,7 @@ def _snapshot_url(base_http_url: str, stream: str, at_offset: int) -> str:
 def rerender_channel(  # noqa: PLR0913 — sync HTTP call needs client + url + conn + channel + auth/sink/timeout.
     http_client: httpx.Client,
     base_http_url: str,
-    conn: Connection[TupleRow],
+    conn: TupleConnection,
     channel_id: str,
     *,
     shared_secret: str | None = None,
@@ -189,7 +188,7 @@ def rerender_channel(  # noqa: PLR0913 — sync HTTP call needs client + url + c
     return RerenderResult(channel_id, status="rerendered", chunks=chunk_count, thread_chunks=thread_count)
 
 
-def _apply_rerender(conn: Connection[TupleRow], stream: str, lines: Sequence[str]) -> list[ApplyResult]:
+def _apply_rerender(conn: TupleConnection, stream: str, lines: Sequence[str]) -> list[ApplyResult]:
     """Re-apply every snapshot row in ONE transaction — upsert-only.
 
     No delete-absent and no cursor advance (see module docstring). Each row is

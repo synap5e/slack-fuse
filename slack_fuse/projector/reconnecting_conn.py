@@ -22,7 +22,7 @@ from collections import deque
 from collections.abc import Callable, Iterable
 from contextlib import AbstractContextManager, suppress
 from types import TracebackType
-from typing import Final, Self, cast
+from typing import Final, Protocol, Self, cast
 
 import psycopg
 from psycopg import Connection, Cursor, OperationalError
@@ -38,6 +38,25 @@ ConnectionFactory = Callable[[str], Connection[TupleRow]]
 ReconnectCallback = Callable[[str], None]
 HealthEventCallback = Callable[[str, str], None]
 NowFn = Callable[[], float]
+
+
+class TupleConnection(Protocol):
+    """Minimal connection surface shared by raw and reconnecting connections."""
+
+    @property
+    def closed(self) -> bool: ...
+
+    @property
+    def autocommit(self) -> bool: ...
+
+    @autocommit.setter
+    def autocommit(self, value: bool) -> None: ...
+
+    def cursor(self) -> Cursor[TupleRow]: ...
+
+    def transaction(self) -> AbstractContextManager[None]: ...
+
+    def close(self) -> None: ...
 
 
 class ClosedConnectionError(RuntimeError):
@@ -121,9 +140,9 @@ class ReconnectingConnection:
             self._configured_autocommit = value
             self._ensure_connection().autocommit = value
 
-    def cursor(self) -> _ReconnectingCursor:
+    def cursor(self) -> Cursor[TupleRow]:
         """Return a cursor proxy bound to the wrapper's current generation."""
-        return _ReconnectingCursor(self)
+        return cast("Cursor[TupleRow]", _ReconnectingCursor(self))
 
     def execute(
         self,
@@ -132,7 +151,7 @@ class ReconnectingConnection:
         *,
         prepare: bool | None = None,
         binary: bool | None = None,
-    ) -> _ReconnectingCursor:
+    ) -> Cursor[TupleRow]:
         """Mirror psycopg's connection-level ``execute`` convenience API."""
         return self.cursor().execute(query, params, prepare=prepare, binary=binary)
 
@@ -445,4 +464,5 @@ __all__ = [
     "DEFAULT_WEDGE_WINDOW_S",
     "ClosedConnectionError",
     "ReconnectingConnection",
+    "TupleConnection",
 ]

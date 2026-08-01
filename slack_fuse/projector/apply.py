@@ -30,12 +30,13 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Protocol, cast
 
-from psycopg import Connection, Cursor
+from psycopg import Cursor
 from psycopg.rows import TupleRow
 from pydantic import ValidationError
 
 from slack_fuse.models import JsonObject, Message, SlackUser, SlackUserProfile
 from slack_fuse.projector.cursor import advance_cursor
+from slack_fuse.projector.reconnecting_conn import TupleConnection
 from slack_fuse_render import (
     extract_mention_channel_ids,
     extract_mention_user_ids,
@@ -111,7 +112,7 @@ class NullInvalidationSink:
 # === Connection contract guard (mirrors OffsetWriter) ===
 
 
-def require_autocommit(conn: Connection[TupleRow]) -> None:
+def require_autocommit(conn: TupleConnection) -> None:
     """Fail-fast on a non-autocommit projector connection.
 
     Mirrors `slack_fuse_server.slurper.offsets.OffsetWriter`'s guard, with the
@@ -134,7 +135,7 @@ def require_autocommit(conn: Connection[TupleRow]) -> None:
 
 
 def apply_event(
-    conn: Connection[TupleRow],
+    conn: TupleConnection,
     frame: EventFrame,
 ) -> ApplyResult:
     """Apply one event in a single transaction. Returns post-commit work.
@@ -166,7 +167,7 @@ def apply_snapshot_row(cur: Cursor[TupleRow], stream: str, payload: JsonObject) 
     return _dispatch_channel_event(cur, channel_id, "message", payload)
 
 
-def record_caught_up(conn: Connection[TupleRow], stream: str, at_offset: int) -> None:
+def record_caught_up(conn: TupleConnection, stream: str, at_offset: int) -> None:
     """Stamp `stream_caught_up` for `stream` at `at_offset`.
 
     The RFC: "The FUSE read layer uses this to drive the *initial catch-up

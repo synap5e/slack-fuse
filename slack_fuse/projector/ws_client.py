@@ -33,14 +33,13 @@ from typing import Final
 import httpx
 import trio
 import trio_websocket
-from psycopg import Connection
-from psycopg.rows import TupleRow
 from pydantic import ValidationError
 
 from slack_fuse.projector.apply import InvalidationSink, NullInvalidationSink
 from slack_fuse.projector.cursor import read_cursor
 from slack_fuse.projector.per_stream import ConnectionFactory, StreamApplier
 from slack_fuse.projector.pool import DEFAULT_POOL_SIZE, ConnectionPool
+from slack_fuse.projector.reconnecting_conn import TupleConnection
 from slack_fuse.projector.snapshot_fetch import SnapshotFetchError, SnapshotRedirect, fetch_and_apply_snapshot
 from slack_fuse_server.wire.frames import (
     CaughtUpFrame,
@@ -90,7 +89,7 @@ class WSClient:
         self,
         options: WSClientOptions,
         connection_factory: ConnectionFactory,
-        state_conn: Connection[TupleRow],
+        state_conn: TupleConnection,
         *,
         sink: InvalidationSink | None = None,
         http_client: httpx.AsyncClient | None = None,
