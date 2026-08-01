@@ -146,7 +146,7 @@ async def test_p0_1_read_after_threshold_trailers_and_skips_notify(
 # ============================================================================
 # P0-2: watch_health is wired to ops.invalidate_all_primed in production. This
 # test exercises the real async loop against the real ops, mirroring
-# cmd_mount_split's nursery wiring.
+# cmd_mount's nursery wiring.
 # ============================================================================
 
 
@@ -165,7 +165,7 @@ async def test_p0_2_watch_health_integrated_invalidates_primed(
         await trio.sleep(0.001)
         set_connection_state(client_conn, last_slurper_health="degraded")
 
-    # Exactly the wiring cmd_mount_split installs: watch_health → ops callback.
+    # Exactly the wiring cmd_mount installs: watch_health → ops callback.
     async with trio.open_nursery() as nursery:
         nursery.start_soon(mutator)
         await watch_health(client_conn, ops.invalidate_all_primed, poll_interval_s=0.001, iterations=10)

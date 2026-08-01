@@ -1,8 +1,9 @@
-"""Sprint 3B FUSE adapter — reads exclusively from the local chunks tables.
+"""FUSE adapter — reads exclusively from the local chunks tables.
 
 Per RFC §FUSE read path, §Three-tier visibility model, §Offline behaviour.
-This adapter replaces ``slack_fuse/fuse_ops.py`` once ``SLACK_FUSE_MODE=split``
-is the default; until then the legacy adapter stays runnable behind a flag.
+Sole adapter used by ``cmd_mount``; ``slack_fuse/fuse_ops.py`` is retained as
+dead code for CLI subcommands (``resolve``, ``permalink``) that still share
+its slug helpers.
 
 Key invariants enforced here (each backed by a test under ``tests/fuse_v2/``):
 
@@ -185,7 +186,7 @@ ControlRefillGapFn = Callable[[str, float, float], str]
 # ``_control/rerender_channel`` hands a resolved channel id off to a background
 # consumer (the rerender is too heavy for the per-callback budget). Returns True
 # if the request was accepted (queued), False if the queue is full / busy. Wired
-# in ``__main__.cmd_mount_split`` to a trio memory-channel ``send_nowait``;
+# in ``__main__.cmd_mount`` to a trio memory-channel ``send_nowait``;
 # called from the trio event loop in ``_fire_control`` (never a worker thread,
 # so the non-thread-safe channel send is safe).
 ControlRerenderChannelFn = Callable[[str], bool]
@@ -1335,7 +1336,7 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         if depth == 0:
             # ``_workspace/`` is a sibling of the conv-roots — a discoverable
             # namespace for read-only diagnostic surfaces. Listed on both the
-            # readdir AND lookup paths so ``ls /views/slack-split`` shows it.
+            # readdir AND lookup paths so ``ls /views/slack`` shows it.
             roots: list[tuple[str, bool]] = [(d, True) for d in CONV_ROOTS]
             if self._workspace_gaps_fetch is not None:
                 roots.append((WORKSPACE_DIR, True))

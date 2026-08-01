@@ -68,7 +68,7 @@ class ClientConfig(BaseSettings):
     # This field is accepted for config-file backwards compatibility but has
     # no effect: the applier-side enforcement (WSClient → StreamApplier →
     # apply_event) was removed because the parameter was never wired into
-    # cmd_mount_split, and b0dcff2 removed the startup migration. Use the
+    # cmd_mount, and b0dcff2 removed the startup migration. Use the
     # server-side blocked_channels table via ``_control/blocked_channels``
     # or ``POST /blocked-channels``. Non-empty entries on startup log a
     # warning classifying each id vs server SSOT (see

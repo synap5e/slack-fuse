@@ -6,7 +6,6 @@ import argparse
 import contextlib
 import logging
 import os
-import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -26,20 +25,6 @@ def _default_mountpoint() -> str:
 
 
 _REFRESH_INTERVAL = 1800  # 30 minutes, matches _CHANNEL_LIST_TTL
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    """Parse a boolean env var. Accepts 1/0, true/false, yes/no, on/off."""
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    val = raw.strip().lower()
-    if val in ("1", "true", "yes", "on"):
-        return True
-    if val in ("0", "false", "no", "off", ""):
-        return False
-    msg = f"{name} must be a boolean (got {raw!r})"
-    raise ValueError(msg)
 
 
 def _http_base_from_server_url(server_url: str) -> str:
@@ -192,144 +177,29 @@ def _migrate_legacy_always_blocked(
             "always_blocked_channel_ids is deprecated. These %d id(s) are in config.toml but NOT server-side "
             "blocked — likely you unblocked them via _control/blocked_channels. This code no longer re-adds "
             "them on startup; either drop them from config.toml, or re-block via `echo <id> > "
-            "/views/slack-split/_control/blocked_channels`: %s",
+            "/views/slack/_control/blocked_channels`: %s",
             len(orphan_config_only),
             orphan_config_only,
         )
 
 
-def _mount_mode(args: argparse.Namespace) -> str:
-    """Mount mode: CLI ``--mode`` wins, else ``SLACK_FUSE_MODE`` env, else legacy."""
-    cli = getattr(args, "mode", None)
-    if cli:
-        return str(cli)
-    return os.environ.get("SLACK_FUSE_MODE", "legacy")
+def cmd_mount(args: argparse.Namespace) -> None:  # noqa: C901  (process-wiring entrypoint: conns, ops, projector, subscriber)
+    """Mount the FUSE filesystem: ``SlackFuseOpsV2`` over the local projections
+    store, with the projector + health subscriber wired to the FUSE-side
+    kernel-cache invalidators.
 
-
-def cmd_mount(args: argparse.Namespace) -> None:
-    """Mount the FUSE filesystem (legacy store-backed or split projections)."""
-    if _mount_mode(args) == "split":
-        cmd_mount_split(args)
-        return
-    import pyfuse3
-    import trio
-
-    from .api import SlackClient
-    from .archive import archive_all
-    from .auth import load_tokens
-    from .backfill import backfill_all
-    from .fuse_ops import InodeInvalidator, SlackFuseOps
-    from .store import SlackStore
-    from .user_cache import UserCache
-
-    mountpoint = Path(args.mountpoint or _default_mountpoint())
-    mountpoint.mkdir(parents=True, exist_ok=True)
-
-    # Clean stale mount if present (e.g. after a crash)
-    import subprocess as _sp
-
-    _sp.run(["fusermount3", "-uz", str(mountpoint)], capture_output=True)
-
-    logging.basicConfig(
-        level=logging.DEBUG if args.debug else logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-    # Quiet httpx request logging — our store already logs what matters
-    logging.getLogger("httpx").setLevel(
-        logging.DEBUG if args.debug else logging.WARNING,
-    )
-
-    tokens = load_tokens()
-    client = SlackClient(tokens.user_token)
-    users = UserCache(client.http)
-    users.populate()
-
-    store = SlackStore(client, users)
-
-    # Preload channel list so first ls is instant
-    store.list_channels(kind="channels")
-
-    # Serializes all sync store/API work to a single worker thread so
-    # the trio event loop stays responsive and shared state stays safe.
-    store_limiter = trio.CapacityLimiter(1)
-    ops = SlackFuseOps(store, store_limiter)
-
-    # Wire the invalidation sink so events trigger kernel page-cache drops.
-    # Has to happen after ops is constructed so we share its InodeMap.
-    store.set_invalidator(InodeInvalidator(ops.inodes, store))
-
-    fuse_options: set[str] = {"fsname=slack-fuse", "ro"}
-    if args.debug:
-        fuse_options.add("debug")
-
-    def _handle_usr1(signum: int, frame: object) -> None:
-        store.force_refresh()
-
-    signal.signal(signal.SIGUSR1, _handle_usr1)
-
-    pyfuse3.init(ops, str(mountpoint), fuse_options)
-
-    backfill_enabled = _env_bool("SLACK_FUSE_BACKFILL", default=False)
-    logging.getLogger(__name__).info(
-        "Backfill: %s",
-        "enabled" if backfill_enabled else "disabled",
-    )
-
-    async def _periodic_refresh() -> None:
-        while True:
-            await trio.sleep(_REFRESH_INTERVAL)
-            await trio.to_thread.run_sync(
-                lambda: store.list_channels(kind="channels"),
-                limiter=store_limiter,
-            )
-
-    async def _run() -> None:
-        async with trio.open_nursery() as nursery:
-            nursery.start_soon(_periodic_refresh)
-            nursery.start_soon(archive_all, store)
-            if backfill_enabled:
-                nursery.start_soon(backfill_all, client, store, store_limiter)
-            if tokens.app_token:
-                from .socket_mode import run_socket_mode
-
-                nursery.start_soon(
-                    run_socket_mode,
-                    store,
-                    tokens.app_token,
-                    client.http,
-                    store_limiter,
-                )
-            await pyfuse3.main()
-            nursery.cancel_scope.cancel()
-
-    try:
-        trio.run(_run)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        pyfuse3.close()
-
-
-def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-wiring entrypoint: conns, ops, projector, subscriber)
-    """Mount the Sprint-3B split adapter (``SlackFuseOpsV2``) over the local
-    projections store, with the projector + health subscriber wired to the
-    FUSE-side kernel-cache invalidators.
-
-    This is the integrated process the RFC describes (FUSE mount + projector +
-    health subscriber share inode state in one process). Two complementary
-    invalidation paths run alongside ``pyfuse3.main()``:
+    Integrated process (FUSE mount + projector + health subscriber share inode
+    state in one process). Two complementary invalidation paths run alongside
+    ``pyfuse3.main()``:
 
     * The **projector** (``WSClient``) subscribes to the server, applies events
       into the local projections store, and fires a :class:`V2InvalidationSink`
       after each TX commits so live chunk mutations drop the matching primed
-      inode (Sprint 3E). Without this the projector ran out-of-process and could
-      not reach this process's kernel page cache, so live messages stayed
-      invisible behind ``fi.keep_cache=True`` until the polling-TTL floor.
+      inode. Without this the projector ran out-of-process and could not reach
+      this process's kernel page cache, so live messages stayed invisible
+      behind ``fi.keep_cache=True`` until the polling-TTL floor.
     * The **health subscriber** polls ``connection_state`` / ``stream_caught_up``
-      and drops every primed inode on a staleness transition (review P0-2).
-
-    Gated behind ``SLACK_FUSE_MODE=split`` / ``--mode split`` so the legacy
-    adapter stays the default per the Phase-4 cutover safety plan.
+      and drops every primed inode on a staleness transition.
     """
     import psycopg
     import pyfuse3
@@ -970,23 +840,14 @@ def build_parser() -> argparse.ArgumentParser:
         "mountpoint",
         nargs="?",
         default=None,
-        # Default resolved lazily in the command handler so that, in split mode,
-        # an unspecified mountpoint falls back to ClientConfig.mountpoint rather
-        # than always being overridden by the legacy default (review residual:
-        # config.mountpoint was dead because the argparse default always won).
-        help=f"Mount point (default: ClientConfig.mountpoint in split mode, else {_default_mountpoint()})",
+        # Resolved lazily in the command handler so an unspecified mountpoint
+        # falls back to ClientConfig.mountpoint from ~/.config/slack-fuse/config.toml.
+        help="Mount point (default: ClientConfig.mountpoint)",
     )
     mount_parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging",
-    )
-    mount_parser.add_argument(
-        "--mode",
-        choices=("legacy", "split"),
-        default=None,
-        help="Adapter to mount: 'legacy' (store-backed, default) or 'split' "
-        "(Sprint-3B projections adapter). Falls back to SLACK_FUSE_MODE.",
     )
     mount_parser.set_defaults(func=cmd_mount)
 

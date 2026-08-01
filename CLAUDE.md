@@ -123,9 +123,9 @@ Push liveness for today's data, alongside the polling TTLs (which stay as the co
 
 **Tokens needed:** `SLACK_APP_TOKEN=xapp-…` with `connections:write` (drives `apps.connections.open`). If unset, the socket-mode task is skipped and the mount falls back to polling-only.
 
-## Control surface (`_control/`, split mode only)
+## Control surface (`_control/`)
 
-A Plan-9-style ctl/status surface at the mount root, wired only in `cmd_mount_split` (`SlackFuseOpsV2`). `slack_fuse/control.py` holds the thread-safe in-memory `ControlState` (last refresh/block/unblock/backfill/rerender outcome) + the HTTP-status→verb map (`result_for_status`: 202→`queued`, 409→`busy`, 401/403→`unauthorised`, 503/`0`→`server_unavailable`, else `http_<code>`). `slack_fuse/projector/refresh_fetch.py` and `slack_fuse/projector/block_fetch.py` are sync httpx helpers (mirroring `gaps_fetch.py`), pointed at the server's mutating endpoints with sub-second timeouts and `0` sentinel on transport error.
+A Plan-9-style ctl/status surface at the mount root, wired in `cmd_mount` (`SlackFuseOpsV2`). `slack_fuse/control.py` holds the thread-safe in-memory `ControlState` (last refresh/block/unblock/backfill/rerender outcome) + the HTTP-status→verb map (`result_for_status`: 202→`queued`, 409→`busy`, 401/403→`unauthorised`, 503/`0`→`server_unavailable`, else `http_<code>`). `slack_fuse/projector/refresh_fetch.py` and `slack_fuse/projector/block_fetch.py` are sync httpx helpers (mirroring `gaps_fetch.py`), pointed at the server's mutating endpoints with sub-second timeouts and `0` sentinel on transport error.
 
 - `_control/refresh_channels` (0o644) — write any non-empty bytes → workspace sweep.
 - `_control/refresh_channel` (0o644) — write a channel id or slug → single-channel refresh (slug→id resolved locally against the `channels` table, hidden allowed, before the POST).
@@ -146,7 +146,7 @@ FUSE write plumbing: writes accumulate per-fh in `_control_write_buffers` (keyed
 - Don't replace `cached_only_mode()`'s ContextVar with a plain instance attribute. The ContextVar ensures per-task isolation so archive's long-running pass doesn't leak to FUSE callbacks.
 - Don't remove the `pyright: ignore` comments on pyfuse3 attribute assignments — they're load-bearing because pyfuse3's stubs are incomplete.
 - Don't drop the `store.set_invalidator(InodeInvalidator(...))` wiring in `__main__.py`. Without it, `fi.keep_cache=True` in `fuse_ops.open()` lets the kernel serve stale buffered bytes after socket-mode events, so live messages won't appear in `cat` until the polling TTL expires.
-- Don't re-add the `ro` mount option to `cmd_mount_split` (it's intentionally only `{"fsname=slack-fuse"}`). `ro` makes the kernel reject every write before it reaches the daemon, killing the `_control/` triggers. Read-only is enforced in-daemon instead: `SlackFuseOpsV2.open` returns `EROFS` for any write-mode open outside `_control` writable files. The legacy v1 `cmd_mount` keeps `ro` (no control surface there).
+- Don't re-add the `ro` mount option to `cmd_mount` (it's intentionally only `{"fsname=slack-fuse"}`). `ro` makes the kernel reject every write before it reaches the daemon, killing the `_control/` triggers. Read-only is enforced in-daemon instead: `SlackFuseOpsV2.open` returns `EROFS` for any write-mode open outside `_control` writable files.
 
 ## Related docs
 

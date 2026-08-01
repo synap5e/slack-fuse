@@ -1,6 +1,6 @@
 """Track whether the local Postgres is currently reachable.
 
-The slack-fuse-split projector reads every chunk from a local PG. When
+The slack-fuse projector reads every chunk from a local PG. When
 that PG goes down — most commonly during a ``game-mode on`` cycle that
 stops ``claude-hooks-postgres.service`` (see ``BACKLOG.md``) — the
 daemon used to crash with ``psycopg.OperationalError`` on every FUSE
