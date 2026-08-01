@@ -194,6 +194,121 @@ slack-fuse code change. Left as a follow-up for the operator.
 
 ---
 
+### Trailer false-positives "server unreachable" on quiet streams
+
+**Discovered**: 2026-06-27 during dump-and-reingest. User read
+`/views/slack-split/channels/general/channel.md` (top-level metadata
+view); rendered fine in 21ms but appended:
+
+```
+> ⚠ Content may be stale. Last successful sync: never. Reason: server unreachable.
+```
+
+**Symptom**: false positive. The mount + server + WS connection are
+all healthy. `slurper-health` stream had a frame 1 minute ago; the
+projector's cursors are advancing actively across many channels; the
+HTTP server returns 200 in milliseconds.
+
+**Root cause**: `slack_fuse/projector/trailer.py::staleness_reason`
+uses **per-stream** ``last_frame_at`` as the WS-liveness signal:
+
+```python
+if state.last_frame_at is None or (now_real - state.last_frame_at) > timedelta(seconds=stale_after_s):
+    if not caught_up:
+        return "catching up after reconnect"
+    return "server unreachable"
+```
+
+For a stream that's naturally quiet — `channel-list` when no channel
+metadata is drifting, or a per-channel stream that's been backfilled
+and has no live messages — no frames arrive for >5min and the trailer
+fires. The threshold's intent was "WS disconnect", but it conflates
+"no traffic on this stream" with "no connectivity".
+
+**Current behaviour**: every read of a top-level `channel.md` (or any
+read whose freshness derives from `channel-list`) on a stable
+workspace appends a misleading "server unreachable" trailer with
+"Last successful sync: never". Users see the warning and reasonably
+conclude the daemon is broken.
+
+**Fix candidates**:
+1. **Use workspace-wide liveness signal**: track the last frame across
+   ANY stream and use that as the WS-disconnect proxy. `slurper-health`
+   is the natural heartbeat — it emits regularly for various reasons.
+2. **Explicit WS-state tracking**: tie staleness to the actual WS
+   connection state (e.g. `connection_state` table or socket
+   reconnect events) instead of inferring from data flow.
+3. **Per-stream threshold tuning**: bump `stale_after_s` for streams
+   that are known to be quiet (channel-list, users). Brittle.
+
+**Recommendation**: option 1. Cheapest fix, doesn't change the
+overall trailer architecture, and aligns with what `slurper-health`
+was designed for. The current `last_frame_at` parameter shape stays;
+it just gets sourced from a workspace-wide MAX instead of the
+queried stream.
+
+**Impact**: ergonomic — operators see the warning and don't know if
+it's real or noise. Doesn't affect data correctness, but every
+warning the user has to mentally filter erodes trust in the trailer.
+
+---
+
+### Skip thread-expansion when local thread is already caught up
+
+**Discovered**: 2026-06-30 watching proj-cloud's backfill spend ~9 hours
+in the thread-expansion phase writing rows that all dedup'd to no-ops.
+proj-cloud's history pagination finished by 17:57; the next 8+ hours
+were `conversations.replies` calls per thread parent, paying the 2-8s
+throttle per call, hitting the dedup index, inserting zero new rows.
+Socket-mode events had already filled the threads in.
+
+**Optimization**: in `backfill_channel`'s thread-expansion loop (in
+`slack_fuse_server/backfill/api.py`, where `_expand_threads` walks
+`thread_parents`), check local state before calling
+`conversations.replies`. Skip the fetch when both hold:
+
+1. We have a `message` event with `ts == parent.latest_reply`
+   (newest reply timestamp from the parent's payload), AND
+2. Count of locally-stored events with `thread_ts == parent.ts` equals
+   `parent.reply_count` (including the parent itself, or off-by-one
+   per Slack's convention — verify against `tests/_fake_slack/`).
+
+If either fails, fetch normally.
+
+**Why it's safe**:
+- False negative (we fetch unnecessarily) is the worst-case if our
+  cached `reply_count` is stale; that's the status quo.
+- False positive (we skip a real gap) requires our local thread to
+  have the exact `latest_reply` ts but be missing intermediate
+  replies — Slack doesn't insert replies in the middle of a thread's
+  timeline retroactively, so this shape doesn't occur in practice.
+- The dedup index remains the correctness backstop: if we somehow
+  miss a reply, the next backfill re-walk catches it (no
+  `latest_reply` match → fetch).
+
+**Wins**:
+- Hours of API budget reclaimed on busy channels where socket-mode
+  already filled the threads.
+- Frees Tier 3 quota for actually-new work.
+- Auto-backfill cycle completes faster after restart — when combined
+  with skip-completed-channels (Wave 1 D), the only API work that
+  actually fires is for genuinely new gaps.
+
+**Where to wire the check**: emit a `slurper.backfill.thread_skip`
+span when the skip fires, so Loki can confirm in production how many
+threads the optimization actually saves. Per-channel run that wastes
+4500 thread fetches × 5s avg = 6+ hours saved on a single big channel.
+
+**Edge case**: huddle channels' transcript "threads" are a separate
+flow (`transcript.py`); this optimization doesn't apply. The
+predicate is on `reply_count` which the huddle path doesn't touch.
+
+**Distinct from**: skip-completed-channels (Wave 1 D), which avoids
+re-walking ENTIRE channels. This is a finer-grained per-thread skip
+within a channel that IS being walked.
+
+---
+
 ### FUSE passthrough + dirty-set + coalesced disk projection
 
 **Discovered**: 2026-06-29 while benchmarking ripgrep throughput. Live
@@ -317,214 +432,50 @@ end-to-end on this stack, (1)-(3) drop in mechanically.
 
 ---
 
-### Skip thread-expansion when local thread is already caught up
+### FUSE getattr returns `st_blocks=0` — du/dust show everything as 0B
 
-**Discovered**: 2026-06-30 watching proj-cloud's backfill spend ~9 hours
-in the thread-expansion phase writing rows that all dedup'd to no-ops.
-proj-cloud's history pagination finished by 17:57; the next 8+ hours
-were `conversations.replies` calls per thread parent, paying the 2-8s
-throttle per call, hitting the dedup index, inserting zero new rows.
-Socket-mode events had already filled the threads in.
+**Discovered**: 2026-06-27 while inspecting `/views/slack-split/channels/general` with `dust`.
 
-**Optimization**: in `backfill_channel`'s thread-expansion loop (in
-`slack_fuse_server/backfill/api.py`, where `_expand_threads` walks
-`thread_parents`), check local state before calling
-`conversations.replies`. Skip the fetch when both hold:
+**Symptom**: every file in the mount shows up as 0B in `dust` and
+default-mode `du`, even though `stat` returns the correct `Size` and
+`cat`/`wc -c` return the real bytes.
 
-1. We have a `message` event with `ts == parent.latest_reply`
-   (newest reply timestamp from the parent's payload), AND
-2. Count of locally-stored events with `thread_ts == parent.ts` equals
-   `parent.reply_count` (including the parent itself, or off-by-one
-   per Slack's convention — verify against `tests/_fake_slack/`).
+```
+$ stat -c "size=%s blocks=%b" channel.md
+size=4035 blocks=0
 
-If either fails, fetch normally.
+$ dust .                           # 0B everywhere
+$ dust --apparent-size .           # real sizes
+$ du -b channel.md                 # 4035
+```
 
-**Why it's safe**:
-- False negative (we fetch unnecessarily) is the worst-case if our
-  cached `reply_count` is stale; that's the status quo.
-- False positive (we skip a real gap) requires our local thread to
-  have the exact `latest_reply` ts but be missing intermediate
-  replies — Slack doesn't insert replies in the middle of a thread's
-  timeline retroactively, so this shape doesn't occur in practice.
-- The dedup index remains the correctness backstop: if we somehow
-  miss a reply, the next backfill re-walk catches it (no
-  `latest_reply` match → fetch).
+**Root cause**: `_make_file_attr` (and friends in
+`slack_fuse/fuse_ops_v2.py`) set `st_size` correctly but leave
+`st_blocks` at 0. There's no real disk block allocation behind these
+files — content is rendered on read from the projector's `chunks` /
+`thread_chunks` tables — so 0 is technically accurate. But `du`/`dust`
+default to `st_blocks * 512` as "disk usage", which produces zeros
+across the board.
 
-**Wins**:
-- Hours of API budget reclaimed on busy channels where socket-mode
-  already filled the threads.
-- Frees Tier 3 quota for actually-new work.
-- Auto-backfill cycle completes faster after restart — when combined
-  with skip-completed-channels (Wave 1 D), the only API work that
-  actually fires is for genuinely new gaps.
+**Current behaviour**: users have to know to pass `--apparent-size`
+(or `du -b`, or `du --apparent-size`) to get usable output. First-time
+users find it confusing — "the mount is empty?"
 
-**Where to wire the check**: emit a `slurper.backfill.thread_skip`
-span when the skip fires, so Loki can confirm in production how many
-threads the optimization actually saves. Per-channel run that wastes
-4500 thread fetches × 5s avg = 6+ hours saved on a single big channel.
+**Fix candidates**:
+1. **Set `st_blocks = ceil(st_size / 512)`** in `_make_file_attr` (and
+   the originals + control-surface attr factories). 5-line change,
+   purely additive, no test risk. Every disk-usage tool Just Works.
+2. **Document the workaround in `README.md` / `CLAUDE.md`** — tell
+   users to pass `--apparent-size`. Cheaper, less ergonomic.
 
-**Edge case**: huddle channels' transcript "threads" are a separate
-flow (`transcript.py`); this optimization doesn't apply. The
-predicate is on `reply_count` which the huddle path doesn't touch.
+**Recommendation**: option 1. It's tiny, the value is genuinely
+meaningful (`ceil(st_size / 512)` is what a tmpfs / overlayfs returns
+for content of size N — same shape), and disk-usage tooling is a
+common enough operation that "works by default" is the right default.
 
-**Distinct from**: skip-completed-channels (Wave 1 D), which avoids
-re-walking ENTIRE channels. This is a finer-grained per-thread skip
-within a channel that IS being walked.
-
----
-
-### Switch from Socket Mode to Events API (HTTP request URL via Tailscale funnel)
-
-**Discovered**: 2026-06-30 spec review. The catchup mid-stream gap bug
-(socket disconnect → message dropped → next live message after reconnect
-advances local `MAX(ts)` past the lost window) is the most damning data
-loss surface in the current architecture. The proper architectural fix
-isn't smarter catchup — it's removing the persistent-WebSocket failure
-mode entirely.
-
-**The proposal**: switch event delivery from Socket Mode (Slack pushes
-over WebSocket we hold open) to the Events API (Slack POSTs events to a
-public HTTPS request URL we expose). Use Tailscale Funnel — already
-supported on our k8s — to expose the slurper's existing HTTP server
-publicly without putting the cluster directly on the internet.
-
-**Critical property to enable**: leave Slack's default event-retry
-semantics ON (do NOT opt out via `X-Slack-No-Retry: 1`). When the slurper
-is down or 5xx's, Slack retries up to 3 times with exponential backoff
-(immediately → ~1 min → ~5 min). This is the catchup-mid-stream-gap fix
-at the architecture layer: short slurper outages become at-least-once
-retries instead of permanent data loss.
-
-**Why this is the right architectural move:**
-
-| Failure mode | Socket Mode (today) | Events API + retries |
-|---|---|---|
-| Slurper restart (10s) | Events fired during the window are lost; catchup races with the head pointer | Slack retries; events land after restart |
-| Slurper down 1 min | Same | Retries within retry-window land cleanly |
-| Slurper down 30 min | Permanent loss past catchup max-lookback | Retries may have expired; need backfill |
-| Slurper down hours | Permanent loss; full re-backfill needed | Same |
-| Network partition (slurper-side) | Connection drops; catchup races | Same recovery path as restart |
-| Tailscale funnel down | n/a | All deliveries fail; Slack retries; recovery on funnel restore |
-| Slack-side delivery lag | None (push) | Bounded; rare in practice |
-
-The race window we hit on 2026-06-28 (and that the catchup query bug
-preserves) is **architecturally impossible** with retries — Slack itself
-becomes the durable buffer.
-
-**Infrastructure**:
-- k8s-homelab already supports Tailscale Funnel for public-HTTPS exposure
-  of cluster-internal services. Confirm with the k8s-homelab-owner whether
-  the slurper specifically can be exposed (some services are funnel-eligible,
-  others aren't, depends on the cluster config).
-- The slurper already runs an HTTP server (`/health`, `/livez`, `/metrics`,
-  the backfill triggers, etc.) so adding a `/slack-events` route is just
-  one more handler.
-- Signing-secret validation on incoming Slack POSTs is mandatory; ship the
-  `x-slack-signature` + `x-slack-request-timestamp` HMAC verification
-  before any subscription change in the Slack admin UI.
-
-**What changes in the slurper code:**
-
-- Add `/slack-events` POST handler. Validates Slack signing-secret,
-  accepts the envelope, dispatches the event to the same handler chain
-  Socket Mode currently uses.
-- The handler must respond with 200 within 3 seconds; do the actual event
-  write asynchronously (write to a bounded trio queue, background task
-  drains into events table). Otherwise high-volume bursts will hit
-  Slack's 3s ack timeout and trigger unnecessary retries.
-- Disable the `SocketModeRunner` task. Keep the code around (gated behind
-  a config flag) during migration — both can run simultaneously, dedup
-  index handles double-writes.
-- Migrate `apps.connections.open` usage out of the slurper.
-
-**What changes in the Slack app config (operator-side):**
-- Disable Socket Mode in the app admin UI.
-- Set the Events API request URL to the funnel address.
-- Confirm/re-verify URL with Slack (URL verification challenge handshake).
-- Re-confirm every event subscription stays enabled across the switch.
-
-**Trade-offs to think through:**
-
-- **At-least-once delivery vs at-most-once.** Slack retries → we may see
-  the same event multiple times. The existing dedup index handles this for
-  `message` and the new partial-unique indexes from PR `9bdf542` cover the
-  extended event kinds, but every NEW event kind we add must declare its
-  dedup contract. Document this as a permanent invariant.
-- **Public URL surface.** The funnel exposes one route publicly. Make sure
-  the handler signature-validates BEFORE doing anything else; reject
-  anything that doesn't match. No content sniffing on unsigned bodies.
-- **Tailscale Funnel availability.** It's no longer beta but still limited
-  per ts.net account / per node. Check our specific node quota and SLA.
-- **Some events are Socket-Mode-only?** Verify against Slack docs — almost
-  every event type works on either delivery mechanism, but a few interactivity
-  endpoints (shortcuts, modals) are Socket-Mode-only. We don't use those, but
-  confirm.
-- **The slurper's HTTP server response time becomes load-bearing.** Today
-  a slow `/livez` is just an observability cost; tomorrow a slow
-  `/slack-events` causes Slack retries. The async-queue pattern above must
-  be airtight.
-- **Migration ordering.** Run BOTH for a few days; compare event volumes;
-  switch over only when Events API parity is confirmed.
-
-**Risks**:
-- Funnel goes down → all deliveries fail → retries expire → permanent loss
-  of the burst. Need monitoring on the funnel itself, not just on the
-  slurper.
-- Signing-secret rotation procedures (Slack lets you rotate; we need to
-  handle gracefully without a window where neither secret works).
-- Migration churn — running both delivery paths produces duplicate event
-  writes (dedup handles, but logs and metrics double-count during the
-  overlap).
-- If our public endpoint is ever compromised or made unauthenticated, a
-  flood of spoofed events lands in our event log. Signing-secret check is
-  the only defense.
-
-**Detection / observability dependencies**:
-- Span the incoming POST handler (`slurper.events_api.handle`) with
-  Wave 2.C instrumentation — duration, result, retry-attempt header.
-- Track Slack's retry attempts via the `x-slack-retry-num` /
-  `x-slack-retry-reason` headers; emit a `events_api_retry_observed`
-  event when retry_num > 0 (signal we had a delivery problem in the
-  prior attempt).
-- Probe-sweep v1's day-presence probe (v2 scope) becomes much less
-  load-bearing — retries cover most of the gap surface. v2 probes can
-  shift toward less-frequent reconciliation rather than primary
-  detection.
-
-**Sequencing dependencies**:
-- The catchup mid-stream gap fix (separate backlog) becomes much less
-  urgent once this lands; consider whether to ship the Events API
-  switchover INSTEAD of fixing catchup. Compare implementation cost.
-- Probe-sweep v1 must be in place first to verify the migration: probes
-  detect ingestion gaps regardless of delivery mechanism, so they validate
-  the new path matches Socket Mode parity.
-- Wave 2 supervisor + spans must be in place (they are — PRs `318b33b`,
-  `1a4ef7d`) so per-event-API latency is observable.
-
-**Recommended sequence to actually do this**:
-1. Spike: prove `/slack-events` can ack a real Slack POST within 3s on
-   a single-channel test workspace. Confirm signing-secret math.
-2. Spike: confirm Tailscale Funnel exposes the slurper's HTTP port. Check
-   with k8s-homelab-owner for any gotchas.
-3. Implement the handler + async-queue + dedup invariants. Tests against
-   real Slack-shaped POST fixtures (capture from the live workspace once
-   in test mode).
-4. Deploy with Socket Mode STILL ACTIVE — run both delivery paths in
-   parallel for ~3 days. Diff the event volumes per stream/kind. Confirm
-   no Events API silent-drop.
-5. Disable Socket Mode in the app config. Watch probe-sweep + spans for
-   24h.
-6. Remove the Socket Mode code path (or keep behind a config flag for
-   recovery scenarios).
-
-**Sleeper consideration**: if Tailscale Funnel goes down for hours, we're
-worse off than Socket Mode (which would just reconnect and retry from
-its position). Worth thinking about whether to retain Socket Mode as a
-fallback delivery path — both subscribed, dedup handles overlap.
-
-**Impact**: removes the single most damning data-loss surface in the
-current architecture. Catchup mid-stream gap stops being a thing.
-Multi-minute slurper outages become recoverable for free.
+**Impact**: ergonomic only. Doesn't affect correctness or data. Worth
+fixing because the alternative is "every user discovers it the first
+time they run `dust` and gets confused."
 
 ---
 
@@ -594,112 +545,6 @@ prompt already drafted at
 **Impact**: changes the operational story from "ad-hoc SQL via kubectl"
 to "cat the file". Reusable for every future "how big is X / how
 complete are we" question.
-
----
-
-### Trailer false-positives "server unreachable" on quiet streams
-
-**Discovered**: 2026-06-27 during dump-and-reingest. User read
-`/views/slack-split/channels/general/channel.md` (top-level metadata
-view); rendered fine in 21ms but appended:
-
-```
-> ⚠ Content may be stale. Last successful sync: never. Reason: server unreachable.
-```
-
-**Symptom**: false positive. The mount + server + WS connection are
-all healthy. `slurper-health` stream had a frame 1 minute ago; the
-projector's cursors are advancing actively across many channels; the
-HTTP server returns 200 in milliseconds.
-
-**Root cause**: `slack_fuse/projector/trailer.py::staleness_reason`
-uses **per-stream** ``last_frame_at`` as the WS-liveness signal:
-
-```python
-if state.last_frame_at is None or (now_real - state.last_frame_at) > timedelta(seconds=stale_after_s):
-    if not caught_up:
-        return "catching up after reconnect"
-    return "server unreachable"
-```
-
-For a stream that's naturally quiet — `channel-list` when no channel
-metadata is drifting, or a per-channel stream that's been backfilled
-and has no live messages — no frames arrive for >5min and the trailer
-fires. The threshold's intent was "WS disconnect", but it conflates
-"no traffic on this stream" with "no connectivity".
-
-**Current behaviour**: every read of a top-level `channel.md` (or any
-read whose freshness derives from `channel-list`) on a stable
-workspace appends a misleading "server unreachable" trailer with
-"Last successful sync: never". Users see the warning and reasonably
-conclude the daemon is broken.
-
-**Fix candidates**:
-1. **Use workspace-wide liveness signal**: track the last frame across
-   ANY stream and use that as the WS-disconnect proxy. `slurper-health`
-   is the natural heartbeat — it emits regularly for various reasons.
-2. **Explicit WS-state tracking**: tie staleness to the actual WS
-   connection state (e.g. `connection_state` table or socket
-   reconnect events) instead of inferring from data flow.
-3. **Per-stream threshold tuning**: bump `stale_after_s` for streams
-   that are known to be quiet (channel-list, users). Brittle.
-
-**Recommendation**: option 1. Cheapest fix, doesn't change the
-overall trailer architecture, and aligns with what `slurper-health`
-was designed for. The current `last_frame_at` parameter shape stays;
-it just gets sourced from a workspace-wide MAX instead of the
-queried stream.
-
-**Impact**: ergonomic — operators see the warning and don't know if
-it's real or noise. Doesn't affect data correctness, but every
-warning the user has to mentally filter erodes trust in the trailer.
-
----
-
-### FUSE getattr returns `st_blocks=0` — du/dust show everything as 0B
-
-**Discovered**: 2026-06-27 while inspecting `/views/slack-split/channels/general` with `dust`.
-
-**Symptom**: every file in the mount shows up as 0B in `dust` and
-default-mode `du`, even though `stat` returns the correct `Size` and
-`cat`/`wc -c` return the real bytes.
-
-```
-$ stat -c "size=%s blocks=%b" channel.md
-size=4035 blocks=0
-
-$ dust .                           # 0B everywhere
-$ dust --apparent-size .           # real sizes
-$ du -b channel.md                 # 4035
-```
-
-**Root cause**: `_make_file_attr` (and friends in
-`slack_fuse/fuse_ops_v2.py`) set `st_size` correctly but leave
-`st_blocks` at 0. There's no real disk block allocation behind these
-files — content is rendered on read from the projector's `chunks` /
-`thread_chunks` tables — so 0 is technically accurate. But `du`/`dust`
-default to `st_blocks * 512` as "disk usage", which produces zeros
-across the board.
-
-**Current behaviour**: users have to know to pass `--apparent-size`
-(or `du -b`, or `du --apparent-size`) to get usable output. First-time
-users find it confusing — "the mount is empty?"
-
-**Fix candidates**:
-1. **Set `st_blocks = ceil(st_size / 512)`** in `_make_file_attr` (and
-   the originals + control-surface attr factories). 5-line change,
-   purely additive, no test risk. Every disk-usage tool Just Works.
-2. **Document the workaround in `README.md` / `CLAUDE.md`** — tell
-   users to pass `--apparent-size`. Cheaper, less ergonomic.
-
-**Recommendation**: option 1. It's tiny, the value is genuinely
-meaningful (`ceil(st_size / 512)` is what a tmpfs / overlayfs returns
-for content of size N — same shape), and disk-usage tooling is a
-common enough operation that "works by default" is the right default.
-
-**Impact**: ergonomic only. Doesn't affect correctness or data. Worth
-fixing because the alternative is "every user discovers it the first
-time they run `dust` and gets confused."
 
 ---
 
