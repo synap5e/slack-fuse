@@ -8,6 +8,84 @@ roll the image and clear the entry.
 
 ## Open
 
+### Client reconnect-after-PG-bounce wedges fixed-conn tasks
+
+**Discovered**: 2026-08-01 by term-62a1 on flow-crastinator (live
+specimen, 3.7-day silent wedge).
+
+**Symptom**: local PG bounces (in flow's case, `postgres.service`
+restarted during a NixOS rebuild switch, 2026-07-27 23:32 PDT). ~43s
+later the projector nursery hits ``psycopg.OperationalError: the
+connection is lost``, logs ``projector exited; reconnecting in 300s``,
+and enters a permanent reconnect loop. ``block_sync.py:169`` fails
+every cycle with ``the connection is closed`` — the wedged conns are
+never rebuilt. Flow logged 165 reconnect messages in one day. Meanwhile
+gap probes to the k8s server still return 200 (event fetch alive; only
+projection to local PG + FUSE was dead). Systemd shows the unit
+``active`` throughout because the process didn't exit. Zero external
+signal that the mount was stale.
+
+**FINDING-06 lineage**: this is the exact class the 2026-07-17
+adversarial review named as "PG-restart survivability". The Tier 3
+plan (`/tmp/claude/v2-uplift-plan.md`) called for routing the five
+fixed conns — ``_inode_conn``, ``state_conn``, ``sink_conn``,
+``block_sync`` conn, ``rerender_consumer`` conns — through either the
+pooled path or a shared ``ReconnectingConnection`` wrapper that
+reopens on ``OperationalError``, plus moving initial connects INSIDE
+the supervised try (the `2026-06-22` comment in `health_subscriber`
+documents this pattern as previously fixed for the subscriber, but
+never propagated). Never landed.
+
+**Why this is worse than a crash**:
+
+- No liveness probe fails — ``/health`` still serves 200.
+- Systemd doesn't restart (no exit).
+- Kubelet-style crash-loop remediation doesn't apply.
+- Only visible via journal grep or a user noticing stale content
+  (flow's own maintainer noticed 3.7 days late).
+
+The failure mode fools every operational tool we have. This is what
+made yesterday's `/views/slack → slack-split` symlink risky — a wedged
+projector serves stale bytes forever, and every consumer trusts the
+mount is live.
+
+**Fix path** (from Tier 3 spec):
+
+1. Introduce a ``ReconnectingConnection`` wrapper. On any
+   ``psycopg.OperationalError``, close the socket + open a fresh conn
+   with the same DSN, retry the current statement once, propagate on
+   second failure. Mirrors ``health_subscriber``'s supervisor pattern.
+2. Route the five fixed conns through it: ``_inode_conn`` in
+   ``fuse_ops_v2``, ``state_conn`` (connection_state polling),
+   ``sink_conn`` (applier sink), ``block_sync``'s persistent conn,
+   ``_run_rerender_consumer``'s apply + sink conns.
+3. Move initial connect() calls INSIDE the supervised try in each
+   task (currently ``block_sync`` and ``rerender_consumer`` open their
+   conns at task-start OUTSIDE the try; PG down at that instant kills
+   the whole nursery).
+4. Applier sink dedicated conn: currently one long-lived conn per
+   WSClient nursery generation; same reconnect treatment.
+5. Emit a ``slurper-health.client_wedged`` observation when the
+   reconnect loop exceeds N minutes without success — so the trailer
+   or ``_control/status`` can surface it externally. This is the
+   observability primitive the current "silently wedged" mode lacks.
+
+**Test**: fault-injection — kill the local PG process mid-callback,
+assert mount recovers within N seconds without a systemd restart.
+Covers the ``NO_POSTGRES`` file's contract end-to-end.
+
+**Why deferred**: touches 5 modules, each with different lifecycle
+semantics (long-lived vs. per-nursery-generation vs. per-request);
+needs careful trio/threading reasoning; needs adversarial verification.
+Estimated 2-3 days of work. Handoff-shaped (Codex 5.6 Sol xhigh with
+worktree, spec builds on `/tmp/claude/v2-uplift-plan.md` Tier 3).
+
+**Not deferred forever, but not this session**: any host that bounces
+its local PG will silently stop projecting. This will bite the next
+time and the wedge won't be discovered for days.
+
+---
+
 ### FUSE mount wedge — host-level condition
 
 **Status**: architectural fix landed (`87487d0`). Per-callback connection
