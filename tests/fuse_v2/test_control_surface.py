@@ -146,6 +146,8 @@ def test_control_state_render_empty_and_recorded() -> None:
         "last_backfill": None,
         "last_probe_sweep": None,
         "last_refill_gap": None,
+        "last_client_wedged": None,
+        "last_client_recovered": None,
     }
 
     state.record_workspace("queued")
@@ -156,6 +158,8 @@ def test_control_state_render_empty_and_recorded() -> None:
     state.record_backfill("CBLK", "queued")
     state.record_probe_sweep("queued", job_id="channel_newest_message", target="C123")
     state.record_refill_gap("CREFILL", "queued", oldest_ts=1783036800.0, latest_ts=1783123199.999999)
+    state.record_client_health("block_sync", "client_wedged", "connection refused")
+    state.record_client_health("block_sync", "client_recovered", "connection refused")
     payload = json.loads(state.render())
     assert payload["last_workspace_refresh"] == {"at": "2026-06-27T11:00:00Z", "result": "queued"}
     assert payload["last_channel_refresh"] == {
@@ -167,6 +171,18 @@ def test_control_state_render_empty_and_recorded() -> None:
         "at": "2026-06-27T11:00:00Z",
         "result": "rerendered",
         "channel": "C0ALLT6Q3SQ",
+    }
+    assert payload["last_client_wedged"] == {
+        "at": "2026-06-27T11:00:00Z",
+        "kind": "client_wedged",
+        "connection": "block_sync",
+        "reason": "connection refused",
+    }
+    assert payload["last_client_recovered"] == {
+        "at": "2026-06-27T11:00:00Z",
+        "kind": "client_recovered",
+        "connection": "block_sync",
+        "reason": "connection refused",
     }
     assert payload["last_block"] == {"at": "2026-06-27T11:00:00Z", "result": "blocked", "channel": "CBLK"}
     assert payload["last_unblock"] == {
@@ -294,6 +310,8 @@ def test_control_read_bytes(client_conn: Connection[TupleRow], utc_tz: ZoneInfo)
         "last_backfill": None,
         "last_probe_sweep": None,
         "last_refill_gap": None,
+        "last_client_wedged": None,
+        "last_client_recovered": None,
     }
     # not a control file.
     assert ops.control_read_for_test("/channels/general/channel.md") is None
@@ -314,6 +332,8 @@ async def test_cat_status_via_read_callback(client_conn: Connection[TupleRow], u
         "last_backfill": None,
         "last_probe_sweep": None,
         "last_refill_gap": None,
+        "last_client_wedged": None,
+        "last_client_recovered": None,
     }
 
 

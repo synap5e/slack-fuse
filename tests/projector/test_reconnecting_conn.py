@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, cast
 
 import pytest
 from psycopg import Connection, OperationalError
 from psycopg.rows import TupleRow
 
+from slack_fuse.control import ControlState
 from slack_fuse.projector.reconnecting_conn import ClosedConnectionError, ReconnectingConnection
 
 if TYPE_CHECKING:
@@ -199,6 +202,7 @@ def test_client_wedged_and_recovered_emit_once_per_episode() -> None:
     ]
     now = 0.0
     events: list[tuple[str, str]] = []
+    control_state = ControlState(now_fn=lambda: datetime(2026, 8, 2, tzinfo=UTC))
 
     def factory(_dsn: str) -> Connection[TupleRow]:
         result = factory_results.pop(0)
@@ -209,10 +213,14 @@ def test_client_wedged_and_recovered_emit_once_per_episode() -> None:
     def now_fn() -> float:
         return now
 
+    def record_health(kind: str, reason: str) -> None:
+        events.append((kind, reason))
+        control_state.record_client_health("test_connection", kind, reason)
+
     conn = ReconnectingConnection(
         "postgresql://test",
         connection_factory=factory,
-        on_health_event=lambda kind, reason: events.append((kind, reason)),
+        on_health_event=record_health,
         now_fn=now_fn,
     )
 
@@ -222,6 +230,9 @@ def test_client_wedged_and_recovered_emit_once_per_episode() -> None:
             _ = conn.execute("SELECT 1")
 
     assert events == [("client_wedged", "reopen 5 failed")]
+    wedged_status = json.loads(control_state.render())
+    assert wedged_status["last_client_wedged"]["kind"] == "client_wedged"
+    assert wedged_status["last_client_recovered"] is None
 
     now = 150.0
     with conn.cursor() as cur:
@@ -232,6 +243,8 @@ def test_client_wedged_and_recovered_emit_once_per_episode() -> None:
         ("client_wedged", "reopen 5 failed"),
         ("client_recovered", "reopen 5 failed"),
     ]
+    recovered_status = json.loads(control_state.render())
+    assert recovered_status["last_client_recovered"]["kind"] == "client_recovered"
     assert factory_results == []
 
 

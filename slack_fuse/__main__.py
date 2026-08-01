@@ -338,6 +338,7 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
 
     import slack_fuse.migrations as client_migrations
     from slack_fuse.config import load_client_config
+    from slack_fuse.control import ControlState
     from slack_fuse.fuse_ops_v2 import SlackFuseOpsV2, V2InvalidationSink
     from slack_fuse.migrations.runner import apply_migrations
     from slack_fuse.pg_health import PgHealth
@@ -372,6 +373,7 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
     for handler in logging.getLogger().handlers:
         handler.addFilter(FuseContextFilter())
     log = logging.getLogger(__name__)
+    control_state = ControlState()
 
     def _open_conn() -> psycopg.Connection[TupleRow]:
         conn: psycopg.Connection[TupleRow] = psycopg.connect(config.database_url)
@@ -395,10 +397,18 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
     def _open_durable_conn(name: str) -> ReconnectingConnection:
         """One fixed client connection that replaces a dead PG socket."""
 
+        def _on_health_event(kind: str, reason: str) -> None:
+            control_state.record_client_health(name, kind, reason)
+            if kind == "client_wedged":
+                log.error("slurper-health.client_wedged connection=%s reason=%s", name, reason)
+            else:
+                log.info("slurper-health.client_recovered connection=%s reason=%s", name, reason)
+
         return ReconnectingConnection(
             config.database_url,
             autocommit=True,
             on_reconnect=lambda reason: log.info("%s postgres connection recovered: %s", name, reason),
+            on_health_event=_on_health_event,
         )
 
     # One-time migrations so the projections schema exists.
@@ -477,7 +487,6 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
     # ``_control/`` write surface: trigger server-side refreshes/backfills and
     # mutate server-side block policy over HTTP. Shares the ghost-file httpx
     # client + server origin. The state is in-process (resets on restart).
-    from slack_fuse.control import ControlState
     from slack_fuse.projector.block_fetch import (
         blocked_channel_ids_from_payload,
         delete_block_channel,
@@ -488,8 +497,6 @@ def cmd_mount_split(args: argparse.Namespace) -> None:  # noqa: C901  (process-w
     )
     from slack_fuse.projector.probe_fetch import post_probe_sweep
     from slack_fuse.projector.refresh_fetch import post_refresh_channel, post_refresh_channels
-
-    control_state = ControlState()
 
     _migrate_legacy_always_blocked(
         ghost_http_client,

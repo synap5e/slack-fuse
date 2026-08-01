@@ -100,6 +100,24 @@ class RefillGapOutcome:
         return payload
 
 
+@dataclass(frozen=True, slots=True)
+class ClientHealthOutcome:
+    """One fixed-connection wedge or recovery observation."""
+
+    at: str
+    kind: str
+    connection: str
+    reason: str
+
+    def to_json(self) -> dict[str, str]:
+        return {
+            "at": self.at,
+            "kind": self.kind,
+            "connection": self.connection,
+            "reason": self.reason,
+        }
+
+
 class ControlState:
     """Thread-safe holder for the last workspace / per-channel refresh outcome."""
 
@@ -114,6 +132,8 @@ class ControlState:
         self._backfill: RefreshOutcome | None = None
         self._probe_sweep: ProbeSweepOutcome | None = None
         self._refill_gap: RefillGapOutcome | None = None
+        self._client_wedged: ClientHealthOutcome | None = None
+        self._client_recovered: ClientHealthOutcome | None = None
 
     def _stamp(self) -> str:
         return self._now_fn().astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -168,6 +188,23 @@ class ControlState:
                 result=result,
             )
 
+    def record_client_health(self, connection: str, kind: str, reason: str) -> None:
+        """Record ``client_wedged``/``client_recovered`` for ``_control/status``."""
+        if kind not in {"client_wedged", "client_recovered"}:
+            msg = f"unsupported client health kind: {kind}"
+            raise ValueError(msg)
+        outcome = ClientHealthOutcome(
+            at=self._stamp(),
+            kind=kind,
+            connection=connection,
+            reason=reason,
+        )
+        with self._lock:
+            if kind == "client_wedged":
+                self._client_wedged = outcome
+            else:
+                self._client_recovered = outcome
+
     def render(self) -> bytes:
         """Serialize the current state to the ``status`` file body."""
         with self._lock:
@@ -179,6 +216,8 @@ class ControlState:
             backfill = self._backfill
             probe_sweep = self._probe_sweep
             refill_gap = self._refill_gap
+            client_wedged = self._client_wedged
+            client_recovered = self._client_recovered
         payload: dict[str, object] = {
             "last_workspace_refresh": workspace.to_json() if workspace is not None else None,
             "last_channel_refresh": channel.to_json() if channel is not None else None,
@@ -188,8 +227,17 @@ class ControlState:
             "last_backfill": backfill.to_json() if backfill is not None else None,
             "last_probe_sweep": probe_sweep.to_json() if probe_sweep is not None else None,
             "last_refill_gap": refill_gap.to_json() if refill_gap is not None else None,
+            "last_client_wedged": client_wedged.to_json() if client_wedged is not None else None,
+            "last_client_recovered": client_recovered.to_json() if client_recovered is not None else None,
         }
         return (json.dumps(payload, indent=2) + "\n").encode()
 
 
-__all__ = ["ControlState", "ProbeSweepOutcome", "RefillGapOutcome", "RefreshOutcome", "result_for_status"]
+__all__ = [
+    "ClientHealthOutcome",
+    "ControlState",
+    "ProbeSweepOutcome",
+    "RefillGapOutcome",
+    "RefreshOutcome",
+    "result_for_status",
+]
