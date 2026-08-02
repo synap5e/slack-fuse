@@ -76,12 +76,13 @@ def _ops(
     *,
     enabled: bool,
 ) -> SlackFuseOpsV2:
-    monkeypatch.setenv("SLACK_FUSE_DISK_PROJECTION_ENABLED", "true" if enabled else "false")
+    _ = monkeypatch  # kept for signature stability; the flag is now a constructor kwarg.
     return SlackFuseOpsV2(
         conn,
         ZoneInfo("UTC"),
         trio.CapacityLimiter(16),
         disk_projection=projection,
+        disk_projection_enabled=enabled,
         trailer_enabled=False,
     )
 

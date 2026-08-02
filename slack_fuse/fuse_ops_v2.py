@@ -154,12 +154,6 @@ def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
-def _disk_projection_enabled_from_env() -> bool:
-    """Return the opt-in read-tier flag (dark by default)."""
-    raw = os.environ.get(_DISK_PROJECTION_ENABLED_ENV, "")
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
-
-
 NowFn = Callable[[], datetime]
 
 log = logging.getLogger(__name__)
@@ -205,7 +199,6 @@ ControlRefillGapFn = Callable[[str, float, float], str]
 # so the non-thread-safe channel send is safe).
 ControlRerenderChannelFn = Callable[[str], bool]
 
-_DISK_PROJECTION_ENABLED_ENV: Final = "SLACK_FUSE_DISK_PROJECTION_ENABLED"
 # D1 stores fully resolved markdown, so an unresolved placeholder has already
 # become its visible ``@UID`` / ``#CID`` fallback. Conservatively recognize
 # those rendered forms to preserve the kernel-cache suppression invariant on
@@ -570,6 +563,7 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         callback_timeout_s: float = DEFAULT_CALLBACK_TIMEOUT_S,
         pg_health: PgHealth | None = None,
         disk_projection: DiskProjection | None = None,
+        disk_projection_enabled: bool = False,
         notify_store: NotifyStoreFn | None = None,
         invalidate_inode: InvalidateInodeFn | None = None,
         stale_after_s: float = STALE_AFTER_DISCONNECT_S,
@@ -610,12 +604,13 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         # ``_run_sync`` mark PG down on OperationalError so subsequent
         # callbacks fast-fail with EIO instead of crashing the process.
         self._pg_health = pg_health
-        # D1 constructs the projection only when the canary is enabled, but
-        # independently snapshot the env flag here as a read-side rollback
-        # gate. Tests deliberately inject a populated projection while the
-        # flag is false to pin the dark-default behavior.
+        # D1 constructs the projection only when the canary is enabled; keep
+        # a separate read-side rollback gate so tests can inject a populated
+        # projection while asserting dark-default behaviour. The value flows
+        # from `ClientConfig.disk_projection_enabled` (typed) — no direct env
+        # reads here, per WTF-audit DESIGN-2.
         self._disk_projection = disk_projection
-        self._disk_projection_enabled = _disk_projection_enabled_from_env()
+        self._disk_projection_enabled = disk_projection_enabled
         self._tz = local_tz
         self._limiter = limiter
         self._notify_store: NotifyStoreFn = notify_store if notify_store is not None else _default_notify_store

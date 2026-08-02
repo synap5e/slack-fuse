@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, cast
 import pytest
 
 import slack_fuse.projector.coalescer as coalescer_module
-from slack_fuse.__main__ import _disk_projection_enabled  # pyright: ignore[reportPrivateUsage]
+from slack_fuse.config import ClientConfig
 from slack_fuse.projector.coalescer import run_coalescer
 from slack_fuse.projector.disk_projection import DiskProjection
 
@@ -108,10 +108,12 @@ async def test_coalescer_sleeps_five_seconds_between_drains(monkeypatch: pytest.
 
 def test_disk_projection_is_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("SLACK_FUSE_DISK_PROJECTION_ENABLED", raising=False)
-    assert not _disk_projection_enabled()  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setenv("SLACK_FUSE_SHARED_SECRET", "test-secret")
+    assert not ClientConfig().disk_projection_enabled  # pyright: ignore[reportCallIssue]
 
 
 @pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on"])
 def test_disk_projection_explicit_opt_in(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+    monkeypatch.setenv("SLACK_FUSE_SHARED_SECRET", "test-secret")
     monkeypatch.setenv("SLACK_FUSE_DISK_PROJECTION_ENABLED", value)
-    assert _disk_projection_enabled()  # pyright: ignore[reportPrivateUsage]
+    assert ClientConfig().disk_projection_enabled  # pyright: ignore[reportCallIssue]

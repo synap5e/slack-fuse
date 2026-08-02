@@ -64,6 +64,14 @@ class ClientConfig(BaseSettings):
     # Server blocked_channels SSOT sync interval.
     block_sync_interval_s: float = 30.0
 
+    # Opt-in coalesced disk projection (Stage D1/D2/D3, 2026-08-02). When true,
+    # the coalescer runs and the FUSE read path serves clean paths from disk.
+    # Dark by default: WTF-audit CORRECTNESS-1 (restart→stale) is unresolved,
+    # so broad enablement is gated. Set via `SLACK_FUSE_DISK_PROJECTION_ENABLED`
+    # env var (pydantic-settings maps it here) or `disk_projection_enabled` in
+    # the TOML config.
+    disk_projection_enabled: bool = False
+
     # DEPRECATED 2026-06-27, chain fully removed 2026-07-17 (FINDING-17).
     # This field is accepted for config-file backwards compatibility but has
     # no effect: the applier-side enforcement (WSClient → StreamApplier →

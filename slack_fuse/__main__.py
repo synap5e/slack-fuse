@@ -25,13 +25,6 @@ def _default_mountpoint() -> str:
 
 
 _REFRESH_INTERVAL = 1800  # 30 minutes, matches _CHANNEL_LIST_TTL
-_DISK_PROJECTION_ENABLED_ENV = "SLACK_FUSE_DISK_PROJECTION_ENABLED"
-
-
-def _disk_projection_enabled() -> bool:
-    """Return the opt-in disk projection flag (dark by default)."""
-    raw = os.environ.get(_DISK_PROJECTION_ENABLED_ENV, "")
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _http_base_from_server_url(server_url: str) -> str:
@@ -320,7 +313,7 @@ def cmd_mount(args: argparse.Namespace) -> None:  # noqa: C901  (process-wiring 
     store_limiter = trio.CapacityLimiter(1)
     projection_conn: ReconnectingConnection | None = None
     disk_projection: DiskProjection | None = None
-    if _disk_projection_enabled():
+    if config.disk_projection_enabled:
         projection_conn = _open_durable_conn("disk_projection")
         disk_projection = DiskProjection(projection_conn, tz)
         log.info("coalesced disk projection enabled")
