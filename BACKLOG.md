@@ -18,45 +18,6 @@ Ordered by priority (highest first). Each entry annotates **Effort**
 (whether I can drive it end-to-end without Simon's intervention — Yes /
 Yes after decisions / No).
 
-## Skip thread-expansion when local thread is already caught up
-
-**Effort**: 2–3 eng-days. **Autonomous**: Yes after decisions — three
-small ADR follow-ups; a handoff can propose defaults for each and
-iterate if you disagree. Direct win, backed by fresh ADR, well-scoped.
-
-**Discovered**: 2026-06-30 watching proj-cloud's backfill spend ~9 hours
-in the thread-expansion phase writing rows that all dedup'd to no-ops.
-proj-cloud's history pagination finished by 17:57; the next 8+ hours
-were `conversations.replies` calls per thread parent, paying the 2-8s
-throttle per call, hitting the dedup index, inserting zero new rows.
-Socket-mode events had already filled the threads in.
-
-**ADR (2026-08-02, `/tmp/claude/adr-skip-thread-expansion.md`)**:
-recommendation **O1** — server-side batched preflight per channel.
-Before each `conversations.replies` call, `COUNT(DISTINCT reply_ts)`
-plus `MAX(reply_ts)` from active (edit/delete-folded) message facts;
-skip only when both match the parent's `reply_count` and `latest_reply`.
-Nulls or mismatch fetch. Reclaims the 4,500-thread / 8+ hour no-op tail
-per channel.
-
-**Decisions ratified 2026-08-02** (handoff-ready):
-1. **No parent-age gate.** Trust the `(reply_count, MAX(reply_ts))`
-   match. Any concurrent-arrival race is self-healing via WS live
-   delivery + the next backfill loop. Skip predicate is just the two
-   equality checks against the parent metadata Slack already gave us.
-2. **No durable full-expansion marker.** Trust count+MAX plus the
-   existing periodic full backfill as the drift catcher. The
-   missed-delete-plus-missed-add double-miss window is vanishingly
-   rare with WS live delivery, and full backfill catches any actual
-   drift. No new `threads_expanded` table.
-3. **Spans only for skip observability, no events.** Emit
-   `slurper.backfill.thread_skip` spans (Loki-queryable for cost
-   visibility). No event row. Crash-resume re-evaluates the predicate
-   cheaply — one batched query per channel restart, no stale skip
-   state to reconcile against live events.
-
----
-
 ## Workspace channel inventory view (`_workspace/channels.md`)
 
 **Effort**: 1–2 eng-days (~200–250 LoC + tests). **Autonomous**: Yes —
@@ -387,6 +348,17 @@ _None currently._
 
 ## 2026-08-02
 
+- **Skip thread-expansion when local thread is already caught up** —
+  `5d46c10`. New `slack_fuse_server/backfill/skip_predicate.py` reads
+  the `active_messages` view (migration 0008 — edit/delete-folded)
+  grouped by `thread_ts` for the current channel's parent worklist,
+  returning `set[thread_ts]` where both local count and MAX(reply_ts)
+  match Slack's `reply_count` and `latest_reply` from Phase 1's history.
+  Skip emits a `slurper.backfill.thread_skip` span (no event row);
+  partially-resumed threads (`cursor != ""`) always fetch. Callback
+  injected into `SlackApiBackfiller` via `caught_up_threads`; slurper
+  wires it through `writer.run_read` under `limiters.admin_read`.
+  35 focused tests; 6 predicate + 6 API/integration.
 - **Clean up repo — sprint/feat worktrees** — inline sweep in Ratified
   orchestration Phase 1. Removed 33 stale worktrees (~30
   `.wt/synap5e/feat/*` + 10 `.wt/handoff/*` + `.wt/server-split-rebuild`);
