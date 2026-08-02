@@ -1,35 +1,27 @@
-"""Built-in interpreted fact probes registered into the slurper sweep."""
+"""Built-in interpreted fact probes registered into the slurper sweep.
+
+Currently EMPTY. `channel_message_count_probed` was deleted 2026-08-03
+after the WTF-audit found it duplicated `channel_totals`' Slack sweep
+with no consumer (`_workspace/channels.md` reads
+`channel_message_totals`, not the event stream). The unified probe
+framework in `slack_fuse_server/slurper/probes.py` stays — future
+fact probes register here by appending to the returned tuple.
+
+Migration 0015 left the partial index
+`events_probe_fact_latest_idx WHERE kind IN ('channel_message_count_probed')`
+in place; the index is empty going forward and costs ~nothing. Old
+events of that kind persist in the events table and are handled by
+the applier's no-op branch in `slack_fuse/projector/apply.py`.
+"""
 
 from __future__ import annotations
 
-from slack_fuse_server.probes.channel_message_count import (
-    CHANNEL_MESSAGE_COUNT_INTERVAL_S,
-    CHANNEL_MESSAGE_COUNT_PROBED,
-    JOB_CHANNEL_MESSAGE_COUNT,
-    channel_message_count_due,
-    channel_message_count_targets,
-    probe_channel_message_counts,
-)
-from slack_fuse_server.probes.registry import EventFactsSink, ProbeKind, ProbeScope, SlackTier
+from slack_fuse_server.probes.registry import ProbeKind
 
 
 def register_fact_probes() -> tuple[ProbeKind, ...]:
     """Return interpreted fact probes for the unified slurper registry."""
-    return (
-        ProbeKind(
-            job_id=JOB_CHANNEL_MESSAGE_COUNT,
-            kind=CHANNEL_MESSAGE_COUNT_PROBED,
-            interval_s=CHANNEL_MESSAGE_COUNT_INTERVAL_S,
-            tier=SlackTier.TIER_2,
-            scope=ProbeScope.PER_CHANNEL,
-            run=probe_channel_message_counts,
-            targets=channel_message_count_targets,
-            due=channel_message_count_due,
-            sink=EventFactsSink(),
-            op=f"slurper.probe.{CHANNEL_MESSAGE_COUNT_PROBED}",
-            manual_triggerable=False,
-        ),
-    )
+    return ()
 
 
 __all__ = ["register_fact_probes"]

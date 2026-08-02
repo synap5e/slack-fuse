@@ -12,8 +12,7 @@ import pytest
 import trio
 
 from slack_fuse_server._json import JsonObject, JsonValue
-from slack_fuse_server.probes.channel_message_count import JOB_CHANNEL_MESSAGE_COUNT
-from slack_fuse_server.probes.registry import EventFactsSink, ProbeDeps, ProbeRunFn, SlurperHealthSink
+from slack_fuse_server.probes.registry import ProbeDeps, ProbeRunFn, SlurperHealthSink
 from slack_fuse_server.slurper import probes
 from slack_fuse_server.slurper.api import SlackClient
 from slack_fuse_server.slurper.limiters import SlurperLimiters
@@ -63,9 +62,11 @@ class _ProbeConfig:
 def test_unified_registry_uses_purpose_specific_sinks() -> None:
     by_job = {probe.job_id: probe for probe in PROBE_REGISTRY}
 
+    # Raw slurper-health probes must ship. Fact probes ship as an empty tuple
+    # after 2026-08-03 (channel_message_count_probed deletion); the EventFactsSink
+    # end of the framework is exercised by test_new_probe_is_registry_entry_only
+    # in tests/server/test_probes_sweep.py.
     assert isinstance(by_job[JOB_CHANNEL_NEWEST_MESSAGE].sink, SlurperHealthSink)
-    assert isinstance(by_job[JOB_CHANNEL_MESSAGE_COUNT].sink, EventFactsSink)
-    assert by_job[JOB_CHANNEL_MESSAGE_COUNT].manual_triggerable is False
 
 
 def _fake_client(http: httpx.Client) -> SlackClient:

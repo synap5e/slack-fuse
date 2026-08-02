@@ -32,7 +32,6 @@ from slack_fuse_server.http.server import (
     serve_http_connection,
     serve_http_on_listeners,
 )
-from slack_fuse_server.probes.channel_message_count import JOB_CHANNEL_MESSAGE_COUNT
 from slack_fuse_server.slurper.probes import JOB_CHANNEL_INVENTORY, JOB_CHANNEL_NEWEST_MESSAGE
 from slack_fuse_server.slurper.supervisor import TaskSupervisor
 
@@ -252,19 +251,6 @@ def test_route_request_probe_sweep_unknown_job_is_400() -> None:
     trigger = _RecordingProbeTrigger()
     response = route_request(
         HttpRequest(method="POST", target="/probe-sweep/not_a_job"),
-        metrics_source=StaticMetricsSource(_sample_metrics()),
-        probe_deps=ProbeDeps(shared_secret=None, trigger=trigger),
-    )
-
-    assert response.status_code == 400
-    assert json.loads(response.body) == {"status": "unknown_job"}
-    assert trigger.calls is None
-
-
-def test_route_request_probe_sweep_fact_job_is_not_manual() -> None:
-    trigger = _RecordingProbeTrigger()
-    response = route_request(
-        HttpRequest(method="POST", target=f"/probe-sweep/{JOB_CHANNEL_MESSAGE_COUNT}"),
         metrics_source=StaticMetricsSource(_sample_metrics()),
         probe_deps=ProbeDeps(shared_secret=None, trigger=trigger),
     )

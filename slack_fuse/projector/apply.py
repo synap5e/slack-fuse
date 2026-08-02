@@ -550,9 +550,11 @@ def _dispatch_channel_list_event(
     if kind == "channel_member_changed":
         return _apply_channel_member_changed(cur, payload)
     if kind == "channel_message_count_probed":
-        # Immutable server-side inventory fact. A later client projector can
-        # consume the latest per-channel total; v1 acknowledges it explicitly
-        # so replay/catchup does not emit an unknown-kind warning.
+        # Historical event kind — probe was deleted 2026-08-03 after the
+        # WTF-audit flagged it as duplicating `channel_totals` with no
+        # consumer. Old events persist in the log; branch stays as a
+        # no-op so replay/catchup does not warn on them. No new events
+        # of this kind are emitted.
         return ApplyResult()
     if kind in ("channel_member_joined", "channel_member_left"):
         # Server-side facts about OTHER users' membership changes. The server's

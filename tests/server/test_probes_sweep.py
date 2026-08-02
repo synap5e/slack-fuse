@@ -8,11 +8,9 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
-import httpx
 import pytest
 import trio
 
-import slack_fuse_server.probes.channel_message_count as channel_message_count_module
 from slack_fuse_server.probes import register_fact_probes
 from slack_fuse_server.probes.registry import (
     EventFactsSink,
@@ -23,7 +21,6 @@ from slack_fuse_server.probes.registry import (
     SlackTier,
     probe_timestamp,
 )
-from slack_fuse_server.search_messages import SearchMessageTotal
 from slack_fuse_server.slurper.api import SlackClient
 from slack_fuse_server.slurper.offsets import EventRecord, write_event
 from slack_fuse_server.slurper.probes import run_probe_registry_once
@@ -280,32 +277,31 @@ def _seed_channel(conn: psycopg.Connection[TupleRow], channel_id: str, name: str
 
 
 @pytest.mark.trio
-async def test_second_probe_is_registry_entry_only_no_framework_change(
+async def test_new_probe_is_registry_entry_only_no_framework_change(
     server_conn: psycopg.Connection[TupleRow],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A second registry entry fires beside the default with no sweep changes."""
+    """A stub probe fires cleanly through the sweep with only a registry entry.
+
+    Before the ``channel_message_count_probed`` deletion (2026-08-03) this
+    test proved a second probe fires beside the default. `register_fact_probes`
+    now returns () so the framework has 0 built-in fact probes; the
+    extensibility invariant is the same — the framework accepts any
+    ``ProbeKind`` in its registry tuple.
+    """
     _seed_channel(server_conn, "C1", "general")
     calls: list[str] = []
-    second = _stub_probe("second_kind_probed", calls)
+    stub = _stub_probe("stub_probe_probed", calls)
 
-    def fake_search(_http: httpx.Client, name: str) -> SearchMessageTotal:
-        assert name == "general"
-        return SearchMessageTotal(total=42, approximate=False)
-
-    monkeypatch.setattr(channel_message_count_module, "search_channel_message_total", fake_search)
     client = SlackClient("xoxp-test")
     deps = _deps(server_conn, client, _Clock(datetime(2026, 8, 2, tzinfo=UTC)))
-    registry = (*register_fact_probes(), second)
+    registry = (*register_fact_probes(), stub)
     try:
         await run_probe_registry_once(RecordingSupervisor(), deps, registry)
     finally:
         client.close()
 
     with server_conn.cursor() as cur:
-        cur.execute(
-            "SELECT kind FROM events WHERE kind IN ('channel_message_count_probed', 'second_kind_probed') ORDER BY kind"
-        )
+        cur.execute("SELECT kind FROM events WHERE kind = 'stub_probe_probed'")
         kinds = [str(row[0]) for row in cur.fetchall()]
-    assert kinds == ["channel_message_count_probed", "second_kind_probed"]
-    assert calls == [second.kind]
+    assert kinds == ["stub_probe_probed"]
+    assert calls == [stub.kind]
