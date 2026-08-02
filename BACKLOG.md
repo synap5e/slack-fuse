@@ -227,6 +227,23 @@ _None currently._
 
 ## 2026-08-02
 
+- **Coalesced disk projection Stage D3 (invalidation ordering + adversarial tests)** —
+  `abd3fbb` + `a1a415d`. Enforces race-safe ordering across D1/D2 with:
+  new `check_and_mark_clean_if_no_drift` atomic primitive in
+  `DiskProjection`, shared commit/clean barrier in `apply.py`,
+  offset-drift snapshots in the applier, commit-gap fixes in
+  `snapshot_fetch.py` and `rerender.py`, multi-writer guard in the
+  coalescer. 11 new deterministic race tests via
+  `test_projection_race_safety.py` — covers event-during-write with
+  offset drift, commit-to-dirty reader gap, old-fd/new-inode atomic
+  replace, double-ENOENT to JIT, 100 dirty flaps + convergence, 10
+  readers during flush, dirty→clean byte-equality, pyfuse3
+  invalidate LAST, feature-disabled no disk access, concurrent
+  flush single-writer guard. D1/D2 were already correct for atomic
+  bytes / bounded ENOENT / feature gate / invalidate shape; D3
+  locks those in with adversarial coverage. 378 projector+fuse_v2
+  tests pass; 1200 full-suite pass (2 authorized backfill timing
+  cases deselected); basedpyright 0/0/0; ruff clean.
 - **Coalesced disk projection Stage D2 (read-side tier logic)** —
   `8186d71` + `111968c`. `fuse_ops_v2.py` clean-tier reads/getattr/
   lookup/readdir now serve from `DiskProjection` when the flag is on
