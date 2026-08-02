@@ -9,7 +9,7 @@ needing the API at all.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from typing import cast
 
 import httpx
@@ -19,7 +19,7 @@ import trio
 from psycopg.conninfo import make_conninfo
 from psycopg.rows import TupleRow
 
-from slack_fuse.models import Message
+from slack_fuse.models import ConversationsRepliesResponse, Message
 from slack_fuse_render import ChannelId
 from slack_fuse_server._json import JsonObject
 from slack_fuse_server.backfill import api as backfill_api
@@ -30,6 +30,8 @@ from slack_fuse_server.backfill.api import (
     backfill_channel,
     write_backfill_batch_with_retry,
 )
+from slack_fuse_server.backfill.resume import ThreadResume
+from slack_fuse_server.backfill.skip_predicate import ThreadParent, find_caught_up_threads
 from slack_fuse_server.backfill.types import (
     BackfillAbortReason,
     BackfillRunTrigger,
@@ -49,6 +51,75 @@ def _fake_client(http: httpx.Client) -> SlackClient:
     client = SlackClient("xoxp-test")
     client._http = http
     return client
+
+
+def _validated_message(raw: JsonObject) -> Validated[Message]:
+    return Validated(raw=raw, model=Message.model_validate(raw))
+
+
+class _RecordingThreadClient:
+    """Minimal Slack client surface for expansion gating tests."""
+
+    def __init__(self) -> None:
+        self.reply_calls: list[tuple[str, str, str]] = []
+
+    @staticmethod
+    def _messages(thread_ts: str) -> tuple[JsonObject, JsonObject]:
+        parent: JsonObject = {
+            "ts": thread_ts,
+            "thread_ts": thread_ts,
+            "user": "U1",
+            "text": "parent",
+            "reply_count": 1,
+        }
+        reply_ts = f"{int(thread_ts.split('.')[0]) + 100}.000100"
+        reply: JsonObject = {
+            "ts": reply_ts,
+            "thread_ts": thread_ts,
+            "user": "U2",
+            "text": "reply",
+        }
+        return parent, reply
+
+    def get_replies(self, channel_id: str, thread_ts: str) -> list[Validated[Message]]:
+        self.reply_calls.append((channel_id, thread_ts, ""))
+        return [_validated_message(raw) for raw in self._messages(thread_ts)]
+
+    def iter_replies_pages(
+        self,
+        channel_id: str,
+        thread_ts: str,
+        start_cursor: str = "",
+    ) -> Iterator[Validated[ConversationsRepliesResponse]]:
+        self.reply_calls.append((channel_id, thread_ts, start_cursor))
+        raw: JsonObject = {
+            "ok": True,
+            "messages": list(self._messages(thread_ts)),
+            "has_more": False,
+            "response_metadata": {"next_cursor": ""},
+        }
+        yield Validated(raw=raw, model=ConversationsRepliesResponse.model_validate(raw))
+
+
+def _seed_active_reply(
+    conn: psycopg.Connection[TupleRow],
+    channel_id: str,
+    thread_ts: str,
+    reply_ts: str,
+) -> None:
+    assert (
+        write_event(
+            conn,
+            EventRecord(
+                stream=f"channel:{channel_id}",
+                kind="message",
+                ts=reply_ts,
+                payload={"ts": reply_ts, "thread_ts": thread_ts, "user": "U2", "text": reply_ts},
+                dedup=True,
+            ),
+        )
+        is not None
+    )
 
 
 # === Source: SlackApiBackfiller over the fake transport ===
@@ -90,6 +161,153 @@ def test_messages_pages_for_channel_yields_one_batch_per_slack_response(fake_sla
     assert parent_record.source is not None
     assert parent_record.source["producer"] == "backfill-corrective-parent"
     assert batches[1].origin.thread_ts == "1700000100.000200"
+
+
+def test_expand_threads_skips_exact_local_match_and_emits_span(
+    server_conn: psycopg.Connection[TupleRow],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    channel_id = "CSKIPAPI"
+    parent_ts = "1700000000.000100"
+    replies = ["1700000100.000100", "1700000200.000100", "1700000300.000100"]
+    for reply_ts in replies:
+        _seed_active_reply(server_conn, channel_id, parent_ts, reply_ts)
+    client = _RecordingThreadClient()
+
+    async def caught_up(candidate_channel: str, parents: Sequence[ThreadParent]) -> set[str]:
+        await trio.lowlevel.checkpoint()
+        return find_caught_up_threads(server_conn, candidate_channel, parents)
+
+    backfiller = SlackApiBackfiller(
+        cast(SlackClient, client),
+        trio.CapacityLimiter(1),
+        _NO_SLEEP,
+        caught_up_threads=caught_up,
+    )
+    parent = ThreadParent(parent_ts, reply_count=3, latest_reply=replies[-1])
+    caplog.set_level("INFO", logger="slack_fuse_server.slurper.spans")
+
+    async def collect() -> list[Validated[Message]]:
+        return [reply async for reply in backfiller._expand_threads(channel_id, None, [parent])]
+
+    assert trio.run(collect) == []
+    assert client.reply_calls == []
+    assert "op=slurper.backfill.thread_skip" in caplog.text
+    assert "result=skipped" in caplog.text
+    assert f"channel_id={channel_id}" in caplog.text
+    assert f"thread_ts={parent_ts}" in caplog.text
+    assert "local_count=3" in caplog.text
+    assert "slack_reply_count=3" in caplog.text
+
+
+@pytest.mark.parametrize("mismatch", ["count", "max", "missing"])
+def test_expand_threads_fetches_when_local_summary_does_not_match(
+    server_conn: psycopg.Connection[TupleRow],
+    caplog: pytest.LogCaptureFixture,
+    mismatch: str,
+) -> None:
+    channel_id = "CFETCHAPI"
+    parent_ts = "1700000000.000100"
+    local_replies = ["1700000100.000100", "1700000200.000100", "1700000300.000100"]
+    if mismatch != "missing":
+        for reply_ts in local_replies[:2] if mismatch == "count" else local_replies:
+            _seed_active_reply(server_conn, channel_id, parent_ts, reply_ts)
+    latest_reply = "1700000400.000100" if mismatch == "max" else local_replies[-1]
+    client = _RecordingThreadClient()
+
+    async def caught_up(candidate_channel: str, parents: Sequence[ThreadParent]) -> set[str]:
+        await trio.lowlevel.checkpoint()
+        return find_caught_up_threads(server_conn, candidate_channel, parents)
+
+    backfiller = SlackApiBackfiller(
+        cast(SlackClient, client),
+        trio.CapacityLimiter(1),
+        _NO_SLEEP,
+        caught_up_threads=caught_up,
+    )
+    parent = ThreadParent(parent_ts, reply_count=3, latest_reply=latest_reply)
+    caplog.set_level("INFO", logger="slack_fuse_server.slurper.spans")
+
+    async def collect() -> list[Validated[Message]]:
+        return [reply async for reply in backfiller._expand_threads(channel_id, None, [parent])]
+
+    replies = trio.run(collect)
+    assert len(replies) == 1
+    assert client.reply_calls == [(channel_id, parent_ts, "")]
+    assert "op=slurper.backfill.thread_skip" not in caplog.text
+
+
+def test_reply_batches_preflights_once_and_fetches_only_misses(caplog: pytest.LogCaptureFixture) -> None:
+    channel_id = "CBATCHSKIP"
+    parents = tuple(
+        ThreadResume(
+            thread_ts=f"1700000000.{index:06d}",
+            reply_count=index,
+            latest_reply=f"1700000100.{index:06d}",
+        )
+        for index in range(1, 6)
+    )
+    skipped = {parents[index].thread_ts for index in (0, 2, 4)}
+    predicate_calls: list[tuple[str, tuple[str, ...]]] = []
+
+    async def caught_up(candidate_channel: str, candidates: Sequence[ThreadParent]) -> set[str]:
+        predicate_calls.append((candidate_channel, tuple(parent.thread_ts for parent in candidates)))
+        await trio.lowlevel.checkpoint()
+        return skipped
+
+    client = _RecordingThreadClient()
+    backfiller = SlackApiBackfiller(
+        cast(SlackClient, client),
+        trio.CapacityLimiter(1),
+        _NO_SLEEP,
+        caught_up_threads=caught_up,
+    )
+    caplog.set_level("INFO", logger="slack_fuse_server.slurper.spans")
+
+    async def collect() -> list[MessageBatch]:
+        return [batch async for batch in backfiller._reply_batches(channel_id, None, parents, 0)]
+
+    batches = trio.run(collect)
+    assert predicate_calls == [(channel_id, tuple(parent.thread_ts for parent in parents))]
+    assert [call[1] for call in client.reply_calls] == [parents[1].thread_ts, parents[3].thread_ts]
+    assert len(batches) == 2
+    skip_spans = [
+        record.getMessage() for record in caplog.records if "op=slurper.backfill.thread_skip" in record.getMessage()
+    ]
+    assert len(skip_spans) == 3
+
+
+def test_reply_batches_never_skips_a_partially_resumed_thread() -> None:
+    channel_id = "CRESUMEFETCH"
+    parent = ThreadResume(
+        thread_ts="1700000000.000100",
+        cursor="cursor-2",
+        reply_count=1,
+        latest_reply="1700000100.000100",
+    )
+    predicate_calls = 0
+
+    async def caught_up(_channel_id: str, _parents: Sequence[ThreadParent]) -> set[str]:
+        nonlocal predicate_calls
+        predicate_calls += 1
+        await trio.lowlevel.checkpoint()
+        return {parent.thread_ts}
+
+    client = _RecordingThreadClient()
+    backfiller = SlackApiBackfiller(
+        cast(SlackClient, client),
+        trio.CapacityLimiter(1),
+        _NO_SLEEP,
+        caught_up_threads=caught_up,
+    )
+
+    async def collect() -> list[MessageBatch]:
+        return [batch async for batch in backfiller._reply_batches(channel_id, None, [parent], 0)]
+
+    batches = trio.run(collect)
+    assert len(batches) == 1
+    assert predicate_calls == 0
+    assert client.reply_calls == [(channel_id, parent.thread_ts, "cursor-2")]
 
 
 def test_thread_reply_raw_is_lossless_not_model_dump(fake_slack_http: httpx.Client) -> None:

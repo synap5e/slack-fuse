@@ -55,6 +55,7 @@ from slack_fuse_server.backfill.run_events import (
     run_started_record,
     started_params,
 )
+from slack_fuse_server.backfill.skip_predicate import ThreadParent, find_caught_up_threads
 from slack_fuse_server.backfill.types import (
     BackfillAbortReason,
     Backfiller,
@@ -220,6 +221,7 @@ def _make_api_backfiller(
     # Restart-safe resume: a crashed run's committed pages (events.source)
     # tell the next full-history run which Slack cursor / threads remain.
     resume = None if writer is None else _make_resume_plan_reader(writer, limiters)
+    caught_up = None if writer is None else _make_caught_up_threads_reader(writer, limiters)
     return SlackApiBackfiller(
         client,
         limiters.slack_api,
@@ -227,6 +229,7 @@ def _make_api_backfiller(
         blocked_channel_ids=blocked,
         task_name=task_name,
         resume_plan=resume,
+        caught_up_threads=caught_up,
     )
 
 
@@ -243,6 +246,19 @@ def _make_resume_plan_reader(
     return _resume_plan
 
 
+def _make_caught_up_threads_reader(
+    writer: OffsetWriter,
+    limiters: SlurperLimiters,
+) -> Callable[[str, Sequence[ThreadParent]], Awaitable[set[str]]]:
+    async def _caught_up_threads(channel_id: str, parents: Sequence[ThreadParent]) -> set[str]:
+        return await writer.run_read(
+            lambda conn: find_caught_up_threads(conn, channel_id, parents),
+            limiter=limiters.admin_read,
+        )
+
+    return _caught_up_threads
+
+
 def _make_catchup_deps(
     client: SlackClient,
     writer: OffsetWriter,
@@ -254,7 +270,7 @@ def _make_catchup_deps(
     Uses its own backfiller with tight sleep bounds (the gap-fill is bounded by
     ``oldest``, so pages are few; the 30-180s backfill page throttle would make
     a multi-page busy channel needlessly slow). Slack HTTP uses the slack_api
-    gate; blocked-list and resume-point SQL use admin_read; event writes go
+    gate; blocked-list and local-state SQL use admin_read; event writes go
     through the writer pool.
     """
     sleeps = SleepBounds(
@@ -269,6 +285,7 @@ def _make_catchup_deps(
         sleeps,
         blocked_channel_ids=lambda: writer.run_read(blocked_channel_ids, limiter=limiters.admin_read),
         task_name="catchup",
+        caught_up_threads=_make_caught_up_threads_reader(writer, limiters),
     )
     catchup_config = CatchupConfig(
         gap_threshold_s=config.catchup_gap_threshold_s,

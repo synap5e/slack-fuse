@@ -41,6 +41,7 @@ from slack_fuse_server.backfill.run_events import (
     run_started_record,
     started_params,
 )
+from slack_fuse_server.backfill.skip_predicate import ThreadParent
 from slack_fuse_server.backfill.types import (
     BackfillAbortReason,
     Backfiller,
@@ -196,17 +197,39 @@ def _parent_record_from_page(
     return None
 
 
-def _merge_thread_worklist(plan: ResumePlan | None, discovered: Sequence[str]) -> tuple[ThreadResume, ...]:
+def _merge_thread_worklist(
+    plan: ResumePlan | None,
+    discovered: Sequence[ThreadParent],
+) -> tuple[ThreadResume, ...]:
     """DB-known worklist (with per-thread cursors) plus freshly discovered parents.
 
     Threads that already reached a `final_page=true` replies row are excluded
     even when a resumed history walk rediscovers their parents.
     """
+
+    def _fresh(parent: ThreadParent) -> ThreadResume:
+        return ThreadResume(
+            thread_ts=parent.thread_ts,
+            reply_count=parent.reply_count,
+            latest_reply=parent.latest_reply,
+        )
+
     if plan is None:
-        return tuple(ThreadResume(thread_ts=ts) for ts in discovered)
+        return tuple(_fresh(parent) for parent in discovered)
+    discovered_by_ts = {parent.thread_ts: parent for parent in discovered}
+    resumed = tuple(
+        _fresh(discovered_by_ts[thread.thread_ts])
+        if thread.cursor == "" and thread.thread_ts in discovered_by_ts
+        else thread
+        for thread in plan.threads
+    )
     known = {t.thread_ts for t in plan.threads}
-    extra = tuple(ThreadResume(thread_ts=ts) for ts in discovered if ts not in known and ts not in plan.done_thread_ts)
-    return plan.threads + extra
+    extra = tuple(
+        _fresh(parent)
+        for parent in discovered
+        if parent.thread_ts not in known and parent.thread_ts not in plan.done_thread_ts
+    )
+    return resumed + extra
 
 
 class SlackApiBackfiller:
@@ -224,6 +247,7 @@ class SlackApiBackfiller:
         blocked_channel_ids: Callable[[], Awaitable[set[str]]] | None = None,
         task_name: str = "backfill",
         resume_plan: Callable[[str], Awaitable[ResumePlan | None]] | None = None,
+        caught_up_threads: Callable[[str, Sequence[ThreadParent]], Awaitable[set[str]]] | None = None,
     ) -> None:
         self._client = client
         self._limiter = limiter
@@ -231,6 +255,7 @@ class SlackApiBackfiller:
         self._blocked_channel_ids = blocked_channel_ids
         self._task_name = task_name
         self._resume_plan = resume_plan
+        self._caught_up_threads = caught_up_threads
 
     @property
     def name(self) -> str:
@@ -270,7 +295,7 @@ class SlackApiBackfiller:
         driver stops early and keeps the recent head); thread replies follow
         once full-history pagination completes.
         """
-        thread_parents: list[str] = []
+        thread_parents: list[ThreadParent] = []
         async for msg in self._paginate_history(channel_id.value, since_ts, thread_parents):
             yield msg
         async for reply in self._expand_threads(channel_id.value, since_ts, thread_parents):
@@ -299,7 +324,7 @@ class SlackApiBackfiller:
                     len(plan.threads),
                     len(plan.done_thread_ts),
                 )
-        thread_parents: list[str] = []
+        thread_parents: list[ThreadParent] = []
         page_index = 0
         if plan is None or not plan.history_done:
             start_cursor = "" if plan is None else plan.history_cursor
@@ -317,7 +342,7 @@ class SlackApiBackfiller:
         self,
         channel_id: str,
         since_ts: float | None,
-        thread_parents: list[str],
+        thread_parents: list[ThreadParent],
     ) -> AsyncIterator[Validated[Message]]:
         cursor = ""
         page = 0
@@ -331,7 +356,7 @@ class SlackApiBackfiller:
             for wrapped_msg in _validated_messages_from_page(wrapped.raw, resp.messages, reverse=True):
                 msg = wrapped_msg.model
                 if _is_thread_parent(msg):
-                    thread_parents.append(msg.ts)
+                    thread_parents.append(ThreadParent(msg.ts, msg.reply_count, msg.latest_reply))
                 if not _passes_since(msg.ts, since_ts):
                     continue
                 yield wrapped_msg
@@ -346,11 +371,18 @@ class SlackApiBackfiller:
         self,
         channel_id: str,
         since_ts: float | None,
-        thread_parents: list[str],
+        thread_parents: Sequence[ThreadParent],
     ) -> AsyncIterator[Validated[Message]]:
-        for i, thread_ts in enumerate(thread_parents):
-            if i > 0:
+        skipped = await self._find_caught_up_threads(channel_id, thread_parents)
+        fetched = 0
+        for parent in thread_parents:
+            if parent.thread_ts in skipped:
+                await self._emit_thread_skip(channel_id, parent)
+                continue
+            if fetched > 0:
                 await trio.sleep(random.uniform(self._sleeps.thread_min_s, self._sleeps.thread_max_s))
+            fetched += 1
+            thread_ts = parent.thread_ts
             thread_msgs = await self._replies(channel_id, thread_ts)
             if thread_msgs is None:
                 continue
@@ -367,7 +399,7 @@ class SlackApiBackfiller:
         self,
         channel_id: str,
         since_ts: float | None,
-        thread_parents: list[str],
+        thread_parents: list[ThreadParent],
         first_page_index: int,
         *,
         start_cursor: str = "",
@@ -388,7 +420,7 @@ class SlackApiBackfiller:
             for wrapped_msg in _validated_messages_from_page(wrapped.raw, resp.messages, reverse=True):
                 msg = wrapped_msg.model
                 if _is_thread_parent(msg):
-                    thread_parents.append(msg.ts)
+                    thread_parents.append(ThreadParent(msg.ts, msg.reply_count, msg.latest_reply))
                 if _passes_since(msg.ts, since_ts):
                     messages.append(wrapped_msg)
             next_cursor = resp.response_metadata.next_cursor
@@ -438,9 +470,22 @@ class SlackApiBackfiller:
         first_page_index: int,
     ) -> AsyncIterator[MessageBatch]:
         page_index = first_page_index
-        for i, thread in enumerate(threads):
-            if i > 0:
+        candidates = tuple(
+            ThreadParent(thread.thread_ts, thread.reply_count, thread.latest_reply)
+            for thread in threads
+            if thread.cursor == "" and thread.reply_count is not None
+        )
+        candidates_by_ts = {parent.thread_ts: parent for parent in candidates}
+        skipped = await self._find_caught_up_threads(channel_id, candidates)
+        fetched = 0
+        for thread in threads:
+            skipped_parent = candidates_by_ts.get(thread.thread_ts) if thread.thread_ts in skipped else None
+            if skipped_parent is not None:
+                await self._emit_thread_skip(channel_id, skipped_parent)
+                continue
+            if fetched > 0:
                 await trio.sleep(random.uniform(self._sleeps.thread_min_s, self._sleeps.thread_max_s))
+            fetched += 1
             thread_ts = thread.thread_ts
             request_cursor = thread.cursor
             async for wrapped in self._replies_pages(channel_id, thread_ts, start_cursor=thread.cursor):
@@ -490,6 +535,36 @@ class SlackApiBackfiller:
                 )
                 page_index += 1
                 request_cursor = next_cursor
+
+    async def _find_caught_up_threads(
+        self,
+        channel_id: str,
+        parents: Sequence[ThreadParent],
+    ) -> set[str]:
+        if self._caught_up_threads is None or not parents:
+            return set()
+        try:
+            return await self._caught_up_threads(channel_id, parents)
+        except PG_TIMEOUT_EXCEPTIONS:
+            log.warning(
+                "backfill: PostgreSQL timeout checking local thread state for %s; fetching all replies",
+                channel_id,
+                exc_info=True,
+            )
+            return set()
+
+    async def _emit_thread_skip(self, channel_id: str, parent: ThreadParent) -> None:
+        async with span(
+            op="slurper.backfill.thread_skip",
+            task=self._task_name,
+            extra={
+                "channel_id": channel_id,
+                "thread_ts": parent.thread_ts,
+                "local_count": parent.reply_count,
+                "slack_reply_count": parent.reply_count,
+            },
+        ) as recorder:
+            recorder.mark_skipped()
 
     async def _history_page(
         self,

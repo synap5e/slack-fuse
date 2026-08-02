@@ -42,10 +42,17 @@ _VALID_SLACK_TS = re.compile(r"^[1-9][0-9]{9}\.[0-9]{6}$")
 
 @dataclass(frozen=True, slots=True)
 class ThreadResume:
-    """One thread the replies phase still needs. `cursor=""` = fetch from the start."""
+    """One thread the replies phase still needs. `cursor=""` = fetch from the start.
+
+    Freshly discovered parents also carry Slack's count/latest summary. Resume
+    plans leave those fields null unless the current history walk rediscovers
+    the parent, which deliberately forces a fetch when metadata is uncertain.
+    """
 
     thread_ts: str
     cursor: str = ""
+    reply_count: int | None = None
+    latest_reply: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
