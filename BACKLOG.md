@@ -251,28 +251,6 @@ probe/proof. Other probes drop in cheaply afterward.
 
 ---
 
-## Clean up repo — sprint/feat worktrees
-
-**Effort**: 1–2 hours. **Autonomous**: Yes — read-only inspection per
-worktree (is the branch merged? are there uncommitted changes?), then
-mechanical `git worktree remove` + optional `git branch -D` for
-fully-merged branches.
-
-**Discovered**: 2026-06-28. Partially done 2026-08-02 (poc/*).
-
-Still to sweep:
-- ~30 `synap5e/feat/sprint*` and `synap5e/feat/*` worktrees under
-  `.wt/synap5e/feat/` (sprint0…sprint3, 2a-2f, 3a-3e,
-  post-sprint3-fixes, slurper-channels-populate). Most shipped;
-  needs one-by-one check.
-- `.wt/handoff/*` — a dozen completed handoff worktrees
-  (`self-join-detection`, `finding-16-refresh-discovery`,
-  `v2-adversarial-review`, wave1/wave2 review, spec-review branches,
-  etc.).
-- `.wt/server-split-rebuild` — likely shipped as the split server.
-
----
-
 ## FUSE mount wedge — host-level prevention (game-mode ordering)
 
 **Effort**: 15–30 min. **Autonomous**: No — the change lives in
@@ -409,6 +387,12 @@ _None currently._
 
 ## 2026-08-02
 
+- **Clean up repo — sprint/feat worktrees** — inline sweep in Ratified
+  orchestration Phase 1. Removed 33 stale worktrees (~30
+  `.wt/synap5e/feat/*` + 10 `.wt/handoff/*` + `.wt/server-split-rebuild`);
+  only the two in-flight handoff worktrees remain. Deleted 7 branches
+  with `ahead=0` vs main. Kept 25+ branch refs (squash-merged; cheap to
+  preserve as history addressability). `.wt/` down to 6.5M.
 - **Migrate `slack-fuse resolve` to v2 projections store** — `057883c` +
   docs `23d080d`. Fully local PG, no Slack API dependency. Composes
   existing v2 helpers (`assign_conv_root_slugs`, `fetch_day_thread_parents`,
