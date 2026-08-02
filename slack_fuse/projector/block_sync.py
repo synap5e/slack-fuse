@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 
 import httpx
 import trio
@@ -21,14 +22,22 @@ log = logging.getLogger(__name__)
 DEFAULT_BLOCK_SYNC_INTERVAL_S = 30.0
 
 
-def apply_blocked_channel_sync(conn: TupleConnection, blocked_ids: set[str]) -> frozenset[str]:
+@dataclass(frozen=True, slots=True)
+class VisibilityChanges:
+    """Channel visibility transitions caused by one server block snapshot."""
+
+    newly_subscribed: frozenset[str]
+    newly_blocked: frozenset[str]
+
+
+def apply_blocked_channel_sync(conn: TupleConnection, blocked_ids: set[str]) -> VisibilityChanges:
     """Apply one server block-list snapshot to the client ``channels`` table.
 
-    Returns the ``frozenset`` of channel_ids that transitioned from blocked to
-    non-blocked in this snapshot — the WSClient consumes this so it can
-    dynamically add appliers + send SubscribeFrame for the newly-visible
-    streams (fix for "unblock via _control/blocked_channels needs mount
-    restart to take effect", 2026-07-16).
+    Returns both directions of visibility change. The WSClient consumes
+    ``newly_subscribed`` so it can dynamically add appliers + send
+    SubscribeFrame for newly-visible streams. The mount consumes
+    ``newly_blocked`` to invalidate materialized FUSE inodes and projected
+    files that could otherwise remain visible from cache.
 
     FINDING-14 (2026-07-17): preserve local tier state across a server
     block/unblock cycle. When a server block first applies (row not
@@ -42,11 +51,25 @@ def apply_blocked_channel_sync(conn: TupleConnection, blocked_ids: set[str]) -> 
         unblocks would come out unblocked (local block silently removed).
     """
     newly_subscribed: set[str] = set()
+    newly_blocked: set[str] = set()
     with conn.transaction(), conn.cursor() as cur:
         cur.execute("SELECT channel_id FROM server_block_sync")
         previously_synced = {str(row[0]) for row in cur.fetchall()}
 
         for channel_id in sorted(blocked_ids):
+            # A previously-synced channel can become visible again between
+            # cycles (for example, a local channel-list mutation or operator
+            # tier change). Inspect every row immediately before enforcing the
+            # server policy so both first-time and re-applied transitions are
+            # reported to cache invalidators.
+            cur.execute(
+                "SELECT tier FROM channels WHERE channel_id = %s",
+                (channel_id,),
+            )
+            tier_row = cur.fetchone()
+            if tier_row is not None and str(tier_row[0]) != "blocked":
+                newly_blocked.add(channel_id)
+
             if channel_id in previously_synced:
                 # Already server-blocked — refresh the synced_at heartbeat.
                 cur.execute(
@@ -115,7 +138,10 @@ def apply_blocked_channel_sync(conn: TupleConnection, blocked_ids: set[str]) -> 
                 if tier != "blocked":
                     newly_subscribed.add(channel_id)
             cur.execute("DELETE FROM server_block_sync WHERE channel_id = %s", (channel_id,))
-    return frozenset(newly_subscribed)
+    return VisibilityChanges(
+        newly_subscribed=frozenset(newly_subscribed),
+        newly_blocked=frozenset(newly_blocked),
+    )
 
 
 def sync_blocked_channels_once(
@@ -124,13 +150,12 @@ def sync_blocked_channels_once(
     conn: TupleConnection,
     *,
     shared_secret: str | None = None,
-) -> frozenset[str] | None:
+) -> VisibilityChanges | None:
     """Fetch the server block list and reconcile local tiers.
 
-    Returns the ``frozenset`` of channel_ids that transitioned from blocked
-    to non-blocked in this cycle when a snapshot was applied; ``None`` when
-    the server was unreachable or returned a non-200 response (so callers
-    can distinguish "no changes this cycle" (empty set) from "sync failed").
+    Returns visibility transitions from an applied snapshot; ``None`` when the
+    server was unreachable or returned a non-200 response (so callers can
+    distinguish "no changes this cycle" from "sync failed").
     """
     status, payload = get_blocked_channels(http_client, base_http_url, shared_secret=shared_secret)
     if status != 200:
@@ -148,6 +173,7 @@ async def sync_blocked_channels_periodically(  # noqa: PLR0913 - process wiring 
     interval_s: float = DEFAULT_BLOCK_SYNC_INTERVAL_S,
     limiter: trio.CapacityLimiter | None = None,
     on_newly_subscribed: Callable[[frozenset[str]], Awaitable[None]] | None = None,
+    on_newly_blocked: Callable[[frozenset[str]], Awaitable[None]] | None = None,
 ) -> None:
     """Long-running trio task for split-mode mount processes.
 
@@ -155,7 +181,9 @@ async def sync_blocked_channels_periodically(  # noqa: PLR0913 - process wiring 
     set of channel_ids that transitioned blocked → subscribed in each cycle.
     Wired to ``WSClient.subscribe_channels`` so unblocking via
     ``_control/blocked_channels`` triggers WS subscribes without a mount
-    restart.
+    restart. ``on_newly_blocked`` separately receives subscribed → blocked
+    transitions so callers can invalidate visibility caches without changing
+    the WSClient callback contract.
     """
     http_client = make_http_client()
     conn: TupleConnection | None = None
@@ -168,7 +196,7 @@ async def sync_blocked_channels_periodically(  # noqa: PLR0913 - process wiring 
                 if conn is None:
                     conn = open_conn()
                 cycle_conn = conn
-                newly_subscribed = await trio.to_thread.run_sync(
+                visibility_changes = await trio.to_thread.run_sync(
                     lambda cycle_conn=cycle_conn: sync_blocked_channels_once(
                         http_client,
                         base_http_url,
@@ -179,12 +207,21 @@ async def sync_blocked_channels_periodically(  # noqa: PLR0913 - process wiring 
                 )
             except Exception:
                 log.exception("block-sync: cycle failed")
-                newly_subscribed = None
-            if newly_subscribed and on_newly_subscribed is not None:
+                visibility_changes = None
+            if (
+                visibility_changes is not None
+                and visibility_changes.newly_subscribed
+                and on_newly_subscribed is not None
+            ):
                 try:
-                    await on_newly_subscribed(newly_subscribed)
+                    await on_newly_subscribed(visibility_changes.newly_subscribed)
                 except Exception:
                     log.exception("block-sync: on_newly_subscribed callback failed")
+            if visibility_changes is not None and visibility_changes.newly_blocked and on_newly_blocked is not None:
+                try:
+                    await on_newly_blocked(visibility_changes.newly_blocked)
+                except Exception:
+                    log.exception("block-sync: on_newly_blocked callback failed")
             await trio.sleep(interval_s)
     finally:
         http_client.close()
@@ -194,6 +231,7 @@ async def sync_blocked_channels_periodically(  # noqa: PLR0913 - process wiring 
 
 __all__ = [
     "DEFAULT_BLOCK_SYNC_INTERVAL_S",
+    "VisibilityChanges",
     "apply_blocked_channel_sync",
     "sync_blocked_channels_once",
     "sync_blocked_channels_periodically",

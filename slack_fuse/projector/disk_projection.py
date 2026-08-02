@@ -105,6 +105,28 @@ class DiskProjection:
         with self._state_lock:
             self._dirty.mark(normalized)
 
+    def mark_channel_paths_dirty(self, channel_ids: frozenset[str]) -> list[str]:
+        """Queue existing projected files for visibility-changed channels.
+
+        A newly blocked channel is deliberately absent from post-mutation slug
+        assignment, so its old path cannot be reconstructed from the database.
+        Projected markdown carries ``channel_id`` in its frontmatter; use that
+        stable identity to find the old paths and let the normal coalescer
+        delete them after the tier gate starts returning no content.
+        """
+        if not channel_ids:
+            return []
+
+        paths = [
+            f"/{backing.relative_to(self._root).as_posix()}"
+            for backing in sorted(self._root.rglob("*.md"))
+            if _projected_channel_id(backing) in channel_ids
+        ]
+        with self._state_lock:
+            for path in paths:
+                self._dirty.mark(path)
+        return paths
+
     @contextmanager
     def invalidation_barrier(self) -> Iterator[None]:
         """Linearize a DB commit + dirty marks against clean transitions.
@@ -351,6 +373,26 @@ def _normalize_path(path: str) -> str:
         msg = f"unsafe projection path: {path!r}"
         raise ValueError(msg)
     return candidate.as_posix()
+
+
+def _projected_channel_id(path: Path) -> str | None:
+    """Read ``channel_id`` from a projected file's small YAML frontmatter."""
+    try:
+        with path.open("rb") as handle:
+            if handle.readline().rstrip(b"\r\n") != b"---":
+                return None
+            for _ in range(32):
+                line = handle.readline()
+                if not line or line.rstrip(b"\r\n") == b"---":
+                    return None
+                if line.startswith(b"channel_id: "):
+                    return line.removeprefix(b"channel_id: ").strip().decode()
+    except (FileNotFoundError, UnicodeDecodeError):
+        # Atomic projection replacement/removal can race this discovery pass.
+        # A vanished path needs no cleanup; malformed disposable bytes will be
+        # repaired by another ordinary dirty mark rather than blocking sync.
+        return None
+    return None
 
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:

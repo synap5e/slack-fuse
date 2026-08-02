@@ -719,6 +719,24 @@ def cmd_mount(args: argparse.Namespace) -> None:  # noqa: C901  (process-wiring 
                 return
             await client.subscribe_channels(ids)
 
+        async def _on_newly_blocked(ids: frozenset[str]) -> None:
+            def _invalidate_visibility() -> None:
+                # Mark projection paths first so a kernel cache miss cannot
+                # select old disk bytes while inode invalidation is in flight.
+                # Post-mutation slug resolution excludes blocked channels, so
+                # DiskProjection discovers their old paths from persisted
+                # frontmatter instead of trying to resolve a stale subtree.
+                if disk_projection is not None:
+                    disk_projection.mark_channel_paths_dirty(ids)
+                # A broad materialized-inode sweep is intentional: the old
+                # slug/root is no longer reliably resolvable after a tier,
+                # membership, or DM-root visibility mutation.
+                sink.channel_list_changed()
+
+            # pyfuse3.invalidate_inode may block on kernel writeback. Keep it
+            # off the trio loop and share the existing store-call budget.
+            await trio.to_thread.run_sync(_invalidate_visibility, limiter=store_limiter)
+
         await sync_blocked_channels_periodically(
             _make_http_client,
             ghost_base_http_url,
@@ -727,6 +745,7 @@ def cmd_mount(args: argparse.Namespace) -> None:  # noqa: C901  (process-wiring 
             interval_s=config.block_sync_interval_s,
             limiter=store_limiter,
             on_newly_subscribed=_on_newly_subscribed,
+            on_newly_blocked=_on_newly_blocked,
         )
 
     async def _run() -> None:

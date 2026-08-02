@@ -86,21 +86,44 @@ def test_apply_returns_newly_subscribed_channel_ids(
     _seed_channel(client_conn, "CB")
     _seed_channel(client_conn, "CC")
 
-    # Initial sync: all three blocked. No transitions yet (they weren't
-    # previously synced), so the returned set is empty.
+    # Initial sync: all three visible rows become blocked.
     transitions_1 = apply_blocked_channel_sync(client_conn, {"CA", "CB", "CC"})
-    assert transitions_1 == frozenset()
+    assert transitions_1.newly_subscribed == frozenset()
+    assert transitions_1.newly_blocked == frozenset({"CA", "CB", "CC"})
 
     # Second sync: CA and CB unblocked. Those are the transitions.
     transitions_2 = apply_blocked_channel_sync(client_conn, {"CC"})
-    assert transitions_2 == frozenset({"CA", "CB"})
+    assert transitions_2.newly_subscribed == frozenset({"CA", "CB"})
+    assert transitions_2.newly_blocked == frozenset()
     assert _channel_row(client_conn, "CA")[0] == "hot"
     assert _channel_row(client_conn, "CB")[0] == "hot"
     assert _channel_row(client_conn, "CC")[0] == "blocked"
 
     # Third sync: nothing changes. Empty transition set.
     transitions_3 = apply_blocked_channel_sync(client_conn, {"CC"})
-    assert transitions_3 == frozenset()
+    assert transitions_3.newly_subscribed == frozenset()
+    assert transitions_3.newly_blocked == frozenset()
+
+
+def test_apply_reports_reblocked_previously_synced_channel(
+    client_conn: psycopg.Connection[TupleRow],
+) -> None:
+    """A channel made visible between sync cycles must invalidate again."""
+    _seed_channel(client_conn, "CREBLOCK")
+    first = apply_blocked_channel_sync(client_conn, {"CREBLOCK"})
+    assert first.newly_blocked == frozenset({"CREBLOCK"})
+
+    with client_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE channels SET tier = 'hot', tier_source = 'manual', subscribed = TRUE "
+            "WHERE channel_id = 'CREBLOCK'"
+        )
+
+    second = apply_blocked_channel_sync(client_conn, {"CREBLOCK"})
+
+    assert second.newly_blocked == frozenset({"CREBLOCK"})
+    assert second.newly_subscribed == frozenset()
+    assert _channel_row(client_conn, "CREBLOCK") == ("blocked", "manual", False)
 
 
 def test_apply_omits_channels_that_stay_blocked_by_local_manual(
@@ -112,7 +135,8 @@ def test_apply_omits_channels_that_stay_blocked_by_local_manual(
 
     transitions = apply_blocked_channel_sync(client_conn, set())
 
-    assert transitions == frozenset()
+    assert transitions.newly_subscribed == frozenset()
+    assert transitions.newly_blocked == frozenset()
     assert _channel_row(client_conn, "CLOCAL")[0] == "blocked"
 
 
@@ -132,7 +156,8 @@ def test_finding_14_operator_hot_pin_survives_server_block_unblock(
     # Server unblocks CPIN — must restore ('hot', 'manual'), not reset to auto.
     transitions = apply_blocked_channel_sync(client_conn, set())
 
-    assert transitions == frozenset({"CPIN"})
+    assert transitions.newly_subscribed == frozenset({"CPIN"})
+    assert transitions.newly_blocked == frozenset()
     assert _channel_row(client_conn, "CPIN") == ("hot", "manual", True), (
         "operator pin lost — pre-fix behavior; must be preserved."
     )
@@ -149,5 +174,6 @@ def test_finding_14_first_time_seen_channel_falls_back_to_auto(
     transitions = apply_blocked_channel_sync(client_conn, set())
 
     # Auto row restored (would_be tier for public+member) is 'hot'.
-    assert transitions == frozenset({"CFRESH"})
+    assert transitions.newly_subscribed == frozenset({"CFRESH"})
+    assert transitions.newly_blocked == frozenset()
     assert _channel_row(client_conn, "CFRESH") == ("hot", "auto", True)
