@@ -12,9 +12,12 @@ import pytest
 import trio
 
 from slack_fuse_server._json import JsonObject, JsonValue
+from slack_fuse_server.probes.channel_message_count import JOB_CHANNEL_MESSAGE_COUNT
+from slack_fuse_server.probes.registry import EventFactsSink, ProbeDeps, ProbeRunFn, SlurperHealthSink
 from slack_fuse_server.slurper import probes
 from slack_fuse_server.slurper.api import SlackClient
-from slack_fuse_server.slurper.offsets import EventRecord, write_event
+from slack_fuse_server.slurper.limiters import SlurperLimiters
+from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter, write_event
 from slack_fuse_server.slurper.probes import (
     CONVERSATIONS_HISTORY_SAMPLED,
     CONVERSATIONS_LIST_SAMPLED,
@@ -23,6 +26,7 @@ from slack_fuse_server.slurper.probes import (
     JOB_CHANNEL_NEWEST_MESSAGE,
     JOB_CHANNEL_OLDER_THAN_OLDEST,
     JOB_WORKSPACE_USER_COUNT,
+    PROBE_REGISTRY,
     PROBE_SWEEP_COMPLETED,
     USERS_LIST_SAMPLED,
     ProbeTarget,
@@ -54,6 +58,14 @@ class _ProbeConfig:
     probe_channel_inventory_cadence_s: float = 86400.0
     probe_workspace_user_count_cadence_s: float = 86400.0
     probe_channel_day_presence_cadence_s: float = 7 * 86400.0
+
+
+def test_unified_registry_uses_purpose_specific_sinks() -> None:
+    by_job = {probe.job_id: probe for probe in PROBE_REGISTRY}
+
+    assert isinstance(by_job[JOB_CHANNEL_NEWEST_MESSAGE].sink, SlurperHealthSink)
+    assert isinstance(by_job[JOB_CHANNEL_MESSAGE_COUNT].sink, EventFactsSink)
+    assert by_job[JOB_CHANNEL_MESSAGE_COUNT].manual_triggerable is False
 
 
 def _fake_client(http: httpx.Client) -> SlackClient:
@@ -105,6 +117,18 @@ async def _wait_for_health_event_count(conn: psycopg.Connection[TupleRow], kind:
     raise AssertionError(f"timed out waiting for {count} {kind} event(s)")
 
 
+async def _run_raw_probe(
+    run: ProbeRunFn,
+    writer: OffsetWriter,
+    client: SlackClient,
+    limiters: SlurperLimiters,
+    target: ProbeTarget,
+) -> None:
+    records = await run(ProbeDeps(client=client, writer=writer, limiters=limiters), target)
+    for record in records:
+        await writer.write_event(record)
+
+
 def test_older_than_oldest_writes_raw_history_sample(
     server_conn: psycopg.Connection[TupleRow],
     fake_slack_http: httpx.Client,
@@ -123,12 +147,12 @@ def test_older_than_oldest_writes_raw_history_sample(
     )
 
     async def body() -> None:
-        await _sample_older_than_oldest_history(
+        await _run_raw_probe(
+            _sample_older_than_oldest_history,
             make_test_writer(server_conn),
             _fake_client(fake_slack_http),
             make_test_limiters(),
             ProbeTarget("C0001", "channel_id"),
-            None,
         )
 
     trio.run(body)
@@ -148,12 +172,12 @@ def test_newest_writes_raw_history_sample_without_latest(
     fake_slack_http: httpx.Client,
 ) -> None:
     async def body() -> None:
-        await _sample_newest_history(
+        await _run_raw_probe(
+            _sample_newest_history,
             make_test_writer(server_conn),
             _fake_client(fake_slack_http),
             make_test_limiters(),
             ProbeTarget("C0001", "channel_id"),
-            None,
         )
 
     trio.run(body)
@@ -187,8 +211,20 @@ def test_day_presence_samples_most_recent_unsampled_day_first(
         writer = make_test_writer(server_conn)
         client = _fake_client(fake_slack_http)
         limiters = make_test_limiters()
-        await _sample_day_presence_history(writer, client, limiters, ProbeTarget("C0001", "channel_id"), None)
-        await _sample_day_presence_history(writer, client, limiters, ProbeTarget("C0001", "channel_id"), None)
+        await _run_raw_probe(
+            _sample_day_presence_history,
+            writer,
+            client,
+            limiters,
+            ProbeTarget("C0001", "channel_id"),
+        )
+        await _run_raw_probe(
+            _sample_day_presence_history,
+            writer,
+            client,
+            limiters,
+            ProbeTarget("C0001", "channel_id"),
+        )
 
     trio.run(body)
 
@@ -226,8 +262,8 @@ def test_day_presence_due_and_older_than_oldest_cadence_are_independent(
         writer = make_test_writer(server_conn)
         client = _fake_client(fake_slack_http)
         limiters = make_test_limiters()
-        await _sample_day_presence_history(writer, client, limiters, target, None)
-        await _sample_day_presence_history(writer, client, limiters, target, None)
+        await _run_raw_probe(_sample_day_presence_history, writer, client, limiters, target)
+        await _run_raw_probe(_sample_day_presence_history, writer, client, limiters, target)
 
     trio.run(body)
 
@@ -243,12 +279,12 @@ def test_inventory_writes_raw_conversations_list_sample(
     fake_slack_http: httpx.Client,
 ) -> None:
     async def body() -> None:
-        await _sample_channel_inventory(
+        await _run_raw_probe(
+            _sample_channel_inventory,
             make_test_writer(server_conn),
             _fake_client(fake_slack_http),
             make_test_limiters(),
             ProbeTarget("workspace"),
-            None,
         )
 
     trio.run(body)
@@ -270,12 +306,12 @@ def test_user_count_writes_raw_users_list_sample(
     fake_slack_http: httpx.Client,
 ) -> None:
     async def body() -> None:
-        await _sample_workspace_users(
+        await _run_raw_probe(
+            _sample_workspace_users,
             make_test_writer(server_conn),
             _fake_client(fake_slack_http),
             make_test_limiters(),
             ProbeTarget("workspace"),
-            None,
         )
 
     trio.run(body)

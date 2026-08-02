@@ -90,8 +90,6 @@ from slack_fuse_server.http.handlers import (
 )
 from slack_fuse_server.http.metrics import MetricsAggregator, SubscriberSnapshot
 from slack_fuse_server.http.slack_webhook import SlackWebhookDeps, serve_slack_webhook
-from slack_fuse_server.probes import make_probe_deps, register_default_probes
-from slack_fuse_server.probes.sweep import run_probe_sweep as run_event_probe_sweep
 from slack_fuse_server.slack_events.dispatcher import SlackEventDispatcher
 from slack_fuse_server.slack_events.inbox import (
     InboxWriter,
@@ -118,7 +116,7 @@ from slack_fuse_server.slurper.ingestion import (
     new_ulid,
     process_boot,
 )
-from slack_fuse_server.slurper.limiters import SlurperLimiters
+from slack_fuse_server.slurper.limiters import SlackTierPacer, SlurperLimiters
 from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter
 from slack_fuse_server.slurper.probes import ProbeTrigger, probe_sweep
 from slack_fuse_server.slurper.refresh import RefreshTrigger, refresh_channels_periodically
@@ -192,6 +190,7 @@ def _make_limiters(config: ServerConfig) -> SlurperLimiters:
         writer=writer_limiter,
         snapshot=snapshot_limiter,
         admin_read=admin_read_limiter,
+        slack_tier2=SlackTierPacer(config.channel_totals_per_channel_sleep_s),
     )
 
 
@@ -453,16 +452,7 @@ async def _serve(config: ServerConfig, boot: BootContext) -> None:
         log.info("tracemalloc: tracing enabled (1 frame)")
 
     source_plan = _event_source_plan(config)
-    slack_api_limiter = trio.CapacityLimiter(2)
-    writer_limiter = trio.CapacityLimiter(config.slurper_writer_pool_size)
-    snapshot_limiter = trio.CapacityLimiter(1)
-    admin_read_limiter = trio.CapacityLimiter(4)
-    limiters = SlurperLimiters(
-        slack_api=slack_api_limiter,
-        writer=writer_limiter,
-        snapshot=snapshot_limiter,
-        admin_read=admin_read_limiter,
-    )
+    limiters = _make_limiters(config)
     supervisor = TaskSupervisor()
     writer_conns = _connect_writer_pool(config)
     writer = OffsetWriter(
@@ -525,12 +515,11 @@ async def _serve(config: ServerConfig, boot: BootContext) -> None:
         trigger=refill_trigger,
     )
     probe_trigger = ProbeTrigger(max_buffer_size=1)
-    probe_deps = ProbeDeps(
-        shared_secret=config.shared_secret,
-        trigger=probe_trigger,
+    probe_deps = (
+        ProbeDeps(shared_secret=config.shared_secret, trigger=probe_trigger)
+        if config.probe_sweep_enabled
+        else None
     )
-    event_probe_deps = make_probe_deps(client, writer, limiters)
-    event_probe_registry = register_default_probes()
     health = HealthEmitter(writer)
 
     # Reconnect/restart catchup: a startup gap-fill plus an on-demand one fired
@@ -701,26 +690,17 @@ async def _serve(config: ServerConfig, boot: BootContext) -> None:
                     supervisor,
                 )
             )
-            nursery.start_soon(
-                _ingesting_task(
-                    boot.task_context("probe-sweep"),
-                    probe_sweep,
-                    writer,
-                    client,
-                    limiters,
-                    supervisor,
-                    config,
-                    probe_trigger,
-                )
-            )
             if config.probe_sweep_enabled:
                 nursery.start_soon(
                     _ingesting_task(
-                        boot.task_context("probe-event-sweep", triggered_by="scheduled"),
-                        run_event_probe_sweep,
+                        boot.task_context("probe-sweep"),
+                        probe_sweep,
+                        writer,
+                        client,
+                        limiters,
                         supervisor,
-                        event_probe_deps,
-                        event_probe_registry,
+                        config,
+                        probe_trigger,
                     )
                 )
             nursery.start_soon(
@@ -840,7 +820,7 @@ async def _serve_dispatch_task(  # noqa: PLR0913, PLR0917 - dispatch wiring need
     refresh_deps: RefreshDeps,
     blocked_channels_deps: BlockedChannelsDeps,
     backfill_deps: BackfillDeps,
-    probe_deps: ProbeDeps,
+    probe_deps: ProbeDeps | None,
     probe_status_deps: ProbeStatusDeps,
     refill_window_deps: RefillWindowDeps,
     livez_deps: LivezDeps,
@@ -904,7 +884,6 @@ async def _run_channel_totals_periodic_task(
         limiters,
         supervisor,
         interval_s=config.channel_totals_interval_s,
-        per_channel_sleep_s=config.channel_totals_per_channel_sleep_s,
     )
 
 
@@ -924,7 +903,6 @@ async def _run_refresh_channel_totals_once(config: ServerConfig) -> None:
             writer,
             client,
             limiters,
-            per_channel_sleep_s=config.channel_totals_per_channel_sleep_s,
         )
     finally:
         client.close()

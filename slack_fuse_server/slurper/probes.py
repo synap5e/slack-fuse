@@ -1,9 +1,15 @@
-"""Raw Slack API sampling probes for slurper data-loss detection.
+"""Unified Slack probe registry and its single periodic sweep.
 
-The probes write raw API captures to the singleton ``slurper-health`` stream.
-They intentionally avoid pre-interpreting the observation into event kinds such
-as "newest message probed": future detection SQL can re-interpret the same raw
-capture as the event model evolves.
+Raw data-loss detection probes use ``SlurperHealthSink`` to write API captures
+to the singleton ``slurper-health`` stream. Interpreted operational facts use
+``EventFactsSink`` to atomically append their purpose-specific event kinds.
+Both families share this scheduler, task supervision, spans, and API budgets;
+there is no second fact-probe nursery task.
+
+The hourly registry scan is inherited from the existing raw-detection system.
+Per-kind event-derived cadence means the six-hour fact probe can be at most one
+scan late, and avoids folding raw per-channel targets every minute merely to
+discover that their daily/weekly jobs are not due.
 
 Cadence is event-derived: due checks read the latest persisted sample for the
 same job/target using ``events.created_at``. A restart therefore resumes from
@@ -27,7 +33,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import re
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -39,6 +45,16 @@ from psycopg import Connection
 from psycopg.rows import TupleRow
 
 from slack_fuse_server._json import JsonObject
+from slack_fuse_server.probes import (
+    ProbeDeps,
+    ProbeKind,
+    ProbeScope,
+    ProbeTarget,
+    SlackTier,
+    SlurperHealthSink,
+    register_fact_probes,
+    validate_registry,
+)
 from slack_fuse_server.slurper.api import ChannelNotFoundError, SlackAPIError, SlackClient
 from slack_fuse_server.slurper.ingestion import ingesting_run
 from slack_fuse_server.slurper.limiters import SlurperLimiters
@@ -49,6 +65,7 @@ from slack_fuse_server.slurper.supervisor import TaskSupervisor, phase
 log = logging.getLogger(__name__)
 
 HEALTH_STREAM = "slurper-health"
+HEALTH_SINK = SlurperHealthSink(HEALTH_STREAM)
 
 CONVERSATIONS_HISTORY_SAMPLED = "conversations_history_sampled"
 CONVERSATIONS_LIST_SAMPLED = "conversations_list_sampled"
@@ -101,39 +118,7 @@ class ProbeCadenceConfig(Protocol):
     def probe_channel_day_presence_cadence_s(self) -> float: ...
 
 
-@dataclass(frozen=True, slots=True)
-class ProbeTarget:
-    """One restart-safe scheduling key for a probe job."""
-
-    value: str
-    payload_field: str | None = None
-
-    def span_extra(self) -> JsonObject:
-        if self.payload_field is None:
-            return {"target": self.value}
-        return {self.payload_field: self.value}
-
-
-type ProbeRun = Callable[
-    [OffsetWriter, SlackClient, SlurperLimiters, ProbeTarget, SpanRecorder | None],
-    Awaitable[bool],
-]
-type ProbeTargeter = Callable[[OffsetWriter, SlurperLimiters], Awaitable[Sequence[ProbeTarget]]]
-type ProbeDueSync = Callable[[Connection[TupleRow], ProbeTarget, float], bool]
-
-
-@dataclass(frozen=True, slots=True)
-class ProbeDescriptor:
-    job_id: str
-    event_kind: str
-    cadence_s: float
-    run: ProbeRun
-    targets: ProbeTargeter
-    due: ProbeDueSync
-    op: str
-    tier: int
-    cadence_config_field: str
-    is_per_target: bool
+ProbeDescriptor = ProbeKind
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,7 +191,14 @@ class ProbeTrigger:
 def build_probe_registry(config: ProbeCadenceConfig) -> tuple[ProbeDescriptor, ...]:
     """Apply ``ServerConfig`` cadence fields to the static probe registry."""
     return tuple(
-        replace(descriptor, cadence_s=float(getattr(config, descriptor.cadence_config_field)))
+        replace(
+            descriptor,
+            interval_s=(
+                descriptor.interval_s
+                if descriptor.cadence_config_field is None
+                else float(getattr(config, descriptor.cadence_config_field))
+            ),
+        )
         for descriptor in PROBE_REGISTRY
     )
 
@@ -317,7 +309,7 @@ async def _run_probe_cycle(  # noqa: PLR0913 - common scheduled/manual runner.
     counters: dict[str, dict[str, int]] = {
         descriptor.job_id: {"succeeded": 0, "failed": 0, "skipped": 0} for descriptor in active_registry
     }
-    selected = _select_probe_descriptors(active_registry, requested)
+    selected = _select_probe_descriptors(active_registry, requested, trigger=trigger)
     with ingesting_run(triggered_by="scheduled" if trigger == "scheduled" else "control-surface"):
         await _run_probe_cycle_body(
             writer,
@@ -350,13 +342,12 @@ async def _run_probe_cycle_body(  # noqa: PLR0913, PLR0917 - mirrors _run_probe_
     task_name: str,
     deadline_s: float | None,
 ) -> None:
+    deps = ProbeDeps(client=client, writer=writer, limiters=limiters)
     for descriptor in selected:
         target = None if requested is None else requested.target
         if supervisor is None:
             await _run_probe_descriptor(
-                writer,
-                client,
-                limiters,
+                deps,
                 descriptor,
                 counters[descriptor.job_id],
                 requested_target=target,
@@ -367,9 +358,7 @@ async def _run_probe_cycle_body(  # noqa: PLR0913, PLR0917 - mirrors _run_probe_
             details: JsonObject = {} if target is None else {"target": target}
             async with phase(supervisor, task_name, descriptor.job_id, details=details, deadline_s=deadline_s):
                 await _run_probe_descriptor(
-                    writer,
-                    client,
-                    limiters,
+                    deps,
                     descriptor,
                     counters[descriptor.job_id],
                     requested_target=target,
@@ -389,16 +378,43 @@ async def _run_probe_cycle_body(  # noqa: PLR0913, PLR0917 - mirrors _run_probe_
 def _select_probe_descriptors(
     registry: Sequence[ProbeDescriptor],
     requested: ProbeSweepRequest | None,
+    *,
+    trigger: Literal["scheduled", "manual"],
 ) -> tuple[ProbeDescriptor, ...]:
+    selectable = tuple(
+        descriptor for descriptor in registry if trigger == "scheduled" or descriptor.manual_triggerable
+    )
     if requested is None or requested.job_id is None:
-        return tuple(registry)
-    return tuple(descriptor for descriptor in registry if descriptor.job_id == requested.job_id)
+        return selectable
+    return tuple(descriptor for descriptor in selectable if descriptor.job_id == requested.job_id)
 
 
-async def _run_probe_descriptor(  # noqa: PLR0913, C901 - common scheduled/manual runner keeps knobs explicit.
-    writer: OffsetWriter,
-    client: SlackClient,
-    limiters: SlurperLimiters,
+async def run_probe_registry_once(
+    supervisor: TaskSupervisor,
+    deps: ProbeDeps,
+    registry: Sequence[ProbeDescriptor],
+) -> dict[str, dict[str, int]]:
+    """Dispatch one scheduled registry tick through the production runner.
+
+    The long-lived sweep and deterministic framework tests share
+    ``_run_probe_descriptor``; this helper omits only the health heartbeat and
+    outer ingestion envelope owned by ``_run_probe_cycle``.
+    """
+    active_registry = validate_registry(registry)
+    counters = {probe.job_id: {"succeeded": 0, "failed": 0, "skipped": 0} for probe in active_registry}
+    for descriptor in active_registry:
+        async with phase(supervisor, "probe-sweep", descriptor.job_id, deadline_s=None):
+            await _run_probe_descriptor(
+                deps,
+                descriptor,
+                counters[descriptor.job_id],
+                trigger="scheduled",
+            )
+    return counters
+
+
+async def _run_probe_descriptor(  # noqa: C901, PLR0913 - target error isolation keeps knobs explicit.
+    deps: ProbeDeps,
     descriptor: ProbeDescriptor,
     counts: dict[str, int],
     *,
@@ -410,93 +426,103 @@ async def _run_probe_descriptor(  # noqa: PLR0913, C901 - common scheduled/manua
         targets: Sequence[ProbeTarget] = (ProbeTarget(requested_target, "channel_id"),)
     else:
         try:
-            targets = await descriptor.targets(writer, limiters)
+            targets = await descriptor.targets(deps)
         except Exception:
             log.exception("probe job %s failed while listing targets", descriptor.job_id)
             counts["failed"] += 1
             return
 
     for target in targets:
-        if not bypass_cadence and not await is_due(writer, limiters, descriptor, target):
-            counts["skipped"] += 1
-            continue
+        if not bypass_cadence:
+            try:
+                due = await is_due(deps, descriptor, target)
+            except Exception:
+                log.exception("probe job %s failed while checking cadence for %s", descriptor.job_id, target.value)
+                counts["failed"] += 1
+                continue
+            if not due:
+                counts["skipped"] += 1
+                continue
         extra = target.span_extra()
         extra["job_id"] = descriptor.job_id
         extra["event_kind"] = descriptor.event_kind
         extra["tier"] = descriptor.tier
         extra["trigger"] = trigger
-        async with span(op=descriptor.op, task="probe-sweep", extra=extra) as probe_span:
-            try:
-                wrote = await descriptor.run(writer, client, limiters, target, probe_span)
-            except ChannelNotFoundError:
-                # Channel deleted, archived-and-purged, or the token was
-                # removed from it. Slack has forgotten the id; there is no
-                # value in probing it again. Emit ``channel_archived`` so the
-                # next ``_channel_targets`` fold drops it from the poll set
-                # (probe target selector filters on !is_archived). Log INFO,
-                # one line, no traceback — reported 2026-07-28 as ~172 stack
-                # traces per 24h in Loki (k8s-homelab-owner triage).
-                log.info(
-                    "probe job %s: channel %s no longer accessible (channel_not_found); evicting",
-                    descriptor.job_id,
-                    target.value,
-                )
-                if target.payload_field == "channel_id":
-                    with contextlib.suppress(Exception):
-                        await writer.write_event(
-                            EventRecord(
-                                stream="channel-list",
-                                kind="channel_archived",
-                                ts=None,
-                                payload={"channel_id": target.value},
-                            ),
-                            span=probe_span,
-                        )
-                counts["failed"] += 1
-            except (SlackAPIError, httpx.HTTPError, ValueError):
-                log.warning("probe job %s failed on %s", descriptor.job_id, target.value, exc_info=True)
-                counts["failed"] += 1
-            except Exception:
-                log.exception("probe job %s failed on %s", descriptor.job_id, target.value)
-                counts["failed"] += 1
-            else:
-                if wrote:
-                    counts["succeeded"] += 1
-                else:
+        probe_span: SpanRecorder | None = None
+        try:
+            async with span(op=descriptor.op, task="probe-sweep", extra=extra) as probe_span:
+                probe_span.set("events_written", 0)
+                probe_span.set("outcome", "error")
+                run_deps = replace(deps, recorder=probe_span)
+                records = tuple(await descriptor.run(run_deps, target))
+                events_written = await descriptor.sink.write(run_deps, descriptor, records)
+                probe_span.set("outcome", "ok")
+                if not events_written:
                     probe_span.mark_skipped()
-                    counts["skipped"] += 1
+        except ChannelNotFoundError:
+            # Channel deleted, archived-and-purged, or the token was removed
+            # from it. Archive the target so future folds stop polling it.
+            log.info(
+                "probe job %s: channel %s no longer accessible (channel_not_found); evicting",
+                descriptor.job_id,
+                target.value,
+            )
+            if target.payload_field == "channel_id":
+                with contextlib.suppress(Exception):
+                    await deps.writer.write_event(
+                        EventRecord(
+                            stream="channel-list",
+                            kind="channel_archived",
+                            ts=None,
+                            payload={"channel_id": target.value},
+                        ),
+                        span=probe_span,
+                    )
+            counts["failed"] += 1
+        except (SlackAPIError, httpx.HTTPError, ValueError):
+            log.warning("probe job %s failed on %s", descriptor.job_id, target.value, exc_info=True)
+            counts["failed"] += 1
+        except Exception:
+            log.exception("probe job %s failed on %s", descriptor.job_id, target.value)
+            counts["failed"] += 1
+        else:
+            if events_written:
+                counts["succeeded"] += 1
+            else:
+                counts["skipped"] += 1
 
 
 async def is_due(
-    writer: OffsetWriter,
-    limiters: SlurperLimiters,
+    deps: ProbeDeps,
     descriptor: ProbeDescriptor,
     target: ProbeTarget,
 ) -> bool:
     """Return true when the latest persisted sample is older than the cadence."""
-    return await writer.run_read(
-        lambda conn: descriptor.due(conn, target, descriptor.cadence_s),
-        limiter=limiters.admin_read,
+    return await deps.writer.run_read(
+        lambda conn: descriptor.due(conn, target, descriptor.cadence_s, deps.clock()),
+        limiter=deps.limiters.admin_read,
     )
 
 
-async def _channel_targets(writer: OffsetWriter, limiters: SlurperLimiters) -> Sequence[ProbeTarget]:
-    channel_ids = await writer.run_read(_list_in_scope_channel_ids_sync, limiter=limiters.admin_read)
+async def _channel_targets(deps: ProbeDeps) -> Sequence[ProbeTarget]:
+    channel_ids = await deps.writer.run_read(
+        _list_in_scope_channel_ids_sync,
+        limiter=deps.limiters.admin_read,
+    )
     return tuple(ProbeTarget(channel_id, "channel_id") for channel_id in channel_ids)
 
 
 async def _channel_targets_with_local_messages(
-    writer: OffsetWriter,
-    limiters: SlurperLimiters,
+    deps: ProbeDeps,
 ) -> Sequence[ProbeTarget]:
-    channel_ids = await writer.run_read(
+    channel_ids = await deps.writer.run_read(
         _list_in_scope_channel_ids_with_local_messages_sync,
-        limiter=limiters.admin_read,
+        limiter=deps.limiters.admin_read,
     )
     return tuple(ProbeTarget(channel_id, "channel_id") for channel_id in channel_ids)
 
 
-async def _workspace_targets(_writer: OffsetWriter, _limiters: SlurperLimiters) -> Sequence[ProbeTarget]:
+async def _workspace_targets(_deps: ProbeDeps) -> Sequence[ProbeTarget]:
     await trio.lowlevel.checkpoint()
     return (ProbeTarget(_WORKSPACE_TARGET, None),)
 
@@ -571,62 +597,58 @@ def _list_in_scope_channel_ids_with_local_messages_sync(conn: Connection[TupleRo
 
 
 async def _sample_older_than_oldest_history(
-    writer: OffsetWriter,
-    client: SlackClient,
-    limiters: SlurperLimiters,
+    deps: ProbeDeps,
     target: ProbeTarget,
-    recorder: SpanRecorder | None,
-) -> bool:
+) -> tuple[EventRecord, ...]:
     channel_id = target.value
-    local_oldest_ts = await writer.run_read(
+    local_oldest_ts = await deps.writer.run_read(
         lambda conn: _local_oldest_ts_sync(conn, channel_id),
-        limiter=limiters.admin_read,
-        span=recorder,
+        limiter=deps.limiters.admin_read,
+        span=deps.recorder,
     )
     if local_oldest_ts is None:
-        return False
+        return ()
     call_params: JsonObject = {"channel": channel_id, "latest": local_oldest_ts, "limit": _HISTORY_SAMPLE_LIMIT}
     response = await run_sync_with_span(
-        lambda: client.sample_conversations_history(
+        lambda: deps.client.sample_conversations_history(
             channel_id=channel_id,
             latest=local_oldest_ts,
             limit=_HISTORY_SAMPLE_LIMIT,
         ),
-        limiter=limiters.slack_api,
-        span=recorder,
+        limiter=deps.limiters.slack_api,
+        span=deps.recorder,
     )
-    await _write_probe_event(
-        writer,
-        CONVERSATIONS_HISTORY_SAMPLED,
-        {"call_params": call_params, "response": response, "captured_at": _utc_iso()},
-        recorder,
+    _record_sample_stats(deps.recorder, response, "messages")
+    return (
+        EventRecord(
+            stream=HEALTH_STREAM,
+            kind=CONVERSATIONS_HISTORY_SAMPLED,
+            ts=None,
+            payload={"call_params": call_params, "response": response, "captured_at": _utc_iso()},
+        ),
     )
-    _record_sample_stats(recorder, response, "messages")
-    return True
 
 
 async def _sample_newest_history(
-    writer: OffsetWriter,
-    client: SlackClient,
-    limiters: SlurperLimiters,
+    deps: ProbeDeps,
     target: ProbeTarget,
-    recorder: SpanRecorder | None,
-) -> bool:
+) -> tuple[EventRecord, ...]:
     channel_id = target.value
     call_params: JsonObject = {"channel": channel_id, "limit": _HISTORY_SAMPLE_LIMIT}
     response = await run_sync_with_span(
-        lambda: client.sample_conversations_history(channel_id=channel_id, limit=_HISTORY_SAMPLE_LIMIT),
-        limiter=limiters.slack_api,
-        span=recorder,
+        lambda: deps.client.sample_conversations_history(channel_id=channel_id, limit=_HISTORY_SAMPLE_LIMIT),
+        limiter=deps.limiters.slack_api,
+        span=deps.recorder,
     )
-    await _write_probe_event(
-        writer,
-        CONVERSATIONS_HISTORY_SAMPLED,
-        {"call_params": call_params, "response": response, "captured_at": _utc_iso()},
-        recorder,
+    _record_sample_stats(deps.recorder, response, "messages")
+    return (
+        EventRecord(
+            stream=HEALTH_STREAM,
+            kind=CONVERSATIONS_HISTORY_SAMPLED,
+            ts=None,
+            payload={"call_params": call_params, "response": response, "captured_at": _utc_iso()},
+        ),
     )
-    _record_sample_stats(recorder, response, "messages")
-    return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -678,19 +700,21 @@ def _presence_sample_ages_sync(
     return {str(row[0]): float(row[1]) for row in rows if row[0] is not None and row[1] is not None}
 
 
-def _day_presence_due_sync(conn: Connection[TupleRow], target: ProbeTarget, cadence_s: float) -> bool:
-    windows = _presence_day_windows(datetime.now(UTC))
+def _day_presence_due_sync(
+    conn: Connection[TupleRow],
+    target: ProbeTarget,
+    cadence_s: float,
+    now: datetime | None = None,
+) -> bool:
+    windows = _presence_day_windows(datetime.now(UTC) if now is None else now)
     ages = _presence_sample_ages_sync(conn, target.value, [window.oldest for window in windows])
     return any(ages.get(window.oldest, float("inf")) >= cadence_s for window in windows)
 
 
 async def _sample_day_presence_history(
-    writer: OffsetWriter,
-    client: SlackClient,
-    limiters: SlurperLimiters,
+    deps: ProbeDeps,
     target: ProbeTarget,
-    recorder: SpanRecorder | None,
-) -> bool:
+) -> tuple[EventRecord, ...]:
     """Sample one (channel, day) window for message presence.
 
     Detects mid-stream gaps that head/tail probes cannot: a single
@@ -702,10 +726,10 @@ async def _sample_day_presence_history(
     """
     channel_id = target.value
     windows = _presence_day_windows(datetime.now(UTC))
-    ages = await writer.run_read(
+    ages = await deps.writer.run_read(
         lambda conn: _presence_sample_ages_sync(conn, channel_id, [window.oldest for window in windows]),
-        limiter=limiters.admin_read,
-        span=recorder,
+        limiter=deps.limiters.admin_read,
+        span=deps.recorder,
     )
     window = max(windows, key=lambda candidate: ages.get(candidate.oldest, float("inf")))
     call_params: JsonObject = {
@@ -715,69 +739,66 @@ async def _sample_day_presence_history(
         "limit": _HISTORY_SAMPLE_LIMIT,
     }
     response = await run_sync_with_span(
-        lambda: client.sample_conversations_history(
+        lambda: deps.client.sample_conversations_history(
             channel_id=channel_id,
             oldest=window.oldest,
             latest=window.latest,
             limit=_HISTORY_SAMPLE_LIMIT,
         ),
-        limiter=limiters.slack_api,
-        span=recorder,
+        limiter=deps.limiters.slack_api,
+        span=deps.recorder,
     )
-    await _write_probe_event(
-        writer,
-        CONVERSATIONS_HISTORY_SAMPLED,
-        {"call_params": call_params, "response": response, "captured_at": _utc_iso()},
-        recorder,
+    _record_sample_stats(deps.recorder, response, "messages")
+    return (
+        EventRecord(
+            stream=HEALTH_STREAM,
+            kind=CONVERSATIONS_HISTORY_SAMPLED,
+            ts=None,
+            payload={"call_params": call_params, "response": response, "captured_at": _utc_iso()},
+        ),
     )
-    _record_sample_stats(recorder, response, "messages")
-    return True
 
 
 async def _sample_channel_inventory(
-    writer: OffsetWriter,
-    client: SlackClient,
-    limiters: SlurperLimiters,
+    deps: ProbeDeps,
     _target: ProbeTarget,
-    recorder: SpanRecorder | None,
-) -> bool:
+) -> tuple[EventRecord, ...]:
     call_params: JsonObject = {"types": _CONVERSATION_TYPES, "exclude_archived": True}
     response = await run_sync_with_span(
-        lambda: client.sample_conversations_list(types=_CONVERSATION_TYPES, exclude_archived=True),
-        limiter=limiters.slack_api,
-        span=recorder,
+        lambda: deps.client.sample_conversations_list(types=_CONVERSATION_TYPES, exclude_archived=True),
+        limiter=deps.limiters.slack_api,
+        span=deps.recorder,
     )
-    await _write_probe_event(
-        writer,
-        CONVERSATIONS_LIST_SAMPLED,
-        {"call_params": call_params, "response": response, "captured_at": _utc_iso()},
-        recorder,
+    _record_sample_stats(deps.recorder, response, "channels")
+    return (
+        EventRecord(
+            stream=HEALTH_STREAM,
+            kind=CONVERSATIONS_LIST_SAMPLED,
+            ts=None,
+            payload={"call_params": call_params, "response": response, "captured_at": _utc_iso()},
+        ),
     )
-    _record_sample_stats(recorder, response, "channels")
-    return True
 
 
 async def _sample_workspace_users(
-    writer: OffsetWriter,
-    client: SlackClient,
-    limiters: SlurperLimiters,
+    deps: ProbeDeps,
     _target: ProbeTarget,
-    recorder: SpanRecorder | None,
-) -> bool:
+) -> tuple[EventRecord, ...]:
     call_params: JsonObject = {"limit": _USERS_LIST_LIMIT}
     response = await run_sync_with_span(
-        lambda: client.sample_users_list(limit=_USERS_LIST_LIMIT),
-        limiter=limiters.slack_api,
-        span=recorder,
+        lambda: deps.client.sample_users_list(limit=_USERS_LIST_LIMIT),
+        limiter=deps.limiters.slack_api,
+        span=deps.recorder,
     )
-    await _write_probe_event(
-        writer,
-        USERS_LIST_SAMPLED,
-        {"call_params": call_params, "response": response, "captured_at": _utc_iso()},
-        recorder,
+    _record_sample_stats(deps.recorder, response, "members")
+    return (
+        EventRecord(
+            stream=HEALTH_STREAM,
+            kind=USERS_LIST_SAMPLED,
+            ts=None,
+            payload={"call_params": call_params, "response": response, "captured_at": _utc_iso()},
+        ),
     )
-    _record_sample_stats(recorder, response, "members")
-    return True
 
 
 def _local_oldest_ts_sync(conn: Connection[TupleRow], channel_id: str) -> str | None:
@@ -836,7 +857,12 @@ def _valid_ts(value: object) -> str | None:
     return value
 
 
-def _history_older_due_sync(conn: Connection[TupleRow], target: ProbeTarget, cadence_s: float) -> bool:
+def _history_older_due_sync(
+    conn: Connection[TupleRow],
+    target: ProbeTarget,
+    cadence_s: float,
+    _now: datetime | None = None,
+) -> bool:
     # latest-only: day-presence samples also carry `latest` (plus `oldest`)
     # and must not reset this job's cadence.
     return _latest_sample_is_due(
@@ -857,7 +883,12 @@ def _history_older_due_sync(conn: Connection[TupleRow], target: ProbeTarget, cad
     )
 
 
-def _history_newest_due_sync(conn: Connection[TupleRow], target: ProbeTarget, cadence_s: float) -> bool:
+def _history_newest_due_sync(
+    conn: Connection[TupleRow],
+    target: ProbeTarget,
+    cadence_s: float,
+    _now: datetime | None = None,
+) -> bool:
     return _latest_sample_is_due(
         conn,
         """
@@ -876,11 +907,21 @@ def _history_newest_due_sync(conn: Connection[TupleRow], target: ProbeTarget, ca
     )
 
 
-def _conversations_list_due_sync(conn: Connection[TupleRow], _target: ProbeTarget, cadence_s: float) -> bool:
+def _conversations_list_due_sync(
+    conn: Connection[TupleRow],
+    _target: ProbeTarget,
+    cadence_s: float,
+    _now: datetime | None = None,
+) -> bool:
     return _event_kind_due_sync(conn, CONVERSATIONS_LIST_SAMPLED, cadence_s)
 
 
-def _users_list_due_sync(conn: Connection[TupleRow], _target: ProbeTarget, cadence_s: float) -> bool:
+def _users_list_due_sync(
+    conn: Connection[TupleRow],
+    _target: ProbeTarget,
+    cadence_s: float,
+    _now: datetime | None = None,
+) -> bool:
     return _event_kind_due_sync(conn, USERS_LIST_SAMPLED, cadence_s)
 
 
@@ -944,7 +985,6 @@ async def _emit_probe_sweep_completed(
 def _record_sample_stats(recorder: SpanRecorder | None, response: JsonObject, collection_key: str) -> None:
     if recorder is None:
         return
-    recorder.set("events_written", 1)
     collection = response.get(collection_key)
     if isinstance(collection, list):
         recorder.set(collection_key, len(collection))
@@ -953,68 +993,75 @@ def _record_sample_stats(recorder: SpanRecorder | None, response: JsonObject, co
         recorder.set("page_count", page_count)
 
 
-PROBE_REGISTRY: tuple[ProbeDescriptor, ...] = (
-    ProbeDescriptor(
+RAW_PROBE_REGISTRY: tuple[ProbeDescriptor, ...] = (
+    ProbeKind(
         job_id=JOB_CHANNEL_OLDER_THAN_OLDEST,
-        event_kind=CONVERSATIONS_HISTORY_SAMPLED,
-        cadence_s=DEFAULT_CHANNEL_OLDER_THAN_OLDEST_CADENCE_S,
+        kind=CONVERSATIONS_HISTORY_SAMPLED,
+        interval_s=DEFAULT_CHANNEL_OLDER_THAN_OLDEST_CADENCE_S,
         run=_sample_older_than_oldest_history,
         targets=_channel_targets_with_local_messages,
         due=_history_older_due_sync,
         op="slurper.probe.conversations_history",
-        tier=3,
+        tier=SlackTier.TIER_3,
+        scope=ProbeScope.PER_CHANNEL,
+        sink=HEALTH_SINK,
         cadence_config_field="probe_channel_older_than_oldest_cadence_s",
-        is_per_target=True,
     ),
-    ProbeDescriptor(
+    ProbeKind(
         job_id=JOB_CHANNEL_NEWEST_MESSAGE,
-        event_kind=CONVERSATIONS_HISTORY_SAMPLED,
-        cadence_s=DEFAULT_CHANNEL_NEWEST_MESSAGE_CADENCE_S,
+        kind=CONVERSATIONS_HISTORY_SAMPLED,
+        interval_s=DEFAULT_CHANNEL_NEWEST_MESSAGE_CADENCE_S,
         run=_sample_newest_history,
         targets=_channel_targets,
         due=_history_newest_due_sync,
         op="slurper.probe.conversations_history",
-        tier=3,
+        tier=SlackTier.TIER_3,
+        scope=ProbeScope.PER_CHANNEL,
+        sink=HEALTH_SINK,
         cadence_config_field="probe_channel_newest_message_cadence_s",
-        is_per_target=True,
     ),
-    ProbeDescriptor(
+    ProbeKind(
         job_id=JOB_CHANNEL_DAY_PRESENCE,
-        event_kind=CONVERSATIONS_HISTORY_SAMPLED,
-        cadence_s=DEFAULT_CHANNEL_DAY_PRESENCE_CADENCE_S,
+        kind=CONVERSATIONS_HISTORY_SAMPLED,
+        interval_s=DEFAULT_CHANNEL_DAY_PRESENCE_CADENCE_S,
         run=_sample_day_presence_history,
         targets=_channel_targets,
         due=_day_presence_due_sync,
         op="slurper.probe.conversations_history",
-        tier=3,
+        tier=SlackTier.TIER_3,
+        scope=ProbeScope.PER_CHANNEL,
+        sink=HEALTH_SINK,
         cadence_config_field="probe_channel_day_presence_cadence_s",
-        is_per_target=True,
     ),
-    ProbeDescriptor(
+    ProbeKind(
         job_id=JOB_CHANNEL_INVENTORY,
-        event_kind=CONVERSATIONS_LIST_SAMPLED,
-        cadence_s=DEFAULT_CHANNEL_INVENTORY_CADENCE_S,
+        kind=CONVERSATIONS_LIST_SAMPLED,
+        interval_s=DEFAULT_CHANNEL_INVENTORY_CADENCE_S,
         run=_sample_channel_inventory,
         targets=_workspace_targets,
         due=_conversations_list_due_sync,
         op="slurper.probe.conversations_list",
-        tier=2,
+        tier=SlackTier.TIER_2,
+        scope=ProbeScope.WORKSPACE,
+        sink=HEALTH_SINK,
         cadence_config_field="probe_channel_inventory_cadence_s",
-        is_per_target=False,
     ),
-    ProbeDescriptor(
+    ProbeKind(
         job_id=JOB_WORKSPACE_USER_COUNT,
-        event_kind=USERS_LIST_SAMPLED,
-        cadence_s=DEFAULT_WORKSPACE_USER_COUNT_CADENCE_S,
+        kind=USERS_LIST_SAMPLED,
+        interval_s=DEFAULT_WORKSPACE_USER_COUNT_CADENCE_S,
         run=_sample_workspace_users,
         targets=_workspace_targets,
         due=_users_list_due_sync,
         op="slurper.probe.users_list",
-        tier=2,
+        tier=SlackTier.TIER_2,
+        scope=ProbeScope.WORKSPACE,
+        sink=HEALTH_SINK,
         cadence_config_field="probe_workspace_user_count_cadence_s",
-        is_per_target=False,
     ),
 )
+
+PROBE_REGISTRY: tuple[ProbeDescriptor, ...] = (*RAW_PROBE_REGISTRY, *register_fact_probes())
 
 
 def _utc_iso() -> str:

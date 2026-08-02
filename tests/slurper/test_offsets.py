@@ -17,7 +17,7 @@ import pytest
 import trio
 from psycopg.rows import TupleRow
 
-from slack_fuse_server.slurper.limiters import SlurperLimiters
+from slack_fuse_server.slurper.limiters import SlackTierPacer, SlurperLimiters
 from slack_fuse_server.slurper.offsets import EventRecord, OffsetWriter, WriterPoolExhausted, write_event
 from slack_fuse_server.slurper.spans import span
 from tests.conftest import ServerConnFactory, make_test_writer
@@ -284,6 +284,7 @@ def test_slack_api_limiter_wait_does_not_block_writer_pool(
         writer=trio.CapacityLimiter(1),
         snapshot=trio.CapacityLimiter(1),
         admin_read=trio.CapacityLimiter(1),
+        slack_tier2=SlackTierPacer(0.0),
     )
     started = threading.Event()
     release = threading.Event()

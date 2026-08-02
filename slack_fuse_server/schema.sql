@@ -18,6 +18,13 @@ CREATE TABLE events (
 );
 CREATE INDEX events_stream_offset_idx ON events (stream, offset_in_stream);
 
+-- Interpreted fact-probe cadence (0015). Keep the literal kind list aligned
+-- with the fact-specific due query so PostgreSQL can prove the partial-index
+-- predicate even after psycopg switches to a generic prepared plan.
+CREATE INDEX events_probe_fact_latest_idx
+    ON events (kind, ts DESC NULLS LAST)
+    WHERE kind IN ('channel_message_count_probed');
+
 -- Source-envelope indexes (0009). Slack facts live in `payload`; `source`
 -- carries ambient facts about the ingestion transaction (producer, boot/task/
 -- run ids, Slack cursors, commit, span id — see slurper/ingestion.py). The

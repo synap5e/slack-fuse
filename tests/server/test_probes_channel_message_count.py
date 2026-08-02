@@ -12,8 +12,7 @@ import trio
 
 import slack_fuse_server.probes.channel_message_count as probe_module
 from slack_fuse_server.probes.channel_message_count import probe_channel_message_counts
-from slack_fuse_server.probes.registry import ProbeDeps
-from slack_fuse_server.probes.sweep import EventsTableProbeCursor
+from slack_fuse_server.probes.registry import ProbeDeps, ProbeTarget
 from slack_fuse_server.search_messages import SearchMessageTotal
 from slack_fuse_server.slurper.api import SlackClient
 from slack_fuse_server.slurper.offsets import EventRecord, write_event
@@ -61,7 +60,6 @@ def _make_deps(conn: psycopg.Connection[TupleRow], client: SlackClient) -> Probe
         client=client,
         writer=writer,
         limiters=limiters,
-        cursor=EventsTableProbeCursor(writer=writer, limiter=limiters.admin_read),
         clock=lambda: datetime(2026, 8, 2, tzinfo=UTC),
         sleep=no_sleep,
     )
@@ -90,7 +88,10 @@ async def test_one_event_per_visible_channel_skips_dms_and_archived(
     monkeypatch.setattr(probe_module, "search_channel_message_total", fake_search)
     client = SlackClient("xoxp-test")
     try:
-        records = await probe_channel_message_counts(_make_deps(server_conn, client))
+        records = await probe_channel_message_counts(
+            _make_deps(server_conn, client),
+            ProbeTarget("workspace"),
+        )
     finally:
         client.close()
 
@@ -123,7 +124,10 @@ async def test_approximate_flag_propagates_to_event_payload(
     monkeypatch.setattr(probe_module, "search_channel_message_total", fake_search)
     client = SlackClient("xoxp-test")
     try:
-        records = await probe_channel_message_counts(_make_deps(server_conn, client))
+        records = await probe_channel_message_counts(
+            _make_deps(server_conn, client),
+            ProbeTarget("workspace"),
+        )
     finally:
         client.close()
 

@@ -12,11 +12,11 @@ import trio
 from psycopg.rows import TupleRow
 from psycopg.types.json import Jsonb
 
-import slack_fuse_server.slurper.channel_totals as channel_totals_module
 from slack_fuse_server.search_messages import SearchMessagesError, SearchMessageTotal
 from slack_fuse_server.slurper.__main__ import _build_parser
 from slack_fuse_server.slurper.api import SlackClient
 from slack_fuse_server.slurper.channel_totals import refresh_channel_totals_once
+from slack_fuse_server.slurper.limiters import SlackTierPacer
 from tests.conftest import make_test_limiters, make_test_writer
 
 
@@ -63,7 +63,6 @@ def _empty_listing_client() -> SlackClient:
 @pytest.mark.trio
 async def test_refresh_sweep_throttles_upserts_and_preserves_old_total_on_error(
     server_conn: psycopg.Connection[TupleRow],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _insert_channel(server_conn, 1, "C1", "alpha")
     _insert_channel(server_conn, 2, "C2", "beta")
@@ -73,12 +72,15 @@ async def test_refresh_sweep_throttles_upserts_and_preserves_old_total_on_error(
         cur.execute("INSERT INTO channel_message_totals (channel_id, total, refresh_status) VALUES ('C2', 42, 'ok')")
 
     sleeps: list[float] = []
+    now = 0.0
 
     async def fake_sleep(delay: float) -> None:
+        nonlocal now
         sleeps.append(delay)
+        now += delay
         await trio.lowlevel.checkpoint()
 
-    monkeypatch.setattr(channel_totals_module.trio, "sleep", fake_sleep)
+    tier2 = SlackTierPacer(3.5, clock=lambda: now, sleep=fake_sleep)
     calls: list[str] = []
 
     def search(_http: httpx.Client, name: str) -> SearchMessageTotal:
@@ -92,8 +94,7 @@ async def test_refresh_sweep_throttles_upserts_and_preserves_old_total_on_error(
         await refresh_channel_totals_once(
             make_test_writer(server_conn),
             client,
-            make_test_limiters(),
-            per_channel_sleep_s=3.5,
+            make_test_limiters(slack_tier2=tier2),
             search_fn=search,
         )
     finally:
@@ -126,7 +127,6 @@ async def test_refresh_channel_totals_rejects_bot_token(server_conn: psycopg.Con
                 make_test_writer(server_conn),
                 client,
                 make_test_limiters(),
-                per_channel_sleep_s=0,
             )
     finally:
         client.close()

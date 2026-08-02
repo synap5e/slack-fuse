@@ -499,7 +499,10 @@ def _validate_probe_request(*, job_id: str | None, target: str | None) -> str | 
         if target is None:
             return None
         return "bad_target"
-    descriptor = next((probe for probe in PROBE_REGISTRY if probe.job_id == job_id), None)
+    descriptor = next(
+        (probe for probe in PROBE_REGISTRY if probe.job_id == job_id and probe.manual_triggerable),
+        None,
+    )
     if descriptor is None:
         return "unknown_job"
     if target is not None and (not target.strip() or any(char.isspace() for char in target)):

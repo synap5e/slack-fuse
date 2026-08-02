@@ -13,18 +13,20 @@ import pytest
 import trio
 
 import slack_fuse_server.probes.channel_message_count as channel_message_count_module
-from slack_fuse_server.probes import register_default_probes
+from slack_fuse_server.probes import register_fact_probes
 from slack_fuse_server.probes.registry import (
+    EventFactsSink,
     ProbeDeps,
     ProbeKind,
     ProbeScope,
+    ProbeTarget,
     SlackTier,
     probe_timestamp,
 )
-from slack_fuse_server.probes.sweep import EventsTableProbeCursor, run_probe_sweep_once
 from slack_fuse_server.search_messages import SearchMessageTotal
 from slack_fuse_server.slurper.api import SlackClient
 from slack_fuse_server.slurper.offsets import EventRecord, write_event
+from slack_fuse_server.slurper.probes import run_probe_registry_once
 from tests.conftest import RecordingSupervisor, make_test_limiters, make_test_writer
 
 if TYPE_CHECKING:
@@ -58,21 +60,41 @@ def _deps(
         client=client,
         writer=writer,
         limiters=limiters,
-        cursor=EventsTableProbeCursor(writer=writer, limiter=limiters.admin_read),
         clock=clock,
         sleep=_checkpoint_sleep,
     )
 
 
-def _stub_probe(
+def _stub_probe(  # noqa: PLR0913 - test factory exposes independent failure modes.
     kind: str,
     calls: list[str],
     *,
     interval_s: float = 60.0,
     count: int = 1,
     error: Exception | None = None,
+    due_error: Exception | None = None,
 ) -> ProbeKind:
-    async def run(deps: ProbeDeps) -> tuple[EventRecord, ...]:
+    async def targets(_deps: ProbeDeps) -> tuple[ProbeTarget, ...]:
+        await trio.lowlevel.checkpoint()
+        return (ProbeTarget("workspace"),)
+
+    def due(
+        conn: psycopg.Connection[TupleRow],
+        _target: ProbeTarget,
+        cadence_s: float,
+        now: datetime,
+    ) -> bool:
+        if due_error is not None:
+            raise due_error
+        with conn.cursor() as cur:
+            cur.execute("SELECT MAX(ts) FROM events WHERE kind = %s", (kind,))
+            row = cur.fetchone()
+        if row is None or row[0] is None:
+            return True
+        last_run_at = datetime.fromisoformat(str(row[0]).replace("Z", "+00:00"))
+        return (now - last_run_at).total_seconds() >= cadence_s
+
+    async def run(deps: ProbeDeps, _target: ProbeTarget) -> tuple[EventRecord, ...]:
         await trio.lowlevel.checkpoint()
         calls.append(kind)
         if error is not None:
@@ -89,11 +111,16 @@ def _stub_probe(
         )
 
     return ProbeKind(
+        job_id=kind,
         kind=kind,
         interval_s=interval_s,
         tier=SlackTier.TIER_2,
         scope=ProbeScope.PER_CHANNEL,
         run=run,
+        targets=targets,
+        due=due,
+        sink=EventFactsSink(),
+        op=f"slurper.probe.{kind}",
     )
 
 
@@ -104,6 +131,37 @@ def _events(conn: psycopg.Connection[TupleRow], kind: str) -> list[tuple[str, in
             (kind,),
         )
         return [(str(row[0]), int(row[1])) for row in cur.fetchall()]
+
+
+def _last_run_at(conn: psycopg.Connection[TupleRow], kind: str) -> datetime | None:
+    with conn.cursor() as cur:
+        cur.execute("SELECT MAX(ts) FROM events WHERE kind = %s", (kind,))
+        row = cur.fetchone()
+    if row is None or row[0] is None:
+        return None
+    return datetime.fromisoformat(str(row[0]).replace("Z", "+00:00"))
+
+
+def test_fact_last_run_query_uses_partial_index(
+    server_conn: psycopg.Connection[TupleRow],
+) -> None:
+    with server_conn.cursor() as cur:
+        cur.execute("SET enable_seqscan = off")
+        try:
+            cur.execute(
+                """
+                EXPLAIN (COSTS OFF)
+                SELECT MAX(ts)
+                FROM events
+                WHERE kind = 'channel_message_count_probed'
+                  AND kind IN ('channel_message_count_probed')
+                """
+            )
+            plan = "\n".join(str(row[0]) for row in cur.fetchall())
+        finally:
+            cur.execute("RESET enable_seqscan")
+
+    assert "events_probe_fact_latest_idx" in plan
 
 
 @pytest.mark.trio
@@ -118,14 +176,14 @@ async def test_registry_dispatches_writes_and_updates_event_backed_last_run(
     deps = _deps(server_conn, client, clock)
     caplog.set_level(logging.INFO, logger="slack_fuse_server.slurper.spans")
     try:
-        await run_probe_sweep_once(RecordingSupervisor(), deps, (probe,))
+        await run_probe_registry_once(RecordingSupervisor(), deps, (probe,))
     finally:
         client.close()
 
     expected_ts = probe_timestamp(clock())
     assert calls == [probe.kind]
     assert _events(server_conn, probe.kind) == [(expected_ts, 0), (expected_ts, 1)]
-    assert await deps.cursor.last_run_at(probe.kind) == clock()
+    assert _last_run_at(server_conn, probe.kind) == clock()
     assert f"op=slurper.probe.{probe.kind}" in caplog.text
     assert "duration_ms=" in caplog.text
     assert "events_written=2" in caplog.text
@@ -143,7 +201,7 @@ async def test_interval_is_respected_across_three_minute_ticks(
     deps = _deps(server_conn, client, clock)
     try:
         for _ in range(3):
-            await run_probe_sweep_once(RecordingSupervisor(), deps, (probe,))
+            await run_probe_registry_once(RecordingSupervisor(), deps, (probe,))
             clock.advance(60.0)
     finally:
         client.close()
@@ -163,22 +221,44 @@ async def test_failure_isolated_and_failed_kind_retries_without_last_run(
     succeeded = _stub_probe("healthy_stub_probed", calls, interval_s=3600.0)
     client = SlackClient("xoxp-test")
     deps = _deps(server_conn, client, clock)
-    caplog.set_level(logging.ERROR, logger="slack_fuse_server.probes.sweep")
+    caplog.set_level(logging.ERROR, logger="slack_fuse_server.slurper.probes")
     caplog.set_level(logging.INFO, logger="slack_fuse_server.slurper.spans")
     try:
-        await run_probe_sweep_once(RecordingSupervisor(), deps, (failed, succeeded))
+        await run_probe_registry_once(RecordingSupervisor(), deps, (failed, succeeded))
         clock.advance(60.0)
-        await run_probe_sweep_once(RecordingSupervisor(), deps, (failed, succeeded))
+        await run_probe_registry_once(RecordingSupervisor(), deps, (failed, succeeded))
     finally:
         client.close()
 
     assert calls == [failed.kind, succeeded.kind, failed.kind]
     assert _events(server_conn, failed.kind) == []
     assert len(_events(server_conn, succeeded.kind)) == 1
-    assert await deps.cursor.last_run_at(failed.kind) is None
-    assert await deps.cursor.last_run_at(succeeded.kind) == datetime(2026, 8, 2, tzinfo=UTC)
+    assert _last_run_at(server_conn, failed.kind) is None
+    assert _last_run_at(server_conn, succeeded.kind) == datetime(2026, 8, 2, tzinfo=UTC)
     assert f"op=slurper.probe.{failed.kind}" in caplog.text
     assert "outcome=error" in caplog.text
+
+
+@pytest.mark.trio
+async def test_cadence_read_failure_isolated_from_later_probe(
+    server_conn: psycopg.Connection[TupleRow],
+) -> None:
+    clock = _Clock(datetime(2026, 8, 2, tzinfo=UTC))
+    calls: list[str] = []
+    failed = _stub_probe("cadence_failed_stub_probed", calls, due_error=RuntimeError("expected due failure"))
+    succeeded = _stub_probe("cadence_healthy_stub_probed", calls)
+    client = SlackClient("xoxp-test")
+    deps = _deps(server_conn, client, clock)
+    try:
+        counters = await run_probe_registry_once(RecordingSupervisor(), deps, (failed, succeeded))
+    finally:
+        client.close()
+
+    assert calls == [succeeded.kind]
+    assert counters[failed.job_id] == {"succeeded": 0, "failed": 1, "skipped": 0}
+    assert counters[succeeded.job_id] == {"succeeded": 1, "failed": 0, "skipped": 0}
+    assert _last_run_at(server_conn, failed.kind) is None
+    assert _last_run_at(server_conn, succeeded.kind) == clock()
 
 
 def _seed_channel(conn: psycopg.Connection[TupleRow], channel_id: str, name: str) -> None:
@@ -216,9 +296,9 @@ async def test_second_probe_is_registry_entry_only_no_framework_change(
     monkeypatch.setattr(channel_message_count_module, "search_channel_message_total", fake_search)
     client = SlackClient("xoxp-test")
     deps = _deps(server_conn, client, _Clock(datetime(2026, 8, 2, tzinfo=UTC)))
-    registry = (*register_default_probes(), second)
+    registry = (*register_fact_probes(), second)
     try:
-        await run_probe_sweep_once(RecordingSupervisor(), deps, registry)
+        await run_probe_registry_once(RecordingSupervisor(), deps, registry)
     finally:
         client.close()
 

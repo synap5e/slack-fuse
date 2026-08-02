@@ -31,7 +31,7 @@ from psycopg.rows import TupleRow
 import slack_fuse_server.migrations as server_migrations
 from slack_fuse.migrations.runner import apply_migrations
 from slack_fuse_server._json import JsonObject
-from slack_fuse_server.slurper.limiters import SlurperLimiters
+from slack_fuse_server.slurper.limiters import SlackTierPacer, SlurperLimiters
 from slack_fuse_server.slurper.offsets import OffsetWriter
 from slack_fuse_server.slurper.supervisor import TaskSupervisor
 from tests._fake_slack import make_fake_slack_transport
@@ -74,13 +74,18 @@ class _EphemeralPostgresUnavailable(RuntimeError):
     """Raised when a temporary Postgres cannot be started for the test session."""
 
 
-def make_test_limiters(*, writer_pool_size: int = 1) -> SlurperLimiters:
+def make_test_limiters(
+    *,
+    writer_pool_size: int = 1,
+    slack_tier2: SlackTierPacer | None = None,
+) -> SlurperLimiters:
     """Small limiter bundle for slurper unit tests."""
     return SlurperLimiters(
         slack_api=trio.CapacityLimiter(1),
         writer=trio.CapacityLimiter(writer_pool_size),
         snapshot=trio.CapacityLimiter(1),
         admin_read=trio.CapacityLimiter(1),
+        slack_tier2=SlackTierPacer(0.0) if slack_tier2 is None else slack_tier2,
     )
 
 

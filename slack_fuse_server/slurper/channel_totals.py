@@ -32,7 +32,6 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 DEFAULT_INTERVAL_S = 6 * 60 * 60.0
-DEFAULT_PER_CHANNEL_SLEEP_S = 3.5
 
 type SearchFn = Callable[[httpx.Client, str], SearchMessageTotal]
 
@@ -44,14 +43,13 @@ class ChannelTotalTarget:
     is_im: bool
 
 
-async def refresh_channel_totals_periodically(  # noqa: PLR0913 - task dependencies plus cadence knobs.
+async def refresh_channel_totals_periodically(
     writer: OffsetWriter,
     client: SlackClient,
     limiters: SlurperLimiters,
     supervisor: TaskSupervisor | None = None,
     *,
     interval_s: float = DEFAULT_INTERVAL_S,
-    per_channel_sleep_s: float = DEFAULT_PER_CHANNEL_SLEEP_S,
 ) -> None:
     """Refresh all visible channel totals forever on a six-hour cadence."""
     while True:
@@ -61,7 +59,6 @@ async def refresh_channel_totals_periodically(  # noqa: PLR0913 - task dependenc
                 client,
                 limiters,
                 supervisor,
-                per_channel_sleep_s=per_channel_sleep_s,
             )
         except Exception:
             log.exception("channel-totals: cycle failed; retrying after interval")
@@ -70,13 +67,12 @@ async def refresh_channel_totals_periodically(  # noqa: PLR0913 - task dependenc
         await trio.sleep(interval_s)
 
 
-async def refresh_channel_totals_once(  # noqa: PLR0913 - task dependencies plus test-injected search/cadence.
+async def refresh_channel_totals_once(
     writer: OffsetWriter,
     client: SlackClient,
     limiters: SlurperLimiters,
     supervisor: TaskSupervisor | None = None,
     *,
-    per_channel_sleep_s: float = DEFAULT_PER_CHANNEL_SLEEP_S,
     search_fn: SearchFn = search_channel_message_total,
 ) -> None:
     """Run one complete, per-channel persisted search sweep."""
@@ -97,7 +93,6 @@ async def refresh_channel_totals_once(  # noqa: PLR0913 - task dependencies plus
     approximate = 0
     unavailable = 0
     errors = 0
-    made_api_call = False
     for target in targets:
         if target.is_im or not target.name:
             await writer.run_transaction(
@@ -106,18 +101,13 @@ async def refresh_channel_totals_once(  # noqa: PLR0913 - task dependencies plus
             unavailable += 1
             continue
 
-        # Tier 2 is roughly 20 calls/minute. Sleeping *between* calls (not
-        # after the final call) keeps the sweep at ~17/minute with headroom.
-        if made_api_call:
-            await trio.sleep(per_channel_sleep_s)
-        made_api_call = True
-
         try:
             async with span(
                 op="slurper.channel_totals.search_channel",
                 task="channel-totals",
                 extra={"channel_id": target.channel_id},
             ) as search_span:
+                await limiters.slack_tier2.wait()
                 result = await run_sync_with_span(
                     lambda channel_name=target.name: search_fn(client.http, channel_name or ""),
                     limiter=limiters.slack_api,
@@ -216,7 +206,6 @@ def _mark_refresh_failed(
 
 __all__ = [
     "DEFAULT_INTERVAL_S",
-    "DEFAULT_PER_CHANNEL_SLEEP_S",
     "ChannelTotalTarget",
     "refresh_channel_totals_once",
     "refresh_channel_totals_periodically",

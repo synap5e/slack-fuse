@@ -56,6 +56,7 @@ def test_discover_server_migrations() -> None:
         "0012_slack_event_inbox.sql",
         "0013_channels_view_fold_drift.sql",
         "0014_channel_message_totals.sql",
+        "0015_probe_fact_latest_idx.sql",
     ]
 
 
@@ -73,6 +74,13 @@ def test_schema_sql_mirrors_channels_view_fold_migration() -> None:
     schema = _SERVER_SCHEMA.read_text()
 
     assert _channels_view_definition(schema) == _channels_view_definition(migration)
+
+
+def test_schema_sql_mirrors_probe_fact_index_migration() -> None:
+    migration = _normalize_ddl((_SERVER_DIR / "0015_probe_fact_latest_idx.sql").read_text())
+    schema = _normalize_ddl(_SERVER_SCHEMA.read_text())
+
+    assert migration in schema
 
 
 def _relkind(conn: psycopg.Connection[TupleRow], name: str) -> str | None:
@@ -108,6 +116,7 @@ def test_apply_server_migrations_idempotent(pg_conn: psycopg.Connection[TupleRow
         "0012_slack_event_inbox.sql",
         "0013_channels_view_fold_drift.sql",
         "0014_channel_message_totals.sql",
+        "0015_probe_fact_latest_idx.sql",
     ]
     assert _table_exists(pg_conn, "events")
     assert _table_exists(pg_conn, "snapshots")
@@ -149,6 +158,7 @@ def test_apply_server_migrations_idempotent(pg_conn: psycopg.Connection[TupleRow
         "events_backfill_page_committed_dedup",
         "events_backfill_run_stream_idx",
         "events_backfill_run_id_idx",
+        "events_probe_fact_latest_idx",
     ):
         with pg_conn.cursor() as cur:
             cur.execute("SELECT to_regclass(%s)", (index,))

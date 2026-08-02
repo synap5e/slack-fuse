@@ -100,12 +100,13 @@ class ServerConfig(BaseSettings):
     probe_workspace_user_count_cadence_s: float = 86400.0
     probe_channel_day_presence_cadence_s: float = 7 * 86400.0
 
-    # Immutable fact probes (slack_fuse_server/probes). Per-kind cadences are
-    # deliberately hardcoded in the registry; only the whole sweep is gated.
+    # Unified raw-detection + interpreted-fact probe sweep. Interpreted fact
+    # cadences are hardcoded registry entries; this only gates the whole task.
     probe_sweep_enabled: bool = True
 
     # Query-derived channel inventory totals (slurper/channel_totals.py).
-    # search.messages is Tier 2, so the default 3.5s gap stays below 20/min.
+    # The 3.5s value now configures the process-wide Tier-2 pacer shared by
+    # channel totals and interpreted search.messages probe facts.
     channel_totals_interval_s: float = 6 * 60 * 60.0
     channel_totals_per_channel_sleep_s: float = 3.5
 
