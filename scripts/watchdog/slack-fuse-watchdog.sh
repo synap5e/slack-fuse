@@ -31,7 +31,7 @@
 #
 # Env knobs:
 #   SLACK_FUSE_UNIT              systemd unit to monitor (default: slack-fuse.service)
-#   SLACK_FUSE_MOUNT             mount path to force-unmount on wedge (default: /views/slack-split)
+#   SLACK_FUSE_MOUNT             mount path to force-unmount on wedge (default: /views/slack)
 #   WEDGE_THRESHOLD_S            consecutive D-state seconds before action (default: 90)
 #   WEDGE_WAITING_THRESHOLD_S    seconds of continuous waiting>0 before action (default: 60)
 #   WATCHDOG_STATE_DIR           where to track detector state across runs
@@ -40,7 +40,7 @@
 set -uo pipefail
 
 UNIT="${SLACK_FUSE_UNIT:-slack-fuse.service}"
-MOUNT="${SLACK_FUSE_MOUNT:-/views/slack-split}"
+MOUNT="${SLACK_FUSE_MOUNT:-/views/slack}"
 THRESHOLD_S="${WEDGE_THRESHOLD_S:-90}"
 WAITING_THRESHOLD_S="${WEDGE_WAITING_THRESHOLD_S:-60}"
 STATE_DIR="${WATCHDOG_STATE_DIR:-${XDG_RUNTIME_DIR:-/tmp}/slack-fuse-watchdog}"

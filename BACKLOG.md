@@ -101,6 +101,139 @@ transitions.
 
 # Agent-raised (needs human review)
 
+## WTF-audit findings (2026-08-02, `/tmp/claude/wtf-audit.md`)
+
+Full report at `/tmp/claude/wtf-audit.md`. Codex ran a read-only end-to-end
+adversarial review after Phase 3 landed and found 4 correctness/privacy bugs
+plus 4 design/ops smells. Watchdog stale-path (item 4 in the report) was fixed
+inline; the rest need triage.
+
+### CORRECTNESS-1: Restart can reclassify stale historical projection bytes as clean
+
+`DiskProjection` keeps `_dirty` and `_inflight` **in-memory only**;
+`is_clean()` treats any existing backing file absent from those sets as
+current. Bootstrap only marks metadata + today's populated files. **Exact
+sequence**: an edit to a yesterday-file commits → yesterday's file marked
+dirty → process dies before coalescer flush → after restart, sets are
+empty, bootstrap ignores yesterday → old backing file passes `is_clean()`
+→ D2 serves stale bytes indefinitely. Also: fresh install never
+proactively materializes older hot history.
+
+Report locations: `slack_fuse/projector/disk_projection.py:66-71,119-125,
+153-167,251-275`. Fix (either): persist a per-path dependency
+offset/generation, OR conservatively invalidate/re-dirty every existing
+projected file on startup. Add a regression test that reconstructs
+`DiskProjection` after the commit/mark-before-flush crash point.
+**Blocks broad enablement** — currently only my canary flag has the
+projection running, so blast radius is bounded to pro until this is fixed.
+
+### CORRECTNESS-2: ReconnectingConnection silent partial-commit on mid-transaction bounce
+
+On transport failure `ReconnectingConnection` opens a new socket,
+restarts every active transaction, then retries only the failed cursor
+operation. **Exact sequence**: statement 1 succeeds → socket dies on
+statement 2 → closing the old conn rolls back statement 1 → wrapper
+begins fresh transaction and retries statement 2 → context exit commits
+→ caller sees success with statement 1 silently missing.
+
+Real multi-statement users: `slack_fuse/projector/block_sync.py:45-117`,
+`slack_fuse/projector/rerender.py:201-212`. Primary applier uses pooled
+raw connections (limited blast radius) but the wrapper's transaction
+abstraction is unsound. The `test_pg_bounce_recovery.py` fixture only
+fails the FIRST execute so it doesn't catch this.
+
+Fix: `ReconnectingConnection` must never reconnect inside an active
+transaction — surface `OperationalError` and let the caller retry the
+whole transaction at its own boundary.
+
+### CORRECTNESS-3: Block sync misses FUSE + projection invalidation
+
+`apply_blocked_channel_sync` mutates `channels.tier/subscribed`
+(`block_sync.py:45-117`); the periodic runner only has an
+`on_newly_subscribed` callback — no blocked/path invalidation callback.
+FUSE `open` sets `keep_cache=True`. **Exact sequence**: user reads a hot
+file → kernel caches → server blocks the channel → local sync flips tier
+to blocked → no inode/entry invalidation, no projection dirty-flip → a
+later open/read may still be satisfied from kernel cache even though
+blocked is contractually ENOENT.
+
+Fix: block-sync returns all visibility changes and performs post-commit
+subtree/inode invalidation plus projection invalidation/removal. Add a
+live-cache transition test.
+
+### CORRECTNESS-4: Watchdog stale mount path ✅ fixed inline
+
+Bug I introduced in `3688c92` (mount rename) — I updated
+`SLACK_FUSE_UNIT` but missed `SLACK_FUSE_MOUNT`. Watchdog was targeting
+the deleted `/views/slack-split` for FUSE-connection lookup + abort +
+unmount. Only the final service restart worked — precisely the recovery
+path the abort was designed to make reliable. Fixed in the same commit
+that migrates this entry.
+
+### OPS-1: Global projection lock is a stop-the-world bottleneck
+
+D3's race fix uses ONE global lock (`_state_lock`) around every event
+transaction AND every disk-tier read. `mark_apply_result` on a
+channel-list event does O(all hot channels) bootstrap inside the lock;
+every unrelated FUSE read on any path takes the same lock to check
+`is_clean`. **Consequence**: an event for channel A can block channel
+B's commit and channel C's FUSE read for the full duration of A's
+transaction + path resolution.
+
+D3 test `test_reader_cannot_pass_clean_gate_between_commit_and_dirty_mark`
+proves blocking is intentional, but there's no sustained-event latency
+test.
+
+Fix or benchmark before scale-up: per-path/version barriers, or a
+monotonic dirty generation instead of a single mutex. At minimum,
+measure callback latency under event load + channel-list churn (D2's
+0.665ms was idle-warm-only).
+
+### DESIGN-1: `channel_message_count_probed` duplicates `channel_totals` sweep for no consumer
+
+Both `channel_totals.py` and `channel_message_count.py` call the same
+`search.messages` per channel. At 664 channels × 3.5s pacer = ~39min
+sweep, doubled to ~78 min every 6h. The only client apply handling is
+an explicit no-op; grep shows NO production reader of
+`channel_message_count_probed`; `_workspace/channels.md` reads
+`channel_message_totals`. Also: fact batch discards ALL successes if
+one channel fails (unlike the table's per-channel persistence). Also:
+registry declares `PER_CHANNEL` scope but schedules the `workspace`
+target.
+
+Fix: reconcile — acquire once and fan out to both sinks per channel,
+OR remove the dead fact until something consumes it. Correct the
+declared scope.
+
+### DESIGN-2: v1 README + config drift
+
+README still tells users to provide Slack tokens + `SLACK_FUSE_BACKFILL`
+(deleted), promises removed `feed.md`/huddle/`.cached-only` surfaces,
+and describes deleted v1 disk cache / socket / USR1 backfill. Current
+v2 needs local PostgreSQL, server URL + shared secret, control/projection
+behaviour. Also: `SLACK_FUSE_DISK_PROJECTION_ENABLED` is read directly
+in construction AND read-tier code — not represented in typed
+`ClientConfig`.
+
+Fix: rewrite README around v2, label remaining v1 CLI island explicitly,
+move the projection flag into `ClientConfig` so construction/consumption
+can't drift.
+
+### DESIGN-3: Workspace completion math is comparing incomparables
+
+`slack_fuse_server/channel_stats.py:26-32` counts every historical
+`kind='message'` event rather than folded `active_messages`; then labels
+a channel "done" at 99% of current Slack total. Deletions make those
+quantities incomparable — false completion possible. Also:
+`workspace.refreshed_at` is `MAX(per-channel refreshed_at)`, so one
+newly-refreshed channel can make the whole workspace look fresh while
+hundreds are 6h stale.
+
+Fix: count folded `active_messages` (or rename to "lifetime ingested");
+expose min/coverage/staleness distribution rather than MAX timestamp.
+
+---
+
 ## Trailer FP: NULL-at-mount is a separate diagnosis
 
 **Raised**: 2026-08-02 during trailer-FP review. The defensive fix in
