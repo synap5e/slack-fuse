@@ -388,6 +388,26 @@ def test_channel_member_joined_and_left_are_no_op_but_not_unknown(
     )
 
 
+def test_channel_message_count_probe_is_no_op_but_not_unknown(
+    client_conn: psycopg.Connection[TupleRow],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("WARNING", logger="slack_fuse.projector.apply")
+    apply_event(
+        client_conn,
+        EventFrame(
+            stream="channel-list",
+            offset=1,
+            kind="channel_message_count_probed",
+            ts="2026-08-02T00:00:00.000000Z",
+            payload={"channel_id": "C001", "message_total": 42, "approximate": False},
+        ),
+    )
+
+    assert _cursor(client_conn, "channel-list") == 1
+    assert not any("unknown channel-list kind" in record.getMessage() for record in caplog.records)
+
+
 def test_channel_info_refreshed_preserves_manual_tier_override(
     client_conn: psycopg.Connection[TupleRow],
 ) -> None:

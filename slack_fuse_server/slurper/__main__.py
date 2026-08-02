@@ -90,6 +90,8 @@ from slack_fuse_server.http.handlers import (
 )
 from slack_fuse_server.http.metrics import MetricsAggregator, SubscriberSnapshot
 from slack_fuse_server.http.slack_webhook import SlackWebhookDeps, serve_slack_webhook
+from slack_fuse_server.probes import make_probe_deps, register_default_probes
+from slack_fuse_server.probes.sweep import run_probe_sweep as run_event_probe_sweep
 from slack_fuse_server.slack_events.dispatcher import SlackEventDispatcher
 from slack_fuse_server.slack_events.inbox import (
     InboxWriter,
@@ -527,6 +529,8 @@ async def _serve(config: ServerConfig, boot: BootContext) -> None:
         shared_secret=config.shared_secret,
         trigger=probe_trigger,
     )
+    event_probe_deps = make_probe_deps(client, writer, limiters)
+    event_probe_registry = register_default_probes()
     health = HealthEmitter(writer)
 
     # Reconnect/restart catchup: a startup gap-fill plus an on-demand one fired
@@ -709,6 +713,16 @@ async def _serve(config: ServerConfig, boot: BootContext) -> None:
                     probe_trigger,
                 )
             )
+            if config.probe_sweep_enabled:
+                nursery.start_soon(
+                    _ingesting_task(
+                        boot.task_context("probe-event-sweep", triggered_by="scheduled"),
+                        run_event_probe_sweep,
+                        supervisor,
+                        event_probe_deps,
+                        event_probe_registry,
+                    )
+                )
             nursery.start_soon(
                 _ingesting_task(
                     boot.task_context("backfill", triggered_by="control-surface"),

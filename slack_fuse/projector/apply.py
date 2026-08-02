@@ -529,6 +529,11 @@ def _dispatch_channel_list_event(
         return _apply_channel_unarchived(cur, payload)
     if kind == "channel_member_changed":
         return _apply_channel_member_changed(cur, payload)
+    if kind == "channel_message_count_probed":
+        # Immutable server-side inventory fact. A later client projector can
+        # consume the latest per-channel total; v1 acknowledges it explicitly
+        # so replay/catchup does not emit an unknown-kind warning.
+        return ApplyResult()
     if kind in ("channel_member_joined", "channel_member_left"):
         # Server-side facts about OTHER users' membership changes. The server's
         # `channels` view folds these to compute member counts (post FINDING-16
