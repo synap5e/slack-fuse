@@ -18,75 +18,6 @@ Ordered by priority (highest first). Each entry annotates **Effort**
 (whether I can drive it end-to-end without Simon's intervention — Yes /
 Yes after decisions / No).
 
-## Workspace channel inventory view (`_workspace/channels.md`)
-
-**Effort**: 1–2 eng-days (~200–250 LoC + tests). **Autonomous**: Yes —
-prompt already drafted at
-`/home/simon/.agent-handoff/2026-06-27/workspace-channels-view/prompt.md`;
-self-contained server + client work; no design decisions blocking.
-
-**Discovered**: 2026-06-27 during the dump-and-reingest while wanting
-a real-time progress denominator. Slack's `search.messages` API exposes
-a per-channel total message count (with `query=in:#<name>`, `count=1`,
-read `messages.total`), giving authoritative size data we don't have
-elsewhere.
-
-**Symptom / motivation**: backfill progress, channel sizing for
-manual-backfill decisions, block-list candidates, workspace overview
-— all rely on knowing "how many messages does this channel have?"
-Currently the only path is ad-hoc SQL + a one-off `search.messages`
-sweep, which:
-
-- requires kubectl exec into the slurper pod
-- has no UI surface
-- has no caching — every check pays Tier 2 rate budget
-- doesn't expose non-joined channels' sizes (which we'd want before
-  deciding whether to manually backfill them)
-
-**Proposed shape**: `_workspace/channels.md` ghost file rendering a
-per-channel inventory table:
-
-| Name | Messages | Ingested | Status | Member | Created |
-
-Status column maps `done` / `in_progress` / `blocked` / `not_started` /
-`not_joined` / `unavailable`. Sorted by total messages desc.
-
-**Server side**:
-- New `channel_message_totals` table (channel_id PK, total BIGINT,
-  refreshed_at TIMESTAMPTZ, refresh_status TEXT)
-- Periodic refresh task (6h cadence) — Tier 2 throttle, 3.5s between
-  calls, ~24 min per cycle for ~418 visible channels
-- HTTP `GET /channel-stats` joining the totals + blocked_channels +
-  latest channel-list payload + live events count
-- CLI `slack-fuse-server refresh-channel-totals` for one-shot
-
-**Client side**:
-- `_workspace/channels.md` ghost file
-- Background-warmed cache (same shape as `_workspace/gaps.md` warmer)
-  so FUSE callbacks never block on server fetch
-- Markdown renderer
-
-**Architectural note**: the search-derived count is a fact about Slack
-but it's *query-derived* (we asked, Slack told us), not pushed via
-the events stream. It belongs in a refreshed table, not an event kind.
-Same shape as `backfill_overrides` and `blocked_channels` — distinct
-from both the events log (immutable upstream facts) and operator-policy
-tables (mutable operator intent).
-
-**Pitfalls** (for the eventual implementor):
-- Search API requires user token, not bot token
-- `is_im` channels can't be queried via `in:#<name>` — handle/skip
-- Slack's total has approximation caveats above ~10K (mark
-  `refresh_status='approximate'`)
-- Don't truncate the totals table on refresh — preserve last-known
-  on error so the view stays useful
-
-**Impact**: changes the operational story from "ad-hoc SQL via kubectl"
-to "cat the file". Reusable for every future "how big is X / how
-complete are we" question.
-
----
-
 ## FUSE passthrough + coalesced disk projection
 
 **Effort**: 5–8 eng-days. **Autonomous**: Yes after decisions — five
@@ -348,6 +279,18 @@ _None currently._
 
 ## 2026-08-02
 
+- **Workspace channel inventory view (`_workspace/channels.md`)** —
+  `34f7f4e`. New server-side sweep `slurper/channel_totals.py` (6h
+  cadence, Tier-2 paced 3.5s between calls) + `search_messages.py`
+  user-token-only wrapper (approximate-flag on 10K+ paging drift) +
+  `channel_message_totals` table (migration 0014, upsert-preserves-
+  last-known on error) + `channel_stats.py` server projection joining
+  metadata/totals/blocks/ingest counts + `/channel-stats` authenticated
+  endpoint + client `channel_stats_fetch.py`/`channel_stats_warmer.py`
+  (5-minute background warmer, callbacks read cache only) + pure
+  markdown renderer + FUSE ghost-file wiring in `fuse_ops_v2.py`.
+  CLI: `slack-fuse-server refresh-channel-totals`. 12 focused new
+  tests + full-suite 1140 pass.
 - **Skip thread-expansion when local thread is already caught up** —
   `5d46c10`. New `slack_fuse_server/backfill/skip_predicate.py` reads
   the `active_messages` view (migration 0008 — edit/delete-folded)
