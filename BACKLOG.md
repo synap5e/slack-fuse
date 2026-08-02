@@ -227,6 +227,23 @@ _None currently._
 
 ## 2026-08-02
 
+- **Coalesced disk projection Stage D2 (read-side tier logic)** —
+  `8186d71` + `111968c`. `fuse_ops_v2.py` clean-tier reads/getattr/
+  lookup/readdir now serve from `DiskProjection` when the flag is on
+  and the path is clean; disk structural bytes go through the same
+  live trailer composition and conservative fallback-cache gate as
+  JIT. Uses `DiskProjection.is_clean()` atomically (dirty+inflight+
+  backing-exists in one lock); no new dirty-set primitive needed.
+  `read_bytes()` has no dirtiness logic; missing-after-clean retries
+  exactly once before warned JIT fallback. Kernel invariants 15/15
+  with flag both false AND true (regression guard). Timing 1.5KB
+  warm read: disk median 0.665ms / p95 1.336ms vs JIT median 0.727ms
+  / p95 0.957ms (under 1ms constraint; the live trailer/tier DB
+  lookups keep it above the ideal 100us — flagged for future). Ghost
+  files + `_control/` + NO_POSTGRES bypass the tier gate entirely;
+  projection gate scoped to normal channel.md/thread.md only.
+  D3 (adversarial invalidation ordering + race-injection tests) is
+  the last stage.
 - **Coalesced disk projection Stage D1 (writer + coalescer)** —
   `98f9657` + `8fea4a2`. Ships DARK behind `SLACK_FUSE_DISK_PROJECTION_ENABLED`
   (default false). New `slack_fuse/projector/disk_projection.py`,
