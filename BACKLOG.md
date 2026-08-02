@@ -256,6 +256,28 @@ one-off `ruff format .` sweep + single commit would clear it.
 
 ---
 
+## `/channel-stats` endpoint latency — server-side query optimisation
+
+**Raised**: 2026-08-02 while verifying the workspace-channels deploy.
+Endpoint takes 5–10s from LAN and 8–12s over Tailscale (135KB payload
+across 664 channels; likely a per-channel JOIN cost). Client fetcher
+timeout bumped 5s→30s inline (commit pending) to stop warmer
+ReadTimeouts, but the endpoint itself needs optimisation.
+
+Candidates:
+1. Materialise the join into a view refreshed by the channel-totals
+   sweep (once per 6h), read it as a single SELECT.
+2. Precompute + cache the JSON body server-side; invalidate on refresh
+   task tick.
+3. Paginate the endpoint — probably unnecessary given the cache-warmer
+   pattern.
+
+Not blocking anything now that timeout is 30s; the warmer runs every
+5 min so a 10s call is fine budget-wise. But 30s is a big client
+budget for what should be a snappy read.
+
+---
+
 ## Two flaky perf tests in `tests/backfill/test_resume.py`
 
 **Raised**: 2026-08-02 by multiple handoffs today. `test_resume_plan_fast_at_scale`
