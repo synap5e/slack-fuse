@@ -102,6 +102,7 @@ journalctl --user -u slack-fuse -n 30 --no-pager
 ├── group-dms/<participants>/       # Group DMs
 ├── other-channels/<name>/          # Public channels you haven't joined
 ├── huddles/<YYYY-MM>/<DD>/<slug>/  # Top-level index of all huddles
+├── _workspace/channels.md           # Channel sizes, ingest status, and metadata
 └── .cached-only/                   # Mirror of the whole tree, no API fetches
 ```
 
@@ -109,6 +110,8 @@ Channel directory names are slugified. Thread slugs come from the first message 
 
 `uv run slack-fuse resolve <slack-url>` returns the FUSE path for a Slack message permalink.
 `uv run slack-fuse permalink <fuse-path>` returns the Slack permalink URL for a FUSE path. Pass `--ts <message_ts>` to permalink a specific message in a day or thread file.
+
+`_workspace/channels.md` is backed by a six-hour server-side `search.messages` sweep and a background-warmed client cache, so reading it never waits on Slack. Run `uv run slack-fuse-server refresh-channel-totals` for an ad-hoc refresh.
 
 ## `.cached-only/` — offline mode
 

@@ -55,6 +55,7 @@ def test_discover_server_migrations() -> None:
         "0011_backfill_run_stream.sql",
         "0012_slack_event_inbox.sql",
         "0013_channels_view_fold_drift.sql",
+        "0014_channel_message_totals.sql",
     ]
 
 
@@ -106,12 +107,14 @@ def test_apply_server_migrations_idempotent(pg_conn: psycopg.Connection[TupleRow
         "0011_backfill_run_stream.sql",
         "0012_slack_event_inbox.sql",
         "0013_channels_view_fold_drift.sql",
+        "0014_channel_message_totals.sql",
     ]
     assert _table_exists(pg_conn, "events")
     assert _table_exists(pg_conn, "snapshots")
     assert _table_exists(pg_conn, "backfill_overrides")
     assert _table_exists(pg_conn, "blocked_channels")
     assert _table_exists(pg_conn, "slack_event_inbox")
+    assert _table_exists(pg_conn, "channel_message_totals")
     # 0004 / 0005 replaced the empty `channels` / `health_log` tables with
     # VIEWs over the events log (ES-clean: one source of truth, no dual write).
     assert _relkind(pg_conn, "channels") == "v"

@@ -74,6 +74,9 @@ CHANNEL_ORIGINAL_MD: Final = "channel.original.md"
 # events-aggregation slow path. Workspace-wide summary lives at
 # ``/_workspace/gaps.md``.
 GAPS_MD: Final = "gaps.md"
+# Discoverable workspace channel inventory, served from a background-warmed
+# cache so the FUSE callback never performs server I/O.
+CHANNELS_MD: Final = "channels.md"
 # Top-level namespace for read-only diagnostic surfaces (currently just
 # gaps; future control-surface ghost files land here too). Listed by the
 # root readdir so it's discoverable; its contents are listed normally

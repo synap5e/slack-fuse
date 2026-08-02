@@ -254,6 +254,8 @@ class SlackClient:
     def list_conversations(
         self,
         types: str = "public_channel,private_channel,mpim,im",
+        *,
+        exclude_archived: bool = True,
     ) -> list[Validated[Channel]]:
         """List all conversations the user has access to.
 
@@ -267,7 +269,7 @@ class SlackClient:
             params: dict[str, str] = {
                 "types": types,
                 "limit": "200",
-                "exclude_archived": "true",
+                "exclude_archived": "true" if exclude_archived else "false",
             }
             if cursor:
                 params["cursor"] = cursor

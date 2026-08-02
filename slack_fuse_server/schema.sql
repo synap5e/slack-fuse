@@ -584,6 +584,16 @@ CREATE TABLE blocked_channels (
     reason TEXT
 );
 
+-- Query-derived Slack facts backing `/_workspace/channels.md`. These are
+-- refreshed in place rather than appended to `events`: search.messages is a
+-- fact Slack returns when asked, not an upstream event Slack pushed.
+CREATE TABLE channel_message_totals (
+    channel_id TEXT PRIMARY KEY,
+    total BIGINT NOT NULL,
+    refreshed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    refresh_status TEXT NOT NULL DEFAULT 'ok'
+);
+
 -- Offset-assignment pattern (RFC §Schemas → Offset assignment pattern).
 -- Concurrent writers to the same stream serialize via the stream_heads row
 -- lock; writers to different streams are independent. Canonical write TX:

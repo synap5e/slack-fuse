@@ -17,6 +17,7 @@ from slack_fuse_server.blocked_channels import (
     unblock_channel,
 )
 from slack_fuse_server.http.dto import (
+    ChannelStatsResponse,
     GapDetectionRow,
     HealthResponse,
     MetricsResponse,
@@ -315,6 +316,20 @@ def handle_workspace_gaps(*, deps: GapsDeps) -> bytes:
 
     with psycopg.connect(deps.database_url, autocommit=True) as conn:
         return render_workspace_gaps(conn)
+
+
+def handle_channel_stats(
+    headers: Sequence[tuple[bytes, bytes]],
+    *,
+    deps: BlockedChannelsDeps,
+) -> ChannelStatsResponse | tuple[int, str]:
+    """``GET /channel-stats`` — authenticated joined workspace inventory."""
+    from slack_fuse_server.channel_stats import fetch_channel_stats  # noqa: PLC0415
+
+    if not is_http_authorized(headers, deps.shared_secret):
+        return 401, "unauthorized"
+    with psycopg.connect(deps.database_url, autocommit=True) as conn:
+        return fetch_channel_stats(conn)
 
 
 def handle_gap_detection(*, deps: GapsDeps) -> list[GapDetectionRow]:

@@ -100,6 +100,11 @@ class ServerConfig(BaseSettings):
     probe_workspace_user_count_cadence_s: float = 86400.0
     probe_channel_day_presence_cadence_s: float = 7 * 86400.0
 
+    # Query-derived channel inventory totals (slurper/channel_totals.py).
+    # search.messages is Tier 2, so the default 3.5s gap stays below 20/min.
+    channel_totals_interval_s: float = 6 * 60 * 60.0
+    channel_totals_per_channel_sleep_s: float = 3.5
+
     @model_validator(mode="after")
     def _validate_event_sources(self) -> Self:
         if self.webhook_port > 0 and not self.signing_secret:

@@ -40,6 +40,7 @@ from slack_fuse_server.http.handlers import (
     handle_backfill_channel,
     handle_block_channel,
     handle_channel_gaps,
+    handle_channel_stats,
     handle_gap_detection,
     handle_health,
     handle_list_blocked_channels,
@@ -219,6 +220,20 @@ def route_request(  # noqa: C901, PLR0913 - endpoint routing dispatch hub.
         if gaps_deps is None:
             return _error_response(status_code=503, code="service_unavailable")
         return _handle_workspace_gaps(deps=gaps_deps)
+
+    if request.path == "/channel-stats":
+        if request.method != "GET":
+            return _error_response(status_code=405, code="method_not_allowed")
+        if blocked_channels_deps is None:
+            return _error_response(status_code=503, code="service_unavailable")
+        try:
+            result = handle_channel_stats(request.headers, deps=blocked_channels_deps)
+        except psycopg.Error:
+            return _error_response(status_code=503, code="service_unavailable")
+        if isinstance(result, tuple):
+            status_code, message = result
+            return HttpResponse(status_code=status_code, body=message.encode(), content_type="text/plain")
+        return _dto_response(status_code=200, payload=result)
 
     if request.path == "/refresh-channels":
         if request.method != "POST":

@@ -105,6 +105,7 @@ from slack_fuse_server.slurper.catchup import (
     CatchupTrigger,
     should_catchup,
 )
+from slack_fuse_server.slurper.channel_totals import refresh_channel_totals_periodically
 from slack_fuse_server.slurper.channels import ensure_channel_added, populate_channels_once
 from slack_fuse_server.slurper.health import HealthEmitter
 from slack_fuse_server.slurper.ingestion import (
@@ -671,6 +672,17 @@ async def _serve(config: ServerConfig, boot: BootContext) -> None:
                     supervisor,
                 )
             )
+            nursery.start_soon(
+                _ingesting_task(
+                    boot.task_context("channel-totals", triggered_by="scheduled"),
+                    _run_channel_totals_periodic_task,
+                    writer,
+                    client,
+                    limiters,
+                    supervisor,
+                    config,
+                )
+            )
             # Long-lived consumer for HTTP-triggered refresh requests
             # (POST /refresh-channels). Same job as the periodic task,
             # fires only on demand. Rendezvous channel means a second
@@ -860,6 +872,46 @@ async def _run_refresh_channels_once(config: ServerConfig) -> None:
     client = SlackClient(config.slack_user_token)
     try:
         await refresh_channels_once(writer, client, limiters)
+    finally:
+        client.close()
+        writer.close()
+
+
+async def _run_channel_totals_periodic_task(
+    writer: OffsetWriter,
+    client: SlackClient,
+    limiters: SlurperLimiters,
+    supervisor: TaskSupervisor,
+    config: ServerConfig,
+) -> None:
+    await refresh_channel_totals_periodically(
+        writer,
+        client,
+        limiters,
+        supervisor,
+        interval_s=config.channel_totals_interval_s,
+        per_channel_sleep_s=config.channel_totals_per_channel_sleep_s,
+    )
+
+
+async def _run_refresh_channel_totals_once(config: ServerConfig) -> None:
+    """One-shot CLI for the same search sweep as the periodic task."""
+    from slack_fuse_server.slurper.channel_totals import refresh_channel_totals_once  # noqa: PLC0415
+
+    limiters = _make_limiters(config)
+    writer = OffsetWriter(
+        _connect_writer_pool(config),
+        limiter=limiters.writer,
+        acquire_timeout_s=config.slurper_writer_pool_acquire_timeout_s,
+    )
+    client = SlackClient(config.slack_user_token)
+    try:
+        await refresh_channel_totals_once(
+            writer,
+            client,
+            limiters,
+            per_channel_sleep_s=config.channel_totals_per_channel_sleep_s,
+        )
     finally:
         client.close()
         writer.close()
@@ -1387,6 +1439,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "task does — exposed as a one-shot so operators can trigger drift "
         "catchup on demand.",
     )
+    sub.add_parser(
+        "refresh-channel-totals",
+        help="run one search.messages channel-size sweep and persist the results",
+    )
     ingest = sub.add_parser("initial-ingest", help="run unbounded admin initial ingest")
     ingest_target = ingest.add_mutually_exclusive_group(required=True)
     ingest_target.add_argument("--channel", dest="channel_id", help="Slack channel id, e.g. C0AKQ5DS0FQ")
@@ -1460,6 +1516,10 @@ def main() -> None:  # noqa: C901 - CLI command dispatch stays flat and explicit
     if args.command == "refresh-channels":
         with ingesting(boot.task_context("refresh-info", triggered_by="admin-cli")):
             trio.run(_run_refresh_channels_once, config)
+        return
+    if args.command == "refresh-channel-totals":
+        with ingesting(boot.task_context("channel-totals", triggered_by="admin-cli")):
+            trio.run(_run_refresh_channel_totals_once, config)
         return
     if args.command == "initial-ingest":
         initial_channel_id: str | None = args.channel_id

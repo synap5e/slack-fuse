@@ -127,12 +127,17 @@ async def populate_channels_once(
     client: SlackClient,
     limiters: SlurperLimiters,
     supervisor: TaskSupervisor | None = None,
+    *,
+    exclude_archived: bool = True,
 ) -> None:
     """One-shot startup conversations.list import (`channel_added` events)."""
     try:
         if supervisor is not None:
             supervisor.declare("populate-channels", "listing_channels", deadline_s=60)
-        channels = await trio.to_thread.run_sync(client.list_conversations, limiter=limiters.slack_api)
+        channels = await trio.to_thread.run_sync(
+            lambda: client.list_conversations(exclude_archived=exclude_archived),
+            limiter=limiters.slack_api,
+        )
         if supervisor is not None:
             supervisor.declare("populate-channels", "writing_channels", deadline_s=30)
         total, inserted = await writer.run_transaction(lambda conn: _populate_channels_once_sync(conn, channels))

@@ -10,7 +10,7 @@ alongside the byte-level one.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 import pytest
 from pydantic import BaseModel, ValidationError
@@ -20,6 +20,8 @@ from slack_fuse_server.http.dto import (
     SNAPSHOT_CONTENT_TYPE,
     BackfillInProgress,
     BackfillMetrics,
+    ChannelStat,
+    ChannelStatsResponse,
     ClientSubscription,
     HealthResponse,
     MetricsResponse,
@@ -44,6 +46,24 @@ _DTOS: list[BaseModel] = [
     PermalinkRequest(path="channels/general/2026-06/08/channel.md", ts="1700000000.000100"),
     PermalinkResponse(url="https://example.slack.com/archives/C1/p1700000000000100"),
     HealthResponse(ok=True),
+    ChannelStatsResponse(
+        refreshed_at=_T,
+        workspace_message_total=12,
+        channels=[
+            ChannelStat(
+                channel_id="C1",
+                name="general",
+                total=12,
+                ingested=5,
+                status="in_progress",
+                is_member=True,
+                is_archived=False,
+                is_blocked=False,
+                created=date(2024, 8, 15),
+                refresh_status="ok",
+            )
+        ],
+    ),
     SnapshotQuery(at=184500),
     SnapshotLine(
         ts="1779000000.000100",

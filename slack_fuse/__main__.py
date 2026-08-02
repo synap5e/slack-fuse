@@ -327,6 +327,8 @@ def cmd_mount(args: argparse.Namespace) -> None:  # noqa: C901  (process-wiring 
     # The fetcher runs in FUSE worker threads (dispatched by ``_run_sync``),
     # so a sync client fits cleanly — no trio context to thread through.
     # Long-lived: one process, connection-pooled.
+    from slack_fuse.channel_stats import render_channel_stats
+    from slack_fuse.projector.channel_stats_fetch import fetch_channel_stats
     from slack_fuse.projector.gaps_fetch import fetch_channel_gaps, fetch_gaps_tsv_bytes, fetch_workspace_gaps
     from slack_fuse.projector.originals_fetch import fetch_originals
     from slack_fuse.projector.probes_fetch import fetch_probes_bytes
@@ -353,6 +355,14 @@ def cmd_mount(args: argparse.Namespace) -> None:  # noqa: C901  (process-wiring 
 
     def _workspace_gaps_fetch_sync() -> bytes:
         return fetch_workspace_gaps(ghost_http_client, ghost_base_http_url)
+
+    def _workspace_channels_fetch_sync() -> bytes:
+        stats = fetch_channel_stats(
+            ghost_http_client,
+            ghost_base_http_url,
+            shared_secret=config.shared_secret,
+        )
+        return render_channel_stats(stats)
 
     # ``_control/`` write surface: trigger server-side refreshes/backfills and
     # mutate server-side block policy over HTTP. Shares the ghost-file httpx
@@ -484,6 +494,7 @@ def cmd_mount(args: argparse.Namespace) -> None:  # noqa: C901  (process-wiring 
         originals_fetch=_originals_fetch_sync,
         channel_gaps_fetch=_channel_gaps_fetch_sync,
         workspace_gaps_fetch=_workspace_gaps_fetch_sync,
+        workspace_channels_fetch=_workspace_channels_fetch_sync,
         control_state=control_state,
         control_refresh_workspace=_control_refresh_workspace,
         control_refresh_channel=_control_refresh_channel,
@@ -601,6 +612,7 @@ def cmd_mount(args: argparse.Namespace) -> None:  # noqa: C901  (process-wiring 
     # never block on HTTP (the workspace query alone runs ~2s server-side
     # and would blow the 1s per-callback budget); this task feeds the
     # in-process cache periodically so callbacks just read from it.
+    from slack_fuse.projector.channel_stats_warmer import warm_channel_stats_periodically
     from slack_fuse.projector.gaps_warmer import warm_gaps_periodically
 
     def _list_known_channel_ids() -> list[str]:
@@ -619,6 +631,15 @@ def cmd_mount(args: argparse.Namespace) -> None:  # noqa: C901  (process-wiring 
             )
         except Exception as exc:  # noqa: BLE001 — supervisor must outlive any warmer error
             log.warning("gaps warmer exited (%s); not restarting (gaps will fall back to ENOENT)", exc)
+
+    async def _run_channel_stats_warmer() -> None:
+        try:
+            await warm_channel_stats_periodically(ops, fetch=_workspace_channels_fetch_sync)
+        except Exception as exc:  # noqa: BLE001 — supervisor must outlive any warmer error
+            log.warning(
+                "channel-stats warmer exited (%s); not restarting (channels.md will fall back to ENOENT)",
+                exc,
+            )
 
     async def _run_rerender_consumer() -> None:
         """Drain ``_control/rerender_channel`` requests and re-render off-budget.
@@ -699,6 +720,7 @@ def cmd_mount(args: argparse.Namespace) -> None:  # noqa: C901  (process-wiring 
                 nursery.start_soon(_run_projector)
                 nursery.start_soon(pg_health.run)
                 nursery.start_soon(_run_gaps_warmer)
+                nursery.start_soon(_run_channel_stats_warmer)
                 nursery.start_soon(_run_rerender_consumer)
                 nursery.start_soon(_run_block_sync)
                 await pyfuse3.main()
@@ -719,6 +741,7 @@ def cmd_mount(args: argparse.Namespace) -> None:  # noqa: C901  (process-wiring 
         fuse_conn.close()
         state_conn.close()
         sink_conn.close()
+        ghost_http_client.close()
         if trailer_log is not None:
             trailer_log.close()
 

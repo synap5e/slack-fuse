@@ -48,6 +48,7 @@ from slack_fuse.fuse_v2_helpers import (
     CHANNEL_LIST_STREAM,
     CHANNEL_MD,
     CHANNEL_ORIGINAL_MD,
+    CHANNELS_MD,
     CONTROL_BACKFILL_CHANNEL,
     CONTROL_BLOCKED_CHANNELS,
     CONTROL_DIR,
@@ -168,6 +169,9 @@ ChannelGapsFetchFn = Callable[[str], bytes]
 # ``WorkspaceGapsFetchFn() -> markdown body``.
 # ``/_workspace/gaps.md`` workspace-wide summary fetcher.
 WorkspaceGapsFetchFn = Callable[[], bytes]
+# ``/_workspace/channels.md`` rendered inventory fetcher. Called only by the
+# background warmer, never from a FUSE callback.
+WorkspaceChannelsFetchFn = Callable[[], bytes]
 
 # ``_control/`` refresh triggers. Both return an HTTP status code (or the ``0``
 # transport-error sentinel). Production wires these to sync httpx POSTs against
@@ -545,6 +549,7 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         originals_fetch: OriginalsFetchFn | None = None,
         channel_gaps_fetch: ChannelGapsFetchFn | None = None,
         workspace_gaps_fetch: WorkspaceGapsFetchFn | None = None,
+        workspace_channels_fetch: WorkspaceChannelsFetchFn | None = None,
         control_state: ControlState | None = None,
         control_refresh_workspace: ControlRefreshWorkspaceFn | None = None,
         control_refresh_channel: ControlRefreshChannelFn | None = None,
@@ -623,6 +628,10 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         self._workspace_gaps_fetch = workspace_gaps_fetch
         self._workspace_gaps_cache: _BytesCache | None = (
             _BytesCache(max_entries=1, ttl_s=600.0) if workspace_gaps_fetch is not None else None
+        )
+        self._workspace_channels_fetch = workspace_channels_fetch
+        self._workspace_channels_cache: _BytesCache | None = (
+            _BytesCache(max_entries=1, ttl_s=600.0) if workspace_channels_fetch is not None else None
         )
         # ``_control/`` write surface. The directory is visible (and writes
         # accepted) only when ``control_state`` is wired — the two refresh
@@ -1338,17 +1347,21 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             # namespace for read-only diagnostic surfaces. Listed on both the
             # readdir AND lookup paths so ``ls /views/slack`` shows it.
             roots: list[tuple[str, bool]] = [(d, True) for d in CONV_ROOTS]
-            if self._workspace_gaps_fetch is not None:
+            if self._workspace_gaps_fetch is not None or self._workspace_channels_fetch is not None:
                 roots.append((WORKSPACE_DIR, True))
             if self._control_enabled:
                 roots.append((CONTROL_DIR, True))
             return roots
 
-        # Top-level ``_workspace/`` namespace. Currently contains only
-        # ``gaps.md``; future read-only diagnostic ghost files land here too.
+        # Top-level ``_workspace/`` namespace for read-only diagnostic files.
         if parts[0] == WORKSPACE_DIR:
-            if depth == 1 and self._workspace_gaps_fetch is not None:
-                return [(GAPS_MD, False)]
+            if depth == 1:
+                entries: list[tuple[str, bool]] = []
+                if self._workspace_channels_fetch is not None:
+                    entries.append((CHANNELS_MD, False))
+                if self._workspace_gaps_fetch is not None:
+                    entries.append((GAPS_MD, False))
+                return entries
             return []
 
         # Top-level ``_control/`` write surface (Plan-9 ctl/status).
@@ -1512,6 +1525,15 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         ):
             return self._assemble_workspace_gaps()
 
+        if (
+            depth == 2
+            and parts[0] == WORKSPACE_DIR
+            and parts[1] == CHANNELS_MD
+            and self._workspace_channels_fetch is not None
+            and self._workspace_channels_cache is not None
+        ):
+            return self._assemble_workspace_channels()
+
         if depth < 3 or parts[0] not in CONV_ROOTS:
             return None
 
@@ -1665,6 +1687,15 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             return None
         return cached, False, False, TrailerDecision(kind="clean", stream="workspace-gaps")
 
+    def _assemble_workspace_channels(self) -> tuple[bytes, bool, bool, TrailerDecision] | None:
+        """``/_workspace/channels.md`` — pure cache lookup, never fetches."""
+        if self._workspace_channels_cache is None:
+            return None
+        cached = self._workspace_channels_cache.get()
+        if not cached:
+            return None
+        return cached, False, False, TrailerDecision(kind="clean", stream="workspace-channels")
+
     # ------------------------------------------------------------------
     # Cache mutators used by the background warmer (off the FUSE path).
     # ------------------------------------------------------------------
@@ -1682,6 +1713,12 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         if self._workspace_gaps_cache is None:
             return
         self._workspace_gaps_cache.put(content=content)
+
+    def put_workspace_channels_cached(self, content: bytes) -> None:
+        """Background warmer entry point for ``/_workspace/channels.md``."""
+        if self._workspace_channels_cache is None:
+            return
+        self._workspace_channels_cache.put(content=content)
 
     # ------------------------------------------------------------------
     # FUSE callbacks

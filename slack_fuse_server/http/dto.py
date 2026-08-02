@@ -18,6 +18,7 @@ content-type/-encoding constants below pin that contract.
 from __future__ import annotations
 
 from datetime import date, datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -99,6 +100,38 @@ class PermalinkResponse(_DTO):
 
 class HealthResponse(_DTO):
     ok: bool
+
+
+# === /channel-stats ===
+
+
+type ChannelStatStatus = Literal[
+    "done",
+    "in_progress",
+    "blocked",
+    "not_started",
+    "not_joined",
+    "unavailable",
+]
+
+
+class ChannelStat(_DTO):
+    channel_id: str
+    name: str
+    total: int | None
+    ingested: int
+    status: ChannelStatStatus
+    is_member: bool
+    is_archived: bool
+    is_blocked: bool
+    created: date | None
+    refresh_status: str
+
+
+class ChannelStatsResponse(_DTO):
+    refreshed_at: datetime | None
+    workspace_message_total: int
+    channels: list[ChannelStat] = Field(default_factory=list)
 
 
 # === /gap-candidates + /probe-status + /refill-window ===
