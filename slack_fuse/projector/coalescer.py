@@ -44,6 +44,9 @@ async def run_coalescer(
             if not bootstrapped:
                 await trio.to_thread.run_sync(functools.partial(projection.bootstrap, conn))
                 bootstrapped = True
+            # D3 step 6: flush_dirty returns only after atomic replace and the
+            # transactional drift-check/clean transition. Kernel invalidation
+            # is deliberately the final observable action for every path.
             flushed = await trio.to_thread.run_sync(projection.flush_dirty, initial_flush_batch)
             if flushed:
                 await trio.to_thread.run_sync(_invalidate_paths, invalidator, flushed)

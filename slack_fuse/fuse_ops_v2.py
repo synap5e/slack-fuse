@@ -1535,7 +1535,13 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         return CHANNEL_LIST_STREAM if is_channel_meta else f"channel:{row.channel_id}"
 
     def _read_from_disk_if_clean(self, path: str) -> bytes | None:
-        """Read clean projection bytes, retrying one disappearance race."""
+        """Read clean projection bytes, retrying one disappearance race.
+
+        D3 read ordering is linearized at ``is_clean`` under the projection
+        state lock. After release, atomic replacement may give either complete
+        old or complete new bytes; both were clean at that point. Two ENOENT
+        results are the bounded race fallback to JIT, never an exception.
+        """
         projection = self._disk_projection
         if not self._disk_projection_enabled or projection is None or not projection.is_clean(path):
             return None

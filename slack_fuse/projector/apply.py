@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import re
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Protocol, cast
@@ -97,7 +98,9 @@ class InvalidationSink(Protocol):
 
 
 class ProjectionSink(Protocol):
-    """Optional post-commit sink for coalesced disk-projection dirtiness."""
+    """Optional commit barrier + sink for disk-projection dirtiness."""
+
+    def invalidation_barrier(self) -> AbstractContextManager[None]: ...
 
     def mark_apply_result(self, result: ApplyResult) -> None: ...
 
@@ -153,14 +156,18 @@ def apply_event(
     ``block_sync.apply_blocked_channel_sync`` which is the sole caller of
     ``_force_blocked_manual`` now.
     """
-    with conn.transaction(), conn.cursor() as cur:
-        result = _dispatch(cur, frame)
-        advance_cursor(cur, frame.stream, frame.offset)
-    # Exiting the transaction above is the commit barrier. Marking only after
-    # that point prevents the coalescer from rendering pre-event bytes and
-    # incorrectly declaring them clean.
-    if projection is not None:
-        projection.mark_apply_result(result)
+    # D3 ordering contract: the event COMMIT and its dirty marks share the same
+    # projection-state acquisition as the coalescer's drift-check/clean
+    # transition.  Without spanning the commit, a reader could pass is_clean()
+    # after PostgreSQL exposed the new JIT bytes but before mark_apply_result()
+    # made the old disk bytes ineligible.
+    barrier = nullcontext() if projection is None else projection.invalidation_barrier()
+    with barrier:
+        with conn.transaction(), conn.cursor() as cur:
+            result = _dispatch(cur, frame)
+            advance_cursor(cur, frame.stream, frame.offset)
+        if projection is not None:
+            projection.mark_apply_result(result)
     return result
 
 

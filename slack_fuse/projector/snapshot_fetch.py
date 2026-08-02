@@ -133,11 +133,19 @@ async def fetch_and_apply_snapshot(  # noqa: PLR0913 (HTTP + post-commit sinks)
     # "this channel now has zero messages" state, so it must DELETE every local
     # chunk/thread_chunk for the channel — not merely advance the cursor, which
     # would orphan stale rows the client never saw deleted.
-    invalidations = await trio.to_thread.run_sync(
-        _apply_snapshot_sync, conn, redirect.stream, redirect.at_offset, tuple(lines)
-    )
-    if projection is not None:
-        await trio.to_thread.run_sync(_mark_projection_dirty, projection, invalidations)
+    if projection is None:
+        invalidations = await trio.to_thread.run_sync(
+            _apply_snapshot_sync, conn, redirect.stream, redirect.at_offset, tuple(lines)
+        )
+    else:
+        invalidations = await trio.to_thread.run_sync(
+            _apply_snapshot_with_projection,
+            conn,
+            redirect.stream,
+            redirect.at_offset,
+            tuple(lines),
+            projection,
+        )
     # Dispatch the sink call to a worker thread. ``pyfuse3.invalidate_inode``
     # can block on kernel writeback and (on a busy mount) deadlock against
     # in-flight FUSE reads — the 2026-06-24 folio_wait_bit_common wedge
@@ -178,6 +186,20 @@ def _apply_snapshot_sync(
         for row in rows:
             results.append(apply_snapshot_row(cur, stream, row))
         advance_cursor(cur, stream, at_offset)
+    return results
+
+
+def _apply_snapshot_with_projection(
+    conn: Connection[TupleRow],
+    stream: str,
+    at_offset: int,
+    lines: tuple[str, ...],
+    projection: ProjectionSink,
+) -> list[ApplyResult]:
+    """Commit snapshot bytes and mark their disk paths under one barrier."""
+    with projection.invalidation_barrier():
+        results = _apply_snapshot_sync(conn, stream, at_offset, lines)
+        _mark_projection_dirty(projection, results)
     return results
 
 

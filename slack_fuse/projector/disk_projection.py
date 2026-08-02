@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import os
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path, PurePosixPath
@@ -45,6 +47,8 @@ from slack_fuse_render import resolve_mentions
 
 PROJECTION_ROOT = Path.home() / ".cache" / "slack-fuse" / "projection"
 
+type OffsetSnapshot = tuple[tuple[str, int], ...]
+
 
 class DiskProjection:
     """Manage dirty state and atomically materialize projected markdown."""
@@ -62,6 +66,9 @@ class DiskProjection:
         self._dirty = DirtySet()
         self._inflight: set[str] = set()
         self._state_lock = threading.RLock()
+        # Production has one coalescer today. Keep that a code-level invariant:
+        # a set-valued _inflight cannot represent two owners of the same path.
+        self._flush_lock = threading.Lock()
         # A psycopg connection is not safe for overlapping operations.  Path
         # resolution runs in applier worker threads while a coalescer render
         # may run in another, so serialize complete DB/render operations.
@@ -98,6 +105,17 @@ class DiskProjection:
         with self._state_lock:
             self._dirty.mark(normalized)
 
+    @contextmanager
+    def invalidation_barrier(self) -> Iterator[None]:
+        """Linearize a DB commit + dirty marks against clean transitions.
+
+        Appliers acquire this before committing bytes that JIT can observe and
+        hold it until every affected path is dirty. Readers and the coalescer's
+        final transition use the same lock, closing the commit-to-mark gap.
+        """
+        with self._state_lock:
+            yield
+
     def is_clean(self, path: str) -> bool:
         """Return whether ``path`` has current, fully-written backing bytes."""
         normalized = _normalize_path(path)
@@ -108,7 +126,10 @@ class DiskProjection:
 
     def mark_apply_result(self, result: ApplyResult) -> None:
         """Translate one committed apply result into dirty FUSE paths."""
-        with self._io_lock:
+        # Lock order is state -> DB I/O everywhere that needs both. The caller
+        # normally already holds the re-entrant barrier across its commit; the
+        # outer acquisition also makes direct/snapshot callers atomic.
+        with self._state_lock, self._io_lock:
             for ref in result.chunks:
                 path = self._day_file_path(ref)
                 if path is not None:
@@ -142,7 +163,7 @@ class DiskProjection:
         """
         bootstrap_conn = self._conn if conn is None else cast("Connection[TupleRow]", conn)
         bootstrap_day = datetime.now(self._tz).date() if today is None else today
-        with self._io_lock:
+        with self._state_lock, self._io_lock:
             return self._bootstrap_locked(bootstrap_conn, bootstrap_day)
 
     def flush_dirty(self, limit: int) -> list[str]:
@@ -153,30 +174,79 @@ class DiskProjection:
         for the next pass.  On failure, the failed and not-yet-attempted paths
         are requeued before the exception escapes.
         """
-        with self._state_lock:
-            batch = self._dirty.drain(limit)
-            self._inflight.update(batch)
-
-        flushed: list[str] = []
-        for index, path in enumerate(batch):
-            try:
-                with self._io_lock:
-                    rendered = self._render_path(path)
-                    backing = self.path_for(path)
-                    if rendered is None:
-                        backing.unlink(missing_ok=True)
-                    else:
-                        _atomic_write_bytes(backing, rendered)
-            except BaseException:
-                with self._state_lock:
-                    for remaining in batch[index:]:
-                        self._dirty.mark(remaining)
-                        self._inflight.discard(remaining)
-                raise
+        with self._flush_lock:
             with self._state_lock:
-                self._inflight.discard(path)
-            flushed.append(path)
-        return flushed
+                batch = self._dirty.drain(limit)
+                self._inflight.update(batch)
+
+            flushed: list[str] = []
+            for index, path in enumerate(batch):
+                try:
+                    # D3 flush ordering steps 1-4: while the path remains
+                    # logically dirty/inflight, snapshot every stream its bytes
+                    # depend on, render at that point, write the sibling temp,
+                    # and atomically replace the visible backing inode.
+                    with self._state_lock, self._io_lock:
+                        at_offset = self._offset_snapshot(path)
+                    with self._io_lock:
+                        rendered = self._render_path(path)
+                        backing = self.path_for(path)
+                        if rendered is None:
+                            backing.unlink(missing_ok=True)
+                        else:
+                            _atomic_write_bytes(backing, rendered)
+                    # Step 5: one state-lock acquisition compares offset drift
+                    # and queued marks, then performs the dirty->clean (or
+                    # dirty->dirty) transition. Never clear inflight separately.
+                    _ = self.check_and_mark_clean_if_no_drift(path, at_offset)
+                except BaseException:
+                    with self._state_lock:
+                        for remaining in batch[index:]:
+                            self._dirty.mark(remaining)
+                            self._inflight.discard(remaining)
+                    raise
+                # The lifecycle coalescer invalidates every attempted path only
+                # after this method returns. A drifted path therefore re-enters
+                # through JIT immediately; its later clean retry invalidates too.
+                flushed.append(path)
+            return flushed
+
+    def check_and_mark_clean_if_no_drift(self, path: str, at_offset: OffsetSnapshot) -> bool:
+        """Finish a flush iff neither dependent offsets nor dirty state drifted.
+
+        ``True`` means the atomic replacement is current and the clean marker
+        stuck. ``False`` means an event/direct invalidation landed during the
+        write; the stale-but-complete disk inode remains ineligible and the path
+        is queued for another coalescer pass.
+        """
+        normalized = _normalize_path(path)
+        with self._state_lock, self._io_lock:
+            current_offset = self._offset_snapshot(normalized)
+            drifted = current_offset != at_offset
+            remarked = self._dirty.is_marked(normalized)
+            was_inflight = normalized in self._inflight
+            if drifted or remarked or not was_inflight:
+                self._dirty.mark(normalized)
+            self._inflight.discard(normalized)
+            return not drifted and not remarked and was_inflight
+
+    def _offset_snapshot(self, path: str) -> OffsetSnapshot:
+        """Copy applied offsets that can change one projected file's bytes."""
+        streams = {"channel-list", "users"}
+        parts = PurePosixPath(path).parts[1:]
+        if len(parts) >= 2 and parts[0] in CONV_ROOTS:
+            row = fetch_channel_by_slug(self._conn, parts[0], parts[1], allow_hidden=True)
+            if row is not None:
+                streams.add(f"channel:{row.channel_id}")
+        offsets = dict.fromkeys(streams, 0)
+        with self._conn.cursor() as cur:
+            _ = cur.execute(
+                "SELECT stream, applied_offset FROM cursors WHERE stream = ANY(%s)",
+                (list(streams),),
+            )
+            for stream, applied_offset in cur.fetchall():
+                offsets[str(stream)] = int(applied_offset)
+        return tuple(sorted(offsets.items()))
 
     def _bootstrap_locked(self, conn: Connection[TupleRow], today: date) -> list[str]:
         marked: list[str] = []
