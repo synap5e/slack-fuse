@@ -14,7 +14,10 @@ def test_fetch_channel_stats_authenticates_and_validates() -> None:
         return httpx.Response(
             200,
             json={
-                "refreshed_at": "2026-06-28T04:00:00Z",
+                "oldest_refreshed_at": "2026-06-28T04:00:00Z",
+                "newest_refreshed_at": "2026-06-28T04:00:00Z",
+                "refreshed_ok_channels": 1,
+                "refreshable_channels": 1,
                 "workspace_message_total": 12,
                 "channels": [
                     {

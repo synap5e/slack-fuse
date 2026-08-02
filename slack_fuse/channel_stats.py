@@ -9,14 +9,12 @@ from slack_fuse.projector.channel_stats_fetch import ChannelStat, ChannelStats
 
 def render_channel_stats(stats: ChannelStats) -> bytes:
     """Render the workspace inventory sorted by Slack total descending."""
-    refreshed = _format_refreshed_at(stats.refreshed_at)
+    refresh_line = _format_refresh_line(stats)
     lines = [
         "# Workspace channels",
         "",
-        (
-            f"{len(stats.channels):,} channels — {stats.workspace_message_total:,} total messages "
-            f"across the workspace (refreshed {refreshed})."
-        ),
+        f"{len(stats.channels):,} channels — {stats.workspace_message_total:,} total messages across the workspace.",
+        refresh_line,
         "",
         "| Name | Messages | Ingested | Status | Member | Created |",
         "|---|---:|---:|---|---|---|",
@@ -56,9 +54,21 @@ def _escape_cell(value: str) -> str:
     return value.replace("\\", "\\\\").replace("|", "\\|").replace("\r", " ").replace("\n", " ")
 
 
-def _format_refreshed_at(value: datetime | None) -> str:
-    if value is None:
-        return "never"
+def _format_refresh_line(stats: ChannelStats) -> str:
+    if stats.refreshable_channels == 0:
+        return "Refresh coverage: no channels are eligible for refresh."
+    if stats.oldest_refreshed_at is None or stats.newest_refreshed_at is None:
+        return f"Refresh coverage: 0/{stats.refreshable_channels} refreshable channels have a total yet."
+    oldest = _format_ts(stats.oldest_refreshed_at)
+    newest = _format_ts(stats.newest_refreshed_at)
+    span = "at" if oldest == newest else f"between {oldest} and {newest}"
+    return (
+        f"Refresh coverage: {stats.refreshed_ok_channels}/{stats.refreshable_channels} "
+        f"refreshable channels refreshed {span}."
+    )
+
+
+def _format_ts(value: datetime) -> str:
     if value.tzinfo is None:
         value = value.replace(tzinfo=UTC)
     return value.astimezone(UTC).isoformat().replace("+00:00", "Z")

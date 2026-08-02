@@ -135,7 +135,13 @@ def test_get_channel_stats_joins_all_status_inputs(server_conn: psycopg.Connecti
 
     assert response.status_code == 200
     payload = json.loads(response.body)
-    assert payload["refreshed_at"] == "2026-06-28T04:00:00Z"
+    assert payload["oldest_refreshed_at"] == "2026-06-28T04:00:00Z"
+    assert payload["newest_refreshed_at"] == "2026-06-28T04:00:00Z"
+    # Six channels have a channel_message_totals row (all except C_NEVER which
+    # is unavailable and therefore not refreshable).
+    assert payload["refreshable_channels"] == 6
+    # Five of those are refresh_status='ok'; C_ERROR is refresh_status='error'.
+    assert payload["refreshed_ok_channels"] == 5
     assert payload["workspace_message_total"] == 49
     by_id = {row["channel_id"]: row for row in payload["channels"]}
     assert {channel_id: row["status"] for channel_id, row in by_id.items()} == {

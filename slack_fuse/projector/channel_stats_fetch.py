@@ -41,7 +41,13 @@ class ChannelStat(_Payload):
 
 
 class ChannelStats(_Payload):
-    refreshed_at: datetime | None
+    # See slack_fuse_server/http/dto.py::ChannelStatsResponse — the previous
+    # single `refreshed_at` MAX was misleading operators when one channel had
+    # been re-refreshed but the rest of the workspace was stale.
+    oldest_refreshed_at: datetime | None
+    newest_refreshed_at: datetime | None
+    refreshed_ok_channels: int
+    refreshable_channels: int
     workspace_message_total: int
     channels: list[ChannelStat] = Field(default_factory=list)
 

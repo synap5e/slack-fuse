@@ -129,7 +129,14 @@ class ChannelStat(_DTO):
 
 
 class ChannelStatsResponse(_DTO):
-    refreshed_at: datetime | None
+    # Two independent timestamps — a single MAX (previous shape) misled operators
+    # by making the workspace look fresh after one channel refreshed. The
+    # coverage field tells you how much of the workspace has an authoritative
+    # count at all.
+    oldest_refreshed_at: datetime | None
+    newest_refreshed_at: datetime | None
+    refreshed_ok_channels: int
+    refreshable_channels: int
     workspace_message_total: int
     channels: list[ChannelStat] = Field(default_factory=list)
 

@@ -47,7 +47,10 @@ _DTOS: list[BaseModel] = [
     PermalinkResponse(url="https://example.slack.com/archives/C1/p1700000000000100"),
     HealthResponse(ok=True),
     ChannelStatsResponse(
-        refreshed_at=_T,
+        oldest_refreshed_at=_T,
+        newest_refreshed_at=_T,
+        refreshed_ok_channels=1,
+        refreshable_channels=1,
         workspace_message_total=12,
         channels=[
             ChannelStat(

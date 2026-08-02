@@ -23,13 +23,14 @@ WITH latest_full_payload AS (
       AND payload->>'id' IS NOT NULL
     ORDER BY payload->>'id', offset_in_stream DESC
 ),
+-- Count post-fold (edits + deletes applied) rather than raw message events —
+-- otherwise deletions make the "done" comparison against Slack's current
+-- total incomparable and can false-report a channel as done.
 message_counts AS (
-    SELECT substr(stream, length('channel:') + 1) AS channel_id,
+    SELECT channel_id,
            count(*)::bigint AS ingested
-    FROM events
-    WHERE stream LIKE 'channel:%'
-      AND kind = 'message'
-    GROUP BY stream
+    FROM active_messages
+    GROUP BY channel_id
 )
 SELECT
     channels.channel_id,
@@ -62,7 +63,10 @@ def fetch_channel_stats(conn: psycopg.Connection[TupleRow]) -> ChannelStatsRespo
 
     channels: list[ChannelStat] = []
     workspace_message_total = 0
-    refreshed_at: datetime | None = None
+    oldest_refreshed_at: datetime | None = None
+    newest_refreshed_at: datetime | None = None
+    refreshed_ok_channels = 0
+    refreshable_channels = 0
     for row in rows:
         channel_id = str(row[0])
         name = str(row[1]) if row[1] is not None else channel_id
@@ -79,8 +83,18 @@ def fetch_channel_stats(conn: psycopg.Connection[TupleRow]) -> ChannelStatsRespo
 
         if total is not None:
             workspace_message_total += total
-        if channel_refreshed_at is not None and (refreshed_at is None or channel_refreshed_at > refreshed_at):
-            refreshed_at = channel_refreshed_at
+        # A channel is "refreshable" if the workspace_channels sweep will
+        # actually try to refresh it (skips DMs and unavailable channels).
+        # Coverage percentage = refreshed_ok_channels / refreshable_channels.
+        if refresh_status != "unavailable":
+            refreshable_channels += 1
+        if refresh_status == "ok":
+            refreshed_ok_channels += 1
+        if channel_refreshed_at is not None:
+            if oldest_refreshed_at is None or channel_refreshed_at < oldest_refreshed_at:
+                oldest_refreshed_at = channel_refreshed_at
+            if newest_refreshed_at is None or channel_refreshed_at > newest_refreshed_at:
+                newest_refreshed_at = channel_refreshed_at
 
         channels.append(
             ChannelStat(
@@ -104,7 +118,10 @@ def fetch_channel_stats(conn: psycopg.Connection[TupleRow]) -> ChannelStatsRespo
         )
 
     return ChannelStatsResponse(
-        refreshed_at=refreshed_at,
+        oldest_refreshed_at=oldest_refreshed_at,
+        newest_refreshed_at=newest_refreshed_at,
+        refreshed_ok_channels=refreshed_ok_channels,
+        refreshable_channels=refreshable_channels,
         workspace_message_total=workspace_message_total,
         channels=channels,
     )
