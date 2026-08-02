@@ -28,6 +28,7 @@ import contextlib
 import errno
 import logging
 import os
+import re
 import stat
 import threading
 import time
@@ -94,6 +95,8 @@ from slack_fuse.fuse_v2_helpers import (
 from slack_fuse.logctx import fuse_op, set_path
 from slack_fuse.pg_health import NO_POSTGRES_INODE, NO_POSTGRES_NAME
 from slack_fuse.projector.trailer import (
+    FALLBACK_CHANNEL_REASON,
+    FALLBACK_USER_REASON,
     STALE_AFTER_DISCONNECT_S,
     TrailerDecision,
     classify_trailer,
@@ -106,6 +109,7 @@ if TYPE_CHECKING:
 
     from slack_fuse.pg_health import PgHealth
     from slack_fuse.projector.apply import ChunkRef, ThreadChunkRef
+    from slack_fuse.projector.disk_projection import DiskProjection
     from slack_fuse.projector.pool import ConnectionPool
     from slack_fuse.projector.reconnecting_conn import ReconnectingConnection
     from slack_fuse.projector.trailer_log import TrailerLog
@@ -148,6 +152,12 @@ _TSync = TypeVar("_TSync")
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+def _disk_projection_enabled_from_env() -> bool:
+    """Return the opt-in read-tier flag (dark by default)."""
+    raw = os.environ.get(_DISK_PROJECTION_ENABLED_ENV, "")
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 NowFn = Callable[[], datetime]
@@ -194,6 +204,14 @@ ControlRefillGapFn = Callable[[str, float, float], str]
 # called from the trio event loop in ``_fire_control`` (never a worker thread,
 # so the non-thread-safe channel send is safe).
 ControlRerenderChannelFn = Callable[[str], bool]
+
+_DISK_PROJECTION_ENABLED_ENV: Final = "SLACK_FUSE_DISK_PROJECTION_ENABLED"
+# D1 stores fully resolved markdown, so an unresolved placeholder has already
+# become its visible ``@UID`` / ``#CID`` fallback. Conservatively recognize
+# those rendered forms to preserve the kernel-cache suppression invariant on
+# the disk tier. A false positive only skips priming; it cannot change bytes.
+_UNRESOLVED_USER_RENDER = re.compile(rb"(?<![A-Za-z0-9])@U[A-Z0-9]+\b")
+_UNRESOLVED_CHANNEL_RENDER = re.compile(rb"(?<![A-Za-z0-9])#C[A-Z0-9]+\b")
 
 # Write-handle file numbers for ``_control/`` writes live in a high, disjoint
 # range so they can never collide with a real persistent inode (those come from
@@ -415,6 +433,17 @@ def _decide_and_apply(
     trailer flag and of ``trailer_enabled``. ``decision`` carries the true
     classification for the JSONL log regardless of either flag.
     """
+    return _decide_and_apply_bytes(conn, base.encode(), stream, fallback_reasons, cfg)
+
+
+def _decide_and_apply_bytes(
+    conn: Connection[TupleRow],
+    base: bytes,
+    stream: str,
+    fallback_reasons: Sequence[str],
+    cfg: TrailerConfig,
+) -> tuple[bytes, bool, bool, TrailerDecision]:
+    """Apply the live trailer decision to already-rendered structural bytes."""
     stale = fetch_staleness_state(conn, stream)
     decision = classify_trailer(
         stale,
@@ -426,8 +455,8 @@ def _decide_and_apply(
     had_fallback = bool(fallback_reasons)
     trailer_text = render_trailer(decision) if cfg.trailer_enabled else None
     if trailer_text is not None:
-        return (base + trailer_text).encode(), True, had_fallback, decision
-    return base.encode(), False, had_fallback, decision
+        return base + trailer_text.encode(), True, had_fallback, decision
+    return base, False, had_fallback, decision
 
 
 def _assemble_channel_day(
@@ -540,6 +569,7 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         pool: ConnectionPool | None = None,
         callback_timeout_s: float = DEFAULT_CALLBACK_TIMEOUT_S,
         pg_health: PgHealth | None = None,
+        disk_projection: DiskProjection | None = None,
         notify_store: NotifyStoreFn | None = None,
         invalidate_inode: InvalidateInodeFn | None = None,
         stale_after_s: float = STALE_AFTER_DISCONNECT_S,
@@ -580,6 +610,12 @@ class SlackFuseOpsV2(pyfuse3.Operations):
         # ``_run_sync`` mark PG down on OperationalError so subsequent
         # callbacks fast-fail with EIO instead of crashing the process.
         self._pg_health = pg_health
+        # D1 constructs the projection only when the canary is enabled, but
+        # independently snapshot the env flag here as a read-side rollback
+        # gate. Tests deliberately inject a populated projection while the
+        # flag is false to pin the dark-default behavior.
+        self._disk_projection = disk_projection
+        self._disk_projection_enabled = _disk_projection_enabled_from_env()
         self._tz = local_tz
         self._limiter = limiter
         self._notify_store: NotifyStoreFn = notify_store if notify_store is not None else _default_notify_store
@@ -1482,6 +1518,108 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             return parts[5] != THREAD_MD
         return False
 
+    def _projection_stream(self, path: str) -> str | None:
+        """Return the live trailer stream for one disk-projectable path."""
+        parts = parse_path(path)
+        depth = len(parts)
+        if depth < 3 or parts[0] not in CONV_ROOTS:
+            return None
+        is_channel_meta = depth == 3 and parts[2] == CHANNEL_MD
+        is_channel_day = depth == 5 and parts[4] == CHANNEL_MD
+        is_thread = depth == 6 and parts[5] == THREAD_MD
+        if not (is_channel_meta or is_channel_day or is_thread):
+            return None
+        row = fetch_channel_by_slug(self._conn, parts[0], parts[1], allow_hidden=True)
+        if row is None or row.tier != "hot":
+            return None
+        return CHANNEL_LIST_STREAM if is_channel_meta else f"channel:{row.channel_id}"
+
+    def _read_from_disk_if_clean(self, path: str) -> bytes | None:
+        """Read clean projection bytes, retrying one disappearance race."""
+        projection = self._disk_projection
+        if not self._disk_projection_enabled or projection is None or not projection.is_clean(path):
+            return None
+        for _attempt in range(2):
+            content = projection.read_bytes(path)
+            if content is not None:
+                log.debug("serving clean disk projection path: %s", path)
+                return content
+        log.warning("clean disk projection path is missing; falling back to JIT: %s", path)
+        return None
+
+    def _stat_disk_if_clean(self, path: str) -> os.stat_result | None:
+        """Stat one clean backing file, retrying one disappearance race."""
+        projection = self._disk_projection
+        if not self._disk_projection_enabled or projection is None or not projection.is_clean(path):
+            return None
+        backing = projection.path_for(path)
+        for _attempt in range(2):
+            try:
+                return os.stat(backing)
+            except FileNotFoundError:
+                continue
+        log.warning("clean disk projection path is missing during stat; falling back to JIT: %s", path)
+        return None
+
+    def _resolve_disk_decision(
+        self,
+        path: str,
+        content: bytes,
+        now: datetime | None = None,
+    ) -> tuple[bytes, bool, bool, TrailerDecision] | None:
+        """Compose the current trailer decision over projected base bytes."""
+        stream = self._projection_stream(path)
+        if stream is None:
+            return None
+        fallback_reasons: list[str] = []
+        if _UNRESOLVED_USER_RENDER.search(content) is not None:
+            fallback_reasons.append(FALLBACK_USER_REASON)
+        if _UNRESOLVED_CHANNEL_RENDER.search(content) is not None:
+            fallback_reasons.append(FALLBACK_CHANNEL_REASON)
+        cfg = TrailerConfig(
+            now=now if now is not None else self._now_fn(),
+            stale_after_s=self._stale_after_s,
+            trailer_enabled=self._trailer_enabled,
+        )
+        return _decide_and_apply_bytes(self._conn, content, stream, fallback_reasons, cfg)
+
+    def _disk_size_if_clean(self, path: str, now: datetime | None = None) -> int | None:
+        """Return backing ``st_size`` plus any currently-live trailer bytes."""
+        disk_stat = self._stat_disk_if_clean(path)
+        if disk_stat is None:
+            return None
+        stream = self._projection_stream(path)
+        if stream is None:
+            return None
+        cfg = TrailerConfig(
+            now=now if now is not None else self._now_fn(),
+            stale_after_s=self._stale_after_s,
+            trailer_enabled=self._trailer_enabled,
+        )
+        decision = classify_trailer(
+            fetch_staleness_state(self._conn, stream),
+            stream=stream,
+            now=cfg.now,
+            stale_after_s=cfg.stale_after_s,
+        )
+        trailer_text = render_trailer(decision) if cfg.trailer_enabled else None
+        trailer_size = 0 if trailer_text is None else len(trailer_text.encode())
+        return disk_stat.st_size + trailer_size
+
+    def _resolve_read_path(self, path: str) -> tuple[bytes, bool, bool, TrailerDecision, str] | None:
+        """Resolve one normal file read through the disk/JIT tier gate."""
+        disk_content = self._read_from_disk_if_clean(path)
+        if disk_content is not None:
+            disk_resolved = self._resolve_disk_decision(path, disk_content)
+            if disk_resolved is not None:
+                content, trailer, fallback, decision = disk_resolved
+                return content, trailer, fallback, decision, path
+        resolved = self._resolve_decision(path)
+        if resolved is None:
+            return None
+        content, trailer, fallback, decision = resolved
+        return content, trailer, fallback, decision, path
+
     def _resolve_content(self, path: str) -> tuple[bytes, bool, bool] | None:
         """Return ``(bytes, had_trailer, had_unresolved_fallback)`` or ``None``.
 
@@ -1742,6 +1880,9 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             set_path(path)
 
             def _sync() -> pyfuse3.EntryAttributes | None:
+                disk_size = self._disk_size_if_clean(path)
+                if disk_size is not None:
+                    return _make_file_attr(inode, disk_size, timeout_s=_file_attr_timeout(path, self._tz))
                 if self._is_dir(path):
                     return _make_dir_attr(inode)
                 if self._control_enabled:
@@ -1818,6 +1959,9 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             ctl = self._control_file_attr(child_path, inode)
             if ctl is not None:
                 return ctl
+        disk_size = self._disk_size_if_clean(child_path)
+        if disk_size is not None:
+            return _make_file_attr(inode, disk_size, timeout_s=_file_attr_timeout(child_path, self._tz))
         resolved = self._resolve_content(child_path)
         if resolved is None:
             return None
@@ -1860,8 +2004,12 @@ class SlackFuseOpsV2(pyfuse3.Operations):
                 if ctl is not None:
                     attr = ctl
                 else:
-                    resolved = self._resolve_content(child_path)
-                    size = len(resolved[0]) if resolved is not None else 0
+                    disk_size = self._disk_size_if_clean(child_path)
+                    if disk_size is None:
+                        resolved = self._resolve_content(child_path)
+                        size = len(resolved[0]) if resolved is not None else 0
+                    else:
+                        size = disk_size
                     attr = _make_file_attr(child_inode, size, timeout_s=_file_attr_timeout(child_path, self._tz))
             result.append((name, attr, idx + 1))
         return result
@@ -1970,14 +2118,7 @@ class SlackFuseOpsV2(pyfuse3.Operations):
             if self._control_enabled and parse_path(path)[:1] == [CONTROL_DIR]:
                 return await self._read_control_file(path, off, size)
 
-            def _sync() -> tuple[bytes, bool, bool, TrailerDecision, str] | None:
-                resolved = self._resolve_decision(path)
-                if resolved is None:
-                    return None
-                content, trailer, fallback, decision = resolved
-                return content, trailer, fallback, decision, path
-
-            result = await self._run_sync(_sync)
+            result = await self._run_sync(lambda: self._resolve_read_path(path))
             if result is None:
                 raise pyfuse3.FUSEError(errno.EIO)
             content, had_trailer, had_fallback, decision, real_path = result

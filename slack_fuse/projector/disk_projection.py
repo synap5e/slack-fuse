@@ -78,6 +78,20 @@ class DiskProjection:
         normalized = _normalize_path(path)
         return self._root.joinpath(*PurePosixPath(normalized).parts[1:])
 
+    def read_bytes(self, path: str) -> bytes | None:
+        """Return a projected file's bytes, or ``None`` when it is absent.
+
+        Dirtiness is deliberately not checked here. The FUSE caller owns the
+        clean/dirty tier decision and uses this accessor only after that gate.
+        A missing file can still be observed after the clean check when an
+        atomic replacement or deletion races the read, so absence is a normal
+        fallback signal rather than an exception.
+        """
+        try:
+            return self.path_for(path).read_bytes()
+        except FileNotFoundError:
+            return None
+
     def mark_dirty(self, path: str) -> None:
         """Mark a FUSE-relative file path dirty."""
         normalized = _normalize_path(path)

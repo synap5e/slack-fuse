@@ -503,6 +503,7 @@ def cmd_mount(args: argparse.Namespace) -> None:  # noqa: C901  (process-wiring 
         store_limiter,
         pool=fuse_pool,
         pg_health=pg_health,
+        disk_projection=disk_projection,
         stale_after_s=config.stale_after_disconnect_s,
         trailer_enabled=config.stale_trailer_enabled,
         trailer_log=trailer_log,
