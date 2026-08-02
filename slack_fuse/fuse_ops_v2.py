@@ -2296,6 +2296,10 @@ class V2InvalidationSink:
         for inode in self._all_materialized_inodes():
             self._invalidate_inode(inode)
 
+    def path_changed(self, path: str) -> None:
+        """Invalidate a materialized path after its disk bytes are replaced."""
+        self._invalidate_path(path)
+
     # -- resolution helpers ---------------------------------------------
 
     def _channel_location(self, channel_id: str) -> tuple[str, str] | None:

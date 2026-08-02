@@ -46,6 +46,7 @@ from slack_fuse.projector.apply import (
     ApplyResult,
     InvalidationSink,
     NullInvalidationSink,
+    ProjectionSink,
     apply_event,
     record_caught_up,
 )
@@ -128,18 +129,20 @@ class StreamApplier:
             await applier.close()
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 (optional projection is lifecycle wiring)
         self,
         stream: str,
         pool: ConnectionLease,
         sink: InvalidationSink | None = None,
         *,
+        projection: ProjectionSink | None = None,
         queue_soft_cap: int = DEFAULT_QUEUE_SOFT_CAP,
         before_apply: Callable[[ProjectorMessage], Awaitable[None]] | None = None,
     ) -> None:
         self.stream = stream
         self._pool = pool
         self._sink: InvalidationSink = sink if sink is not None else NullInvalidationSink()
+        self._projection = projection
         # Unbounded queue (P1-E): send_nowait never blocks the WS receive loop.
         self._send, self._receive = trio.open_memory_channel[ProjectorMessage](math.inf)
         self._soft_cap = queue_soft_cap
@@ -220,9 +223,10 @@ class StreamApplier:
         acquire_ms = int((trio.current_time() - acquire_start) * 1000)
         sync_start = trio.current_time()
         try:
-            result = await trio.to_thread.run_sync(
-                functools.partial(apply_event, conn, message)
-            )
+            apply_sync = functools.partial(apply_event, conn, message)
+            if self._projection is not None:
+                apply_sync = functools.partial(apply_event, conn, message, projection=self._projection)
+            result = await trio.to_thread.run_sync(apply_sync)
         except Exception as exc:
             await self._pool.release(conn, discard=True)
             # P1-D: do NOT advance the cursor past a failed offset. Poison the

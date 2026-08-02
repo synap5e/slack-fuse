@@ -62,6 +62,7 @@ from slack_fuse.projector.apply import (
     ChunkRef,
     InvalidationSink,
     NullInvalidationSink,
+    ProjectionSink,
     ThreadChunkRef,
     apply_snapshot_row,
     require_autocommit,
@@ -95,13 +96,14 @@ class SnapshotRedirect:
     url: str
 
 
-async def fetch_and_apply_snapshot(
+async def fetch_and_apply_snapshot(  # noqa: PLR0913 (HTTP + post-commit sinks)
     http: httpx.AsyncClient,
     conn: Connection[TupleRow],
     redirect: SnapshotRedirect,
     *,
     base_url: str | None = None,
     sink: InvalidationSink | None = None,
+    projection: ProjectionSink | None = None,
 ) -> SnapshotResult:
     """Fetch a snapshot, apply every JSONL row, advance the cursor — one TX.
 
@@ -134,6 +136,8 @@ async def fetch_and_apply_snapshot(
     invalidations = await trio.to_thread.run_sync(
         _apply_snapshot_sync, conn, redirect.stream, redirect.at_offset, tuple(lines)
     )
+    if projection is not None:
+        await trio.to_thread.run_sync(_mark_projection_dirty, projection, invalidations)
     # Dispatch the sink call to a worker thread. ``pyfuse3.invalidate_inode``
     # can block on kernel writeback and (on a busy mount) deadlock against
     # in-flight FUSE reads — the 2026-06-24 folio_wait_bit_common wedge
@@ -257,3 +261,9 @@ def _fire_invalidations(sink: InvalidationSink, results: Iterable[ApplyResult]) 
             sink.thread_chunk_changed(thread_ref)
         if result.channel_list_changed:
             sink.channel_list_changed()
+
+
+def _mark_projection_dirty(projection: ProjectionSink, results: Iterable[ApplyResult]) -> None:
+    """Mark snapshot paths only after the full replacement TX commits."""
+    for result in results:
+        projection.mark_apply_result(result)

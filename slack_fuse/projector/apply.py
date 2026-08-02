@@ -96,6 +96,12 @@ class InvalidationSink(Protocol):
     def channel_list_changed(self) -> None: ...
 
 
+class ProjectionSink(Protocol):
+    """Optional post-commit sink for coalesced disk-projection dirtiness."""
+
+    def mark_apply_result(self, result: ApplyResult) -> None: ...
+
+
 class NullInvalidationSink:
     """No-op `InvalidationSink`. Default for tests and pre-FUSE wiring."""
 
@@ -137,6 +143,8 @@ def require_autocommit(conn: TupleConnection) -> None:
 def apply_event(
     conn: TupleConnection,
     frame: EventFrame,
+    *,
+    projection: ProjectionSink | None = None,
 ) -> ApplyResult:
     """Apply one event in a single transaction. Returns post-commit work.
 
@@ -148,6 +156,11 @@ def apply_event(
     with conn.transaction(), conn.cursor() as cur:
         result = _dispatch(cur, frame)
         advance_cursor(cur, frame.stream, frame.offset)
+    # Exiting the transaction above is the commit barrier. Marking only after
+    # that point prevents the coalescer from rendering pre-event bytes and
+    # incorrectly declaring them clean.
+    if projection is not None:
+        projection.mark_apply_result(result)
     return result
 
 
@@ -869,6 +882,7 @@ __all__ = [
     "ChunkRef",
     "InvalidationSink",
     "NullInvalidationSink",
+    "ProjectionSink",
     "ThreadChunkRef",
     "apply_event",
     "apply_snapshot_row",

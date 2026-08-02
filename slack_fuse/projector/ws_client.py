@@ -35,7 +35,7 @@ import trio
 import trio_websocket
 from pydantic import ValidationError
 
-from slack_fuse.projector.apply import InvalidationSink, NullInvalidationSink
+from slack_fuse.projector.apply import InvalidationSink, NullInvalidationSink, ProjectionSink
 from slack_fuse.projector.cursor import read_cursor
 from slack_fuse.projector.per_stream import ConnectionFactory, StreamApplier
 from slack_fuse.projector.pool import DEFAULT_POOL_SIZE, ConnectionPool
@@ -85,13 +85,14 @@ class WSClientOptions:
 class WSClient:
     """Trio WebSocket subscriber. Routes frames into per-stream appliers."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 (optional integration seams)
         self,
         options: WSClientOptions,
         connection_factory: ConnectionFactory,
         state_conn: TupleConnection,
         *,
         sink: InvalidationSink | None = None,
+        projection: ProjectionSink | None = None,
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self._options = options
@@ -102,6 +103,7 @@ class WSClient:
         # one-off cursor reads at startup — never for chunk writes.
         self._state_conn = state_conn
         self._sink: InvalidationSink = sink if sink is not None else NullInvalidationSink()
+        self._projection = projection
         self._http: httpx.AsyncClient | None = http_client
         self._appliers: dict[str, StreamApplier] = {}
         self._ws: trio_websocket.WebSocketConnection | None = None
@@ -172,7 +174,7 @@ class WSClient:
     def _make_applier(self, stream: str) -> StreamApplier:
         """Construct a `StreamApplier` for `stream`. Test seam: subclasses
         override this to inject a `before_apply` hook (e.g. the HoL test)."""
-        return StreamApplier(stream, self._pool, self._sink)
+        return StreamApplier(stream, self._pool, self._sink, projection=self._projection)
 
     async def _ensure_applier(self, stream: str) -> StreamApplier:
         existing = self._appliers.get(stream)
@@ -264,6 +266,7 @@ class WSClient:
                     redirect,
                     base_url=self._options.base_http_url,
                     sink=self._sink,
+                    projection=self._projection,
                 )
             except (httpx.HTTPError, SnapshotFetchError, ValueError) as exc:
                 # ValueError: a stale server offering a snapshot for a stream the

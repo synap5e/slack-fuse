@@ -66,6 +66,7 @@ from slack_fuse.projector.apply import (
     ApplyResult,
     InvalidationSink,
     NullInvalidationSink,
+    ProjectionSink,
     apply_snapshot_row,
     require_autocommit,
 )
@@ -132,6 +133,7 @@ def rerender_channel(  # noqa: PLR0913 — sync HTTP call needs client + url + c
     *,
     shared_secret: str | None = None,
     sink: InvalidationSink | None = None,
+    projection: ProjectionSink | None = None,
     timeout_s: float = DEFAULT_RERENDER_TIMEOUT_S,
 ) -> RerenderResult:
     """Re-render ``channel_id``'s chunks from the server's latest snapshot.
@@ -175,6 +177,8 @@ def rerender_channel(  # noqa: PLR0913 — sync HTTP call needs client + url + c
         log.warning("rerender %s: malformed snapshot body; apply rolled back", channel_id)
         return RerenderResult(channel_id, status="malformed")
 
+    if projection is not None:
+        _mark_projection_dirty(projection, results)
     _fire_invalidations(sink_or_default, results)
     chunk_count = sum(len(r.chunks) for r in results)
     thread_count = sum(len(r.thread_chunks) for r in results)
@@ -218,6 +222,11 @@ def _fire_invalidations(sink: InvalidationSink, results: Iterable[ApplyResult]) 
             sink.chunk_changed(ref)
         for thread_ref in result.thread_chunks:
             sink.thread_chunk_changed(thread_ref)
+
+
+def _mark_projection_dirty(projection: ProjectionSink, results: Iterable[ApplyResult]) -> None:
+    for result in results:
+        projection.mark_apply_result(result)
 
 
 __all__ = ["DEFAULT_RERENDER_TIMEOUT_S", "RerenderResult", "rerender_channel"]

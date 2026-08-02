@@ -25,6 +25,13 @@ def _default_mountpoint() -> str:
 
 
 _REFRESH_INTERVAL = 1800  # 30 minutes, matches _CHANNEL_LIST_TTL
+_DISK_PROJECTION_ENABLED_ENV = "SLACK_FUSE_DISK_PROJECTION_ENABLED"
+
+
+def _disk_projection_enabled() -> bool:
+    """Return the opt-in disk projection flag (dark by default)."""
+    raw = os.environ.get(_DISK_PROJECTION_ENABLED_ENV, "")
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _http_base_from_server_url(server_url: str) -> str:
@@ -212,6 +219,8 @@ def cmd_mount(args: argparse.Namespace) -> None:  # noqa: C901  (process-wiring 
     from slack_fuse.fuse_ops_v2 import SlackFuseOpsV2, V2InvalidationSink
     from slack_fuse.migrations.runner import apply_migrations
     from slack_fuse.pg_health import PgHealth
+    from slack_fuse.projector.coalescer import run_coalescer
+    from slack_fuse.projector.disk_projection import DiskProjection
     from slack_fuse.projector.health_subscriber import watch_health
     from slack_fuse.projector.pool import ConnectionPool as ProjectorConnectionPool
     from slack_fuse.projector.reconnecting_conn import ReconnectingConnection
@@ -309,6 +318,12 @@ def cmd_mount(args: argparse.Namespace) -> None:  # noqa: C901  (process-wiring 
 
     tz = _resolve_local_zoneinfo()
     store_limiter = trio.CapacityLimiter(1)
+    projection_conn: ReconnectingConnection | None = None
+    disk_projection: DiskProjection | None = None
+    if _disk_projection_enabled():
+        projection_conn = _open_durable_conn("disk_projection")
+        disk_projection = DiskProjection(projection_conn, tz)
+        log.info("coalesced disk projection enabled")
 
     # PG-down tolerance: when the local Postgres vanishes (game-mode on
     # stops claude-hooks-postgres.service, manual restart, crash …) the
@@ -546,7 +561,13 @@ def cmd_mount(args: argparse.Namespace) -> None:  # noqa: C901  (process-wiring 
         backoff = 2.0
         max_backoff = 300.0
         while True:
-            client = WSClient(ws_options, _open_conn, state_conn, sink=sink)
+            client = WSClient(
+                ws_options,
+                _open_conn,
+                state_conn,
+                sink=sink,
+                projection=disk_projection,
+            )
             current_ws_client[0] = client
             try:
                 with state_conn.cursor() as cur:
@@ -669,6 +690,7 @@ def cmd_mount(args: argparse.Namespace) -> None:  # noqa: C901  (process-wiring 
                     channel_id,
                     shared_secret=config.shared_secret,
                     sink=rerender_sink,
+                    projection=disk_projection,
                 ).status
 
             async for channel_id in rerender_recv:
@@ -723,6 +745,8 @@ def cmd_mount(args: argparse.Namespace) -> None:  # noqa: C901  (process-wiring 
                 nursery.start_soon(_run_channel_stats_warmer)
                 nursery.start_soon(_run_rerender_consumer)
                 nursery.start_soon(_run_block_sync)
+                if disk_projection is not None and projection_conn is not None:
+                    nursery.start_soon(run_coalescer, disk_projection, projection_conn, sink)
                 await pyfuse3.main()
                 nursery.cancel_scope.cancel()
         finally:
@@ -741,6 +765,8 @@ def cmd_mount(args: argparse.Namespace) -> None:  # noqa: C901  (process-wiring 
         fuse_conn.close()
         state_conn.close()
         sink_conn.close()
+        if projection_conn is not None:
+            projection_conn.close()
         ghost_http_client.close()
         if trailer_log is not None:
             trailer_log.close()
