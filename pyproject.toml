@@ -46,7 +46,7 @@ reportUnusedCallResult = false
 reportImplicitStringConcatenation = false
 reportUnannotatedClassAttribute = false
 reportUnknownLambdaType = false
-include = ["slack_fuse", "slack_fuse_server", "slack_fuse_render", "slack_fuse_poc_b", "tests"]
+include = ["slack_fuse", "slack_fuse_server", "slack_fuse_render", "tests"]
 exclude = ["**/__pycache__", "**/.venv", "**/.ruff_cache"]
 
 [tool.ruff]
