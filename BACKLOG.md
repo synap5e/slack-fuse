@@ -69,80 +69,6 @@ sized for.
 
 ---
 
-## Probe-event pattern — channel message counts + wider pattern
-
-**Effort**: 3–5 eng-days (one-time design pass + first probe
-implementation). **Autonomous**: Yes after decisions — the design
-choices below (one sweep vs many, cadence per kind, tier budget
-accounting) benefit from your ratification before implementation.
-
-**Discovered**: 2026-06-28, post Wave 2 deploy. Triggered by the
-question "what's the % progress of the backfill?" — we have no
-authoritative denominator until a channel is fully backfilled.
-
-**Specific item**: add a `channel_message_count_probed` event kind.
-Slurper periodically calls `search.messages?query=in:<channel>` and
-emits one event per channel per period with the total count from the
-API. Tier 2 (`search.messages`: 60/min). Lets `/livez` (or a new
-endpoint) compute "% complete" as `sum(events_written from
-backfill_completed) / sum(latest probed count)`. Cheap to implement
-once the pattern shape is decided.
-
-**Wider pattern to think through** before building the specific item.
-Today our event kinds split cleanly into two shapes:
-
-- **Push-driven** (Socket Mode): `message`, `channel_added`,
-  `user_added`, `member_joined_channel`, `reaction_added`, etc.
-- **Diff-driven refreshes** (`channel_info_refreshed`): fire ONLY when
-  a periodic `conversations.info` sweep detects payload drift.
-
-A **probe event** is a third shape: slurper-initiated, periodic,
-captures authoritative Slack API state regardless of drift, immutable
-in the events log. The latest probe wins; older ones are history.
-
-Candidate probes — picked specifically because Slack EITHER lacks a
-push event for them OR we don't subscribe today. (Thread replies are
-covered by existing `message.*` subscriptions regardless of the
-parent's age, so they don't fit this pattern.)
-
-1. **`channel_message_count_probed`** — the asked-for one. Backfill %
-   visibility. Tier 2.
-2. **`channel_pin_count_probed`** — `pin_added`/`pin_removed` socket
-   events exist but we don't subscribe. `pins.list` is cheap.
-3. **`workspace_emoji_probed`** — `emoji.list` for custom emoji.
-   `emoji_changed` socket event exists but we don't subscribe.
-   Useful for rendering markdown output.
-4. **`channel_bookmark_probed`** — no socket event exists. Some teams
-   use bookmarks as canvas pointers.
-
-**Decisions ratified 2026-08-02**:
-1. **Single sweep task + probe registry.** One supervisor entry, one
-   limiter, one task that walks a registry of probe kinds every N
-   seconds and dispatches each probe whose interval has elapsed. No
-   per-probe tasks / no nursery-slot proliferation.
-2. **Hardcoded cadence per probe kind** — `channel_message_count`
-   every 6h, `workspace_emoji` daily, `pins` weekly, etc. Baked into
-   the probe registry. No ServerConfig knob — one place to change,
-   never actually tuned per deployment.
-
-**Settled by structure, not decisions to make**:
-- **Tier budget accounting** is baked into the sweep (`search.messages`
-  Tier 2 = 60/min; for N channels at interval T, the sweep respects
-  the ceiling via its limiter).
-- **Failure handling**: API failure = no event written. Last probe
-  stays as truth. Consumers must not assume any cadence.
-- **Spans wrap probes**: each probe emits `slurper.probe.<kind>`
-  spans for cost visibility (follows the Wave 2.C span pattern).
-- **Distinct from `channel_info_refreshed`**: refreshes fire on diff;
-  probes fire on period regardless. Two different consumers; do not
-  piggyback probes onto the refresh sweep.
-
-**Implementation order**: build the sweep + registry as the framework
-in one pass, then land `channel_message_count_probed` as the first
-probe/proof. Other probes drop in cheaply afterward.
-
----
-
 ## FUSE mount wedge — host-level prevention (game-mode ordering)
 
 **Effort**: 15–30 min. **Autonomous**: No — the change lives in
@@ -301,6 +227,28 @@ _None currently._
 
 ## 2026-08-02
 
+- **Probe-event pattern (framework + first fact probe)** — `a3be0ba`
+  + `a0b7193`. First pass built a parallel `slack_fuse_server/probes/*`
+  package; reconciliation collapsed it into the existing
+  `slack_fuse_server/slurper/probes.py` scheduler with a `ProbeSink`
+  Protocol and two implementations — `SlurperHealthSink` (raw
+  detection, writes to `slurper-health`) and `EventFactsSink`
+  (interpreted facts, atomic append to `events`). One unified sweep,
+  one registry, two sinks. First fact probe is
+  `channel_message_count_probed` (6h cadence, feeds backfill % calcs).
+  Extensibility hard gate: `test_second_probe_is_registry_entry_only_no_framework_change`
+  proves a new stub probe fires beside the default with no
+  sweep/framework code changes. New `SlackTierPacer` primitive shared
+  by `channel_totals.py` + fact probes for the search.messages
+  Tier-2 budget (raw probes stay per-method as before). Migration
+  0015 adds a partial index `events_probe_fact_latest_idx` on
+  `(kind, ts DESC NULLS LAST) WHERE kind IN ('channel_message_count_probed')`
+  so the MAX(ts) cadence lookup is O(1) — adding a new fact kind
+  requires extending the WHERE clause via a follow-up migration.
+  Client applier: explicit no-op branch for the new kind (real
+  projection is a follow-up). 1163 pass, basedpyright 0/0/0, ruff
+  clean (including the pre-existing en-dashes I introduced in
+  `801af2a`, fixed in the merge commit).
 - **Workspace channel inventory view (`_workspace/channels.md`)** —
   `34f7f4e`. New server-side sweep `slurper/channel_totals.py` (6h
   cadence, Tier-2 paced 3.5s between calls) + `search_messages.py`

@@ -9,7 +9,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
 DEFAULT_FETCH_TIMEOUT_S = 30.0  # /channel-stats returns 100+KB across 600+ channels;
-# empirically 5–10s from LAN, 8–12s over Tailscale. 5s was too tight and caused
+# empirically 5-10s from LAN, 8-12s over Tailscale. 5s was too tight and caused
 # warmer ReadTimeout on flow (2026-08-02). Server-side query optimisation is a
 # follow-up — noted in BACKLOG.
 
