@@ -227,6 +227,20 @@ _None currently._
 
 ## 2026-08-02
 
+- **Coalesced disk projection Stage D1 (writer + coalescer)** —
+  `98f9657` + `8fea4a2`. Ships DARK behind `SLACK_FUSE_DISK_PROJECTION_ENABLED`
+  (default false). New `slack_fuse/projector/disk_projection.py`,
+  `coalescer.py`, `dirty_set.py`. Writes to `~/.cache/slack-fuse/projection/`
+  (atomic temp+rename). Coalescer wakes every 5s, initial bootstrap
+  paginates 200 paths/tick to keep the trio loop responsive during
+  the first ~600 hot-channel bootstrap. Render composes exactly the
+  same `fetch_day_chunks`/`fetch_thread_chunks` + `sql_resolvers_for`
+  + `resolve_mentions` + frontmatter helpers as JIT — byte-equality
+  test proves projection bytes match `synchronous_read_for_test`.
+  Adds public `path_changed` invalidation adapter to `SlackFuseOpsV2`
+  for D2 to consume. 17 focused tests + 1180 pass. D2 (read-side
+  tier logic) and D3 (adversarial invalidation ordering + race tests)
+  follow.
 - **Probe-event pattern (framework + first fact probe)** — `a3be0ba`
   + `a0b7193`. First pass built a parallel `slack_fuse_server/probes/*`
   package; reconciliation collapsed it into the existing
