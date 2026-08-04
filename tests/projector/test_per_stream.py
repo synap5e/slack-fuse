@@ -315,9 +315,10 @@ def test_applier_failure_poisons_stream_without_skipping_offset(
 
     pool = ConnectionPool(client_conn_factory)
     captured: list[BaseException] = []
+    failed_streams: list[str] = []
 
     async def body() -> None:
-        applier = StreamApplier("channel:CFAIL", pool, tz=_UTC)
+        applier = StreamApplier("channel:CFAIL", pool, tz=_UTC, on_failure=failed_streams.append)
         try:
             async with trio.open_nursery() as nursery:
                 await nursery.start(applier.serve)
@@ -337,6 +338,7 @@ def test_applier_failure_poisons_stream_without_skipping_offset(
     poison = [e for c in captured for e in _flatten(c) if isinstance(e, StreamApplyError)]
     assert poison, f"expected StreamApplyError, got {captured!r}"
     assert poison[0].offset == 42
+    assert failed_streams == ["channel:CFAIL"]
 
     verify_conn = client_conn_factory()
     # 41 applied; 42 failed; 43 never processed (stream died at 42).

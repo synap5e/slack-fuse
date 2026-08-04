@@ -247,6 +247,11 @@ def _dispatch(cur: Cursor[TupleRow], frame: EventFrame) -> ApplyResult:
 
 
 def _dispatch_channel_event(cur: Cursor[TupleRow], channel_id: str, kind: str, payload: JsonObject) -> ApplyResult:
+    cur.execute("SELECT tier FROM channels WHERE channel_id = %s", (channel_id,))
+    tier_row = cur.fetchone()
+    if tier_row is not None and str(tier_row[0]) == "blocked":
+        log.debug("apply: dropping %s for currently blocked channel:%s", kind, channel_id)
+        return ApplyResult()
     if kind == "message":
         return _apply_message(cur, channel_id, payload)
     if kind == "message_changed":

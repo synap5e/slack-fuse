@@ -56,6 +56,7 @@ class _HoLProbeClient(WSClient):
         """Route A's flood then one B frame; return A's progress when B lands."""
         async with trio.open_nursery() as nursery:
             self._nursery = nursery
+            self._desired_channel_ids.update({"HA", "HB"})
             a_applier = await self._ensure_applier(_SLOW_STREAM)
             b_applier = await self._ensure_applier(_FAST_STREAM)
 

@@ -47,14 +47,18 @@ class ConnectionSubscriptions:
         subscription = self._subscriptions.get(stream)
         return subscription is not None and subscription.generation == generation
 
-    def mark_sent(self, stream: str, offset: int) -> None:
+    def mark_sent(self, stream: str, offset: int, *, generation: int) -> None:
         subscription = self._subscriptions.get(stream)
-        if subscription is not None and offset > subscription.last_sent_offset:
+        if (
+            subscription is not None
+            and subscription.generation == generation
+            and offset > subscription.last_sent_offset
+        ):
             subscription.last_sent_offset = offset
 
-    def mark_caught_up(self, stream: str, head_offset: int) -> bool:
+    def mark_caught_up(self, stream: str, head_offset: int, *, generation: int) -> bool:
         subscription = self._subscriptions.get(stream)
-        if subscription is None:
+        if subscription is None or subscription.generation != generation:
             return False
         subscription.last_sent_offset = max(subscription.last_sent_offset, head_offset)
         subscription.caught_up = True

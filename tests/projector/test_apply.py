@@ -128,6 +128,21 @@ def test_top_level_message_replay_is_idempotent(client_conn: psycopg.Connection[
     assert _cursor(client_conn, "channel:CIDM") == 5
 
 
+def test_blocked_channel_events_dropped_by_applier(client_conn: psycopg.Connection[TupleRow]) -> None:
+    with client_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO channels "
+            "(channel_id, name, is_im, is_mpim, is_member, is_archived, tier, tier_source, subscribed) "
+            "VALUES ('CBLOCKED', 'blocked', FALSE, FALSE, TRUE, FALSE, 'blocked', 'manual', FALSE)"
+        )
+    [event] = list(channel_message_events("CBLOCKED", 1, start_offset=9))
+
+    apply_event(client_conn, event.to_frame())
+
+    assert _chunks(client_conn) == []
+    assert _cursor(client_conn, "channel:CBLOCKED") == 9
+
+
 # === message: thread reply (thread_chunks) ===
 
 

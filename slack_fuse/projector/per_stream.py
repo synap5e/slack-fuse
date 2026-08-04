@@ -73,6 +73,7 @@ type ProjectorMessage = EventFrame | CaughtUpFrame
 
 #: How the pool acquires a postgres connection (also the pool's own factory).
 type ConnectionFactory = Callable[[], Connection[TupleRow]]
+type FailureCallback = Callable[[str], None]
 
 
 class ConnectionLease(Protocol):
@@ -140,6 +141,7 @@ class StreamApplier:
         projection: ProjectionSink | None = None,
         queue_soft_cap: int = DEFAULT_QUEUE_SOFT_CAP,
         before_apply: Callable[[ProjectorMessage], Awaitable[None]] | None = None,
+        on_failure: FailureCallback | None = None,
     ) -> None:
         self.stream = stream
         self._pool = pool
@@ -160,6 +162,7 @@ class StreamApplier:
         # Optional hook (tests): awaited before each event apply. Used to
         # simulate slow appliers without touching the SQL path.
         self._before_apply = before_apply
+        self._on_failure = on_failure
 
     @property
     def queue_depth(self) -> int:
@@ -202,8 +205,16 @@ class StreamApplier:
     async def serve(self, *, task_status: trio.TaskStatus[None] = trio.TASK_STATUS_IGNORED) -> None:
         """Drain the queue until close. Borrows a pooled connection per event."""
         task_status.started()
-        async for message in self._receive:
-            await self._handle(message)
+        try:
+            async for message in self._receive:
+                await self._handle(message)
+        except Exception:
+            if self._on_failure is not None:
+                try:
+                    self._on_failure(self.stream)
+                except Exception:
+                    log.exception("applier %s: failure callback raised", self.stream)
+            raise
 
     async def close(self) -> None:
         await self._send.aclose()

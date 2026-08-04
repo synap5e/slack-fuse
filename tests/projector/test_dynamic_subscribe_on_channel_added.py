@@ -3,11 +3,13 @@
 
 from __future__ import annotations
 
+from typing import cast
 from zoneinfo import ZoneInfo
 
 import psycopg
 import trio
 from psycopg.rows import TupleRow
+from trio_websocket import WebSocketConnection
 
 from slack_fuse.projector.per_stream import StreamApplier
 from slack_fuse.projector.ws_client import WSClient, WSClientOptions
@@ -37,6 +39,7 @@ class _SubscribeProbeClient(WSClient):
     async def drive(self) -> None:
         async with trio.open_nursery() as nursery:
             self._nursery = nursery
+            self._ws = cast("WebSocketConnection", object())
             channel_list = await self._ensure_applier("channel-list")
             first = EventFrame(
                 stream="channel-list",
@@ -58,6 +61,7 @@ class _SubscribeProbeClient(WSClient):
             for applier in self._appliers.values():
                 await applier.close()
         self._nursery = None
+        self._ws = None
         await self._pool.aclose()
 
 

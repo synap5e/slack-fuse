@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterable
 from dataclasses import dataclass
+from enum import Enum
 from typing import Final
 from zoneinfo import ZoneInfo
 
@@ -52,6 +53,7 @@ from slack_fuse_server.wire.frames import (
     PongFrame,
     SnapshotAtFrame,
     SubscribeFrame,
+    UnsubscribeFrame,
 )
 
 log = logging.getLogger(__name__)
@@ -84,6 +86,18 @@ class WSClientOptions:
     pool_size: int = DEFAULT_POOL_SIZE  # bounded applier connection pool (review P0-A)
 
 
+class SubscriptionState(Enum):
+    """Client-side evidence for one server subscription.
+
+    The protocol has no subscribe acknowledgement, so a successful send stays
+    ``PENDING`` until the first stream-scoped server frame arrives.
+    """
+
+    PENDING = "pending"
+    ACTIVE = "active"
+    FAILED = "failed"
+
+
 class WSClient:
     """Trio WebSocket subscriber. Routes frames into per-stream appliers."""
 
@@ -110,6 +124,8 @@ class WSClient:
         self._projection = projection
         self._http: httpx.AsyncClient | None = http_client
         self._appliers: dict[str, StreamApplier] = {}
+        self._subscription_state: dict[str, SubscriptionState] = {}
+        self._desired_channel_ids: set[str] = set()
         self._ws: trio_websocket.WebSocketConnection | None = None
         self._send_lock = trio.Lock()
         self._nursery: trio.Nursery | None = None
@@ -139,14 +155,16 @@ class WSClient:
             async with trio.open_nursery() as nursery:
                 self._nursery = nursery
                 streams = list(initial_streams) if initial_streams is not None else list(SINGLETON_STREAMS)
+                self._desired_channel_ids = {
+                    stream.removeprefix("channel:") for stream in streams if stream.startswith("channel:")
+                }
                 for stream in streams:
                     await self._ensure_applier(stream)
                 headers = _build_headers(self._options.shared_secret)
                 async with trio_websocket.open_websocket_url(self._options.server_url, extra_headers=headers) as ws:
                     self._ws = ws
                     for stream in streams:
-                        since = await trio.to_thread.run_sync(self._read_cursor_sync, stream)
-                        await self._send_frame(SubscribeFrame(stream=stream, since=since))
+                        await self._subscribe_stream(stream)
                     nursery.start_soon(self._heartbeat_loop)
                     nursery.start_soon(self._straggler_watchdog)
                     task_status.started()
@@ -158,6 +176,8 @@ class WSClient:
             for applier in self._appliers.values():
                 await applier.close()
             self._appliers.clear()
+            self._subscription_state.clear()
+            self._desired_channel_ids.clear()
             await self._pool.aclose()
             if owned_http is not None:
                 await owned_http.aclose()
@@ -184,7 +204,14 @@ class WSClient:
             self._sink,
             tz=self._tz,
             projection=self._projection,
+            on_failure=self._mark_subscription_failed,
         )
+
+    def _mark_subscription_failed(self, stream: str) -> None:
+        self._subscription_state[stream] = SubscriptionState.FAILED
+
+    def _is_desired_stream(self, stream: str) -> bool:
+        return not stream.startswith("channel:") or stream.removeprefix("channel:") in self._desired_channel_ids
 
     async def _ensure_applier(self, stream: str) -> StreamApplier:
         existing = self._appliers.get(stream)
@@ -198,6 +225,18 @@ class WSClient:
         self._appliers[stream] = applier
         await nursery.start(applier.serve)
         return applier
+
+    async def _subscribe_stream(self, stream: str, *, since: int | None = None) -> None:
+        """Create/reuse an applier and attempt one server subscription."""
+        await self._ensure_applier(stream)
+        self._subscription_state[stream] = SubscriptionState.PENDING
+        try:
+            if since is None:
+                since = await trio.to_thread.run_sync(self._read_cursor_sync, stream)
+            await self._send_frame(SubscribeFrame(stream=stream, since=since))
+        except BaseException:
+            self._subscription_state[stream] = SubscriptionState.FAILED
+            raise
 
     # === wire IO ===
 
@@ -221,28 +260,47 @@ class WSClient:
 
     async def _dispatch_frame(  # noqa: C901 - dispatch hub
         self,
-        frame: EventFrame | CaughtUpFrame | SnapshotAtFrame | ErrorFrame | PingFrame | PongFrame | SubscribeFrame,
+        frame: EventFrame
+        | CaughtUpFrame
+        | SnapshotAtFrame
+        | ErrorFrame
+        | PingFrame
+        | PongFrame
+        | SubscribeFrame
+        | UnsubscribeFrame,
     ) -> None:
+        stream = getattr(frame, "stream", None)
+        if isinstance(stream, str) and not self._is_desired_stream(stream):
+            log.debug("ws: dropping frame for undesired stream %s", stream)
+            return
         if isinstance(frame, EventFrame):
             applier = await self._ensure_applier(frame.stream)
-            await applier.enqueue(frame)
+            self._subscription_state[frame.stream] = SubscriptionState.ACTIVE
+            try:
+                await applier.enqueue(frame)
+            except BaseException:
+                self._mark_subscription_failed(frame.stream)
+                raise
             # On `channel_added`, eagerly subscribe to the new channel's stream.
             if frame.stream == "channel-list" and frame.kind == "channel_added":
                 channel_id = frame.payload.get("id")
                 if isinstance(channel_id, str):
-                    new_stream = f"channel:{channel_id}"
-                    if new_stream not in self._appliers:
-                        await self._ensure_applier(new_stream)
-                        since = await trio.to_thread.run_sync(self._read_cursor_sync, new_stream)
-                        await self._send_frame(SubscribeFrame(stream=new_stream, since=since))
+                    await self.subscribe_channels(frozenset({channel_id}))
             return
         if isinstance(frame, CaughtUpFrame):
             applier = await self._ensure_applier(frame.stream)
-            await applier.enqueue(frame)
+            self._subscription_state[frame.stream] = SubscriptionState.ACTIVE
+            try:
+                await applier.enqueue(frame)
+            except BaseException:
+                self._mark_subscription_failed(frame.stream)
+                raise
             return
         if isinstance(frame, SnapshotAtFrame):
+            self._subscription_state[frame.stream] = SubscriptionState.PENDING
             nursery = self._nursery
             if nursery is None:  # pragma: no cover
+                self._mark_subscription_failed(frame.stream)
                 return
             nursery.start_soon(self._handle_snapshot, frame)
             return
@@ -253,6 +311,8 @@ class WSClient:
             return
         if isinstance(frame, ErrorFrame):
             log.warning("ws: server error %s stream=%s head=%s", frame.code, frame.stream, frame.head_offset)
+            if frame.stream is not None:
+                self._mark_subscription_failed(frame.stream)
             return
         log.warning("ws: unexpected frame %r", type(frame).__name__)
 
@@ -285,6 +345,7 @@ class WSClient:
                 # P0-C). Log + leave the stream subscribed via the replay path
                 # rather than tearing the client down.
                 log.warning("ws: snapshot fetch for %s failed: %s", frame.stream, exc)
+                self._mark_subscription_failed(frame.stream)
                 discard = True
                 return
         finally:
@@ -292,7 +353,7 @@ class WSClient:
         # A stale snapshot is rejected in its DB transaction and reports the
         # already-current cursor here. Resume from that offset rather than
         # replaying backwards from the redirect's obsolete one.
-        await self._send_frame(SubscribeFrame(stream=frame.stream, since=result.at_offset))
+        await self._subscribe_stream(frame.stream, since=result.at_offset)
 
     async def _send_frame(self, frame: object) -> None:
         ws = self._ws
@@ -318,41 +379,57 @@ class WSClient:
 
         Called by block-sync after a server-side unblock cycle so the WS
         stream picks up the previously-suppressed traffic without a mount
-        restart. Idempotent — subscribing a channel already in
-        ``self._appliers`` is a no-op. Silently skips if the WS connection
+        restart. Idempotent for ``ACTIVE``/``PENDING`` subscriptions, while a
+        ``FAILED`` attempt remains retryable. Silently skips if the WS connection
         is not currently established (mid-reconnect, or shutdown in
         progress); the next mount startup will pick it up from
         ``initial_streams``.
         """
+        self._desired_channel_ids.update(channel_ids)
         if not channel_ids or self._ws is None or self._nursery is None:
             return
         for channel_id in sorted(channel_ids):
             stream = f"channel:{channel_id}"
-            if stream in self._appliers:
+            if self._subscription_state.get(stream) in {SubscriptionState.ACTIVE, SubscriptionState.PENDING}:
                 continue
-            await self._ensure_applier(stream)
-            since = await trio.to_thread.run_sync(self._read_cursor_sync, stream)
-            log.info("subscribe_channels: %s at since=%d (dynamic subscribe from block-sync)", stream, since)
             try:
-                await self._send_frame(SubscribeFrame(stream=stream, since=since))
+                await self._subscribe_stream(stream)
             except trio_websocket.ConnectionClosed:
                 # Reconnect will pick this up via initial_streams (subscribed=TRUE
                 # in the channels table now). Nothing to recover here.
                 return
 
-    async def reconcile_subscriptions(self, desired: frozenset[str]) -> None:
-        """Ensure every desired channel has an active WS subscription.
+    async def unsubscribe_channels(self, channel_ids: frozenset[str]) -> None:
+        """Stop server delivery and retire appliers for no-longer-desired channels."""
+        if not channel_ids or self._ws is None:
+            return
+        for channel_id in sorted(channel_ids):
+            stream = f"channel:{channel_id}"
+            try:
+                await self._send_frame(UnsubscribeFrame(stream=stream))
+            except trio_websocket.ConnectionClosed:
+                return
+            applier = self._appliers.pop(stream, None)
+            if applier is not None:
+                await applier.close()
+            self._subscription_state.pop(stream, None)
+            log.info("unsubscribe_channels: %s (removed from desired set)", stream)
 
-        The current wire protocol has no unsubscribe frame, so this can repair
-        missing subscriptions but cannot remove extras from the live socket.
-        Reconnect rebuilds the exact set from the ``channels`` table. This
-        idempotent add-side reconciliation is sufficient to recover when an
-        unblock COMMIT succeeds server-side but its acknowledgement is lost.
-        """
-        active = frozenset(
-            stream.removeprefix("channel:") for stream in self._appliers if stream.startswith("channel:")
+    async def reconcile_subscriptions(self, desired: frozenset[str]) -> None:
+        """Make the live server subscription set match the durable desired set."""
+        tracked = frozenset(
+            stream.removeprefix("channel:")
+            for stream in set(self._subscription_state) | set(self._appliers)
+            if stream.startswith("channel:")
         )
-        await self.subscribe_channels(frozenset(desired - active))
+        active_or_pending = frozenset(
+            stream.removeprefix("channel:")
+            for stream, state in self._subscription_state.items()
+            if stream.startswith("channel:") and state in {SubscriptionState.ACTIVE, SubscriptionState.PENDING}
+        )
+        self._desired_channel_ids = set(desired)
+        await self.unsubscribe_channels(frozenset(tracked - desired))
+        await self.subscribe_channels(frozenset(desired - active_or_pending))
 
     async def _straggler_watchdog(self) -> None:
         """Log any per-stream applier that's sitting on undrained work.

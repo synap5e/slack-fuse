@@ -45,6 +45,13 @@ class SubscribeFrame(_Frame):
     since: int = 0
 
 
+class UnsubscribeFrame(_Frame):
+    """Client → server: stop delivering one stream on this connection."""
+
+    type: Literal["unsubscribe"] = "unsubscribe"
+    stream: str
+
+
 class EventFrame(_Frame):
     """Server → client: an individual event.
 
@@ -114,7 +121,14 @@ class PongFrame(_Frame):
 
 
 type Frame = Annotated[
-    SubscribeFrame | EventFrame | CaughtUpFrame | SnapshotAtFrame | ErrorFrame | PingFrame | PongFrame,
+    SubscribeFrame
+    | UnsubscribeFrame
+    | EventFrame
+    | CaughtUpFrame
+    | SnapshotAtFrame
+    | ErrorFrame
+    | PingFrame
+    | PongFrame,
     Field(discriminator="type"),
 ]
 

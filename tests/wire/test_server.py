@@ -29,6 +29,7 @@ from slack_fuse_server.wire.frames import (
     PongFrame,
     SnapshotAtFrame,
     SubscribeFrame,
+    UnsubscribeFrame,
 )
 from slack_fuse_server.wire.server import WireServer, WireServerOptions
 
@@ -431,6 +432,26 @@ async def test_notify_delivers_live_event_within_500ms(pg_conn: psycopg.Connecti
     assert frame.stream == stream
     assert frame.offset == offset
     assert frame.payload["text"] == "two"
+
+
+async def test_unsubscribe_stops_live_delivery(pg_conn: psycopg.Connection[TupleRow]) -> None:
+    database_url = _prepare_database(pg_conn)
+    stream = "channel:C1"
+    _seed_stream(pg_conn, stream, [_message("1.000001", "one")])
+
+    async with _running_server(database_url) as port, _connect(port) as ws:
+        await ws.send_message(SubscribeFrame(stream=stream, since=1).model_dump_json())
+        assert isinstance(await _recv_frame(ws), CaughtUpFrame)
+
+        await ws.send_message(UnsubscribeFrame(stream=stream).model_dump_json())
+        # Ping/pong is a receive-loop barrier: the unsubscribe was processed
+        # before the event is committed and NOTIFY wakes the live tailer.
+        await ws.send_message(PingFrame().model_dump_json())
+        assert isinstance(await _recv_frame(ws), PongFrame)
+        _ = _append_event(pg_conn, stream, _message("2.000001", "blocked"))
+        frame = await _maybe_recv_frame(ws)
+
+    assert frame is None
 
 
 async def test_concurrent_connections_do_not_crosstalk(pg_conn: psycopg.Connection[TupleRow]) -> None:

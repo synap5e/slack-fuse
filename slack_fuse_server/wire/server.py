@@ -23,6 +23,7 @@ from slack_fuse_server.wire.frames import (
     PongFrame,
     SnapshotAtFrame,
     SubscribeFrame,
+    UnsubscribeFrame,
 )
 from slack_fuse_server.wire.subscriptions import ConnectionSubscriptions
 from slack_fuse_server.wire.tail import DEFAULT_MAX_REPLAY_EVENTS, EventTailer
@@ -229,7 +230,14 @@ class _ConnectionHandler:
                 return
 
             if isinstance(frame, SubscribeFrame):
-                nursery.start_soon(self._handle_subscribe, frame)
+                # Reserve the generation before the async handler starts. An
+                # unsubscribe received while the handler is waiting on PG then
+                # invalidates this exact request instead of being undone when
+                # the older subscribe task resumes.
+                subscription = self._subscriptions.subscribe(frame.stream, frame.since)
+                nursery.start_soon(self._handle_subscribe, frame, subscription.generation)
+            elif isinstance(frame, UnsubscribeFrame):
+                self._subscriptions.remove(frame.stream)
             elif isinstance(frame, PingFrame):
                 await self._send_frame(PongFrame())
             elif isinstance(frame, PongFrame):
@@ -250,16 +258,26 @@ class _ConnectionHandler:
             return None
         return message
 
-    async def _handle_subscribe(self, frame: SubscribeFrame) -> None:  # noqa: C901  (linear guard chain — head_offset cases + snapshot-redirect + replay)
+    async def _handle_subscribe(  # noqa: C901  (linear guard chain: validity + head/snapshot/replay cases)
+        self,
+        frame: SubscribeFrame,
+        generation: int,
+    ) -> None:
+        if not self._subscriptions.is_current(frame.stream, generation):
+            return
         if frame.since < 0:
-            await self._ws.aclose(1003, "negative since")
+            if self._subscriptions.is_current(frame.stream, generation):
+                await self._ws.aclose(1003, "negative since")
             return
         if not _subscription_allowed(frame.stream):
-            self._subscriptions.remove(frame.stream)
-            await self._send_frame(ErrorFrame(code=ErrorCode.STREAM_NOT_FOUND, stream=frame.stream))
+            if self._subscriptions.is_current(frame.stream, generation):
+                self._subscriptions.remove(frame.stream)
+                await self._send_frame(ErrorFrame(code=ErrorCode.STREAM_NOT_FOUND, stream=frame.stream))
             return
 
         head_offset = await self._tailer.get_head_offset(frame.stream)
+        if not self._subscriptions.is_current(frame.stream, generation):
+            return
         if head_offset is None:
             # Empty stream: accept ``since == 0`` as a live-only subscription. The
             # stream exists conceptually (the client knows about it from
@@ -278,9 +296,8 @@ class _ConnectionHandler:
                 self._subscriptions.remove(frame.stream)
                 await self._send_frame(ErrorFrame(code=ErrorCode.SINCE_TOO_HIGH, stream=frame.stream, head_offset=0))
                 return
-            _ = self._subscriptions.subscribe(frame.stream, 0)
             await self._send_frame(CaughtUpFrame(stream=frame.stream, head_offset=0))
-            _ = self._subscriptions.mark_caught_up(frame.stream, 0)
+            _ = self._subscriptions.mark_caught_up(frame.stream, 0, generation=generation)
             return
 
         if frame.since > head_offset:
@@ -292,6 +309,8 @@ class _ConnectionHandler:
 
         if _snapshot_redirect_allowed(frame.stream) and self._tailer.replay_is_too_old(frame.since, head_offset):
             snapshot_offset = await self._tailer.find_snapshot_at_or_after(frame.stream, frame.since, head_offset)
+            if not self._subscriptions.is_current(frame.stream, generation):
+                return
             self._subscriptions.remove(frame.stream)
             if snapshot_offset is not None:
                 await self._send_frame(
@@ -311,16 +330,15 @@ class _ConnectionHandler:
             )
             return
 
-        subscription = self._subscriptions.subscribe(frame.stream, frame.since)
         async for event in self._tailer.iter_events_after(frame.stream, frame.since, through=head_offset):
-            if not self._subscriptions.is_current(frame.stream, subscription.generation):
+            if not self._subscriptions.is_current(frame.stream, generation):
                 return
-            await self._send_event(event, subscription.generation)
+            await self._send_event(event, generation)
 
-        if not self._subscriptions.is_current(frame.stream, subscription.generation):
+        if not self._subscriptions.is_current(frame.stream, generation):
             return
         await self._send_frame(CaughtUpFrame(stream=frame.stream, head_offset=head_offset))
-        pending = self._subscriptions.mark_caught_up(frame.stream, head_offset)
+        pending = self._subscriptions.mark_caught_up(frame.stream, head_offset, generation=generation)
         if pending:
             await self._drain_live_stream(frame.stream)
         else:
@@ -352,7 +370,7 @@ class _ConnectionHandler:
         if not self._subscriptions.is_current(event.stream, generation):
             return
         await self._send_frame(event)
-        self._subscriptions.mark_sent(event.stream, event.offset)
+        self._subscriptions.mark_sent(event.stream, event.offset, generation=generation)
 
     async def _heartbeat_loop(self) -> None:
         while True:
