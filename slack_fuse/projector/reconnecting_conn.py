@@ -6,7 +6,9 @@ socket dies.  The split mount deliberately keeps a handful of connections for
 its whole lifetime, so retaining one raw object turns a short Postgres bounce
 into a permanently stale mount.  ``ReconnectingConnection`` keeps the same
 single-connection shape while replacing that object after an
-``OperationalError`` and retrying the interrupted cursor operation once.
+``OperationalError``. Cursor operations outside an explicit transaction are
+retried once; failures inside a transaction are propagated so the wrapper can
+never silently split one logical transaction across two sockets.
 
 The wrapper is synchronous because its callers already run in worker threads.
 An ``RLock`` serializes a cursor/transaction context, matching psycopg's shared
@@ -71,10 +73,12 @@ def _connect(dsn: str) -> Connection[TupleRow]:
 class ReconnectingConnection:
     """A durable, single-slot ``psycopg.Connection[TupleRow]`` wrapper.
 
-    The raw connection is opened lazily.  On the first ``OperationalError``
-    from ``execute``/``executemany``/``fetch*``, the broken socket is closed,
-    a fresh connection is opened from the same DSN, and that operation is
-    retried once.  A second ``OperationalError`` is propagated unchanged.
+    The raw connection is opened lazily. Outside an explicit transaction, the
+    first ``OperationalError`` from ``execute``/``executemany``/``fetch*``
+    replaces the broken socket and retries that cursor operation once. Inside
+    a transaction, the original error is propagated unchanged and the socket
+    is abandoned after transaction unwind. In particular, a COMMIT transport
+    error has an ambiguous server-side outcome and is never retried here.
 
     ``on_reconnect`` fires after every successful replacement (never for the
     initial connection).  ``on_health_event`` receives ``client_wedged`` once
@@ -111,6 +115,7 @@ class ReconnectingConnection:
 
         self._lock = threading.RLock()
         self._conn: Connection[TupleRow] | None = None
+        self._broken = False
         self._generation = 0
         self._connect_attempted = False
         self._explicitly_closed = False
@@ -156,7 +161,7 @@ class ReconnectingConnection:
         return self.cursor().execute(query, params, prepare=prepare, binary=binary)
 
     def transaction(self) -> _ReconnectingTransaction:
-        """Return a transaction context that follows a reopened connection."""
+        """Return a transaction context that abandons, rather than reopens, on failure."""
         return _ReconnectingTransaction(self)
 
     def commit(self) -> None:
@@ -196,8 +201,12 @@ class ReconnectingConnection:
 
     def _ensure_connection(self) -> Connection[TupleRow]:
         self._ensure_open()
-        if self._conn is not None and not self._conn.closed:
+        if self._conn is not None and not self._conn.closed and not self._broken:
             return self._conn
+        if self._transactions:
+            self._broken = True
+            msg = "postgres connection became unavailable during an active transaction"
+            raise OperationalError(msg)
         if self._conn is not None:
             self._close_raw()
 
@@ -214,15 +223,8 @@ class ReconnectingConnection:
             raise
 
         self._conn = conn
+        self._broken = False
         self._generation += 1
-        try:
-            for transaction in self._transactions:
-                transaction._restart(conn)
-        except OperationalError as exc:
-            self._close_raw()
-            self._last_reconnect_reason = str(exc)
-            self._record_reconnect_failure(str(exc))
-            raise
 
         if is_reconnect:
             reason = self._last_reconnect_reason
@@ -241,6 +243,16 @@ class ReconnectingConnection:
         self._last_reconnect_reason = str(exc)
         self._close_raw()
         self._record_reconnect_failure(str(exc))
+
+    def _mark_broken(self, exc: OperationalError) -> None:
+        """Prevent the failed raw socket from being reused or reopened mid-TX."""
+        self._broken = True
+        self._last_reconnect_reason = str(exc)
+
+    def _abandon_broken_if_idle(self) -> None:
+        """Close a failed socket only after its outermost transaction unwinds."""
+        if self._broken and not self._transactions:
+            self._close_raw()
 
     def _close_raw(self) -> None:
         conn = self._conn
@@ -372,14 +384,30 @@ class _ReconnectingCursor:
         *,
         replay_before_retry: bool = True,
     ) -> object:
+        """Run one cursor operation, with one narrowly-scoped reconnect retry.
+
+        Replay is permitted only when this operation discovers a broken socket
+        while no explicit transaction is active. It is not a general safe-write
+        retry contract: callers must account for ambiguous outcomes of writes
+        outside transactions. An operation that fails inside a transaction is
+        never reopened or retried, because doing so would lose prior statements.
+        """
         with self._owner._lock:
-            cursor = self._current_cursor(replay=replay_before_retry)
+            try:
+                cursor = self._current_cursor(replay=replay_before_retry)
+            except OperationalError as setup_exc:
+                if self._owner._transactions:
+                    self._owner._mark_broken(setup_exc)
+                raise
             try:
                 return operation(cursor)
             except OperationalError as first_exc:
+                if self._owner._transactions:
+                    self._owner._mark_broken(first_exc)
+                    raise
                 _ = self._owner._reopen(str(first_exc))
-                cursor = self._replace_cursor(replay=replay_before_retry)
                 try:
+                    cursor = self._replace_cursor(replay=replay_before_retry)
                     return operation(cursor)
                 except OperationalError as retry_exc:
                     self._owner._abandon_failed_retry(retry_exc)
@@ -409,7 +437,7 @@ class _ReconnectingCursor:
 
 
 class _ReconnectingTransaction(AbstractContextManager[None]):
-    """Transaction context whose commit target follows a connection reopen."""
+    """Transaction context that never follows a connection reopen."""
 
     def __init__(self, owner: ReconnectingConnection) -> None:
         self._owner = owner
@@ -442,21 +470,20 @@ class _ReconnectingTransaction(AbstractContextManager[None]):
                 return None
             try:
                 return transaction.__exit__(exc_type, exc_value, traceback)
-            except Exception:
+            except OperationalError as exit_exc:
+                self._owner._mark_broken(exit_exc)
                 if exc_value is None:
                     raise
+                # Preserve the original body failure. The rollback error is a
+                # follow-on from the same dead socket, which is abandoned below.
                 return False
         finally:
             if self in self._owner._transactions:
                 self._owner._transactions.remove(self)
+            self._owner._abandon_broken_if_idle()
             if self._entered:
                 self._entered = False
                 self._owner._lock.release()
-
-    def _restart(self, conn: Connection[TupleRow]) -> None:
-        transaction = cast("AbstractContextManager[None]", conn.transaction())
-        _ = transaction.__enter__()
-        self._transaction = transaction
 
 
 __all__ = [

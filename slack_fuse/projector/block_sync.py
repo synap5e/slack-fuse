@@ -30,6 +30,16 @@ class VisibilityChanges:
     newly_blocked: frozenset[str]
 
 
+def desired_subscribed_channel_ids(conn: TupleConnection) -> frozenset[str]:
+    """Return the full channel subscription postcondition from local state."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT channel_id FROM channels "
+            "WHERE tier != 'blocked' AND subscribed = TRUE ORDER BY channel_id"
+        )
+        return frozenset(str(row[0]) for row in cur.fetchall())
+
+
 def apply_blocked_channel_sync(conn: TupleConnection, blocked_ids: set[str]) -> VisibilityChanges:
     """Apply one server block-list snapshot to the client ``channels`` table.
 
@@ -164,6 +174,46 @@ def sync_blocked_channels_once(
     return apply_blocked_channel_sync(conn, blocked_channel_ids_from_payload(payload))
 
 
+def _sync_cycle_with_desired_subscriptions(
+    http_client: httpx.Client,
+    base_http_url: str,
+    conn: TupleConnection,
+    shared_secret: str | None,
+) -> tuple[VisibilityChanges | None, frozenset[str] | None]:
+    changes = sync_blocked_channels_once(
+        http_client,
+        base_http_url,
+        conn,
+        shared_secret=shared_secret,
+    )
+    desired = desired_subscribed_channel_ids(conn) if changes is not None else None
+    return changes, desired
+
+
+async def _dispatch_cycle_callbacks(
+    changes: VisibilityChanges | None,
+    desired: frozenset[str] | None,
+    on_newly_subscribed: Callable[[frozenset[str]], Awaitable[None]] | None,
+    on_newly_blocked: Callable[[frozenset[str]], Awaitable[None]] | None,
+    on_reconcile_subscriptions: Callable[[frozenset[str]], Awaitable[None]] | None,
+) -> None:
+    if changes is not None and changes.newly_subscribed and on_newly_subscribed is not None:
+        try:
+            await on_newly_subscribed(changes.newly_subscribed)
+        except Exception:
+            log.exception("block-sync: on_newly_subscribed callback failed")
+    if changes is not None and changes.newly_blocked and on_newly_blocked is not None:
+        try:
+            await on_newly_blocked(changes.newly_blocked)
+        except Exception:
+            log.exception("block-sync: on_newly_blocked callback failed")
+    if desired is not None and on_reconcile_subscriptions is not None:
+        try:
+            await on_reconcile_subscriptions(desired)
+        except Exception:
+            log.exception("block-sync: on_reconcile_subscriptions callback failed")
+
+
 async def sync_blocked_channels_periodically(  # noqa: PLR0913 - process wiring needs explicit factories/knobs.
     make_http_client: Callable[[], httpx.Client],
     base_http_url: str,
@@ -174,6 +224,7 @@ async def sync_blocked_channels_periodically(  # noqa: PLR0913 - process wiring 
     limiter: trio.CapacityLimiter | None = None,
     on_newly_subscribed: Callable[[frozenset[str]], Awaitable[None]] | None = None,
     on_newly_blocked: Callable[[frozenset[str]], Awaitable[None]] | None = None,
+    on_reconcile_subscriptions: Callable[[frozenset[str]], Awaitable[None]] | None = None,
 ) -> None:
     """Long-running trio task for split-mode mount processes.
 
@@ -183,7 +234,10 @@ async def sync_blocked_channels_periodically(  # noqa: PLR0913 - process wiring 
     ``_control/blocked_channels`` triggers WS subscribes without a mount
     restart. ``on_newly_blocked`` separately receives subscribed → blocked
     transitions so callers can invalidate visibility caches without changing
-    the WSClient callback contract.
+    the WSClient callback contract. After every successful cycle, including a
+    no-op cycle, ``on_reconcile_subscriptions`` receives the complete desired
+    channel set. That idempotent postcondition repairs an unblock whose COMMIT
+    succeeded but whose acknowledgement was lost.
     """
     http_client = make_http_client()
     conn: TupleConnection | None = None
@@ -196,32 +250,25 @@ async def sync_blocked_channels_periodically(  # noqa: PLR0913 - process wiring 
                 if conn is None:
                     conn = open_conn()
                 cycle_conn = conn
-                visibility_changes = await trio.to_thread.run_sync(
-                    lambda cycle_conn=cycle_conn: sync_blocked_channels_once(
-                        http_client,
-                        base_http_url,
-                        cycle_conn,
-                        shared_secret=shared_secret,
-                    ),
+                visibility_changes, desired_subscriptions = await trio.to_thread.run_sync(
+                    _sync_cycle_with_desired_subscriptions,
+                    http_client,
+                    base_http_url,
+                    cycle_conn,
+                    shared_secret,
                     limiter=limiter,
                 )
             except Exception:
                 log.exception("block-sync: cycle failed")
                 visibility_changes = None
-            if (
-                visibility_changes is not None
-                and visibility_changes.newly_subscribed
-                and on_newly_subscribed is not None
-            ):
-                try:
-                    await on_newly_subscribed(visibility_changes.newly_subscribed)
-                except Exception:
-                    log.exception("block-sync: on_newly_subscribed callback failed")
-            if visibility_changes is not None and visibility_changes.newly_blocked and on_newly_blocked is not None:
-                try:
-                    await on_newly_blocked(visibility_changes.newly_blocked)
-                except Exception:
-                    log.exception("block-sync: on_newly_blocked callback failed")
+                desired_subscriptions = None
+            await _dispatch_cycle_callbacks(
+                visibility_changes,
+                desired_subscriptions,
+                on_newly_subscribed,
+                on_newly_blocked,
+                on_reconcile_subscriptions,
+            )
             await trio.sleep(interval_s)
     finally:
         http_client.close()
@@ -233,6 +280,7 @@ __all__ = [
     "DEFAULT_BLOCK_SYNC_INTERVAL_S",
     "VisibilityChanges",
     "apply_blocked_channel_sync",
+    "desired_subscribed_channel_ids",
     "sync_blocked_channels_once",
     "sync_blocked_channels_periodically",
 ]

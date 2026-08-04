@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from typing import Final
 
 import httpx
+import psycopg
 import trio
 import trio_websocket
 from pydantic import ValidationError
@@ -268,7 +269,7 @@ class WSClient:
                     sink=self._sink,
                     projection=self._projection,
                 )
-            except (httpx.HTTPError, SnapshotFetchError, ValueError) as exc:
+            except (httpx.HTTPError, SnapshotFetchError, ValueError, psycopg.OperationalError) as exc:
                 # ValueError: a stale server offering a snapshot for a stream the
                 # client cannot replace-apply (e.g. a singleton stream — review
                 # P0-C). Log + leave the stream subscribed via the replay path
@@ -326,6 +327,20 @@ class WSClient:
                 # Reconnect will pick this up via initial_streams (subscribed=TRUE
                 # in the channels table now). Nothing to recover here.
                 return
+
+    async def reconcile_subscriptions(self, desired: frozenset[str]) -> None:
+        """Ensure every desired channel has an active WS subscription.
+
+        The current wire protocol has no unsubscribe frame, so this can repair
+        missing subscriptions but cannot remove extras from the live socket.
+        Reconnect rebuilds the exact set from the ``channels`` table. This
+        idempotent add-side reconciliation is sufficient to recover when an
+        unblock COMMIT succeeds server-side but its acknowledgement is lost.
+        """
+        active = frozenset(
+            stream.removeprefix("channel:") for stream in self._appliers if stream.startswith("channel:")
+        )
+        await self.subscribe_channels(frozenset(desired - active))
 
     async def _straggler_watchdog(self) -> None:
         """Log any per-stream applier that's sitting on undrained work.

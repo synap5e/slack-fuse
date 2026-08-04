@@ -2,13 +2,22 @@
 
 from __future__ import annotations
 
+import functools
 from typing import TYPE_CHECKING
 
+import httpx
+import psycopg
+import pytest
+import trio
+
+import slack_fuse.projector.block_sync as block_sync_module
 from slack_fuse.projector.block_sync import apply_blocked_channel_sync
 
 if TYPE_CHECKING:
-    import psycopg
     from psycopg.rows import TupleRow
+
+    from slack_fuse.projector.reconnecting_conn import TupleConnection
+    from tests.projector.conftest import ClientConnFactory
 
 
 def _seed_channel(
@@ -177,3 +186,95 @@ def test_finding_14_first_time_seen_channel_falls_back_to_auto(
     assert transitions.newly_subscribed == frozenset({"CFRESH"})
     assert transitions.newly_blocked == frozenset()
     assert _channel_row(client_conn, "CFRESH") == ("hot", "auto", True)
+
+
+@pytest.mark.trio
+async def test_block_sync_reconcile_recovers_from_committed_but_unacked_unblock(
+    client_conn_factory: ClientConnFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    block_conn = client_conn_factory()
+    verify_conn = client_conn_factory()
+    _seed_channel(block_conn, "CAMBIGUOUS")
+    _ = apply_blocked_channel_sync(block_conn, {"CAMBIGUOUS"})
+
+    calls = 0
+    real_sync_once = block_sync_module.sync_blocked_channels_once
+
+    def commit_then_lose_ack(
+        http_client: httpx.Client,
+        base_http_url: str,
+        conn: TupleConnection,
+        *,
+        shared_secret: str | None = None,
+    ) -> block_sync_module.VisibilityChanges | None:
+        nonlocal calls
+        calls += 1
+        changes = real_sync_once(
+            http_client,
+            base_http_url,
+            conn,
+            shared_secret=shared_secret,
+        )
+        if calls == 1:
+            # The transaction above committed the unblock and deleted the
+            # server_block_sync row; only the client-side acknowledgement is
+            # lost. The next cycle therefore has an empty transition set.
+            raise psycopg.OperationalError("fault injection: COMMIT acknowledgement lost")
+        return changes
+
+    monkeypatch.setattr(block_sync_module, "sync_blocked_channels_once", commit_then_lose_ack)
+
+    def no_server_blocks(
+        _http_client: httpx.Client,
+        _base_http_url: str,
+        *,
+        shared_secret: str | None = None,
+        timeout_s: float = 10.0,
+    ) -> tuple[int, dict[str, object]]:
+        del shared_secret, timeout_s
+        return 200, {"blocked": []}
+
+    monkeypatch.setattr(block_sync_module, "get_blocked_channels", no_server_blocks)
+
+    class _FakeWSClient:
+        def __init__(self) -> None:
+            self.reconciled: list[frozenset[str]] = []
+
+        async def reconcile_subscriptions(self, desired: frozenset[str]) -> None:
+            self.reconciled.append(desired)
+
+    fake_ws = _FakeWSClient()
+    transitions: list[frozenset[str]] = []
+    reconciled = trio.Event()
+
+    async def on_newly_subscribed(ids: frozenset[str]) -> None:
+        await trio.lowlevel.checkpoint()
+        transitions.append(ids)
+
+    async def reconcile(desired: frozenset[str]) -> None:
+        await fake_ws.reconcile_subscriptions(desired)
+        reconciled.set()
+
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(
+            functools.partial(
+                block_sync_module.sync_blocked_channels_periodically,
+                httpx.Client,
+                "http://server.invalid",
+                lambda: block_conn,
+                interval_s=0.01,
+                on_newly_subscribed=on_newly_subscribed,
+                on_reconcile_subscriptions=reconcile,
+            )
+        )
+        with trio.fail_after(5):
+            await reconciled.wait()
+        nursery.cancel_scope.cancel()
+
+    with verify_conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM server_block_sync WHERE channel_id = 'CAMBIGUOUS'")
+        assert cur.fetchone() == (0,)
+    assert transitions == []
+    assert fake_ws.reconciled == [frozenset({"CAMBIGUOUS"})]
+    assert calls == 2

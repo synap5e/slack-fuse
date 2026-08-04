@@ -737,6 +737,14 @@ def cmd_mount(args: argparse.Namespace) -> None:  # noqa: C901  (process-wiring 
             # off the trio loop and share the existing store-call budget.
             await trio.to_thread.run_sync(_invalidate_visibility, limiter=store_limiter)
 
+        async def _reconcile_subscriptions(desired: frozenset[str]) -> None:
+            client = current_ws_client[0]
+            if client is None:
+                # The next projector run queries this same postcondition before
+                # connecting, so reconciliation is naturally deferred.
+                return
+            await client.reconcile_subscriptions(desired)
+
         await sync_blocked_channels_periodically(
             _make_http_client,
             ghost_base_http_url,
@@ -746,6 +754,7 @@ def cmd_mount(args: argparse.Namespace) -> None:  # noqa: C901  (process-wiring 
             limiter=store_limiter,
             on_newly_subscribed=_on_newly_subscribed,
             on_newly_blocked=_on_newly_blocked,
+            on_reconcile_subscriptions=_reconcile_subscriptions,
         )
 
     async def _run() -> None:
