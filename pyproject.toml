@@ -100,3 +100,6 @@ line-ending = "auto"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "benchmark: sustained rollout evidence with latency distributions",
+]

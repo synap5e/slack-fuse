@@ -318,6 +318,8 @@ def _default_invalidate_inode(inode: int) -> None:
         pyfuse3.invalidate_inode(inode)  # pyright: ignore[reportArgumentType]
     except OSError as exc:
         _log_kernel_cache_oserror("invalidate_inode", inode, exc)
+        if exc.errno not in _BENIGN_KERNEL_CACHE_ERRNOS:
+            raise
 
 
 # Attribute/entry caching timeouts (review P2-8 / Gemini Class 8). Without

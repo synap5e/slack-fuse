@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import errno
 import functools
 import logging
+import re
 import statistics
 import threading
 import time
@@ -18,9 +20,10 @@ import trio
 from psycopg import Cursor
 from psycopg.rows import TupleRow
 
+import slack_fuse.fuse_ops_v2 as fuse_ops_module
 import slack_fuse.projector.apply as apply_module
 import slack_fuse.projector.disk_projection as projection_module
-from slack_fuse.fuse_ops_v2 import SlackFuseOpsV2
+from slack_fuse.fuse_ops_v2 import SlackFuseOpsV2, V2InvalidationSink
 from slack_fuse.models import JsonObject
 from slack_fuse.projector.apply import ApplyResult, apply_event
 from slack_fuse.projector.block_sync import apply_blocked_channel_sync
@@ -570,6 +573,57 @@ def test_replace_is_invalidated_before_cas_failure(
     assert projection.pending_count == 1
 
 
+def test_v2_invalidation_sink_propagates_eio_and_projection_retries(
+    client_conn_factory: ClientConnFactory,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    projection_conn = client_conn_factory()
+    sink_conn = client_conn_factory()
+    _seed_world(projection_conn)
+    projection = DiskProjection(projection_conn, _TZ, root=tmp_path / "projection")
+    _set_target(projection_conn, _KEY, target_generation=1, rendered_generation=0)
+    projection.mark_target_dirty(_KEY)
+    inode_ops = SlackFuseOpsV2(sink_conn, _TZ, trio.CapacityLimiter(1))
+    inode = inode_ops.inodes.get_or_create(_PATH)
+    sink = V2InvalidationSink(sink_conn, _TZ)
+    invalidation_calls: list[int] = []
+
+    def fail_once(actual_inode: int) -> None:
+        invalidation_calls.append(actual_inode)
+        if len(invalidation_calls) == 1:
+            raise OSError(errno.EIO, "forced non-benign invalidation failure")
+
+    monkeypatch.setattr(fuse_ops_module.pyfuse3, "invalidate_inode", fail_once)
+
+    assert projection.flush_dirty(1, sink.path_changed) == []
+    assert _target_row(projection_conn, _KEY) == (1, 0, RENDERER_VERSION)
+    pending = projection._pending_invalidations  # pyright: ignore[reportPrivateUsage]
+    assert pending[_KEY] == {_PATH}
+
+    assert projection.flush_dirty(1, sink.path_changed) == [_PATH]
+    assert invalidation_calls == [inode, inode, inode]
+    assert _target_row(projection_conn, _KEY) == (1, 1, RENDERER_VERSION)
+    assert _KEY not in pending
+
+
+@pytest.mark.parametrize("benign_errno", [errno.ENOENT, errno.EBADF])
+def test_v2_invalidation_sink_accepts_benign_teardown_errors(
+    client_conn: Connection[TupleRow],
+    monkeypatch: pytest.MonkeyPatch,
+    benign_errno: int,
+) -> None:
+    inode_ops = SlackFuseOpsV2(client_conn, _TZ, trio.CapacityLimiter(1))
+    _ = inode_ops.inodes.get_or_create(_PATH)
+    sink = V2InvalidationSink(client_conn, _TZ)
+
+    def benign_failure(_inode: int) -> None:
+        raise OSError(benign_errno, "forced benign teardown race")
+
+    monkeypatch.setattr(fuse_ops_module.pyfuse3, "invalidate_inode", benign_failure)
+    sink.path_changed(_PATH)
+
+
 def test_thread_slug_drift_removes_and_invalidates_old_alias_before_cas(
     client_conn: Connection[TupleRow],
     tmp_path: Path,
@@ -715,6 +769,39 @@ async def test_clean_disk_read_equals_bytes_rendered_for_completed_generation(
     disk_read = await _read(_ops(reader_conn, projection))
     assert rendered_at_start == [projection.path_for(_PATH).read_bytes()]
     assert disk_read == rendered_at_start[0]
+
+
+@pytest.mark.trio
+async def test_projector_span_logs_pin_read_and_flush_field_shapes(
+    client_conn: Connection[TupleRow],
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO)
+    _seed_world(client_conn)
+    projection = DiskProjection(client_conn, _TZ, root=tmp_path / "projection")
+    _set_target(client_conn, _KEY, target_generation=1, rendered_generation=0)
+    projection.mark_target_dirty(_KEY)
+
+    assert projection.flush_dirty(1) == [_PATH]
+    assert b"hello from C1" in await _read(_ops(client_conn, projection))
+
+    flush_message = next(
+        message for message in caplog.messages if "op=projection.flush" in message
+    )
+    read_message = next(
+        message for message in caplog.messages if "op=projection.is_clean_check" in message
+    )
+    assert re.fullmatch(
+        r"projector-span op=projection\.flush target_kind=day channel_id=C1 "
+        r"duration_ms=\d+\.\d{3} cas_result=applied",
+        flush_message,
+    )
+    assert re.fullmatch(
+        r"projector-span op=projection\.is_clean_check target_kind=day "
+        r"duration_ms=\d+\.\d{3} result=clean",
+        read_message,
+    )
 
 
 def test_kernel_invalidation_precedes_ledger_completion(
