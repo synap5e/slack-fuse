@@ -19,6 +19,8 @@ import slack_fuse_server.migrations as server_migrations
 from slack_fuse.migrations.runner import apply_migrations
 from slack_fuse_server._json import JsonObject
 from slack_fuse_server.wire.frames import (
+    CAPABILITIES_REQUEST_HEADER,
+    CAPABILITIES_REQUEST_VALUE,
     CaughtUpFrame,
     ErrorCode,
     ErrorFrame,
@@ -27,6 +29,7 @@ from slack_fuse_server.wire.frames import (
     FrameAdapter,
     PingFrame,
     PongFrame,
+    ServerCapabilitiesFrame,
     SnapshotAtFrame,
     SubscribeFrame,
     UnsubscribeFrame,
@@ -64,8 +67,18 @@ async def _running_server(
 
 
 @asynccontextmanager
-async def _connect(port: int) -> AsyncIterator[WebSocketConnection]:
-    async with open_websocket("127.0.0.1", port, "/ws", use_ssl=False) as ws:
+async def _connect(
+    port: int,
+    *,
+    extra_headers: list[tuple[bytes, bytes]] | None = None,
+) -> AsyncIterator[WebSocketConnection]:
+    async with open_websocket(
+        "127.0.0.1",
+        port,
+        "/ws",
+        use_ssl=False,
+        extra_headers=extra_headers,
+    ) as ws:
         yield ws
 
 
@@ -200,6 +213,31 @@ async def test_subscribe_from_zero_replays_events_then_caught_up(pg_conn: psycop
     assert isinstance(caught_up, CaughtUpFrame)
     assert caught_up.stream == stream
     assert caught_up.head_offset == 2
+
+
+async def test_server_advertises_unsubscribe_to_capability_aware_client(
+    pg_conn: psycopg.Connection[TupleRow],
+) -> None:
+    database_url = _prepare_database(pg_conn)
+    headers = [(CAPABILITIES_REQUEST_HEADER, CAPABILITIES_REQUEST_VALUE)]
+
+    async with _running_server(database_url) as port, _connect(port, extra_headers=headers) as ws:
+        frame = await _recv_frame(ws)
+
+    assert frame == ServerCapabilitiesFrame(supported_frames=["unsubscribe"])
+
+
+async def test_server_does_not_send_capabilities_to_legacy_client(
+    pg_conn: psycopg.Connection[TupleRow],
+) -> None:
+    database_url = _prepare_database(pg_conn)
+    stream = "channel:LEGACY"
+
+    async with _running_server(database_url) as port, _connect(port) as ws:
+        await ws.send_message(SubscribeFrame(stream=stream, since=0).model_dump_json())
+        frame = await _recv_frame(ws)
+
+    assert frame == CaughtUpFrame(stream=stream, head_offset=0)
 
 
 async def test_subscribe_from_recent_offset_replays_gap(pg_conn: psycopg.Connection[TupleRow]) -> None:

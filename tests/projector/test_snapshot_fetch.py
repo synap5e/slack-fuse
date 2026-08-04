@@ -1,3 +1,4 @@
+# pyright: reportPrivateUsage=false
 """HTTP snapshot fetch tests (acceptance criterion 7).
 
 Drives `fetch_and_apply_snapshot` against an httpx mock transport that returns
@@ -10,15 +11,20 @@ from __future__ import annotations
 
 import functools
 import json
+import threading
+from collections.abc import Sequence
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 import httpx
 import psycopg
+import pytest
 import trio
 from psycopg.rows import TupleRow
 
-from slack_fuse.projector.apply import ChunkRef, ThreadChunkRef
+import slack_fuse.projector.snapshot_fetch as snapshot_fetch_module
+from slack_fuse.models import JsonObject
+from slack_fuse.projector.apply import ApplyResult, ChunkRef, ThreadChunkRef
 from slack_fuse.projector.snapshot_fetch import (
     SnapshotFetchError,
     SnapshotRedirect,
@@ -62,6 +68,89 @@ def _cursor(conn: psycopg.Connection[TupleRow], stream: str) -> int:
         cur.execute("SELECT applied_offset FROM cursors WHERE stream = %s", (stream,))
         row = cur.fetchone()
     return 0 if row is None else int(row[0])
+
+
+def test_snapshot_replacement_blocked_race_serializes(
+    client_conn_factory: ClientConnFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stream = "channel:CSNAPRACE"
+    seed_conn = client_conn_factory()
+    with seed_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO channels "
+            "(channel_id, name, is_im, is_mpim, is_member, is_archived, tier, tier_source, subscribed) "
+            "VALUES ('CSNAPRACE', 'snapshot-race', FALSE, FALSE, TRUE, FALSE, 'hot', 'auto', TRUE)"
+        )
+    stale_ts = "100.000001"
+    _seed_top_level_chunk(seed_conn, "CSNAPRACE", stale_ts, mention="USTALE")
+    [snapshot_line] = _make_snapshot_lines("CSNAPRACE", 1)
+    snapshot_conn = client_conn_factory()
+    block_conn = client_conn_factory()
+    snapshot_has_lock = threading.Event()
+    release_snapshot = threading.Event()
+    block_started = threading.Event()
+    block_done = threading.Event()
+    errors: list[BaseException] = []
+    real_delete = snapshot_fetch_module._delete_chunks_absent_from_snapshot
+
+    def paused_delete(
+        cur: psycopg.Cursor[TupleRow],
+        channel_id: str,
+        rows: Sequence[JsonObject],
+    ) -> ApplyResult:
+        snapshot_has_lock.set()
+        if not release_snapshot.wait(timeout=5):
+            msg = "timed out waiting to release paused snapshot"
+            raise TimeoutError(msg)
+        return real_delete(cur, channel_id, rows)
+
+    monkeypatch.setattr(snapshot_fetch_module, "_delete_chunks_absent_from_snapshot", paused_delete)
+
+    def run_snapshot() -> None:
+        try:
+            _ = snapshot_fetch_module._apply_snapshot_sync(
+                snapshot_conn,
+                stream,
+                42,
+                (snapshot_line.decode(),),
+                ZoneInfo("UTC"),
+            )
+        except BaseException as exc:  # pragma: no cover - assertion reports thread errors
+            errors.append(exc)
+
+    def run_block() -> None:
+        try:
+            block_started.set()
+            with block_conn.transaction(), block_conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE channels SET tier = 'blocked', tier_source = 'manual', subscribed = FALSE "
+                    "WHERE channel_id = 'CSNAPRACE'"
+                )
+            block_done.set()
+        except BaseException as exc:  # pragma: no cover - assertion reports thread errors
+            errors.append(exc)
+
+    snapshot_thread = threading.Thread(target=run_snapshot)
+    block_thread = threading.Thread(target=run_block)
+    snapshot_thread.start()
+    assert snapshot_has_lock.wait(timeout=5)
+    block_thread.start()
+    assert block_started.wait(timeout=5)
+    assert not block_done.wait(timeout=0.2), "block commit bypassed the snapshot row lock"
+    release_snapshot.set()
+    snapshot_thread.join(timeout=5)
+    block_thread.join(timeout=5)
+
+    assert not snapshot_thread.is_alive()
+    assert not block_thread.is_alive()
+    assert errors == []
+    assert not _chunk_exists(seed_conn, "CSNAPRACE", stale_ts)
+    assert _count_chunks(seed_conn, "CSNAPRACE") == 1
+    assert _cursor(seed_conn, stream) == 42
+    with seed_conn.cursor() as cur:
+        cur.execute("SELECT tier FROM channels WHERE channel_id = 'CSNAPRACE'")
+        assert cur.fetchone() == ("blocked",)
 
 
 def test_snapshot_fetch_applies_jsonl_atomically(client_conn_factory: ClientConnFactory) -> None:

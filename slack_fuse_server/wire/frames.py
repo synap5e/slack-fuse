@@ -12,11 +12,15 @@ All frames are frozen and forbid unknown fields — this is our own protocol
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Annotated, Literal
+from typing import Annotated, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from slack_fuse_server._json import JsonObject
+
+CAPABILITIES_REQUEST_HEADER: Final = b"x-slack-fuse-capabilities"
+CAPABILITIES_REQUEST_VALUE: Final = b"server-capabilities-v1"
+UNSUBSCRIBE_CAPABILITY: Final = "unsubscribe"
 
 
 class ErrorCode(StrEnum):
@@ -50,6 +54,13 @@ class UnsubscribeFrame(_Frame):
 
     type: Literal["unsubscribe"] = "unsubscribe"
     stream: str
+
+
+class ServerCapabilitiesFrame(_Frame):
+    """Server → client: wire extensions supported on this connection."""
+
+    type: Literal["server_capabilities"] = "server_capabilities"
+    supported_frames: list[str] = Field(default_factory=list)
 
 
 class EventFrame(_Frame):
@@ -123,6 +134,7 @@ class PongFrame(_Frame):
 type Frame = Annotated[
     SubscribeFrame
     | UnsubscribeFrame
+    | ServerCapabilitiesFrame
     | EventFrame
     | CaughtUpFrame
     | SnapshotAtFrame

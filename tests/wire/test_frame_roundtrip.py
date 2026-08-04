@@ -24,6 +24,7 @@ from slack_fuse_server.wire.frames import (
     FrameAdapter,
     PingFrame,
     PongFrame,
+    ServerCapabilitiesFrame,
     SnapshotAtFrame,
     SubscribeFrame,
     UnsubscribeFrame,
@@ -33,6 +34,7 @@ _FRAMES: list[Frame] = [
     SubscribeFrame(stream="channel:C0AKQ5DS0FQ", since=184523),
     SubscribeFrame(stream="users"),  # default since=0
     UnsubscribeFrame(stream="channel:C0AKQ5DS0FQ"),
+    ServerCapabilitiesFrame(supported_frames=["unsubscribe"]),
     EventFrame(
         stream="channel:C0AKQ5DS0FQ",
         offset=184524,

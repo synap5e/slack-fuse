@@ -14,6 +14,9 @@ from trio_websocket import ConnectionClosed, WebSocketConnection, WebSocketReque
 
 from slack_fuse_server.http.snapshot import build_snapshot_url
 from slack_fuse_server.wire.frames import (
+    CAPABILITIES_REQUEST_HEADER,
+    CAPABILITIES_REQUEST_VALUE,
+    UNSUBSCRIBE_CAPABILITY,
     CaughtUpFrame,
     ErrorCode,
     ErrorFrame,
@@ -21,6 +24,7 @@ from slack_fuse_server.wire.frames import (
     FrameAdapter,
     PingFrame,
     PongFrame,
+    ServerCapabilitiesFrame,
     SnapshotAtFrame,
     SubscribeFrame,
     UnsubscribeFrame,
@@ -140,6 +144,11 @@ class WireServer:
             await ws.send_message(ErrorFrame(code=ErrorCode.AUTH_FAILED).model_dump_json())
             await ws.aclose(1008, "auth failed")
             return
+
+        if _client_requests_capabilities(request.headers):
+            await ws.send_message(
+                ServerCapabilitiesFrame(supported_frames=[UNSUBSCRIBE_CAPABILITY]).model_dump_json()
+            )
 
         conn_id = self._next_conn_id
         self._next_conn_id += 1
@@ -413,3 +422,10 @@ def _is_authorized(headers: Sequence[tuple[bytes, bytes]], shared_secret: str | 
         if lowered == _AUTHORIZATION_HEADER and value == expected_bearer:
             return True
     return False
+
+
+def _client_requests_capabilities(headers: Sequence[tuple[bytes, bytes]]) -> bool:
+    return any(
+        name.lower() == CAPABILITIES_REQUEST_HEADER and value == CAPABILITIES_REQUEST_VALUE
+        for name, value in headers
+    )

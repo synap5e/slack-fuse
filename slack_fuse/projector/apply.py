@@ -247,9 +247,7 @@ def _dispatch(cur: Cursor[TupleRow], frame: EventFrame) -> ApplyResult:
 
 
 def _dispatch_channel_event(cur: Cursor[TupleRow], channel_id: str, kind: str, payload: JsonObject) -> ApplyResult:
-    cur.execute("SELECT tier FROM channels WHERE channel_id = %s", (channel_id,))
-    tier_row = cur.fetchone()
-    if tier_row is not None and str(tier_row[0]) == "blocked":
+    if lock_channel_tier_for_update(cur, channel_id) == "blocked":
         log.debug("apply: dropping %s for currently blocked channel:%s", kind, channel_id)
         return ApplyResult()
     if kind == "message":
@@ -267,6 +265,13 @@ def _dispatch_channel_event(cur: Cursor[TupleRow], channel_id: str, kind: str, p
         return ApplyResult()
     log.warning("apply: unknown channel event kind %r on channel:%s", kind, channel_id)
     return ApplyResult()
+
+
+def lock_channel_tier_for_update(cur: Cursor[TupleRow], channel_id: str) -> str | None:
+    """Serialize content application with tier changes for one channel."""
+    cur.execute("SELECT tier FROM channels WHERE channel_id = %s FOR UPDATE", (channel_id,))
+    row = cur.fetchone()
+    return None if row is None else str(row[0])
 
 
 def _parse_message(payload: JsonObject) -> Message | None:

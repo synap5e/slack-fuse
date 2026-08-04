@@ -66,6 +66,7 @@ from slack_fuse.projector.apply import (
     ProjectionSink,
     ThreadChunkRef,
     apply_snapshot_row,
+    lock_channel_tier_for_update,
     require_autocommit,
 )
 from slack_fuse.projector.cursor import advance_cursor
@@ -217,6 +218,9 @@ def _apply_snapshot_sync(
         rows = [_decode_row(stream, raw) for raw in lines]
         if stream.startswith(_CHANNEL_STREAM_PREFIX):
             channel_id = stream.removeprefix(_CHANNEL_STREAM_PREFIX)
+            # Same first lock as live channel-event apply and tier writers.
+            # Snapshot deletion must not get ahead of the visibility decision.
+            _ = lock_channel_tier_for_update(cur, channel_id)
             results.append(_delete_chunks_absent_from_snapshot(cur, channel_id, rows))
         for row in rows:
             results.append(apply_snapshot_row(cur, stream, row))

@@ -45,12 +45,16 @@ from slack_fuse.projector.pool import DEFAULT_POOL_SIZE, ConnectionPool
 from slack_fuse.projector.reconnecting_conn import TupleConnection
 from slack_fuse.projector.snapshot_fetch import SnapshotFetchError, SnapshotRedirect, fetch_and_apply_snapshot
 from slack_fuse_server.wire.frames import (
+    CAPABILITIES_REQUEST_HEADER,
+    CAPABILITIES_REQUEST_VALUE,
+    UNSUBSCRIBE_CAPABILITY,
     CaughtUpFrame,
     ErrorFrame,
     EventFrame,
     FrameAdapter,
     PingFrame,
     PongFrame,
+    ServerCapabilitiesFrame,
     SnapshotAtFrame,
     SubscribeFrame,
     UnsubscribeFrame,
@@ -125,7 +129,11 @@ class WSClient:
         self._http: httpx.AsyncClient | None = http_client
         self._appliers: dict[str, StreamApplier] = {}
         self._subscription_state: dict[str, SubscriptionState] = {}
+        self._subscription_tokens: dict[str, int] = {}
+        self._next_subscription_token = 1
         self._desired_channel_ids: set[str] = set()
+        self._server_capabilities: frozenset[str] = frozenset()
+        self._controlled_reconnect_requested = False
         self._ws: trio_websocket.WebSocketConnection | None = None
         self._send_lock = trio.Lock()
         self._nursery: trio.Nursery | None = None
@@ -177,7 +185,10 @@ class WSClient:
                 await applier.close()
             self._appliers.clear()
             self._subscription_state.clear()
+            self._subscription_tokens.clear()
             self._desired_channel_ids.clear()
+            self._server_capabilities = frozenset()
+            self._controlled_reconnect_requested = False
             await self._pool.aclose()
             if owned_http is not None:
                 await owned_http.aclose()
@@ -207,7 +218,11 @@ class WSClient:
             on_failure=self._mark_subscription_failed,
         )
 
-    def _mark_subscription_failed(self, stream: str) -> None:
+    def _mark_subscription_failed(self, stream: str, *, token: int | None = None) -> None:
+        if not self._is_desired_stream(stream):
+            return
+        if token is not None and self._subscription_tokens.get(stream) != token:
+            return
         self._subscription_state[stream] = SubscriptionState.FAILED
 
     def _is_desired_stream(self, stream: str) -> bool:
@@ -229,13 +244,16 @@ class WSClient:
     async def _subscribe_stream(self, stream: str, *, since: int | None = None) -> None:
         """Create/reuse an applier and attempt one server subscription."""
         await self._ensure_applier(stream)
+        token = self._next_subscription_token
+        self._next_subscription_token += 1
+        self._subscription_tokens[stream] = token
         self._subscription_state[stream] = SubscriptionState.PENDING
         try:
             if since is None:
                 since = await trio.to_thread.run_sync(self._read_cursor_sync, stream)
             await self._send_frame(SubscribeFrame(stream=stream, since=since))
         except BaseException:
-            self._subscription_state[stream] = SubscriptionState.FAILED
+            self._mark_subscription_failed(stream, token=token)
             raise
 
     # === wire IO ===
@@ -266,6 +284,7 @@ class WSClient:
         | ErrorFrame
         | PingFrame
         | PongFrame
+        | ServerCapabilitiesFrame
         | SubscribeFrame
         | UnsubscribeFrame,
     ) -> None:
@@ -298,11 +317,20 @@ class WSClient:
             return
         if isinstance(frame, SnapshotAtFrame):
             self._subscription_state[frame.stream] = SubscriptionState.PENDING
+            token = self._subscription_tokens.get(frame.stream)
+            if token is None:
+                log.warning("ws: snapshot redirect for untracked subscription %s", frame.stream)
+                self._mark_subscription_failed(frame.stream)
+                return
             nursery = self._nursery
             if nursery is None:  # pragma: no cover
                 self._mark_subscription_failed(frame.stream)
                 return
-            nursery.start_soon(self._handle_snapshot, frame)
+            nursery.start_soon(self._handle_snapshot, frame, token)
+            return
+        if isinstance(frame, ServerCapabilitiesFrame):
+            self._server_capabilities = frozenset(frame.supported_frames)
+            log.info("ws: server capabilities=%s", ",".join(sorted(self._server_capabilities)) or "none")
             return
         if isinstance(frame, PingFrame):
             await self._send_frame(PongFrame())
@@ -316,7 +344,7 @@ class WSClient:
             return
         log.warning("ws: unexpected frame %r", type(frame).__name__)
 
-    async def _handle_snapshot(self, frame: SnapshotAtFrame) -> None:
+    async def _handle_snapshot(self, frame: SnapshotAtFrame, token: int) -> None:
         """Fetch + apply a snapshot, then re-subscribe at the new cursor."""
         http = self._http
         if http is None:  # pragma: no cover
@@ -345,7 +373,7 @@ class WSClient:
                 # P0-C). Log + leave the stream subscribed via the replay path
                 # rather than tearing the client down.
                 log.warning("ws: snapshot fetch for %s failed: %s", frame.stream, exc)
-                self._mark_subscription_failed(frame.stream)
+                self._mark_subscription_failed(frame.stream, token=token)
                 discard = True
                 return
         finally:
@@ -353,6 +381,13 @@ class WSClient:
         # A stale snapshot is rejected in its DB transaction and reports the
         # already-current cursor here. Resume from that offset rather than
         # replaying backwards from the redirect's obsolete one.
+        if (
+            not self._is_desired_stream(frame.stream)
+            or self._subscription_tokens.get(frame.stream) != token
+            or self._subscription_state.get(frame.stream) is not SubscriptionState.PENDING
+        ):
+            log.info("ws: snapshot completed for retired subscription %s; not resubscribing", frame.stream)
+            return
         await self._subscribe_stream(frame.stream, since=result.at_offset)
 
     async def _send_frame(self, frame: object) -> None:
@@ -399,21 +434,33 @@ class WSClient:
                 # in the channels table now). Nothing to recover here.
                 return
 
-    async def unsubscribe_channels(self, channel_ids: frozenset[str]) -> None:
+    async def _retire_subscription(self, stream: str) -> None:
+        applier = self._appliers.pop(stream, None)
+        if applier is not None:
+            await applier.close()
+        self._subscription_state.pop(stream, None)
+        self._subscription_tokens.pop(stream, None)
+
+    async def unsubscribe_channels(self, channel_ids: frozenset[str]) -> bool:
         """Stop server delivery and retire appliers for no-longer-desired channels."""
         if not channel_ids or self._ws is None:
-            return
+            return True
+        if UNSUBSCRIBE_CAPABILITY not in self._server_capabilities:
+            for channel_id in sorted(channel_ids):
+                await self._retire_subscription(f"channel:{channel_id}")
+            self._controlled_reconnect_requested = True
+            log.info("unsubscribe unsupported by server; requesting controlled reconnect")
+            await self._ws.aclose(1000, "subscription set changed")
+            return False
         for channel_id in sorted(channel_ids):
             stream = f"channel:{channel_id}"
             try:
                 await self._send_frame(UnsubscribeFrame(stream=stream))
             except trio_websocket.ConnectionClosed:
-                return
-            applier = self._appliers.pop(stream, None)
-            if applier is not None:
-                await applier.close()
-            self._subscription_state.pop(stream, None)
+                return False
+            await self._retire_subscription(stream)
             log.info("unsubscribe_channels: %s (removed from desired set)", stream)
+        return True
 
     async def reconcile_subscriptions(self, desired: frozenset[str]) -> None:
         """Make the live server subscription set match the durable desired set."""
@@ -428,7 +475,9 @@ class WSClient:
             if stream.startswith("channel:") and state in {SubscriptionState.ACTIVE, SubscriptionState.PENDING}
         )
         self._desired_channel_ids = set(desired)
-        await self.unsubscribe_channels(frozenset(tracked - desired))
+        exact = await self.unsubscribe_channels(frozenset(tracked - desired))
+        if not exact or self._controlled_reconnect_requested:
+            return
         await self.subscribe_channels(frozenset(desired - active_or_pending))
 
     async def _straggler_watchdog(self) -> None:
@@ -467,7 +516,7 @@ class WSClient:
 
 
 def _build_headers(shared_secret: str | None) -> list[tuple[bytes, bytes]]:
-    headers: list[tuple[bytes, bytes]] = []
+    headers: list[tuple[bytes, bytes]] = [(CAPABILITIES_REQUEST_HEADER, CAPABILITIES_REQUEST_VALUE)]
     if shared_secret:
         headers.append((b"x-slack-fuse-secret", shared_secret.encode()))
     return headers

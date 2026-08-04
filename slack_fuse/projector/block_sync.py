@@ -74,7 +74,7 @@ def apply_blocked_channel_sync(conn: TupleConnection, blocked_ids: set[str]) -> 
             # server policy so both first-time and re-applied transitions are
             # reported to cache invalidators.
             cur.execute(
-                "SELECT tier FROM channels WHERE channel_id = %s",
+                "SELECT tier, tier_source FROM channels WHERE channel_id = %s FOR UPDATE",
                 (channel_id,),
             )
             tier_row = cur.fetchone()
@@ -92,11 +92,7 @@ def apply_blocked_channel_sync(conn: TupleConnection, blocked_ids: set[str]) -> 
                 # local (tier, tier_source) so the eventual unblock can
                 # restore it. NULLs on brand-new channels the client has
                 # never seen; the unblock branch then falls back to auto.
-                cur.execute(
-                    "SELECT tier, tier_source FROM channels WHERE channel_id = %s",
-                    (channel_id,),
-                )
-                snapshot_row = cur.fetchone()
+                snapshot_row = tier_row
                 prior_tier = str(snapshot_row[0]) if snapshot_row is not None else None
                 prior_tier_source = str(snapshot_row[1]) if snapshot_row is not None else None
                 cur.execute(
@@ -119,7 +115,7 @@ def apply_blocked_channel_sync(conn: TupleConnection, blocked_ids: set[str]) -> 
                 "SELECT c.is_im, c.is_mpim, c.is_member, c.is_archived, c.tier, c.tier_source, "
                 "  s.prior_tier, s.prior_tier_source "
                 "FROM channels c LEFT JOIN server_block_sync s ON s.channel_id = c.channel_id "
-                "WHERE c.channel_id = %s",
+                "WHERE c.channel_id = %s FOR UPDATE OF c",
                 (channel_id,),
             )
             row = cur.fetchone()

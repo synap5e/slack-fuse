@@ -1,3 +1,4 @@
+# pyright: reportPrivateUsage=false
 """Apply unit tests — every entry in the §Projection logic table.
 
 These exercise `apply_event` against a real Postgres schema with the client
@@ -9,6 +10,7 @@ from __future__ import annotations
 
 import functools
 import re
+import threading
 from decimal import Decimal
 from typing import cast
 from zoneinfo import ZoneInfo
@@ -17,6 +19,7 @@ import psycopg
 import pytest
 from psycopg.rows import TupleRow
 
+import slack_fuse.projector.apply as apply_module
 from slack_fuse.models import JsonObject
 from slack_fuse.projector.apply import (
     apply_event as _apply_event,
@@ -141,6 +144,77 @@ def test_blocked_channel_events_dropped_by_applier(client_conn: psycopg.Connecti
 
     assert _chunks(client_conn) == []
     assert _cursor(client_conn, "channel:CBLOCKED") == 9
+
+
+def test_apply_event_blocked_race_serializes_via_row_lock(
+    client_conn_factory: ClientConnFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seed_conn = client_conn_factory()
+    with seed_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO channels "
+            "(channel_id, name, is_im, is_mpim, is_member, is_archived, tier, tier_source, subscribed) "
+            "VALUES ('CRACE', 'race', FALSE, FALSE, TRUE, FALSE, 'hot', 'auto', TRUE)"
+        )
+    [event] = list(channel_message_events("CRACE", 1, start_offset=1))
+    apply_conn = client_conn_factory()
+    block_conn = client_conn_factory()
+    apply_has_lock = threading.Event()
+    release_apply = threading.Event()
+    block_started = threading.Event()
+    block_done = threading.Event()
+    errors: list[BaseException] = []
+    real_apply_message = apply_module._apply_message
+
+    def paused_apply_message(
+        cur: psycopg.Cursor[TupleRow],
+        channel_id: str,
+        payload: JsonObject,
+    ) -> apply_module.ApplyResult:
+        apply_has_lock.set()
+        if not release_apply.wait(timeout=5):
+            msg = "timed out waiting to release paused channel apply"
+            raise TimeoutError(msg)
+        return real_apply_message(cur, channel_id, payload)
+
+    monkeypatch.setattr(apply_module, "_apply_message", paused_apply_message)
+
+    def run_apply() -> None:
+        try:
+            apply_event(apply_conn, event.to_frame())
+        except BaseException as exc:  # pragma: no cover - assertion reports thread errors
+            errors.append(exc)
+
+    def run_block() -> None:
+        try:
+            block_started.set()
+            with block_conn.transaction(), block_conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE channels SET tier = 'blocked', tier_source = 'manual', subscribed = FALSE "
+                    "WHERE channel_id = 'CRACE'"
+                )
+            block_done.set()
+        except BaseException as exc:  # pragma: no cover - assertion reports thread errors
+            errors.append(exc)
+
+    apply_thread = threading.Thread(target=run_apply)
+    block_thread = threading.Thread(target=run_block)
+    apply_thread.start()
+    assert apply_has_lock.wait(timeout=5)
+    block_thread.start()
+    assert block_started.wait(timeout=5)
+    assert not block_done.wait(timeout=0.2), "block commit bypassed the event apply row lock"
+    release_apply.set()
+    apply_thread.join(timeout=5)
+    block_thread.join(timeout=5)
+
+    assert not apply_thread.is_alive()
+    assert not block_thread.is_alive()
+    assert errors == []
+    assert len(_chunks(seed_conn)) == 1
+    assert _cursor(seed_conn, "channel:CRACE") == 1
+    assert _channels(seed_conn)[0][2] == "blocked"
 
 
 # === message: thread reply (thread_chunks) ===
