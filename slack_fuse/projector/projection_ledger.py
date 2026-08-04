@@ -101,6 +101,22 @@ def bump_channel_meta_target(
     )
 
 
+def bump_channel_visibility_targets(
+    cur: Cursor[TupleRow],
+    channel_id: str,
+    renderer_version: str,
+) -> None:
+    """Bump channel metadata and global layout for a visibility transition."""
+    bump_targets(
+        cur,
+        (
+            TargetKey("channel-meta", channel_id, None, None),
+            TargetKey("layout", None, None, None),
+        ),
+        renderer_version,
+    )
+
+
 def _local_day_for_ts(ts: Decimal, tz: ZoneInfo) -> date:
     return datetime.fromtimestamp(float(ts), tz=UTC).astimezone(tz).date()
 
@@ -109,6 +125,7 @@ __all__ = [
     "RENDERER_VERSION",
     "TargetKey",
     "bump_channel_meta_target",
+    "bump_channel_visibility_targets",
     "bump_targets",
     "targets_for_apply_result",
 ]

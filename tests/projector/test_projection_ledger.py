@@ -265,12 +265,40 @@ def test_block_sync_bumps_channel_meta_target_on_block_and_unblock(
     channel_id = "CBLOCKLEDGER"
     _seed_channel(client_conn, channel_id)
     target = TargetKey("channel-meta", channel_id, None, None)
+    layout = TargetKey("layout", None, None, None)
 
     apply_blocked_channel_sync(client_conn, {channel_id})
     assert _target_row(client_conn, target) == (2, 0, "v1")
+    assert _target_row(client_conn, layout) == (2, 0, "v1")
 
     apply_blocked_channel_sync(client_conn, set())
     assert _target_row(client_conn, target) == (3, 0, "v1")
+    assert _target_row(client_conn, layout) == (3, 0, "v1")
+
+
+def test_block_bumps_layout_singleton(
+    client_conn: psycopg.Connection[TupleRow],
+) -> None:
+    channel_id = "CBLOCKLAYOUT"
+    layout = TargetKey("layout", None, None, None)
+    _seed_channel(client_conn, channel_id)
+
+    assert _target_row(client_conn, layout) == (1, 0, "pre-ledger")
+    apply_blocked_channel_sync(client_conn, {channel_id})
+    assert _target_row(client_conn, layout) == (2, 0, "v1")
+
+
+def test_unblock_bumps_layout_singleton(
+    client_conn: psycopg.Connection[TupleRow],
+) -> None:
+    channel_id = "CUNBLOCKLAYOUT"
+    layout = TargetKey("layout", None, None, None)
+    _seed_channel(client_conn, channel_id)
+    apply_blocked_channel_sync(client_conn, {channel_id})
+
+    assert _target_row(client_conn, layout) == (2, 0, "v1")
+    apply_blocked_channel_sync(client_conn, set())
+    assert _target_row(client_conn, layout) == (3, 0, "v1")
 
 
 def test_channel_list_change_bumps_layout_singleton_target(

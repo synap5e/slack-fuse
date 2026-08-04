@@ -15,7 +15,7 @@ from slack_fuse.projector.apply import (  # pyright: ignore[reportPrivateUsage]
     _force_blocked_manual,
 )
 from slack_fuse.projector.block_fetch import blocked_channel_ids_from_payload, get_blocked_channels
-from slack_fuse.projector.projection_ledger import RENDERER_VERSION, bump_channel_meta_target
+from slack_fuse.projector.projection_ledger import RENDERER_VERSION, bump_channel_visibility_targets
 from slack_fuse.projector.reconnecting_conn import TupleConnection
 
 log = logging.getLogger(__name__)
@@ -155,7 +155,7 @@ def apply_blocked_channel_sync(conn: TupleConnection, blocked_ids: set[str]) -> 
         # existing DiskProjection dirty callback remains the active reader-side
         # correctness path until PR 3.
         for channel_id in sorted(newly_blocked | newly_subscribed):
-            bump_channel_meta_target(cur, channel_id, RENDERER_VERSION)
+            bump_channel_visibility_targets(cur, channel_id, RENDERER_VERSION)
     return VisibilityChanges(
         newly_subscribed=frozenset(newly_subscribed),
         newly_blocked=frozenset(newly_blocked),

@@ -19,6 +19,7 @@ from pydantic_settings import (
 
 from slack_fuse.fuse_v2_helpers import CONV_ROOTS, fetch_channel_by_slug
 from slack_fuse.projector.apply import _default_tier  # pyright: ignore[reportPrivateUsage]
+from slack_fuse.projector.projection_ledger import RENDERER_VERSION, bump_channel_visibility_targets
 
 TierName = Literal["hot", "hidden", "blocked"]
 _VALID_TIERS: tuple[TierName, TierName, TierName] = ("hot", "hidden", "blocked")
@@ -168,9 +169,9 @@ def set_channel_tier(*, database_url: str, slug_or_channel_id: str, desired_tier
             msg = f"unknown channel slug or id: {slug_or_channel_id}"
             raise TierCommandError(msg, exit_code=2)
 
-        with conn.cursor() as cur:
+        with conn.transaction(), conn.cursor() as cur:
             cur.execute(
-                "SELECT tier, tier_source, subscribed FROM channels WHERE channel_id = %s",
+                "SELECT tier, tier_source, subscribed FROM channels WHERE channel_id = %s FOR UPDATE",
                 (channel_id,),
             )
             row = cur.fetchone()
@@ -201,6 +202,9 @@ def set_channel_tier(*, database_url: str, slug_or_channel_id: str, desired_tier
                 msg = f"failed to update tier for channel: {channel_id}"
                 raise TierCommandError(msg, exit_code=1)
 
+            if current_tier != desired_tier or current_subscribed != desired_subscribed:
+                bump_channel_visibility_targets(cur, channel_id, RENDERER_VERSION)
+
             return TierUpdateResult(
                 channel_id=channel_id, tier=desired_tier, changed=True, tier_source="manual"
             )
@@ -225,10 +229,10 @@ def reset_channel_tier_to_auto(*, database_url: str, slug_or_channel_id: str) ->
             msg = f"unknown channel slug or id: {slug_or_channel_id}"
             raise TierCommandError(msg, exit_code=2)
 
-        with conn.cursor() as cur:
+        with conn.transaction(), conn.cursor() as cur:
             cur.execute(
                 "SELECT tier, tier_source, subscribed, is_archived, is_im, is_mpim, is_member "
-                "FROM channels WHERE channel_id = %s",
+                "FROM channels WHERE channel_id = %s FOR UPDATE",
                 (channel_id,),
             )
             row = cur.fetchone()
@@ -271,6 +275,9 @@ def reset_channel_tier_to_auto(*, database_url: str, slug_or_channel_id: str) ->
             if cur.rowcount != 1:
                 msg = f"failed to reset tier for channel: {channel_id}"
                 raise TierCommandError(msg, exit_code=1)
+
+            if current_tier != recomputed or current_subscribed != desired_subscribed:
+                bump_channel_visibility_targets(cur, channel_id, RENDERER_VERSION)
 
             return TierUpdateResult(
                 channel_id=channel_id, tier=recomputed, changed=True, tier_source="auto"

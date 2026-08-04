@@ -20,9 +20,10 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import psycopg
 import pytest
-from psycopg import sql
+from psycopg import Cursor, sql
 from psycopg.rows import TupleRow
 
+import slack_fuse.cli.tier as tier_module
 import slack_fuse.migrations as client_migrations
 from slack_fuse.cli.tier import (
     TierCommandError,
@@ -34,6 +35,7 @@ from slack_fuse.cli.tier import (
 )
 from slack_fuse.fuse_v2_helpers import fetch_channel_by_slug
 from slack_fuse.migrations.runner import apply_migrations
+from slack_fuse.projector.projection_ledger import TargetKey
 
 _CLIENT_MIGRATIONS_DIR = Path(client_migrations.__file__).parent
 
@@ -103,6 +105,30 @@ def _channel_row(conn: psycopg.Connection[TupleRow], channel_id: str) -> tuple[s
         row = cur.fetchone()
     assert row is not None
     return (str(row[0]), str(row[1]), bool(row[2]), str(row[3]))
+
+
+def _target_row(
+    conn: psycopg.Connection[TupleRow],
+    target: TargetKey,
+) -> tuple[int, int, str] | None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT target_generation, rendered_generation, renderer_version "
+            "FROM projection_targets WHERE target_kind = %s "
+            "AND channel_id IS NOT DISTINCT FROM %s "
+            "AND local_day IS NOT DISTINCT FROM %s "
+            "AND thread_ts IS NOT DISTINCT FROM %s",
+            (
+                target.target_kind,
+                target.channel_id,
+                target.local_day,
+                target.thread_ts,
+            ),
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    return int(row[0]), int(row[1]), str(row[2])
 
 
 @pytest.fixture
@@ -286,6 +312,61 @@ def test_set_channel_tier_noop_when_already_manual(client_database_url: str) -> 
         assert result == TierUpdateResult(channel_id="C300", tier="hot", changed=False)
         assert after_row[:3] == ("hot", "manual", True)
         assert after_row[3] == before
+        assert _target_row(conn, TargetKey("channel-meta", "C300", None, None)) is None
+        assert _target_row(conn, TargetKey("layout", None, None, None)) == (1, 0, "pre-ledger")
+    finally:
+        conn.close()
+
+
+def test_tier_cli_set_hot_to_blocked_bumps_channel_meta_and_layout(
+    client_database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    channel_id = "CTIERLEDGER"
+    conn = _connect(client_database_url)
+    try:
+        _insert_channel(conn, _ChannelSeed(channel_id=channel_id, name="ledger", tier="hot"))
+        monkeypatch.setenv("SLACK_FUSE_DATABASE_URL", client_database_url)
+
+        cmd_tier(argparse.Namespace(slug_or_channel_id=channel_id, tier="blocked", reset_to_auto=False))
+
+        assert _channel_row(conn, channel_id)[:3] == ("blocked", "manual", False)
+        assert _target_row(conn, TargetKey("channel-meta", channel_id, None, None)) == (2, 0, "v1")
+        assert _target_row(conn, TargetKey("layout", None, None, None)) == (2, 0, "v1")
+        assert "tier set to blocked" in capsys.readouterr().out
+    finally:
+        conn.close()
+
+
+def test_tier_cli_writes_are_atomic(
+    client_database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    channel_id = "CTIERATOMIC"
+    conn = _connect(client_database_url)
+    real_bump = tier_module.bump_channel_visibility_targets
+
+    def fail_after_ledger_write(
+        cur: Cursor[TupleRow],
+        target_channel_id: str,
+        renderer_version: str,
+    ) -> None:
+        real_bump(cur, target_channel_id, renderer_version)
+        msg = "fault injection after tier ledger writes"
+        raise RuntimeError(msg)
+
+    try:
+        _insert_channel(conn, _ChannelSeed(channel_id=channel_id, name="atomic", tier="hot"))
+        monkeypatch.setenv("SLACK_FUSE_DATABASE_URL", client_database_url)
+        monkeypatch.setattr(tier_module, "bump_channel_visibility_targets", fail_after_ledger_write)
+
+        with pytest.raises(RuntimeError, match="fault injection after tier ledger writes"):
+            cmd_tier(argparse.Namespace(slug_or_channel_id=channel_id, tier="blocked", reset_to_auto=False))
+
+        assert _channel_row(conn, channel_id)[:3] == ("hot", "auto", True)
+        assert _target_row(conn, TargetKey("channel-meta", channel_id, None, None)) is None
+        assert _target_row(conn, TargetKey("layout", None, None, None)) == (1, 0, "pre-ledger")
     finally:
         conn.close()
 
@@ -374,6 +455,36 @@ def test_reset_to_auto_archived_channel_recomputes_to_hidden(client_database_url
         conn.close()
 
 
+def test_tier_cli_reset_bumps_channel_meta_and_layout(
+    client_database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    channel_id = "CTIERRESETLEDGER"
+    conn = _connect(client_database_url)
+    try:
+        _insert_channel(
+            conn,
+            _ChannelSeed(
+                channel_id=channel_id,
+                name="reset-ledger",
+                tier="blocked",
+                tier_source="manual",
+                subscribed=False,
+            ),
+        )
+        monkeypatch.setenv("SLACK_FUSE_DATABASE_URL", client_database_url)
+
+        cmd_tier(argparse.Namespace(slug_or_channel_id=channel_id, tier=None, reset_to_auto=True))
+
+        assert _channel_row(conn, channel_id)[:3] == ("hot", "auto", True)
+        assert _target_row(conn, TargetKey("channel-meta", channel_id, None, None)) == (2, 0, "v1")
+        assert _target_row(conn, TargetKey("layout", None, None, None)) == (2, 0, "v1")
+        assert "tier set to hot" in capsys.readouterr().out
+    finally:
+        conn.close()
+
+
 def test_reset_to_auto_noop_when_already_auto_and_matching(client_database_url: str) -> None:
     """If the row is already auto AND the current tier already matches what
     _default_tier would compute, no write happens (xmin unchanged)."""
@@ -403,6 +514,8 @@ def test_reset_to_auto_noop_when_already_auto_and_matching(client_database_url: 
         )
         assert after_row[:3] == ("hot", "auto", True)
         assert after_row[3] == before_xmin  # xmin proves no write
+        assert _target_row(conn, TargetKey("channel-meta", "C402", None, None)) is None
+        assert _target_row(conn, TargetKey("layout", None, None, None)) == (1, 0, "pre-ledger")
     finally:
         conn.close()
 
