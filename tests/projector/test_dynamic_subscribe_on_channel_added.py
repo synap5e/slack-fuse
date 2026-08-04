@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from zoneinfo import ZoneInfo
+
 import psycopg
 import trio
 from psycopg.rows import TupleRow
@@ -20,7 +22,7 @@ class _SubscribeProbeClient(WSClient):
         connection_factory: ClientConnFactory,
         state_conn: psycopg.Connection[TupleRow],
     ) -> None:
-        super().__init__(options, connection_factory, state_conn)
+        super().__init__(options, connection_factory, state_conn, tz=ZoneInfo("UTC"))
         self.started_streams: list[str] = []
         self.sent_subscribes: list[SubscribeFrame] = []
 

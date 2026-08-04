@@ -10,6 +10,7 @@ from collections.abc import Iterable
 from contextlib import AbstractContextManager
 from types import TracebackType
 from typing import cast
+from zoneinfo import ZoneInfo
 
 import pytest
 from psycopg import Connection, Cursor, OperationalError
@@ -346,7 +347,7 @@ def test_projector_recovers_after_connection_transport_break(
     while True:
         attempts += 1
         try:
-            _ = apply_event(conn, frame)
+            _ = apply_event(conn, frame, tz=ZoneInfo("UTC"))
         except OperationalError:
             if time.monotonic() >= deadline:  # pragma: no cover - fail_after guard
                 raise

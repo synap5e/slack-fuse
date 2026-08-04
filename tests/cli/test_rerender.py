@@ -15,6 +15,7 @@ import uuid
 from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import psycopg
 import pytest
@@ -94,11 +95,13 @@ def test_cmd_rerender_resolves_slug_to_channel_id(client_database_url: str, monk
         _conn: object,
         channel_id: str,
         *,
+        tz: ZoneInfo,
         shared_secret: str | None = None,
     ) -> RerenderResult:
         captured["channel_id"] = channel_id
         captured["base_http_url"] = base_http_url
         captured["shared_secret"] = shared_secret or ""
+        captured["tz"] = tz.key
         return RerenderResult(channel_id, status="rerendered", chunks=3, thread_chunks=1)
 
     monkeypatch.setattr("slack_fuse.config.load_client_config", fake_config)
@@ -110,6 +113,7 @@ def test_cmd_rerender_resolves_slug_to_channel_id(client_database_url: str, monk
     assert captured["channel_id"] == "C0ALLT6Q3SQ"
     assert captured["base_http_url"] == "http://localhost:8765"
     assert captured["shared_secret"] == "sek"
+    assert captured["tz"]
 
 
 def test_cmd_rerender_unknown_channel_exits_2(client_database_url: str, monkeypatch: pytest.MonkeyPatch) -> None:

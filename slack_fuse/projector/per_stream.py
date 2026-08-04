@@ -37,6 +37,7 @@ import math
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Final, Protocol
+from zoneinfo import ZoneInfo
 
 import trio
 from psycopg import Connection
@@ -135,6 +136,7 @@ class StreamApplier:
         pool: ConnectionLease,
         sink: InvalidationSink | None = None,
         *,
+        tz: ZoneInfo,
         projection: ProjectionSink | None = None,
         queue_soft_cap: int = DEFAULT_QUEUE_SOFT_CAP,
         before_apply: Callable[[ProjectorMessage], Awaitable[None]] | None = None,
@@ -142,6 +144,7 @@ class StreamApplier:
         self.stream = stream
         self._pool = pool
         self._sink: InvalidationSink = sink if sink is not None else NullInvalidationSink()
+        self._tz = tz
         self._projection = projection
         # Unbounded queue (P1-E): send_nowait never blocks the WS receive loop.
         self._send, self._receive = trio.open_memory_channel[ProjectorMessage](math.inf)
@@ -223,9 +226,13 @@ class StreamApplier:
         acquire_ms = int((trio.current_time() - acquire_start) * 1000)
         sync_start = trio.current_time()
         try:
-            apply_sync = functools.partial(apply_event, conn, message)
-            if self._projection is not None:
-                apply_sync = functools.partial(apply_event, conn, message, projection=self._projection)
+            apply_sync = functools.partial(
+                apply_event,
+                conn,
+                message,
+                tz=self._tz,
+                projection=self._projection,
+            )
             result = await trio.to_thread.run_sync(apply_sync)
         except Exception as exc:
             await self._pool.release(conn, discard=True)

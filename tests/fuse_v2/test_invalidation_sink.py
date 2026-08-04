@@ -9,6 +9,7 @@ migrated client schema, plus the end-to-end original cross-stream race
 
 from __future__ import annotations
 
+import functools
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, cast
@@ -20,8 +21,8 @@ import pytest
 from slack_fuse.fuse_ops_v2 import SlackFuseOpsV2, V2InvalidationSink
 from slack_fuse.fuse_v2_helpers import dedup_thread_slug_map, fetch_day_thread_parents
 from slack_fuse.models import JsonObject
-from slack_fuse.projector.apply import ChunkRef, ThreadChunkRef, apply_event
-from slack_fuse.projector.snapshot_fetch import SnapshotRedirect, fetch_and_apply_snapshot
+from slack_fuse.projector.apply import ChunkRef, ThreadChunkRef, apply_event as _apply_event
+from slack_fuse.projector.snapshot_fetch import SnapshotRedirect, fetch_and_apply_snapshot as _fetch_and_apply_snapshot
 from slack_fuse_server.wire.frames import EventFrame
 from tests.fuse_v2.conftest import (
     FakePyfuse3,
@@ -30,6 +31,12 @@ from tests.fuse_v2.conftest import (
     seed_chunk,
     seed_user,
     set_connection_state,
+)
+
+apply_event = functools.partial(_apply_event, tz=ZoneInfo("UTC"))
+fetch_and_apply_snapshot = functools.partial(
+    _fetch_and_apply_snapshot,
+    tz=ZoneInfo("UTC"),
 )
 
 if TYPE_CHECKING:

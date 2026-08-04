@@ -17,6 +17,7 @@ from __future__ import annotations
 import time
 from collections.abc import Awaitable, Callable
 from typing import cast
+from zoneinfo import ZoneInfo
 
 import psycopg
 import pytest
@@ -24,11 +25,14 @@ import trio
 from psycopg.rows import TupleRow
 
 from slack_fuse.projector import per_stream as per_stream_module
+from slack_fuse.projector.apply import ApplyResult, ProjectionSink
 from slack_fuse.projector.per_stream import ProjectorMessage, StreamApplier, StreamApplyError
 from slack_fuse.projector.pool import ConnectionPool
 from slack_fuse_server.wire.frames import CaughtUpFrame, EventFrame
 from tests._synthetic_events import channel_message_events
 from tests.projector.conftest import ClientConnFactory, RecordingSink
+
+_UTC = ZoneInfo("UTC")
 
 
 def _count_chunks(conn: psycopg.Connection[TupleRow], channel_id: str) -> int:
@@ -61,7 +65,7 @@ def test_applier_applies_events_and_advances_cursor(client_conn_factory: ClientC
     pool = ConnectionPool(client_conn_factory)
 
     async def body() -> None:
-        applier = StreamApplier("channel:CSA", pool, sink)
+        applier = StreamApplier("channel:CSA", pool, sink, tz=_UTC)
         async with trio.open_nursery() as nursery:
             await nursery.start(applier.serve)
             for event in channel_message_events("CSA", 5, start_offset=1):
@@ -91,7 +95,7 @@ def test_health_seconds_since_last_apply(
     pool = ConnectionPool(client_conn_factory)
 
     async def body() -> None:
-        applier = StreamApplier("channel:CTIMER", pool)
+        applier = StreamApplier("channel:CTIMER", pool, tz=_UTC)
         assert applier.health().seconds_since_last_apply is None
         async with trio.open_nursery() as nursery:
             await nursery.start(applier.serve)
@@ -129,7 +133,7 @@ def test_slow_apply_logs_warning_with_split_timing(
     caplog.set_level("WARNING", logger="slack_fuse.projector.per_stream")
 
     async def body() -> None:
-        applier = StreamApplier("channel:CSLOW", pool)
+        applier = StreamApplier("channel:CSLOW", pool, tz=_UTC)
         async with trio.open_nursery() as nursery:
             await nursery.start(applier.serve)
             await applier.enqueue(next(iter(channel_message_events("CSLOW", 1, start_offset=1))).to_frame())
@@ -154,7 +158,7 @@ def test_caught_up_frame_inserts_stream_caught_up(client_conn_factory: ClientCon
     pool = ConnectionPool(client_conn_factory)
 
     async def body() -> None:
-        applier = StreamApplier("channel:CSC", pool)
+        applier = StreamApplier("channel:CSC", pool, tz=_UTC)
         async with trio.open_nursery() as nursery:
             await nursery.start(applier.serve)
             await applier.enqueue(CaughtUpFrame(stream="channel:CSC", head_offset=42))
@@ -190,8 +194,8 @@ def test_per_stream_no_hol_blocking(client_conn_factory: ClientConnFactory) -> N
     b_count = 20
 
     async def body() -> None:
-        a_applier = StreamApplier("channel:CA", pool, sink, before_apply=_slow_hook(slow_s))
-        b_applier = StreamApplier("channel:CB", pool, sink)
+        a_applier = StreamApplier("channel:CA", pool, sink, tz=_UTC, before_apply=_slow_hook(slow_s))
+        b_applier = StreamApplier("channel:CB", pool, sink, tz=_UTC)
 
         async with trio.open_nursery() as nursery:
             await nursery.start(a_applier.serve)
@@ -255,7 +259,7 @@ def test_pool_bounds_connections_under_many_streams(client_conn_factory: ClientC
     pool = ConnectionPool(limited_factory, max_size=cap)
 
     async def body() -> None:
-        appliers = [StreamApplier(f"channel:C{i:04d}", pool) for i in range(num_streams)]
+        appliers = [StreamApplier(f"channel:C{i:04d}", pool, tz=_UTC) for i in range(num_streams)]
         async with trio.open_nursery() as nursery:
             for applier in appliers:
                 await nursery.start(applier.serve)
@@ -295,11 +299,17 @@ def test_applier_failure_poisons_stream_without_skipping_offset(
     """
     real_apply = per_stream_module.apply_event
 
-    def failing_apply(conn: psycopg.Connection[TupleRow], frame: EventFrame):
+    def failing_apply(
+        conn: psycopg.Connection[TupleRow],
+        frame: EventFrame,
+        *,
+        tz: ZoneInfo,
+        projection: ProjectionSink | None = None,
+    ) -> ApplyResult:
         if frame.offset == 42:
             msg = "simulated transient apply failure"
             raise RuntimeError(msg)
-        return real_apply(conn, frame)
+        return real_apply(conn, frame, tz=tz, projection=projection)
 
     monkeypatch.setattr(per_stream_module, "apply_event", failing_apply)
 
@@ -307,7 +317,7 @@ def test_applier_failure_poisons_stream_without_skipping_offset(
     captured: list[BaseException] = []
 
     async def body() -> None:
-        applier = StreamApplier("channel:CFAIL", pool)
+        applier = StreamApplier("channel:CFAIL", pool, tz=_UTC)
         try:
             async with trio.open_nursery() as nursery:
                 await nursery.start(applier.serve)

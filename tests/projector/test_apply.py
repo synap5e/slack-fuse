@@ -7,9 +7,11 @@ test depends on another's state.
 
 from __future__ import annotations
 
+import functools
 import re
 from decimal import Decimal
 from typing import cast
+from zoneinfo import ZoneInfo
 
 import psycopg
 import pytest
@@ -17,7 +19,7 @@ from psycopg.rows import TupleRow
 
 from slack_fuse.models import JsonObject
 from slack_fuse.projector.apply import (
-    apply_event,
+    apply_event as _apply_event,
     record_caught_up,
     require_autocommit,
 )
@@ -29,6 +31,8 @@ from tests._synthetic_events import (
     synthetic_ts,
 )
 from tests.projector.conftest import ClientConnFactory
+
+apply_event = functools.partial(_apply_event, tz=ZoneInfo("UTC"))
 
 # === helpers ===
 

@@ -15,6 +15,7 @@ from slack_fuse.projector.apply import (  # pyright: ignore[reportPrivateUsage]
     _force_blocked_manual,
 )
 from slack_fuse.projector.block_fetch import blocked_channel_ids_from_payload, get_blocked_channels
+from slack_fuse.projector.projection_ledger import RENDERER_VERSION, bump_channel_meta_target
 from slack_fuse.projector.reconnecting_conn import TupleConnection
 
 log = logging.getLogger(__name__)
@@ -148,6 +149,13 @@ def apply_blocked_channel_sync(conn: TupleConnection, blocked_ids: set[str]) -> 
                 if tier != "blocked":
                     newly_subscribed.add(channel_id)
             cur.execute("DELETE FROM server_block_sync WHERE channel_id = %s", (channel_id,))
+
+        # DUAL-WRITE: visibility mutations are cursor-neutral, so their durable
+        # invalidation signal must commit with the channel row itself. The
+        # existing DiskProjection dirty callback remains the active reader-side
+        # correctness path until PR 3.
+        for channel_id in sorted(newly_blocked | newly_subscribed):
+            bump_channel_meta_target(cur, channel_id, RENDERER_VERSION)
     return VisibilityChanges(
         newly_subscribed=frozenset(newly_subscribed),
         newly_blocked=frozenset(newly_blocked),

@@ -58,6 +58,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import cast
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -71,6 +72,11 @@ from slack_fuse.projector.apply import (
     require_autocommit,
 )
 from slack_fuse.projector.cursor import read_cursor
+from slack_fuse.projector.projection_ledger import (
+    RENDERER_VERSION,
+    bump_targets,
+    targets_for_apply_result,
+)
 from slack_fuse.projector.reconnecting_conn import TupleConnection
 
 log = logging.getLogger(__name__)
@@ -131,6 +137,7 @@ def rerender_channel(  # noqa: PLR0913 — sync HTTP call needs client + url + c
     conn: TupleConnection,
     channel_id: str,
     *,
+    tz: ZoneInfo,
     shared_secret: str | None = None,
     sink: InvalidationSink | None = None,
     projection: ProjectionSink | None = None,
@@ -173,13 +180,13 @@ def rerender_channel(  # noqa: PLR0913 — sync HTTP call needs client + url + c
     lines = tuple(line for line in response.text.splitlines() if line.strip())
     try:
         if projection is None:
-            results = _apply_rerender(conn, stream, lines)
+            results = _apply_rerender(conn, stream, lines, tz)
         else:
             # Rerenders intentionally do not advance a cursor, so offset drift
             # cannot protect their commit-to-dirty gap. Use the same D3 barrier
             # as live events and snapshot replacement.
             with projection.invalidation_barrier():
-                results = _apply_rerender(conn, stream, lines)
+                results = _apply_rerender(conn, stream, lines, tz)
                 _mark_projection_dirty(projection, results)
     except _MalformedSnapshotError:
         log.warning("rerender %s: malformed snapshot body; apply rolled back", channel_id)
@@ -198,7 +205,12 @@ def rerender_channel(  # noqa: PLR0913 — sync HTTP call needs client + url + c
     return RerenderResult(channel_id, status="rerendered", chunks=chunk_count, thread_chunks=thread_count)
 
 
-def _apply_rerender(conn: TupleConnection, stream: str, lines: Sequence[str]) -> list[ApplyResult]:
+def _apply_rerender(
+    conn: TupleConnection,
+    stream: str,
+    lines: Sequence[str],
+    tz: ZoneInfo,
+) -> list[ApplyResult]:
     """Re-apply every snapshot row in ONE transaction — upsert-only.
 
     No delete-absent and no cursor advance (see module docstring). Each row is
@@ -209,6 +221,11 @@ def _apply_rerender(conn: TupleConnection, stream: str, lines: Sequence[str]) ->
     with conn.transaction(), conn.cursor() as cur:
         for raw in lines:
             results.append(apply_snapshot_row(cur, stream, _decode_row(raw)))
+        bump_targets(
+            cur,
+            (target for result in results for target in targets_for_apply_result(result, tz)),
+            RENDERER_VERSION,
+        )
     return results
 
 

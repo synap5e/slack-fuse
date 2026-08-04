@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import os
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -15,10 +16,12 @@ import trio
 import slack_fuse.projector.disk_projection as projection_module
 from slack_fuse.fuse_ops_v2 import SlackFuseOpsV2, synchronous_read_for_test
 from slack_fuse.models import JsonObject
-from slack_fuse.projector.apply import apply_event
+from slack_fuse.projector.apply import apply_event as _apply_event
 from slack_fuse.projector.disk_projection import DiskProjection
 from slack_fuse_server.wire.frames import EventFrame
 from tests.fuse_v2.conftest import seed_channel, seed_chunk, seed_thread_chunk, seed_user
+
+apply_event = functools.partial(_apply_event, tz=ZoneInfo("UTC"))
 
 if TYPE_CHECKING:
     from psycopg import Connection

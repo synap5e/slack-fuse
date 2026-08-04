@@ -23,6 +23,7 @@ import trio
 from psycopg.rows import TupleRow
 
 import slack_fuse.migrations as client_migrations
+from slack_fuse.__main__ import _resolve_local_zoneinfo  # pyright: ignore[reportPrivateUsage]
 from slack_fuse.config import ClientConfig, load_client_config
 from slack_fuse.migrations.runner import apply_migrations
 from slack_fuse.projector.reconnecting_conn import ReconnectingConnection
@@ -76,7 +77,7 @@ async def _run(config: ClientConfig) -> None:
     state_conn = _open_state_conn(config.database_url)
     factory = _make_connection_factory(config.database_url)
     options = WSClientOptions(server_url=config.server_url, shared_secret=config.shared_secret)
-    client = WSClient(options, factory, state_conn)
+    client = WSClient(options, factory, state_conn, tz=_resolve_local_zoneinfo())
     # Pull existing channel streams from the projections store so the projector
     # resumes them rather than waiting for `channel_added` re-emission.
     with state_conn.cursor() as cur:

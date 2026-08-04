@@ -8,8 +8,10 @@ fire post-commit.
 
 from __future__ import annotations
 
+import functools
 import json
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 import httpx
 import psycopg
@@ -20,10 +22,15 @@ from slack_fuse.projector.apply import ChunkRef, ThreadChunkRef
 from slack_fuse.projector.snapshot_fetch import (
     SnapshotFetchError,
     SnapshotRedirect,
-    fetch_and_apply_snapshot,
+    fetch_and_apply_snapshot as _fetch_and_apply_snapshot,
 )
 from tests._synthetic_events import synthetic_ts
 from tests.projector.conftest import ClientConnFactory, RecordingSink
+
+fetch_and_apply_snapshot = functools.partial(
+    _fetch_and_apply_snapshot,
+    tz=ZoneInfo("UTC"),
+)
 
 
 def _make_snapshot_lines(channel: str, count: int) -> list[bytes]:

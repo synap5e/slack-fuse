@@ -35,6 +35,7 @@ def test_discover_client_migrations() -> None:
         "0001_init.sql",
         "0002_block_sync.sql",
         "0003_server_block_sync_prior_tier.sql",
+        "0004_projection_targets.sql",
     ]
     assert found[0][0] == 1
 
@@ -190,16 +191,26 @@ def test_apply_client_migrations_idempotent(pg_conn: psycopg.Connection[TupleRow
         "0001_init.sql",
         "0002_block_sync.sql",
         "0003_server_block_sync_prior_tier.sql",
+        "0004_projection_targets.sql",
     ]
     assert _table_exists(pg_conn, "chunks")
     assert _table_exists(pg_conn, "thread_chunks")
     assert _table_exists(pg_conn, "chunk_mentions")
     assert _table_exists(pg_conn, "server_block_sync")
+    assert _table_exists(pg_conn, "projection_targets")
     # connection_state is seeded with its single row.
     with pg_conn.cursor() as cur:
         cur.execute("SELECT count(*) FROM connection_state")
         row = cur.fetchone()
     assert row is not None and row[0] == 1
+    with pg_conn.cursor() as cur:
+        cur.execute(
+            "SELECT target_generation, rendered_generation, renderer_version "
+            "FROM projection_targets WHERE target_kind = 'layout' "
+            "AND channel_id IS NULL AND local_day IS NULL AND thread_ts IS NULL"
+        )
+        layout_row = cur.fetchone()
+    assert layout_row == (1, 0, "pre-ledger")
     # Second run applies nothing (and does not re-seed connection_state).
     assert apply_migrations(pg_conn, _CLIENT_DIR) == []
     with pg_conn.cursor() as cur:

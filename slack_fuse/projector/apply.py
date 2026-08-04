@@ -30,6 +30,7 @@ from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Protocol, cast
+from zoneinfo import ZoneInfo
 
 from psycopg import Cursor
 from psycopg.rows import TupleRow
@@ -37,6 +38,11 @@ from pydantic import ValidationError
 
 from slack_fuse.models import JsonObject, Message, SlackUser, SlackUserProfile
 from slack_fuse.projector.cursor import advance_cursor
+from slack_fuse.projector.projection_ledger import (
+    RENDERER_VERSION,
+    bump_targets,
+    targets_for_apply_result,
+)
 from slack_fuse.projector.reconnecting_conn import TupleConnection
 from slack_fuse_render import (
     extract_mention_channel_ids,
@@ -147,6 +153,7 @@ def apply_event(
     conn: TupleConnection,
     frame: EventFrame,
     *,
+    tz: ZoneInfo,
     projection: ProjectionSink | None = None,
 ) -> ApplyResult:
     """Apply one event in a single transaction. Returns post-commit work.
@@ -166,6 +173,11 @@ def apply_event(
         with conn.transaction(), conn.cursor() as cur:
             result = _dispatch(cur, frame)
             advance_cursor(cur, frame.stream, frame.offset)
+            # DUAL-WRITE: persist invalidation identities in the SAME PG
+            # transaction as the source-data mutations and cursor advance.
+            # This is the WTF #1 durability primitive that survives restart;
+            # readers/coalescer remain on the legacy path until PR 3.
+            bump_targets(cur, targets_for_apply_result(result, tz), RENDERER_VERSION)
         if projection is not None:
             projection.mark_apply_result(result)
     return result

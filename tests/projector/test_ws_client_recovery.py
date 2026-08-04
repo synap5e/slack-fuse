@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, cast
+from zoneinfo import ZoneInfo
 
 import httpx
 import psycopg
@@ -54,6 +55,7 @@ async def test_snapshot_operational_error_discards_pool_conn(
             WSClientOptions(server_url="ws://server.invalid", base_http_url="http://server.invalid"),
             client_conn_factory,
             state_conn,
+            tz=ZoneInfo("UTC"),
             http_client=http,
         )
         client._pool = cast("ConnectionPool", recording_pool)
@@ -75,6 +77,7 @@ async def test_reconcile_subscriptions_only_adds_missing_channels(
         WSClientOptions(server_url="ws://server.invalid"),
         client_conn_factory,
         state_conn,
+        tz=ZoneInfo("UTC"),
     )
     client._appliers = cast(
         "dict[str, StreamApplier]",

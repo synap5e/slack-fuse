@@ -57,6 +57,7 @@ def cmd_rerender(args: argparse.Namespace) -> None:
         msg = "rerender command arguments are invalid"
         raise ValueError(msg)
 
+    from slack_fuse.__main__ import _resolve_local_zoneinfo  # pyright: ignore[reportPrivateUsage]
     from slack_fuse.config import load_client_config
     from slack_fuse.projector.rerender import rerender_channel
     from slack_fuse.projector.ws_client import derive_http_base
@@ -78,6 +79,7 @@ def cmd_rerender(args: argparse.Namespace) -> None:
                 base_http_url,
                 conn,
                 channel_id,
+                tz=_resolve_local_zoneinfo(),
                 shared_secret=config.shared_secret,
             )
     except TierCommandError as exc:

@@ -8,16 +8,20 @@ on the singletons. The whole suite is replayed and compared row-by-row.
 
 from __future__ import annotations
 
+import functools
 from typing import cast
+from zoneinfo import ZoneInfo
 
 import psycopg
 from psycopg.rows import TupleRow
 
 from slack_fuse.models import JsonObject
-from slack_fuse.projector.apply import apply_event
+from slack_fuse.projector.apply import apply_event as _apply_event
 from slack_fuse_server.wire.frames import EventFrame
 from tests._synthetic_events import channel_message_events, channel_reply_events, synthetic_ts
 from tests.projector.conftest import ClientConnFactory
+
+apply_event = functools.partial(_apply_event, tz=ZoneInfo("UTC"))
 
 
 def _payload(**fields: object) -> JsonObject:

@@ -21,6 +21,7 @@ through the protected surface intended for subclasses.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from zoneinfo import ZoneInfo
 
 import psycopg
 import trio
@@ -49,7 +50,7 @@ class _HoLProbeClient(WSClient):
 
     def _make_applier(self, stream: str) -> StreamApplier:
         hook = _slow_hook(0.02) if stream == _SLOW_STREAM else None
-        return StreamApplier(stream, self._pool, self._sink, before_apply=hook)
+        return StreamApplier(stream, self._pool, self._sink, tz=self._tz, before_apply=hook)
 
     async def drive_until_b_applied(self) -> int:
         """Route A's flood then one B frame; return A's progress when B lands."""
@@ -80,7 +81,7 @@ def test_ws_receiver_routes_fast_stream_past_saturated_slow_stream(
     sink = RecordingSink()
     state_conn: psycopg.Connection[TupleRow] = client_conn_factory()
     options = WSClientOptions(server_url="ws://unused.test", pool_size=8)
-    client = _HoLProbeClient(options, client_conn_factory, state_conn, sink=sink)
+    client = _HoLProbeClient(options, client_conn_factory, state_conn, tz=ZoneInfo("UTC"), sink=sink)
 
     a_progress = trio.run(client.drive_until_b_applied)
 

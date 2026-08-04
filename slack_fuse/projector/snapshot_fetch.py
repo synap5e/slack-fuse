@@ -50,6 +50,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import cast
 from urllib.parse import urljoin
+from zoneinfo import ZoneInfo
 
 import httpx
 import trio
@@ -68,6 +69,11 @@ from slack_fuse.projector.apply import (
     require_autocommit,
 )
 from slack_fuse.projector.cursor import advance_cursor
+from slack_fuse.projector.projection_ledger import (
+    RENDERER_VERSION,
+    bump_targets,
+    targets_for_apply_result,
+)
 
 log = logging.getLogger(__name__)
 
@@ -76,6 +82,16 @@ _CHANNEL_STREAM_PREFIX = "channel:"
 
 class SnapshotFetchError(Exception):
     """The snapshot fetch or apply failed; caller should retry from the cursor."""
+
+
+class StaleSnapshotError(SnapshotFetchError):
+    """A snapshot replacement lost a race with newer committed stream data."""
+
+    def __init__(self, stream: str, snapshot_offset: int, current_offset: int) -> None:
+        super().__init__(f"snapshot for {stream} at {snapshot_offset} is stale; current cursor is {current_offset}")
+        self.stream = stream
+        self.snapshot_offset = snapshot_offset
+        self.current_offset = current_offset
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +117,7 @@ async def fetch_and_apply_snapshot(  # noqa: PLR0913 (HTTP + post-commit sinks)
     conn: Connection[TupleRow],
     redirect: SnapshotRedirect,
     *,
+    tz: ZoneInfo,
     base_url: str | None = None,
     sink: InvalidationSink | None = None,
     projection: ProjectionSink | None = None,
@@ -133,18 +150,35 @@ async def fetch_and_apply_snapshot(  # noqa: PLR0913 (HTTP + post-commit sinks)
     # "this channel now has zero messages" state, so it must DELETE every local
     # chunk/thread_chunk for the channel — not merely advance the cursor, which
     # would orphan stale rows the client never saw deleted.
-    if projection is None:
-        invalidations = await trio.to_thread.run_sync(
-            _apply_snapshot_sync, conn, redirect.stream, redirect.at_offset, tuple(lines)
-        )
-    else:
-        invalidations = await trio.to_thread.run_sync(
-            _apply_snapshot_with_projection,
-            conn,
-            redirect.stream,
-            redirect.at_offset,
-            tuple(lines),
-            projection,
+    try:
+        if projection is None:
+            invalidations = await trio.to_thread.run_sync(
+                _apply_snapshot_sync,
+                conn,
+                redirect.stream,
+                redirect.at_offset,
+                tuple(lines),
+                tz,
+            )
+        else:
+            invalidations = await trio.to_thread.run_sync(
+                _apply_snapshot_with_projection,
+                conn,
+                redirect.stream,
+                redirect.at_offset,
+                tuple(lines),
+                tz,
+                projection,
+            )
+    except StaleSnapshotError as exc:
+        # A live applier committed beyond the redirect while its HTTP body was
+        # in flight. The replacement TX rolled back; keep the healthy
+        # connection and resume WS delivery from the newer durable cursor.
+        log.warning("snapshot refused stale replacement: %s", exc)
+        return SnapshotResult(
+            stream=redirect.stream,
+            at_offset=exc.current_offset,
+            records_applied=0,
         )
     # Dispatch the sink call to a worker thread. ``pyfuse3.invalidate_inode``
     # can block on kernel writeback and (on a busy mount) deadlock against
@@ -168,6 +202,7 @@ def _apply_snapshot_sync(
     stream: str,
     at_offset: int,
     lines: tuple[str, ...],
+    tz: ZoneInfo,
 ) -> list[ApplyResult]:
     """Apply the snapshot as a full-state replacement in one TX.
 
@@ -185,22 +220,55 @@ def _apply_snapshot_sync(
             results.append(_delete_chunks_absent_from_snapshot(cur, channel_id, rows))
         for row in rows:
             results.append(apply_snapshot_row(cur, stream, row))
+        _lock_and_reject_stale_snapshot(cur, stream, at_offset)
         advance_cursor(cur, stream, at_offset)
+        bump_targets(
+            cur,
+            (target for result in results for target in targets_for_apply_result(result, tz)),
+            RENDERER_VERSION,
+        )
     return results
 
 
-def _apply_snapshot_with_projection(
+def _apply_snapshot_with_projection(  # noqa: PLR0913, PLR0917
     conn: Connection[TupleRow],
     stream: str,
     at_offset: int,
     lines: tuple[str, ...],
+    tz: ZoneInfo,
     projection: ProjectionSink,
 ) -> list[ApplyResult]:
     """Commit snapshot bytes and mark their disk paths under one barrier."""
     with projection.invalidation_barrier():
-        results = _apply_snapshot_sync(conn, stream, at_offset, lines)
+        results = _apply_snapshot_sync(conn, stream, at_offset, lines, tz)
         _mark_projection_dirty(projection, results)
     return results
+
+
+def _lock_and_reject_stale_snapshot(
+    cur: Cursor[TupleRow],
+    stream: str,
+    at_offset: int,
+) -> None:
+    """Lock the stream cursor and reject replacement behind its live head.
+
+    Ensure the row exists before ``FOR UPDATE`` so a first snapshot and a
+    first live event serialize on the same identity. This runs after the
+    tentative chunk writes to preserve the live applier's chunk-then-cursor
+    lock order; raising still rolls every replacement write back.
+    """
+    cur.execute(
+        "INSERT INTO cursors (stream, applied_offset) VALUES (%s, 0) ON CONFLICT (stream) DO NOTHING",
+        (stream,),
+    )
+    cur.execute(
+        "SELECT applied_offset FROM cursors WHERE stream = %s FOR UPDATE",
+        (stream,),
+    )
+    row = cur.fetchone()
+    current_offset = 0 if row is None else int(row[0])
+    if current_offset > at_offset:
+        raise StaleSnapshotError(stream, at_offset, current_offset)
 
 
 def _decode_row(stream: str, raw: str) -> JsonObject:

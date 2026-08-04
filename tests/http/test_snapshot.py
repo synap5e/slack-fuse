@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import gzip
 import json
 import uuid
@@ -12,6 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import httpx
 import psycopg
@@ -24,7 +26,7 @@ from psycopg.rows import TupleRow
 import slack_fuse.migrations as client_migrations
 from slack_fuse.migrations.runner import apply_migrations
 from slack_fuse.models import Message
-from slack_fuse.projector.snapshot_fetch import SnapshotRedirect, fetch_and_apply_snapshot
+from slack_fuse.projector.snapshot_fetch import SnapshotRedirect, fetch_and_apply_snapshot as _fetch_and_apply_snapshot
 from slack_fuse_server._json import JsonObject
 from slack_fuse_server.http.dto import (
     SNAPSHOT_CONTENT_ENCODING,
@@ -43,6 +45,11 @@ from slack_fuse_server.snapshot.generator import SnapshotResult, generate_snapsh
 from tests.conftest import ServerConnFactory
 
 _CLIENT_MIGRATIONS_DIR = Path(client_migrations.__file__).parent
+
+fetch_and_apply_snapshot = functools.partial(
+    _fetch_and_apply_snapshot,
+    tz=ZoneInfo("UTC"),
+)
 type ClientConnFactory = Callable[[], psycopg.Connection[TupleRow]]
 
 

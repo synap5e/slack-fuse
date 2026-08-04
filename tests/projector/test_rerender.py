@@ -17,16 +17,20 @@ JSONL body. Verifies the core contract:
 
 from __future__ import annotations
 
+import functools
 import json
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 import httpx
 import psycopg
 from psycopg.rows import TupleRow
 
 from slack_fuse.projector.cursor import advance_cursor
-from slack_fuse.projector.rerender import rerender_channel
+from slack_fuse.projector.rerender import rerender_channel as _rerender_channel
 from tests.projector.conftest import ClientConnFactory, RecordingSink
+
+rerender_channel = functools.partial(_rerender_channel, tz=ZoneInfo("UTC"))
 
 
 def _seed_chunk(conn: psycopg.Connection[TupleRow], channel_id: str, ts: str, content: str) -> None:

@@ -16,6 +16,7 @@ assert only the projector-side state and the InvalidationSink callback fan-out.
 
 from __future__ import annotations
 
+import functools
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, cast
@@ -28,7 +29,7 @@ from psycopg.rows import TupleRow
 
 from slack_fuse.fuse_ops_v2 import SlackFuseOpsV2
 from slack_fuse.models import JsonObject
-from slack_fuse.projector.apply import ChunkRef, ThreadChunkRef, apply_event
+from slack_fuse.projector.apply import ChunkRef, ThreadChunkRef, apply_event as _apply_event
 from slack_fuse_server.wire.frames import EventFrame
 from tests._synthetic_events import synthetic_ts
 from tests.fuse_v2.conftest import (
@@ -37,6 +38,8 @@ from tests.fuse_v2.conftest import (
     seed_channel,
     set_connection_state,
 )
+
+apply_event = functools.partial(_apply_event, tz=ZoneInfo("UTC"))
 
 if TYPE_CHECKING:
     from tests.projector.conftest import ClientConnFactory

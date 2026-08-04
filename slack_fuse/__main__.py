@@ -559,6 +559,7 @@ def cmd_mount(args: argparse.Namespace) -> None:  # noqa: C901  (process-wiring 
                 ws_options,
                 _open_conn,
                 state_conn,
+                tz=tz,
                 sink=sink,
                 projection=disk_projection,
             )
@@ -682,6 +683,7 @@ def cmd_mount(args: argparse.Namespace) -> None:  # noqa: C901  (process-wiring 
                     ghost_base_http_url,
                     rerender_conn,
                     channel_id,
+                    tz=tz,
                     shared_secret=config.shared_secret,
                     sink=rerender_sink,
                     projection=disk_projection,
