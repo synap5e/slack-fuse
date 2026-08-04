@@ -94,6 +94,11 @@ from slack_fuse.fuse_v2_helpers import (
 )
 from slack_fuse.logctx import fuse_op, set_path
 from slack_fuse.pg_health import NO_POSTGRES_INODE, NO_POSTGRES_NAME
+from slack_fuse.projector.projection_ledger import (
+    RENDERER_VERSION,
+    target_clean_result,
+    target_key_for_path,
+)
 from slack_fuse.projector.trailer import (
     FALLBACK_CHANNEL_REASON,
     FALLBACK_USER_REASON,
@@ -111,6 +116,7 @@ if TYPE_CHECKING:
     from slack_fuse.projector.apply import ChunkRef, ThreadChunkRef
     from slack_fuse.projector.disk_projection import DiskProjection
     from slack_fuse.projector.pool import ConnectionPool
+    from slack_fuse.projector.projection_ledger import TargetKey
     from slack_fuse.projector.reconnecting_conn import ReconnectingConnection
     from slack_fuse.projector.trailer_log import TrailerLog
 
@@ -1532,17 +1538,23 @@ class SlackFuseOpsV2(pyfuse3.Operations):
     def _read_from_disk_if_clean(self, path: str) -> bytes | None:
         """Read clean projection bytes, retrying one disappearance race.
 
-        D3 read ordering is linearized at ``is_clean`` under the projection
-        state lock. After release, atomic replacement may give either complete
-        old or complete new bytes; both were clean at that point. Two ENOENT
-        results are the bounded race fallback to JIT, never an exception.
+        The ledger lookup uses the FUSE callback's already-borrowed pool
+        connection. Atomic replacement may subsequently give either complete
+        old or complete new bytes; two ENOENT results are the bounded race
+        fallback to JIT, never an exception.
         """
         projection = self._disk_projection
-        if not self._disk_projection_enabled or projection is None or not projection.is_clean(path):
+        if not self._disk_projection_enabled or projection is None:
+            return None
+        key = self._clean_projection_target(path)
+        if key is None:
             return None
         for _attempt in range(2):
             content = projection.read_bytes(path)
             if content is not None:
+                if not projection.backing_matches_target(path, key, content):
+                    log.warning("projection backing identity mismatch; falling back to JIT: %s", path)
+                    return None
                 log.debug("serving clean disk projection path: %s", path)
                 return content
         log.warning("clean disk projection path is missing; falling back to JIT: %s", path)
@@ -1551,7 +1563,10 @@ class SlackFuseOpsV2(pyfuse3.Operations):
     def _stat_disk_if_clean(self, path: str) -> os.stat_result | None:
         """Stat one clean backing file, retrying one disappearance race."""
         projection = self._disk_projection
-        if not self._disk_projection_enabled or projection is None or not projection.is_clean(path):
+        if not self._disk_projection_enabled or projection is None:
+            return None
+        key = self._clean_projection_target(path)
+        if key is None or not projection.backing_matches_target(path, key):
             return None
         backing = projection.path_for(path)
         for _attempt in range(2):
@@ -1561,6 +1576,25 @@ class SlackFuseOpsV2(pyfuse3.Operations):
                 continue
         log.warning("clean disk projection path is missing during stat; falling back to JIT: %s", path)
         return None
+
+    def _clean_projection_target(self, path: str) -> TargetKey | None:
+        """Resolve and validate one disk target through this callback's conn."""
+        started = time.perf_counter()
+        target_kind = "unresolved"
+        result = "missing"
+        with self._conn.cursor() as cur:
+            key = target_key_for_path(path, self._tz, cur)
+            if key is not None:
+                target_kind = key.target_kind
+                result = target_clean_result(cur, key, RENDERER_VERSION)
+        duration_ms = (time.perf_counter() - started) * 1000
+        log.info(
+            "projector-span op=projection.is_clean_check target_kind=%s duration_ms=%.3f result=%s",
+            target_kind,
+            duration_ms,
+            result,
+        )
+        return key if result == "clean" else None
 
     def _resolve_disk_decision(
         self,

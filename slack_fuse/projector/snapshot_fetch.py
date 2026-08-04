@@ -242,10 +242,9 @@ def _apply_snapshot_with_projection(  # noqa: PLR0913, PLR0917
     tz: ZoneInfo,
     projection: ProjectionSink,
 ) -> list[ApplyResult]:
-    """Commit snapshot bytes and mark their disk paths under one barrier."""
-    with projection.invalidation_barrier():
-        results = _apply_snapshot_sync(conn, stream, at_offset, lines, tz)
-        _mark_projection_dirty(projection, results)
+    """Commit snapshot bytes, then queue their durable target identities."""
+    results = _apply_snapshot_sync(conn, stream, at_offset, lines, tz)
+    _mark_projection_dirty(projection, results)
     return results
 
 

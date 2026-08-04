@@ -727,16 +727,10 @@ def cmd_mount(args: argparse.Namespace) -> None:  # noqa: C901  (process-wiring 
 
         async def _on_newly_blocked(ids: frozenset[str]) -> None:
             def _invalidate_visibility() -> None:
-                # Mark projection paths first so a kernel cache miss cannot
-                # select old disk bytes while inode invalidation is in flight.
-                # Post-mutation slug resolution excludes blocked channels, so
-                # DiskProjection discovers their old paths from persisted
-                # frontmatter instead of trying to resolve a stale subtree.
-                if disk_projection is not None:
-                    disk_projection.mark_channel_paths_dirty(ids)
                 # A broad materialized-inode sweep is intentional: the old
                 # slug/root is no longer reliably resolvable after a tier,
-                # membership, or DM-root visibility mutation.
+                # membership, or DM-root visibility mutation. The committed
+                # layout target drives projection cleanup on the next tick.
                 sink.channel_list_changed()
 
             # pyfuse3.invalidate_inode may block on kernel writeback. Keep it

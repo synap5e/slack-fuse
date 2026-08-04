@@ -26,19 +26,29 @@ class _FileWritingProjection:
         self._root = root
         self._dirty = [f"/channels/c-{index}/channel.md" for index in range(count)]
         self.batch_sizes: list[int] = []
-        self.bootstrap_calls = 0
+        self.startup_calls = 0
 
-    def bootstrap(self, _conn: object) -> list[str]:
-        self.bootstrap_calls += 1
+    def reconcile_startup(self, _conn: object, invalidate_path: object) -> tuple[list[str], int, float]:
+        assert callable(invalidate_path)
+        self.startup_calls += 1
+        return [], 0, 0.0
+
+    def reconcile_layout(self, _conn: object, invalidate_path: object) -> list[str]:
+        assert callable(invalidate_path)
         return []
 
-    def flush_dirty(self, limit: int) -> list[str]:
+    def discover_pending(self, _limit: int, _conn: object) -> tuple[()]:
+        return ()
+
+    def flush_dirty(self, limit: int, invalidate_path: object) -> list[str]:
         batch, self._dirty = self._dirty[:limit], self._dirty[limit:]
         self.batch_sizes.append(len(batch))
         for path in batch:
             backing = self._root.joinpath(*Path(path.lstrip("/")).parts)
             backing.parent.mkdir(parents=True, exist_ok=True)
             backing.write_bytes(path.encode())
+            assert callable(invalidate_path)
+            invalidate_path(path)
         return batch
 
 
@@ -75,7 +85,7 @@ async def test_coalescer_drains_500_paths_in_three_bounded_ticks(
             initial_flush_batch=200,
         )
 
-    assert fake.bootstrap_calls == 1
+    assert fake.startup_calls == 1
     assert fake.batch_sizes == [200, 200, 100]
     assert len(list(tmp_path.glob("channels/*/channel.md"))) == 500
     assert len(invalidator.paths) == 500

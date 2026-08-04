@@ -182,12 +182,8 @@ def rerender_channel(  # noqa: PLR0913 — sync HTTP call needs client + url + c
         if projection is None:
             results = _apply_rerender(conn, stream, lines, tz)
         else:
-            # Rerenders intentionally do not advance a cursor, so offset drift
-            # cannot protect their commit-to-dirty gap. Use the same D3 barrier
-            # as live events and snapshot replacement.
-            with projection.invalidation_barrier():
-                results = _apply_rerender(conn, stream, lines, tz)
-                _mark_projection_dirty(projection, results)
+            results = _apply_rerender(conn, stream, lines, tz)
+            _mark_projection_dirty(projection, results)
     except _MalformedSnapshotError:
         log.warning("rerender %s: malformed snapshot body; apply rolled back", channel_id)
         return RerenderResult(channel_id, status="malformed")

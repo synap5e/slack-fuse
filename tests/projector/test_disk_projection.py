@@ -86,8 +86,7 @@ def test_atomic_replace_failure_leaves_no_visible_file_and_requeues(
         raise OSError("simulated rename crash")
 
     monkeypatch.setattr(projection_module.os, "replace", fail_replace)
-    with pytest.raises(OSError, match="simulated rename crash"):
-        projection.flush_dirty(1)
+    assert projection.flush_dirty(1) == []
 
     backing = projection.path_for(fuse_path)
     assert not backing.exists()

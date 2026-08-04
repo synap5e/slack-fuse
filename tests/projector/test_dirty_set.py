@@ -10,7 +10,7 @@ from slack_fuse.projector.dirty_set import DirtySet
 
 
 def test_empty_and_over_limit_drains() -> None:
-    dirty = DirtySet()
+    dirty = DirtySet[str]()
     assert dirty.drain(10) == []
 
     dirty.mark("/a")
@@ -21,7 +21,7 @@ def test_empty_and_over_limit_drains() -> None:
 
 
 def test_zero_limit_preserves_paths_and_negative_limit_rejected() -> None:
-    dirty = DirtySet()
+    dirty = DirtySet[str]()
     dirty.mark("/a")
     assert dirty.drain(0) == []
     assert len(dirty) == 1
@@ -30,7 +30,7 @@ def test_zero_limit_preserves_paths_and_negative_limit_rejected() -> None:
 
 
 def test_concurrent_marks_during_drain_are_not_lost() -> None:
-    dirty = DirtySet()
+    dirty = DirtySet[str]()
     initial = {f"/initial/{index}" for index in range(100)}
     concurrent = {f"/concurrent/{index}" for index in range(100)}
     for path in initial:

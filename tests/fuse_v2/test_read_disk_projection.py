@@ -58,6 +58,9 @@ def _seed_day(
 
 def _projection(conn: Connection[TupleRow], tmp_path: Path) -> DiskProjection:
     projection = DiskProjection(conn, ZoneInfo("UTC"), root=tmp_path / "projection")
+    _removed, _recovered, _duration_ms = projection.reconcile_startup()
+    assert projection.reconcile_layout() == []
+    _ = projection.flush_dirty(100)
     projection.mark_dirty(_PATH)
     assert projection.flush_dirty(1) == [_PATH]
     return projection
@@ -177,12 +180,8 @@ async def test_enabled_clean_missing_file_retries_then_warns_and_uses_jit(
         disk_read_calls.append(path)
         return None
 
-    def observed_clean(_path: str) -> bool:
-        return True
-
-    # Model the post-is_clean disappearance boundary: the backing file was
-    # observed during the clean check, then both bounded reads miss it.
-    monkeypatch.setattr(projection, "is_clean", observed_clean)
+    # Model the post-ledger-check disappearance boundary: the backing file was
+    # present when materialization completed, then both bounded reads miss it.
     monkeypatch.setattr(projection, "read_bytes", missing_read)
     ops = _ops(client_conn, projection)
     jit_calls = _spy_jit(ops, monkeypatch)

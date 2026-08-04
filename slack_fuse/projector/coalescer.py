@@ -30,7 +30,7 @@ async def run_coalescer(
     tick_s: float = 5.0,
     initial_flush_batch: int = 200,
 ) -> None:
-    """Bootstrap and flush dirty paths in bounded batches every ``tick_s``."""
+    """Reconstruct ledger work and flush target keys in bounded batches."""
     if tick_s < 0:
         msg = "coalescer tick_s must be non-negative"
         raise ValueError(msg)
@@ -42,19 +42,36 @@ async def run_coalescer(
     while True:
         try:
             if not bootstrapped:
-                await trio.to_thread.run_sync(functools.partial(projection.bootstrap, conn))
+                removed, _recovered, _duration_ms = await trio.to_thread.run_sync(
+                    functools.partial(
+                        projection.reconcile_startup,
+                        conn,
+                        invalidator.path_changed,
+                    )
+                )
+                _ = removed
                 bootstrapped = True
-            # D3 step 6: flush_dirty returns only after atomic replace and the
-            # transactional drift-check/clean transition. Kernel invalidation
-            # is deliberately the final observable action for every path.
-            flushed = await trio.to_thread.run_sync(projection.flush_dirty, initial_flush_batch)
-            if flushed:
-                await trio.to_thread.run_sync(_invalidate_paths, invalidator, flushed)
+            removed = await trio.to_thread.run_sync(
+                functools.partial(
+                    projection.reconcile_layout,
+                    conn,
+                    invalidator.path_changed,
+                )
+            )
+            _ = removed
+            _ = await trio.to_thread.run_sync(
+                functools.partial(projection.discover_pending, initial_flush_batch, conn)
+            )
+            # Invalidate each attempted path inside the same worker call. A
+            # later target failure can no longer suppress cache drops for
+            # earlier atomic replacements in the batch.
+            _ = await trio.to_thread.run_sync(
+                functools.partial(
+                    projection.flush_dirty,
+                    initial_flush_batch,
+                    invalidator.path_changed,
+                )
+            )
         except Exception:
             log.warning("disk projection coalescer tick failed; retrying", exc_info=True)
         await trio.sleep(tick_s)
-
-
-def _invalidate_paths(invalidator: ProjectionPathInvalidator, paths: list[str]) -> None:
-    for path in paths:
-        invalidator.path_changed(path)

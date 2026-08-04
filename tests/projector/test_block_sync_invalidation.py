@@ -52,6 +52,9 @@ async def test_live_cached_file_is_invalidated_and_projection_removed_on_block(
     seed_chunk(projection_conn, _CHANNEL_ID, message_ts, "## 09:30 @alice\n\nCached secret\n")
 
     projection = DiskProjection(projection_conn, ZoneInfo("UTC"), root=tmp_path / "projection")
+    _removed, _recovered, _duration_ms = projection.reconcile_startup()
+    assert projection.reconcile_layout() == []
+    _ = projection.flush_dirty(100)
     projection.mark_dirty(_PATH)
     assert projection.flush_dirty(1) == [_PATH]
     assert projection.path_for(_PATH).is_file()
@@ -103,7 +106,6 @@ async def test_live_cached_file_is_invalidated_and_projection_removed_on_block(
         callback_ids.append(ids)
 
         def invalidate_visibility() -> None:
-            assert projection.mark_channel_paths_dirty(ids) == [_PATH]
             sink.channel_list_changed()
 
         await trio.to_thread.run_sync(invalidate_visibility)
@@ -128,5 +130,9 @@ async def test_live_cached_file_is_invalidated_and_projection_removed_on_block(
     assert sink.channel_list_changes == 1
     assert inode in invalidated_inodes
     assert not projection.is_clean(_PATH)
-    assert projection.flush_dirty(1) == [_PATH]
+    removed = projection.reconcile_layout()
+    assert _PATH in removed
+    assert "/channels/general/channel.md" in removed
+    assert projection.discover_pending(100)
+    _ = projection.flush_dirty(100)
     assert not projection.path_for(_PATH).exists()

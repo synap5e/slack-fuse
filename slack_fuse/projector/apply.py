@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import logging
 import re
-from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Protocol, cast
@@ -104,9 +103,7 @@ class InvalidationSink(Protocol):
 
 
 class ProjectionSink(Protocol):
-    """Optional commit barrier + sink for disk-projection dirtiness."""
-
-    def invalidation_barrier(self) -> AbstractContextManager[None]: ...
+    """Optional post-commit disk-projection scheduling sink."""
 
     def mark_apply_result(self, result: ApplyResult) -> None: ...
 
@@ -163,23 +160,14 @@ def apply_event(
     ``block_sync.apply_blocked_channel_sync`` which is the sole caller of
     ``_force_blocked_manual`` now.
     """
-    # D3 ordering contract: the event COMMIT and its dirty marks share the same
-    # projection-state acquisition as the coalescer's drift-check/clean
-    # transition.  Without spanning the commit, a reader could pass is_clean()
-    # after PostgreSQL exposed the new JIT bytes but before mark_apply_result()
-    # made the old disk bytes ineligible.
-    barrier = nullcontext() if projection is None else projection.invalidation_barrier()
-    with barrier:
-        with conn.transaction(), conn.cursor() as cur:
-            result = _dispatch(cur, frame)
-            advance_cursor(cur, frame.stream, frame.offset)
-            # DUAL-WRITE: persist invalidation identities in the SAME PG
-            # transaction as the source-data mutations and cursor advance.
-            # This is the WTF #1 durability primitive that survives restart;
-            # readers/coalescer remain on the legacy path until PR 3.
-            bump_targets(cur, targets_for_apply_result(result, tz), RENDERER_VERSION)
-        if projection is not None:
-            projection.mark_apply_result(result)
+    with conn.transaction(), conn.cursor() as cur:
+        result = _dispatch(cur, frame)
+        advance_cursor(cur, frame.stream, frame.offset)
+        # This commit is the validity linearization point. The heap mark below
+        # is only a latency hint for the ledger-polling coalescer.
+        bump_targets(cur, targets_for_apply_result(result, tz), RENDERER_VERSION)
+    if projection is not None:
+        projection.mark_apply_result(result)
     return result
 
 
@@ -832,7 +820,8 @@ def _apply_user_added(cur: Cursor[TupleRow], payload: JsonObject) -> ApplyResult
     # between a message's INSERT and COMMIT and miss the just-written chunk.
     refs = _collect_user_mention_refs(cur, user.id)
     thread_refs = _collect_thread_user_mention_refs(cur, user.id)
-    return ApplyResult(chunks=refs, thread_chunks=thread_refs)
+    # User display names own DM slugs, so their mutation also advances layout.
+    return ApplyResult(chunks=refs, thread_chunks=thread_refs, channel_list_changed=True)
 
 
 def _apply_user_renamed(cur: Cursor[TupleRow], payload: JsonObject) -> ApplyResult:
@@ -848,7 +837,7 @@ def _apply_user_renamed(cur: Cursor[TupleRow], payload: JsonObject) -> ApplyResu
     )
     refs = _collect_user_mention_refs(cur, user_id)
     thread_refs = _collect_thread_user_mention_refs(cur, user_id)
-    return ApplyResult(chunks=refs, thread_chunks=thread_refs)
+    return ApplyResult(chunks=refs, thread_chunks=thread_refs, channel_list_changed=True)
 
 
 def _apply_user_profile_changed(cur: Cursor[TupleRow], payload: JsonObject) -> ApplyResult:
@@ -870,7 +859,7 @@ def _apply_user_profile_changed(cur: Cursor[TupleRow], payload: JsonObject) -> A
     )
     refs = _collect_user_mention_refs(cur, user_id)
     thread_refs = _collect_thread_user_mention_refs(cur, user_id)
-    return ApplyResult(chunks=refs, thread_chunks=thread_refs)
+    return ApplyResult(chunks=refs, thread_chunks=thread_refs, channel_list_changed=True)
 
 
 # === `slurper-health` stream ===
