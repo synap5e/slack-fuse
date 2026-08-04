@@ -146,10 +146,8 @@ def apply_blocked_channel_sync(conn: TupleConnection, blocked_ids: set[str]) -> 
                     newly_subscribed.add(channel_id)
             cur.execute("DELETE FROM server_block_sync WHERE channel_id = %s", (channel_id,))
 
-        # DUAL-WRITE: visibility mutations are cursor-neutral, so their durable
-        # invalidation signal must commit with the channel row itself. The
-        # existing DiskProjection dirty callback remains the active reader-side
-        # correctness path until PR 3.
+        # Visibility mutations are cursor-neutral, so their authoritative
+        # ledger invalidation must commit with the channel row itself.
         for channel_id in sorted(newly_blocked | newly_subscribed):
             bump_channel_visibility_targets(cur, channel_id, RENDERER_VERSION)
     return VisibilityChanges(

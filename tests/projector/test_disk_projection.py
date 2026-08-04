@@ -68,7 +68,6 @@ def test_writes_right_path_and_resolved_bytes(
         b"---\nchannel: general\nchannel_id: C-GEN\ndate: 2026-08-02\n---\n"
         b"## 09:30 @alice\n\nHello @alice\n"
     )
-    assert projection.is_clean(fuse_path)
 
 
 def test_atomic_replace_failure_leaves_no_visible_file_and_requeues(
@@ -91,12 +90,12 @@ def test_atomic_replace_failure_leaves_no_visible_file_and_requeues(
     backing = projection.path_for(fuse_path)
     assert not backing.exists()
     assert backing.with_suffix(".md.tmp").exists()
-    assert not projection.is_clean(fuse_path)
+    assert projection.pending_count == 1
 
     monkeypatch.setattr(projection_module.os, "replace", real_replace)
     assert projection.flush_dirty(1) == [fuse_path]
     assert backing.is_file()
-    assert projection.is_clean(fuse_path)
+    assert projection.pending_count == 0
 
 
 def test_bootstrap_marks_today_for_hot_channels_only(

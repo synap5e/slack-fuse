@@ -1,9 +1,13 @@
-"""Coalesced on-disk mirror of hot-channel FUSE markdown files.
+"""Ledger-backed on-disk mirror of hot-channel FUSE markdown files.
 
 The chunks tables remain authoritative.  This module composes their current
 base bytes into a disposable tree rooted at ``PROJECTION_ROOT``.  Dynamic
 staleness trailers remain a read-path concern; structural rendering, mention
 resolution, frontmatter, path slugs, and ordering match the current JIT path.
+
+PostgreSQL ``projection_targets`` rows are authoritative for materialization
+validity.  The in-process dirty and in-flight sets only schedule ledger work;
+they never admit projected bytes on the read path.
 """
 
 from __future__ import annotations
@@ -12,8 +16,7 @@ import logging
 import os
 import threading
 import time
-from collections.abc import Callable, Iterable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable, Iterable
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path, PurePosixPath
@@ -65,7 +68,7 @@ log = logging.getLogger(__name__)
 
 
 class DiskProjection:
-    """Manage dirty state and atomically materialize projected markdown."""
+    """Atomically materialize ledger-versioned projected markdown."""
 
     def __init__(
         self,
@@ -88,7 +91,7 @@ class DiskProjection:
         # a set-valued _inflight cannot represent two owners of one target.
         self._flush_lock = threading.Lock()
         # A psycopg connection is not safe for overlapping operations. Only
-        # the coalescer and legacy scheduling helpers use this dedicated conn;
+        # the coalescer and direct/manual scheduling helpers use this conn;
         # FUSE readers use their callback-pool connections instead.
         self._io_lock = threading.Lock()
 
@@ -149,54 +152,6 @@ class DiskProjection:
             return
         with self._state_lock:
             self._dirty.mark(key)
-
-    def mark_channel_paths_dirty(self, channel_ids: frozenset[str]) -> list[str]:
-        """Queue existing projected files for visibility-changed channels.
-
-        A newly blocked channel is deliberately absent from post-mutation slug
-        assignment, so its old path cannot be reconstructed from the database.
-        Projected markdown carries ``channel_id`` in its frontmatter; use that
-        stable identity to find the old paths and let the normal coalescer
-        delete them after the tier gate starts returning no content.
-        """
-        if not channel_ids:
-            return []
-
-        discovered = [
-            (f"/{backing.relative_to(self._root).as_posix()}", _target_key_from_backing(backing))
-            for backing in sorted(self._root.rglob("*.md"))
-        ]
-        matching = [(path, key) for path, key in discovered if key is not None and key.channel_id in channel_ids]
-        paths = [path for path, _key in matching]
-        keys = tuple(key for _path, key in matching)
-        if keys:
-            with self._io_lock, self._conn.transaction(), self._conn.cursor() as cur:
-                bump_targets(cur, keys, RENDERER_VERSION)
-            for key in keys:
-                self.mark_target_dirty(key)
-        return paths
-
-    @contextmanager
-    def invalidation_barrier(self) -> Iterator[None]:
-        """Compatibility no-op; PostgreSQL ledger commits now linearize validity."""
-        yield
-
-    def is_clean(self, path: str) -> bool:
-        """Return the legacy heap scheduling hint for ``path``.
-
-        FUSE readers must not call this method; only the ledger is
-        authoritative. It remains temporarily for scheduling diagnostics and
-        is removed with the PR 4 heap-cache cleanup.
-        """
-        normalized = _normalize_path(path)
-        with self._io_lock, self._conn.cursor() as cur:
-            key = target_key_for_path(normalized, self._tz, cur)
-        if key is None:
-            return False
-        with self._state_lock:
-            if key in self._inflight or self._dirty.is_marked(key):
-                return False
-            return self.path_for(normalized).is_file()
 
     def mark_apply_result(self, result: ApplyResult) -> None:
         """Queue stable keys from one committed result without DB or path I/O."""

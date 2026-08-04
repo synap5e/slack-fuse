@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import functools
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
@@ -16,6 +16,7 @@ import trio
 import slack_fuse.projector.block_sync as block_sync_module
 from slack_fuse.fuse_ops_v2 import SlackFuseOpsV2, V2InvalidationSink, synchronous_read_for_test
 from slack_fuse.projector.disk_projection import DiskProjection
+from slack_fuse.projector.projection_ledger import RENDERER_VERSION, TargetKey, is_target_clean
 from tests.fuse_v2.conftest import seed_channel, seed_chunk
 
 if TYPE_CHECKING:
@@ -27,6 +28,7 @@ if TYPE_CHECKING:
 
 _PATH = "/channels/general/2026-08/02/channel.md"
 _CHANNEL_ID = "CBLOCK"
+_TARGET = TargetKey("day", _CHANNEL_ID, date(2026, 8, 2), None)
 
 
 @dataclass(slots=True)
@@ -129,7 +131,8 @@ async def test_live_cached_file_is_invalidated_and_projection_removed_on_block(
     assert callback_ids == [frozenset({_CHANNEL_ID})]
     assert sink.channel_list_changes == 1
     assert inode in invalidated_inodes
-    assert not projection.is_clean(_PATH)
+    with projection_conn.cursor() as cur:
+        assert not is_target_clean(cur, _TARGET, RENDERER_VERSION)
     removed = projection.reconcile_layout()
     assert _PATH in removed
     assert "/channels/general/channel.md" in removed
