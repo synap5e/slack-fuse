@@ -19,6 +19,7 @@ from slack_fuse.projector.reconnecting_conn import (
     ClosedConnectionError,
     HealthEventPayload,
     ReconnectingConnection,
+    ReconnectRecord,
 )
 
 if TYPE_CHECKING:
@@ -120,24 +121,62 @@ def test_basic_reconnect_on_operational_error() -> None:
     assert connections == []
 
 
-def test_second_operational_error_propagates_unchanged() -> None:
+def test_reconnect_records_exactly_one_result_per_whole_operation_when_retry_fails() -> None:
     first_error = OperationalError("first socket lost")
     second_error = OperationalError("replacement socket lost")
     connections = [
         _FakeConnection(_Behavior(execute_errors=[first_error])),
         _FakeConnection(_Behavior(execute_errors=[second_error])),
     ]
+    events: list[tuple[str, HealthEventPayload]] = []
 
     def factory(_dsn: str) -> Connection[TupleRow]:
         return _as_connection(connections.pop(0))
 
-    conn = ReconnectingConnection("postgresql://test", connection_factory=factory)
+    conn = ReconnectingConnection(
+        "postgresql://test",
+        connection_factory=factory,
+        on_health_event=lambda kind, payload: events.append((kind, payload)),
+    )
 
     with pytest.raises(OperationalError) as raised, conn.cursor() as cur:
         _ = cur.execute("SELECT 1")
 
     assert raised.value is second_error
     assert connections == []
+    records = [cast("ReconnectRecord", payload) for kind, payload in events if kind == "reconnect_recorded"]
+    assert len(records) == 1
+    assert records[0]["attempt_result"] == "failed"
+    assert records[0]["failure_phase"] == "execute"
+
+
+def test_reconnect_log_is_not_duplicated(caplog: pytest.LogCaptureFixture) -> None:
+    connections = [
+        _FakeConnection(_Behavior(execute_errors=[OperationalError("socket lost")])),
+        _FakeConnection(_Behavior(rows=[(42,)])),
+    ]
+    events: list[tuple[str, HealthEventPayload]] = []
+
+    def factory(_dsn: str) -> Connection[TupleRow]:
+        return _as_connection(connections.pop(0))
+
+    caplog.set_level("INFO", logger="slack_fuse.projector.reconnecting_conn")
+    conn = ReconnectingConnection(
+        "postgresql://test",
+        connection_factory=factory,
+        name="block_sync",
+        on_health_event=lambda kind, payload: events.append((kind, payload)),
+    )
+
+    assert conn.execute("SELECT 42").fetchone() == (42,)
+
+    records = [cast("ReconnectRecord", payload) for kind, payload in events if kind == "reconnect_recorded"]
+    log_lines = [record.getMessage() for record in caplog.records if "op=postgres-reconnect" in record.getMessage()]
+    assert len(records) == 1
+    assert records[0]["attempt_result"] == "succeeded"
+    assert records[0]["connection"] == "block_sync"
+    assert len(log_lines) == 1
+    assert "connection=block_sync" in log_lines[0]
 
 
 def test_explicit_close_never_reopens() -> None:

@@ -55,6 +55,7 @@ class ReconnectRecord(TypedDict):
     failure_phase: FailurePhase
     reason: str
     attempt_result: AttemptResult
+    connection: str
     generation: int
     commit_outcome: NotRequired[Literal["unknown"]]
 
@@ -113,6 +114,7 @@ class ReconnectingConnection:
         *,
         connection_factory: ConnectionFactory = _connect,
         autocommit: bool | None = None,
+        name: str = "postgres",
         on_reconnect: ReconnectCallback | None = None,
         on_health_event: HealthEventCallback | None = None,
         wedge_failure_count: int = DEFAULT_WEDGE_FAILURE_COUNT,
@@ -128,6 +130,7 @@ class ReconnectingConnection:
         self._dsn = dsn
         self._connection_factory = connection_factory
         self._configured_autocommit = autocommit
+        self._name = name
         self._on_reconnect = on_reconnect
         self._on_health_event = on_health_event
         self._wedge_failure_count = wedge_failure_count
@@ -220,7 +223,12 @@ class ReconnectingConnection:
             msg = "reconnecting connection is explicitly closed"
             raise ClosedConnectionError(msg)
 
-    def _ensure_connection(self, *, failure_phase: FailurePhase = "outside-tx") -> Connection[TupleRow]:
+    def _ensure_connection(
+        self,
+        *,
+        failure_phase: FailurePhase = "outside-tx",
+        record_result: bool = True,
+    ) -> Connection[TupleRow]:
         self._ensure_open()
         if self._conn is not None and not self._conn.closed and not self._broken:
             return self._conn
@@ -240,7 +248,8 @@ class ReconnectingConnection:
         except OperationalError as exc:
             self._conn = None
             self._last_reconnect_reason = str(exc)
-            self._record_reconnect_failure(str(exc), failure_phase=failure_phase)
+            if record_result:
+                self._record_reconnect_failure(str(exc), failure_phase=failure_phase)
             raise
 
         self._conn = conn
@@ -249,21 +258,27 @@ class ReconnectingConnection:
 
         if is_reconnect:
             reason = self._last_reconnect_reason
-            self._record_reconnect_success(reason, failure_phase=failure_phase)
+            if record_result:
+                self._record_reconnect_success(reason, failure_phase=failure_phase)
             self._fire_callback(self._on_reconnect, reason)
             log.info("postgres connection reopened: %s", reason)
         return conn
 
-    def _reopen(self, reason: str, *, failure_phase: FailurePhase) -> Connection[TupleRow]:
+    def _reopen(
+        self,
+        reason: str,
+        *,
+        failure_phase: FailurePhase,
+        record_result: bool = True,
+    ) -> Connection[TupleRow]:
         self._last_reconnect_reason = reason
         self._close_raw()
-        return self._ensure_connection(failure_phase=failure_phase)
+        return self._ensure_connection(failure_phase=failure_phase, record_result=record_result)
 
-    def _abandon_failed_retry(self, exc: OperationalError, *, failure_phase: FailurePhase) -> None:
+    def _abandon_failed_retry(self, exc: OperationalError) -> None:
         """Leave no bad socket behind after the one permitted retry fails."""
         self._last_reconnect_reason = str(exc)
         self._close_raw()
-        self._record_reconnect_failure(str(exc), failure_phase=failure_phase)
 
     def _mark_broken(self, exc: OperationalError) -> None:
         """Prevent the failed raw socket from being reused or reopened mid-TX."""
@@ -336,6 +351,7 @@ class ReconnectingConnection:
             failure_phase=failure_phase,
             reason=reason,
             attempt_result=attempt_result,
+            connection=self._name,
             generation=self._generation,
         )
         fields: dict[str, object] = {
@@ -343,14 +359,14 @@ class ReconnectingConnection:
             **record,
         }
         message = (
-            "projector-span op=%(op)s failure_phase=%(failure_phase)s "
+            "projector-span op=%(op)s connection=%(connection)s failure_phase=%(failure_phase)s "
             "attempt_result=%(attempt_result)s generation=%(generation)d reason=%(reason)s"
         )
         if commit_outcome is not None:
             record["commit_outcome"] = commit_outcome
             fields["commit_outcome"] = commit_outcome
             message = (
-                "projector-span op=%(op)s failure_phase=%(failure_phase)s "
+                "projector-span op=%(op)s connection=%(connection)s failure_phase=%(failure_phase)s "
                 "commit_outcome=%(commit_outcome)s attempt_result=%(attempt_result)s "
                 "generation=%(generation)d reason=%(reason)s"
             )
@@ -496,13 +512,20 @@ class _ReconnectingCursor:
                     self._owner._mark_broken(first_exc)
                     self._owner._record_transaction_abort(str(first_exc), failure_phase=failure_phase)
                     raise
-                _ = self._owner._reopen(str(first_exc), failure_phase=failure_phase)
                 try:
+                    _ = self._owner._reopen(
+                        str(first_exc),
+                        failure_phase=failure_phase,
+                        record_result=False,
+                    )
                     cursor = self._replace_cursor(replay=replay_before_retry)
-                    return operation(cursor)
+                    result = operation(cursor)
                 except OperationalError as retry_exc:
-                    self._owner._abandon_failed_retry(retry_exc, failure_phase=failure_phase)
+                    self._owner._abandon_failed_retry(retry_exc)
+                    self._owner._record_reconnect_failure(str(retry_exc), failure_phase=failure_phase)
                     raise
+                self._owner._record_reconnect_success(str(first_exc), failure_phase=failure_phase)
+                return result
 
     def _current_cursor(self, *, replay: bool, failure_phase: FailurePhase) -> Cursor[TupleRow]:
         conn = self._owner._ensure_connection(failure_phase=failure_phase)

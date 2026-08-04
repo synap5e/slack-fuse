@@ -272,31 +272,6 @@ def cmd_mount(args: argparse.Namespace) -> None:  # noqa: C901  (process-wiring 
         def _on_health_event(kind: str, payload: HealthEventPayload) -> None:
             reason = payload["reason"]
             if kind == "reconnect_recorded":
-                failure_phase = payload.get("failure_phase", "outside-tx")
-                attempt_result = payload.get("attempt_result", "failed")
-                generation = payload.get("generation", 0)
-                commit_outcome = payload.get("commit_outcome")
-                if commit_outcome is None:
-                    log.info(
-                        "projector-span op=postgres-reconnect connection=%s generation=%s "
-                        "failure_phase=%s attempt_result=%s reason=%s",
-                        name,
-                        generation,
-                        failure_phase,
-                        attempt_result,
-                        reason,
-                    )
-                else:
-                    log.info(
-                        "projector-span op=postgres-reconnect connection=%s generation=%s "
-                        "failure_phase=%s commit_outcome=%s attempt_result=%s reason=%s",
-                        name,
-                        generation,
-                        failure_phase,
-                        commit_outcome,
-                        attempt_result,
-                        reason,
-                    )
                 return
             control_state.record_client_health(name, kind, reason)
             if kind == "client_wedged":
@@ -307,6 +282,7 @@ def cmd_mount(args: argparse.Namespace) -> None:  # noqa: C901  (process-wiring 
         return ReconnectingConnection(
             config.database_url,
             autocommit=True,
+            name=name,
             on_reconnect=lambda reason: log.info("%s postgres connection recovered: %s", name, reason),
             on_health_event=_on_health_event,
         )
