@@ -19,7 +19,7 @@ from psycopg.rows import TupleRow
 
 from slack_fuse.control import ControlState
 from slack_fuse.projector.apply import apply_event
-from slack_fuse.projector.reconnecting_conn import ReconnectingConnection
+from slack_fuse.projector.reconnecting_conn import HealthEventPayload, ReconnectingConnection, ReconnectRecord
 from slack_fuse_server.wire.frames import EventFrame
 from tests.projector.conftest import ClientConnFactory
 
@@ -180,7 +180,11 @@ def _channel_count(conn: Connection[TupleRow], channel_id: str) -> int:
     return int(row[0])
 
 
-def test_operational_error_mid_transaction_surfaces_original_error(
+def _reconnect_records(events: list[tuple[str, HealthEventPayload]]) -> list[ReconnectRecord]:
+    return [cast("ReconnectRecord", payload) for kind, payload in events if kind == "reconnect_recorded"]
+
+
+def test_reconnect_event_carries_failure_phase_execute(
     client_conn_factory: ClientConnFactory,
 ) -> None:
     first_raw = client_conn_factory()
@@ -189,10 +193,12 @@ def test_operational_error_mid_transaction_surfaces_original_error(
         cast("Connection[TupleRow]", _BreakOnNthExecuteConnection(first_raw, fail_on=2)),
         recovered_raw,
     ]
+    health_events: list[tuple[str, HealthEventPayload]] = []
     conn = ReconnectingConnection(
         "postgresql://fault-injection",
         connection_factory=lambda _dsn: factory_results.pop(0),
         autocommit=True,
+        on_health_event=lambda kind, payload: health_events.append((kind, payload)),
     )
 
     with pytest.raises(OperationalError), conn.transaction(), conn.cursor() as cur:
@@ -207,9 +213,12 @@ def test_operational_error_mid_transaction_surfaces_original_error(
 
     assert _channel_count(recovered_raw, "CMIDTX") == 1
     assert factory_results == []
+    [record] = [record for record in _reconnect_records(health_events) if record["failure_phase"] == "execute"]
+    assert record["attempt_result"] == "failed"
+    assert "commit_outcome" not in record
 
 
-def test_fetch_error_mid_transaction_surfaces_original_error(
+def test_reconnect_event_carries_failure_phase_fetch(
     client_conn_factory: ClientConnFactory,
 ) -> None:
     first_raw = client_conn_factory()
@@ -218,10 +227,12 @@ def test_fetch_error_mid_transaction_surfaces_original_error(
         cast("Connection[TupleRow]", _BreakOnFetchConnection(first_raw)),
         recovered_raw,
     ]
+    health_events: list[tuple[str, HealthEventPayload]] = []
     conn = ReconnectingConnection(
         "postgresql://fault-injection",
         connection_factory=lambda _dsn: factory_results.pop(0),
         autocommit=True,
+        on_health_event=lambda kind, payload: health_events.append((kind, payload)),
     )
 
     with pytest.raises(OperationalError), conn.transaction(), conn.cursor() as cur:
@@ -240,15 +251,19 @@ def test_fetch_error_mid_transaction_surfaces_original_error(
         cur.execute("SELECT 1")
         assert cur.fetchone() == (1,)
     assert factory_results == []
+    [record] = [record for record in _reconnect_records(health_events) if record["failure_phase"] == "fetch"]
+    assert record["attempt_result"] == "failed"
+    assert "commit_outcome" not in record
 
 
-def test_commit_transport_error_propagates_as_operational_error(
+def test_reconnect_event_commit_failure_marks_outcome_unknown(
     client_conn_factory: ClientConnFactory,
 ) -> None:
     first_raw = client_conn_factory()
     recovered_raw = client_conn_factory()
     commit_error = OperationalError("fault injection: COMMIT acknowledgement lost")
     factory_calls = 0
+    health_events: list[tuple[str, HealthEventPayload]] = []
 
     def factory(_dsn: str) -> Connection[TupleRow]:
         nonlocal factory_calls
@@ -261,6 +276,7 @@ def test_commit_transport_error_propagates_as_operational_error(
         "postgresql://fault-injection",
         connection_factory=factory,
         autocommit=True,
+        on_health_event=lambda kind, payload: health_events.append((kind, payload)),
     )
 
     with pytest.raises(OperationalError) as raised, conn.transaction(), conn.cursor() as cur:
@@ -276,16 +292,22 @@ def test_commit_transport_error_propagates_as_operational_error(
         assert cur.fetchone() == (1,)
     assert factory_calls == 2
     assert _channel_count(recovered_raw, "CCOMMITUNKNOWN") == 1
+    [record] = [record for record in _reconnect_records(health_events) if record["failure_phase"] == "commit"]
+    assert record["attempt_result"] == "failed"
+    assert record.get("commit_outcome") == "unknown"
+    assert record["reason"] == str(commit_error)
 
 
-def test_reconnect_only_between_transactions(client_conn_factory: ClientConnFactory) -> None:
+def test_reconnect_event_outside_tx_recovery_phase(client_conn_factory: ClientConnFactory) -> None:
     first_raw = client_conn_factory()
     recovered_raw = client_conn_factory()
     factory_results = [first_raw, recovered_raw]
+    health_events: list[tuple[str, HealthEventPayload]] = []
     conn = ReconnectingConnection(
         "postgresql://fault-injection",
         connection_factory=lambda _dsn: factory_results.pop(0),
         autocommit=True,
+        on_health_event=lambda kind, payload: health_events.append((kind, payload)),
     )
 
     with conn.transaction(), conn.cursor() as cur:
@@ -300,6 +322,10 @@ def test_reconnect_only_between_transactions(client_conn_factory: ClientConnFact
     assert _channel_count(recovered_raw, "CTXONE") == 1
     assert _channel_count(recovered_raw, "CTXTWO") == 1
     assert factory_results == []
+    [record] = _reconnect_records(health_events)
+    assert record["failure_phase"] == "outside-tx"
+    assert record["attempt_result"] == "succeeded"
+    assert "commit_outcome" not in record
 
 
 def test_projector_recovers_after_connection_transport_break(
@@ -310,7 +336,7 @@ def test_projector_recovers_after_connection_transport_break(
     first_raw = client_conn_factory()
     recovered_raw = client_conn_factory()
     factory_calls = 0
-    health_events: list[tuple[str, str]] = []
+    health_events: list[tuple[str, HealthEventPayload]] = []
     control_state = ControlState()
 
     def factory(_dsn: str) -> Connection[TupleRow]:
@@ -323,9 +349,10 @@ def test_projector_recovers_after_connection_transport_break(
             raise OperationalError("fault injection: postgres still restarting")
         return recovered_raw
 
-    def record_health(kind: str, reason: str) -> None:
-        health_events.append((kind, reason))
-        control_state.record_client_health("projector_state", kind, reason)
+    def record_health(kind: str, payload: HealthEventPayload) -> None:
+        health_events.append((kind, payload))
+        if kind != "reconnect_recorded":
+            control_state.record_client_health("projector_state", kind, payload["reason"])
 
     conn = ReconnectingConnection(
         "postgresql://fault-injection",
@@ -364,6 +391,9 @@ def test_projector_recovers_after_connection_transport_break(
     status = json.loads(control_state.render())
     assert attempts == 3
     assert factory_calls == 3
-    assert [kind for kind, _reason in health_events] == ["client_wedged", "client_recovered"]
+    assert [kind for kind, _payload in health_events if kind != "reconnect_recorded"] == [
+        "client_wedged",
+        "client_recovered",
+    ]
     assert status["last_client_recovered"]["kind"] == "client_recovered"
     assert "postgres connection reopened" in caplog.text

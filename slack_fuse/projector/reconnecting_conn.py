@@ -24,7 +24,7 @@ from collections import deque
 from collections.abc import Callable, Iterable
 from contextlib import AbstractContextManager, suppress
 from types import TracebackType
-from typing import Final, Protocol, Self, cast
+from typing import Final, Literal, NotRequired, Protocol, Self, TypedDict, cast
 
 import psycopg
 from psycopg import Connection, Cursor, OperationalError
@@ -38,8 +38,29 @@ DEFAULT_WEDGE_WINDOW_S: Final = 180.0
 
 ConnectionFactory = Callable[[str], Connection[TupleRow]]
 ReconnectCallback = Callable[[str], None]
-HealthEventCallback = Callable[[str, str], None]
 NowFn = Callable[[], float]
+type FailurePhase = Literal["outside-tx", "execute", "fetch", "commit"]
+type AttemptResult = Literal["succeeded", "failed"]
+
+
+class ClientHealthEvent(TypedDict):
+    """Payload for the existing wedge/recovery health events."""
+
+    reason: str
+
+
+class ReconnectRecord(TypedDict):
+    """Structured record for a reconnect attempt or transaction abort."""
+
+    failure_phase: FailurePhase
+    reason: str
+    attempt_result: AttemptResult
+    generation: int
+    commit_outcome: NotRequired[Literal["unknown"]]
+
+
+type HealthEventPayload = ClientHealthEvent | ReconnectRecord
+HealthEventCallback = Callable[[str, HealthEventPayload], None]
 
 
 class TupleConnection(Protocol):
@@ -81,9 +102,9 @@ class ReconnectingConnection:
     error has an ambiguous server-side outcome and is never retried here.
 
     ``on_reconnect`` fires after every successful replacement (never for the
-    initial connection).  ``on_health_event`` receives ``client_wedged`` once
-    five consecutive reconnect attempts fail within three minutes, then
-    ``client_recovered`` once the next connection succeeds.
+    initial connection). ``on_health_event`` receives a structured
+    ``reconnect_recorded`` payload for every reconnect attempt and mid-TX
+    abort, plus ``client_wedged``/``client_recovered`` episode events.
     """
 
     def __init__(  # noqa: PLR0913 - constructor exposes testable recovery policy knobs.
@@ -199,7 +220,7 @@ class ReconnectingConnection:
             msg = "reconnecting connection is explicitly closed"
             raise ClosedConnectionError(msg)
 
-    def _ensure_connection(self) -> Connection[TupleRow]:
+    def _ensure_connection(self, *, failure_phase: FailurePhase = "outside-tx") -> Connection[TupleRow]:
         self._ensure_open()
         if self._conn is not None and not self._conn.closed and not self._broken:
             return self._conn
@@ -219,7 +240,7 @@ class ReconnectingConnection:
         except OperationalError as exc:
             self._conn = None
             self._last_reconnect_reason = str(exc)
-            self._record_reconnect_failure(str(exc))
+            self._record_reconnect_failure(str(exc), failure_phase=failure_phase)
             raise
 
         self._conn = conn
@@ -228,21 +249,21 @@ class ReconnectingConnection:
 
         if is_reconnect:
             reason = self._last_reconnect_reason
-            self._record_reconnect_success(reason)
+            self._record_reconnect_success(reason, failure_phase=failure_phase)
             self._fire_callback(self._on_reconnect, reason)
             log.info("postgres connection reopened: %s", reason)
         return conn
 
-    def _reopen(self, reason: str) -> Connection[TupleRow]:
+    def _reopen(self, reason: str, *, failure_phase: FailurePhase) -> Connection[TupleRow]:
         self._last_reconnect_reason = reason
         self._close_raw()
-        return self._ensure_connection()
+        return self._ensure_connection(failure_phase=failure_phase)
 
-    def _abandon_failed_retry(self, exc: OperationalError) -> None:
+    def _abandon_failed_retry(self, exc: OperationalError, *, failure_phase: FailurePhase) -> None:
         """Leave no bad socket behind after the one permitted retry fails."""
         self._last_reconnect_reason = str(exc)
         self._close_raw()
-        self._record_reconnect_failure(str(exc))
+        self._record_reconnect_failure(str(exc), failure_phase=failure_phase)
 
     def _mark_broken(self, exc: OperationalError) -> None:
         """Prevent the failed raw socket from being reused or reopened mid-TX."""
@@ -261,7 +282,12 @@ class ReconnectingConnection:
             with suppress(Exception):
                 conn.close()
 
-    def _record_reconnect_failure(self, reason: str) -> None:
+    def _record_reconnect_failure(self, reason: str, *, failure_phase: FailurePhase) -> None:
+        self._fire_reconnect_record(
+            failure_phase=failure_phase,
+            reason=reason,
+            attempt_result="failed",
+        )
         now = self._now_fn()
         oldest = now - self._wedge_window_s
         self._failure_times.append(now)
@@ -269,21 +295,74 @@ class ReconnectingConnection:
             self._failure_times.popleft()
         if len(self._failure_times) >= self._wedge_failure_count and not self._wedged:
             self._wedged = True
-            self._fire_health_event("client_wedged", reason)
+            self._fire_health_event("client_wedged", {"reason": reason})
 
-    def _record_reconnect_success(self, reason: str) -> None:
+    def _record_reconnect_success(self, reason: str, *, failure_phase: FailurePhase) -> None:
+        self._fire_reconnect_record(
+            failure_phase=failure_phase,
+            reason=reason,
+            attempt_result="succeeded",
+        )
         was_wedged = self._wedged
         self._failure_times.clear()
         self._wedged = False
         if was_wedged:
-            self._fire_health_event("client_recovered", reason)
+            self._fire_health_event("client_recovered", {"reason": reason})
 
-    def _fire_health_event(self, kind: str, reason: str) -> None:
+    def _record_transaction_abort(
+        self,
+        reason: str,
+        *,
+        failure_phase: FailurePhase,
+        commit_outcome: Literal["unknown"] | None = None,
+    ) -> None:
+        """Record a no-retry transaction abort without counting it as a wedge attempt."""
+        self._fire_reconnect_record(
+            failure_phase=failure_phase,
+            reason=reason,
+            attempt_result="failed",
+            commit_outcome=commit_outcome,
+        )
+
+    def _fire_reconnect_record(
+        self,
+        *,
+        failure_phase: FailurePhase,
+        reason: str,
+        attempt_result: AttemptResult,
+        commit_outcome: Literal["unknown"] | None = None,
+    ) -> None:
+        record = ReconnectRecord(
+            failure_phase=failure_phase,
+            reason=reason,
+            attempt_result=attempt_result,
+            generation=self._generation,
+        )
+        fields: dict[str, object] = {
+            "op": "postgres-reconnect",
+            **record,
+        }
+        message = (
+            "projector-span op=%(op)s failure_phase=%(failure_phase)s "
+            "attempt_result=%(attempt_result)s generation=%(generation)d reason=%(reason)s"
+        )
+        if commit_outcome is not None:
+            record["commit_outcome"] = commit_outcome
+            fields["commit_outcome"] = commit_outcome
+            message = (
+                "projector-span op=%(op)s failure_phase=%(failure_phase)s "
+                "commit_outcome=%(commit_outcome)s attempt_result=%(attempt_result)s "
+                "generation=%(generation)d reason=%(reason)s"
+            )
+        log.info(message, fields)
+        self._fire_health_event("reconnect_recorded", record)
+
+    def _fire_health_event(self, kind: str, payload: HealthEventPayload) -> None:
         callback = self._on_health_event
         if callback is None:
             return
         try:
-            callback(kind, reason)
+            callback(kind, payload)
         except Exception:
             log.exception("postgres reconnect health callback failed: kind=%s", kind)
 
@@ -345,7 +424,7 @@ class _ReconnectingCursor:
         def operation(cursor: Cursor[TupleRow]) -> object:
             return cursor.execute(query, params, prepare=prepare, binary=binary)
 
-        _ = self._call_with_reconnect(operation, replay_before_retry=False)
+        _ = self._call_with_reconnect(operation, failure_phase="execute", replay_before_retry=False)
         return self
 
     def executemany(
@@ -360,16 +439,25 @@ class _ReconnectingCursor:
         def operation(cursor: Cursor[TupleRow]) -> object:
             return cursor.executemany(query, materialized_params, returning=returning)
 
-        _ = self._call_with_reconnect(operation, replay_before_retry=False)
+        _ = self._call_with_reconnect(operation, failure_phase="execute", replay_before_retry=False)
 
     def fetchone(self) -> TupleRow | None:
-        return cast("TupleRow | None", self._call_with_reconnect(lambda cursor: cursor.fetchone()))
+        return cast(
+            "TupleRow | None",
+            self._call_with_reconnect(lambda cursor: cursor.fetchone(), failure_phase="fetch"),
+        )
 
     def fetchmany(self, size: int = 0) -> list[TupleRow]:
-        return cast("list[TupleRow]", self._call_with_reconnect(lambda cursor: cursor.fetchmany(size)))
+        return cast(
+            "list[TupleRow]",
+            self._call_with_reconnect(lambda cursor: cursor.fetchmany(size), failure_phase="fetch"),
+        )
 
     def fetchall(self) -> list[TupleRow]:
-        return cast("list[TupleRow]", self._call_with_reconnect(lambda cursor: cursor.fetchall()))
+        return cast(
+            "list[TupleRow]",
+            self._call_with_reconnect(lambda cursor: cursor.fetchall(), failure_phase="fetch"),
+        )
 
     def close(self) -> None:
         cursor = self._cursor
@@ -382,6 +470,7 @@ class _ReconnectingCursor:
         self,
         operation: Callable[[Cursor[TupleRow]], object],
         *,
+        failure_phase: FailurePhase,
         replay_before_retry: bool = True,
     ) -> object:
         """Run one cursor operation, with one narrowly-scoped reconnect retry.
@@ -394,27 +483,29 @@ class _ReconnectingCursor:
         """
         with self._owner._lock:
             try:
-                cursor = self._current_cursor(replay=replay_before_retry)
+                cursor = self._current_cursor(replay=replay_before_retry, failure_phase=failure_phase)
             except OperationalError as setup_exc:
                 if self._owner._transactions:
                     self._owner._mark_broken(setup_exc)
+                    self._owner._record_transaction_abort(str(setup_exc), failure_phase=failure_phase)
                 raise
             try:
                 return operation(cursor)
             except OperationalError as first_exc:
                 if self._owner._transactions:
                     self._owner._mark_broken(first_exc)
+                    self._owner._record_transaction_abort(str(first_exc), failure_phase=failure_phase)
                     raise
-                _ = self._owner._reopen(str(first_exc))
+                _ = self._owner._reopen(str(first_exc), failure_phase=failure_phase)
                 try:
                     cursor = self._replace_cursor(replay=replay_before_retry)
                     return operation(cursor)
                 except OperationalError as retry_exc:
-                    self._owner._abandon_failed_retry(retry_exc)
+                    self._owner._abandon_failed_retry(retry_exc, failure_phase=failure_phase)
                     raise
 
-    def _current_cursor(self, *, replay: bool) -> Cursor[TupleRow]:
-        conn = self._owner._ensure_connection()
+    def _current_cursor(self, *, replay: bool, failure_phase: FailurePhase) -> Cursor[TupleRow]:
+        conn = self._owner._ensure_connection(failure_phase=failure_phase)
         if self._cursor is None or self._generation != self._owner._generation:
             return self._replace_cursor(conn=conn, replay=replay)
         return self._cursor
@@ -473,6 +564,11 @@ class _ReconnectingTransaction(AbstractContextManager[None]):
             except OperationalError as exit_exc:
                 self._owner._mark_broken(exit_exc)
                 if exc_value is None:
+                    self._owner._record_transaction_abort(
+                        str(exit_exc),
+                        failure_phase="commit",
+                        commit_outcome="unknown",
+                    )
                     raise
                 # Preserve the original body failure. The rollback error is a
                 # follow-on from the same dead socket, which is abandoned below.
@@ -490,6 +586,8 @@ __all__ = [
     "DEFAULT_WEDGE_FAILURE_COUNT",
     "DEFAULT_WEDGE_WINDOW_S",
     "ClosedConnectionError",
+    "HealthEventPayload",
+    "ReconnectRecord",
     "ReconnectingConnection",
     "TupleConnection",
 ]

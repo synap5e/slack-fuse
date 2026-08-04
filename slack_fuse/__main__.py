@@ -216,7 +216,7 @@ def cmd_mount(args: argparse.Namespace) -> None:  # noqa: C901  (process-wiring 
     from slack_fuse.projector.disk_projection import DiskProjection
     from slack_fuse.projector.health_subscriber import watch_health
     from slack_fuse.projector.pool import ConnectionPool as ProjectorConnectionPool
-    from slack_fuse.projector.reconnecting_conn import ReconnectingConnection
+    from slack_fuse.projector.reconnecting_conn import HealthEventPayload, ReconnectingConnection
     from slack_fuse.projector.trailer_log import TrailerLog
     from slack_fuse.projector.ws_client import SINGLETON_STREAMS, WSClient, WSClientOptions
 
@@ -269,7 +269,35 @@ def cmd_mount(args: argparse.Namespace) -> None:  # noqa: C901  (process-wiring 
     def _open_durable_conn(name: str) -> ReconnectingConnection:
         """One fixed client connection that replaces a dead PG socket."""
 
-        def _on_health_event(kind: str, reason: str) -> None:
+        def _on_health_event(kind: str, payload: HealthEventPayload) -> None:
+            reason = payload["reason"]
+            if kind == "reconnect_recorded":
+                failure_phase = payload.get("failure_phase", "outside-tx")
+                attempt_result = payload.get("attempt_result", "failed")
+                generation = payload.get("generation", 0)
+                commit_outcome = payload.get("commit_outcome")
+                if commit_outcome is None:
+                    log.info(
+                        "projector-span op=postgres-reconnect connection=%s generation=%s "
+                        "failure_phase=%s attempt_result=%s reason=%s",
+                        name,
+                        generation,
+                        failure_phase,
+                        attempt_result,
+                        reason,
+                    )
+                else:
+                    log.info(
+                        "projector-span op=postgres-reconnect connection=%s generation=%s "
+                        "failure_phase=%s commit_outcome=%s attempt_result=%s reason=%s",
+                        name,
+                        generation,
+                        failure_phase,
+                        commit_outcome,
+                        attempt_result,
+                        reason,
+                    )
+                return
             control_state.record_client_health(name, kind, reason)
             if kind == "client_wedged":
                 log.error("slurper-health.client_wedged connection=%s reason=%s", name, reason)

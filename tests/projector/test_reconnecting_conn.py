@@ -15,7 +15,11 @@ from psycopg import Connection, OperationalError
 from psycopg.rows import TupleRow
 
 from slack_fuse.control import ControlState
-from slack_fuse.projector.reconnecting_conn import ClosedConnectionError, ReconnectingConnection
+from slack_fuse.projector.reconnecting_conn import (
+    ClosedConnectionError,
+    HealthEventPayload,
+    ReconnectingConnection,
+)
 
 if TYPE_CHECKING:
     from psycopg.abc import Params, QueryNoTemplate
@@ -201,7 +205,7 @@ def test_client_wedged_and_recovered_emit_once_per_episode() -> None:
         _as_connection(healthy),
     ]
     now = 0.0
-    events: list[tuple[str, str]] = []
+    events: list[tuple[str, HealthEventPayload]] = []
     control_state = ControlState(now_fn=lambda: datetime(2026, 8, 2, tzinfo=UTC))
 
     def factory(_dsn: str) -> Connection[TupleRow]:
@@ -213,9 +217,10 @@ def test_client_wedged_and_recovered_emit_once_per_episode() -> None:
     def now_fn() -> float:
         return now
 
-    def record_health(kind: str, reason: str) -> None:
-        events.append((kind, reason))
-        control_state.record_client_health("test_connection", kind, reason)
+    def record_health(kind: str, payload: HealthEventPayload) -> None:
+        events.append((kind, payload))
+        if kind != "reconnect_recorded":
+            control_state.record_client_health("test_connection", kind, payload["reason"])
 
     conn = ReconnectingConnection(
         "postgresql://test",
@@ -229,7 +234,9 @@ def test_client_wedged_and_recovered_emit_once_per_episode() -> None:
         with pytest.raises(OperationalError):
             _ = conn.execute("SELECT 1")
 
-    assert events == [("client_wedged", "reopen 5 failed")]
+    assert [(kind, payload["reason"]) for kind, payload in events if kind != "reconnect_recorded"] == [
+        ("client_wedged", "reopen 5 failed")
+    ]
     wedged_status = json.loads(control_state.render())
     assert wedged_status["last_client_wedged"]["kind"] == "client_wedged"
     assert wedged_status["last_client_recovered"] is None
@@ -239,7 +246,7 @@ def test_client_wedged_and_recovered_emit_once_per_episode() -> None:
         _ = cur.execute("SELECT 1")
         assert cur.fetchone() == (1,)
 
-    assert events == [
+    assert [(kind, payload["reason"]) for kind, payload in events if kind != "reconnect_recorded"] == [
         ("client_wedged", "reopen 5 failed"),
         ("client_recovered", "reopen 5 failed"),
     ]
@@ -253,7 +260,7 @@ def test_failures_outside_window_do_not_wedge() -> None:
     failures = [OperationalError(f"reopen {index} failed") for index in range(5)]
     factory_results: list[Connection[TupleRow] | OperationalError] = [_as_connection(broken), *failures]
     now = 0.0
-    events: list[tuple[str, str]] = []
+    events: list[tuple[str, HealthEventPayload]] = []
 
     def factory(_dsn: str) -> Connection[TupleRow]:
         result = factory_results.pop(0)
@@ -264,7 +271,7 @@ def test_failures_outside_window_do_not_wedge() -> None:
     conn = ReconnectingConnection(
         "postgresql://test",
         connection_factory=factory,
-        on_health_event=lambda kind, reason: events.append((kind, reason)),
+        on_health_event=lambda kind, payload: events.append((kind, payload)),
         now_fn=lambda: now,
     )
 
@@ -273,7 +280,7 @@ def test_failures_outside_window_do_not_wedge() -> None:
         with pytest.raises(OperationalError):
             _ = conn.execute("SELECT 1")
 
-    assert events == []
+    assert [kind for kind, _payload in events if kind != "reconnect_recorded"] == []
 
 
 def test_reconnect_callback_failure_does_not_break_query() -> None:
