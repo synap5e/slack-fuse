@@ -23,14 +23,24 @@ WITH latest_full_payload AS (
       AND payload->>'id' IS NOT NULL
     ORDER BY payload->>'id', offset_in_stream DESC
 ),
--- Count post-fold (edits + deletes applied) rather than raw message events —
--- otherwise deletions make the "done" comparison against Slack's current
--- total incomparable and can false-report a channel as done.
+-- Lifetime-ingested count of message events. Was briefly switched to
+-- count(active_messages) in 185fde4 (post-fold, so deletions removed from
+-- the total per WTF-audit DESIGN-3), but active_messages is an unmaterialized
+-- view that folds edits+deletes across the entire event stream on every
+-- query — 261s wall clock against 828k events, starving the process every
+-- 5min when the client warmer polls this endpoint (production incident,
+-- 2026-08-17). Reverted here to the raw-event count until a maintained
+-- counter table lands. Metric name is now honest about being lifetime-ingested
+-- rather than active; the "done" comparison at 99% of Slack total is still
+-- approximate but false-completion via deletion is a rare mode we accept
+-- until the counter fix.
 message_counts AS (
-    SELECT channel_id,
+    SELECT substr(stream, length('channel:') + 1) AS channel_id,
            count(*)::bigint AS ingested
-    FROM active_messages
-    GROUP BY channel_id
+    FROM events
+    WHERE stream LIKE 'channel:%'
+      AND kind = 'message'
+    GROUP BY stream
 )
 SELECT
     channels.channel_id,
