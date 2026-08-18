@@ -73,16 +73,6 @@ Cheapest first check: capture 100 sequential `/health` timings from the pod + co
 
 Investigation approach: 100 sequential /health timings correlated with `projector-span op=slurper.*` logs to identify what's on the loop during slow samples.
 
-## Migrate `slack-fuse permalink` off v1 island
-
-**Effort**: 1-2 eng-days. **Autonomous**: Yes.
-
-**Verified 2026-08-17**: grep confirms `permalink.py` is the sole live consumer of `_slug_helpers.py`, which keeps the entire v1 module island alive:
-
-- `store.py`, `api.py`, `user_cache.py`, `disk_cache.py`, `renderer.py`, `fuse_ops.py`, `backfill.py`, `archive.py`, `socket_mode.py`
-
-Zero live-production callers of any of these outside the v1 island itself. Migrating `permalink` unblocks deleting all nine modules + their tests (~several thousand LoC). Migration same shape as `resolve` (commit `057883c`): parse FUSE path → reverse slug via `channels` table + `assign_conv_root_slugs`, use `fetch_day_thread_parents` + `dedup_thread_slug_map` for thread slug reversal, call server's `chat.getPermalink` for message URLs, retain `SLACK_WORKSPACE_URL` requirement for channel-root URLs.
-
 ## Snapshot DELETE leaves parent `reply_count` stale
 
 **Effort**: 1-2h. **Autonomous**: Yes.
@@ -169,6 +159,16 @@ _None currently._
 ---
 
 # Resolved
+
+## 2026-08-18
+
+### v1 island deleted, `permalink` migrated
+
+`3c7ef8b` `refactor(v1-island): delete dead v1 code, migrate permalink to v2`. `permalink.py` was the sole live consumer of `_slug_helpers.py`, which kept the entire v1 module island alive. Migrated `permalink` to the v2 projections store (mirrors `resolve` shape from `057883c`) with local URL synthesis from `SLACK_WORKSPACE_URL` — no Slack API round-trip. Deleted 12 v1 modules + 9 v1-only tests + trimmed the v1 half of `test_stat_blocks.py`.
+
+Kept alive: `user_cache`, `models`, `mrkdwn` — all still used by `slack_fuse_server` for its own `/resolve` endpoint + slurper.
+
+Net: -6,241 LoC across 26 files. `slack_fuse/` package dropped from 17,620 → 13,698 lines (-3,922). Client is now meaningfully smaller than the server (`slack_fuse_server/` is 16,006 lines). Full suite: 1102 passed in 75s (was 1265 pre-cleanup; the 163 disappeared tests were the v1-only files we deleted).
 
 ## 2026-08-17
 
