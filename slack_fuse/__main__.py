@@ -852,6 +852,8 @@ def cmd_resolve(args: argparse.Namespace) -> None:
 
 def cmd_permalink(args: argparse.Namespace) -> None:
     """Resolve a FUSE path to a Slack permalink."""
+    from slack_fuse.config import load_client_config
+
     mountpoint = os.path.expanduser(args.mountpoint)
     if args.server_url:
         request_payload: dict[str, str] = {"path": _path_for_server(args.path, mountpoint)}
@@ -868,33 +870,42 @@ def cmd_permalink(args: argparse.Namespace) -> None:
             sys.exit(1)
         return
 
-    from .api import SlackAPIError, SlackClient
-    from .auth import load_tokens
-    from .permalink import resolve_path_to_permalink
-    from .user_cache import UserCache
+    import psycopg
+    from psycopg.rows import TupleRow
 
-    tokens = load_tokens()
-    client = SlackClient(tokens.user_token)
-    users = UserCache(client.http)
+    from .auth import load_workspace_url
+    from .permalink import PermalinkGenerationError, resolve_path_to_permalink
 
+    workspace_url = load_workspace_url()
+    if not workspace_url:
+        print(
+            "Error: SLACK_WORKSPACE_URL not set (set it in the environment, .env, or "
+            "~/.config/slack-fuse/config.json).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    config = load_client_config()
+    conn: psycopg.Connection[TupleRow] | None = None
     try:
+        conn = psycopg.connect(config.database_url)
         url = resolve_path_to_permalink(
             args.path,
             mountpoint,
-            client,
-            users,
-            tokens.workspace_url,
+            conn,
+            workspace_url,
             ts=args.ts,
         )
         print(url)
-    except ValueError as e:
+    except PermalinkGenerationError as e:
         print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
-    except SlackAPIError as e:
+        sys.exit(2)
+    except (ValueError, psycopg.Error) as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
     finally:
-        client.close()
+        if conn is not None:
+            conn.close()
 
 
 def build_parser() -> argparse.ArgumentParser:

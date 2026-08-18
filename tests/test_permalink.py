@@ -1,363 +1,355 @@
-# pyright: reportPrivateUsage=false
-"""Tests for reverse FUSE path -> Slack permalink resolution."""
+"""Tests for FUSE-path → Slack-permalink resolution (v2 projections store)."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import os
+import time
+from collections.abc import Iterator
+from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING
+from zoneinfo import ZoneInfo
 
 import pytest
 
-from slack_fuse import _slug_helpers
-from slack_fuse.api import SlackClient
-from slack_fuse.models import Channel, JsonObject, Message
-from slack_fuse.permalink import _read_frontmatter, resolve_path_to_permalink
-from slack_fuse.user_cache import UserCache
+from slack_fuse.fuse_v2_helpers import derive_thread_slug
+from slack_fuse.permalink import PermalinkGenerationError, resolve_path_to_permalink
 
-
-class _StubClient:
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, str]] = []
-        self.channels = [Channel.model_validate({"id": "C1", "name": "general", "is_member": True})]
-
-    def get_permalink(self, channel_id: str, message_ts: str) -> str:
-        self.calls.append((channel_id, message_ts))
-        return f"https://workspace.slack.com/archives/{channel_id}/p{message_ts.replace('.', '')}"
-
-    def list_conversations(self) -> list[Channel]:
-        return self.channels
-
-    def get_channel_info(self, channel_id: str) -> Channel:
-        for channel in self.channels:
-            if channel.id == channel_id:
-                return channel
-        return Channel.model_validate({"id": channel_id, "name": channel_id, "is_member": True})
-
-    def get_history(
-        self,
-        _channel_id: str,
-        oldest: str | None = None,
-        latest: str | None = None,
-        limit: int = 200,
-    ) -> list[Message]:
-        return []
-
-
-class _StubUsers:
-    def get_display_name(self, user_id: str) -> str:
-        return user_id
-
-
-@dataclass(frozen=True)
-class _PathCase:
-    relative_path: str
-    frontmatter_relative: str
-    ts: str | None
-    workspace_url: str | None
-    expected: str
-
-
-def _client(stub: _StubClient) -> SlackClient:
-    return cast("SlackClient", stub)
-
-
-def _users() -> UserCache:
-    return cast("UserCache", _StubUsers())
-
-
-def _write(path: Path, frontmatter: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(frontmatter)
-
-
-def _frontmatter(*, channel_id: str = "C1", thread_ts: str | None = None) -> str:
-    lines = ["---", "channel: general", f"channel_id: {channel_id}"]
-    if thread_ts is not None:
-        lines.append(f'thread_ts: "{thread_ts}"')
-    lines.extend(["---", "body"])
-    return "\n".join(lines)
-
-
-@pytest.mark.parametrize(
-    "case",
-    [
-        _PathCase(
-            "channels/general",
-            "channels/general/channel.md",
-            None,
-            "https://workspace.slack.com",
-            "archives/C1",
-        ),
-        _PathCase(
-            "channels/general/channel.md",
-            "channels/general/channel.md",
-            None,
-            "https://workspace.slack.com",
-            "archives/C1",
-        ),
-        _PathCase(
-            "channels/general/2026-04/09/channel.md",
-            "channels/general/2026-04/09/channel.md",
-            "1712649600.123456",
-            None,
-            "p1712649600123456",
-        ),
-        _PathCase(
-            "channels/general/2026-04/09/feed.md",
-            "channels/general/2026-04/09/feed.md",
-            "1712649600.123456",
-            None,
-            "p1712649600123456",
-        ),
-        _PathCase(
-            "channels/general/2026-04/09/thread-title/thread.md",
-            "channels/general/2026-04/09/thread-title/thread.md",
-            None,
-            None,
-            "p1712649600123456",
-        ),
-        _PathCase(
-            "channels/general/2026-04/09/thread-title/feed.md",
-            "channels/general/2026-04/09/thread-title/feed.md",
-            None,
-            None,
-            "p1712649600123456",
-        ),
-    ],
+# Re-export the migrated-client fixtures so pytest picks them up here (they
+# live under tests/projector/conftest.py for the projector suite).
+from tests.projector.conftest import (
+    client_conn as _client_conn,
+    client_conn_factory as _client_conn_factory,
 )
-def test_path_types_resolve(tmp_path: Path, case: _PathCase) -> None:
-    mountpoint = tmp_path / "slack"
-    _write(mountpoint / case.frontmatter_relative, _frontmatter(thread_ts="1712649600.123456"))
-    stub = _StubClient()
 
-    url = resolve_path_to_permalink(
-        str(mountpoint / case.relative_path),
-        str(mountpoint),
-        _client(stub),
-        _users(),
-        case.workspace_url,
-        ts=case.ts,
-    )
+client_conn = _client_conn
+client_conn_factory = _client_conn_factory
 
-    assert case.expected in url
+if TYPE_CHECKING:
+    from psycopg import Connection
+    from psycopg.rows import TupleRow
 
 
-@pytest.mark.parametrize(
-    ("relative_path", "frontmatter_relative", "ts", "workspace_url"),
-    [
-        (
-            ".cached-only/channels/general",
-            ".cached-only/channels/general/channel.md",
-            None,
-            "https://workspace.slack.com",
-        ),
-        (
-            ".cached-only/channels/general/channel.md",
-            ".cached-only/channels/general/channel.md",
-            None,
-            "https://workspace.slack.com",
-        ),
-        (
-            ".cached-only/channels/general/2026-04/09/channel.md",
-            ".cached-only/channels/general/2026-04/09/channel.md",
-            "1712649600.123456",
-            None,
-        ),
-        (
-            ".cached-only/channels/general/2026-04/09/thread-title/thread.md",
-            ".cached-only/channels/general/2026-04/09/thread-title/thread.md",
-            None,
-            None,
-        ),
-    ],
-)
-def test_cached_only_path_prefix_resolves(
-    tmp_path: Path,
-    relative_path: str,
-    frontmatter_relative: str,
-    ts: str | None,
-    workspace_url: str | None,
+_LOCAL_TZ = ZoneInfo("Pacific/Auckland")
+_MOUNTPOINT = "/mnt/slack"
+_WORKSPACE = "https://workspace.slack.com"
+
+
+@pytest.fixture(autouse=True)
+def pin_local_timezone(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Pin the resolver's date arithmetic to a deterministic non-UTC zone."""
+    original = os.environ.get("TZ")
+    monkeypatch.setenv("TZ", _LOCAL_TZ.key)
+    time.tzset()
+    yield
+    if original is None:
+        monkeypatch.delenv("TZ", raising=False)
+    else:
+        monkeypatch.setenv("TZ", original)
+    time.tzset()
+
+
+def _local_ts(year: int, month: int, day: int, hour: int, minute: int = 0) -> Decimal:
+    value = datetime(year, month, day, hour, minute, tzinfo=_LOCAL_TZ).timestamp()
+    return Decimal(str(value)).quantize(Decimal("0.000001"))
+
+
+def _seed_channel(
+    conn: Connection[TupleRow],
+    channel_id: str = "C1",
+    name: str = "general",
+    *,
+    im_user_id: str | None = None,
+    tier: str = "hot",
 ) -> None:
-    mountpoint = tmp_path / "slack"
-    _write(mountpoint / frontmatter_relative, _frontmatter(thread_ts="1712649600.123456"))
-    stub = _StubClient()
-
-    url = resolve_path_to_permalink(
-        str(mountpoint / relative_path),
-        str(mountpoint),
-        _client(stub),
-        _users(),
-        workspace_url,
-        ts=ts,
-    )
-
-    assert "C1" in url
+    is_im = im_user_id is not None
+    with conn.cursor() as cur:
+        _ = cur.execute(
+            "INSERT INTO channels "
+            "(channel_id, name, is_im, is_mpim, is_member, is_archived, im_user_id, tier) "
+            "VALUES (%s, %s, %s, %s, %s, FALSE, %s, %s)",
+            (channel_id, name, is_im, False, True, im_user_id, tier),
+        )
 
 
-def test_frontmatter_parser_reads_known_keys_and_ignores_extra(tmp_path: Path) -> None:
-    path = tmp_path / "thread.md"
-    path.write_text(
-        "\n".join([
-            "---",
-            "channel: general",
-            "channel_id: C1",
-            'thread_ts: "1712649600.123456"',
-            "unused: ok",
-            "---",
-            "body",
-        ])
-    )
-
-    parsed = _read_frontmatter(path)
-
-    assert parsed["channel_id"] == "C1"
-    assert parsed["thread_ts"] == "1712649600.123456"
-    assert parsed["unused"] == "ok"
-
-
-def test_frontmatter_parser_tolerates_missing_keys(tmp_path: Path) -> None:
-    path = tmp_path / "channel.md"
-    path.write_text("---\nchannel: general\n---\nbody")
-
-    parsed = _read_frontmatter(path)
-
-    assert parsed == {"channel": "general"}
-
-
-def test_fallback_slug_reversal_when_frontmatter_lacks_channel_id(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+def _seed_chunk(
+    conn: Connection[TupleRow],
+    message_ts: Decimal,
+    content_md: str,
+    *,
+    channel_id: str = "C1",
+    reply_count: int = 0,
 ) -> None:
-    mountpoint = tmp_path / "slack"
-    _write(mountpoint / "channels/general/channel.md", "---\nchannel: general\n---\nbody")
-    channel = Channel.model_validate({"id": "C1", "name": "general", "is_member": True})
-
-    def cached_channel_list() -> list[JsonObject]:
-        return [cast("JsonObject", channel.model_dump(mode="json"))]
-
-    monkeypatch.setattr(_slug_helpers, "get_channel_list", cached_channel_list)
-
-    url = resolve_path_to_permalink(
-        str(mountpoint / "channels/general/channel.md"),
-        str(mountpoint),
-        _client(_StubClient()),
-        _users(),
-        "https://workspace.slack.com/",
-    )
-
-    assert url == "https://workspace.slack.com/archives/C1"
+    with conn.cursor() as cur:
+        _ = cur.execute(
+            "INSERT INTO chunks (channel_id, message_ts, content_md, reply_count) VALUES (%s, %s, %s, %s)",
+            (channel_id, message_ts, content_md, reply_count),
+        )
 
 
-def test_thread_slug_fallback_when_frontmatter_lacks_thread_ts(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    mountpoint = tmp_path / "slack"
-    _write(
-        mountpoint / "channels/general/2026-04/09/thread-title/thread.md",
-        _frontmatter().replace("body", "body"),
-    )
-    parent = Message(
-        ts="1712649600.123456",
-        user="U1",
-        text="Thread Title",
-        thread_ts="1712649600.123456",
-        reply_count=1,
-    )
+def _seed_user(conn: Connection[TupleRow], user_id: str, display_name: str) -> None:
+    with conn.cursor() as cur:
+        _ = cur.execute(
+            "INSERT INTO users (user_id, display_name) VALUES (%s, %s)",
+            (user_id, display_name),
+        )
 
-    def cached_day_messages(_channel_id: str, _date_str: str) -> list[JsonObject]:
-        return [cast("JsonObject", parent.model_dump(mode="json"))]
 
-    monkeypatch.setattr(_slug_helpers, "get_day_messages", cached_day_messages)
-    stub = _StubClient()
+def _write_frontmatter(tmp_path: Path, relative: str, keys: dict[str, str]) -> Path:
+    """Materialise a fake rendered file with just the frontmatter we care about."""
+    file = tmp_path / relative
+    file.parent.mkdir(parents=True, exist_ok=True)
+    lines = ["---"]
+    lines.extend(f"{k}: {v}" for k, v in keys.items())
+    lines.append("---")
+    lines.append("")  # empty body — the resolver only reads the header
+    file.write_text("\n".join(lines))
+    return file
+
+
+# ---------------------------------------------------------------------------
+# URL synthesis (no PG)
+# ---------------------------------------------------------------------------
+
+
+def test_channel_dir_returns_archives_url(client_conn: Connection[TupleRow], tmp_path: Path) -> None:
+    _seed_channel(client_conn)
+    _write_frontmatter(tmp_path, "channels/general/channel.md", {"channel_id": "C1"})
 
     url = resolve_path_to_permalink(
-        str(mountpoint / "channels/general/2026-04/09/thread-title/thread.md"),
-        str(mountpoint),
-        _client(stub),
-        _users(),
-        None,
+        f"{tmp_path}/channels/general",
+        str(tmp_path),
+        client_conn,
+        _WORKSPACE,
     )
 
-    assert url.endswith("/p1712649600123456")
-    assert stub.calls == [("C1", "1712649600.123456")]
+    assert url == f"{_WORKSPACE}/archives/C1"
 
 
-def test_day_file_without_ts_is_ambiguous(tmp_path: Path) -> None:
-    mountpoint = tmp_path / "slack"
-    _write(mountpoint / "channels/general/2026-04/09/channel.md", _frontmatter())
+def test_channel_file_returns_archives_url(client_conn: Connection[TupleRow], tmp_path: Path) -> None:
+    _seed_channel(client_conn)
+    _write_frontmatter(tmp_path, "channels/general/channel.md", {"channel_id": "C1"})
+
+    url = resolve_path_to_permalink(
+        f"{tmp_path}/channels/general/channel.md",
+        str(tmp_path),
+        client_conn,
+        _WORKSPACE,
+    )
+
+    assert url == f"{_WORKSPACE}/archives/C1"
+
+
+def test_day_file_requires_ts(client_conn: Connection[TupleRow], tmp_path: Path) -> None:
+    _seed_channel(client_conn)
+    _write_frontmatter(tmp_path, "channels/general/2026-07/31/channel.md", {"channel_id": "C1"})
 
     with pytest.raises(ValueError, match="day file is ambiguous"):
-        resolve_path_to_permalink(
-            str(mountpoint / "channels/general/2026-04/09/channel.md"),
-            str(mountpoint),
-            _client(_StubClient()),
-            _users(),
-            None,
+        _ = resolve_path_to_permalink(
+            f"{tmp_path}/channels/general/2026-07/31/channel.md",
+            str(tmp_path),
+            client_conn,
+            _WORKSPACE,
         )
 
 
-def test_channel_root_without_workspace_url_errors(tmp_path: Path) -> None:
-    mountpoint = tmp_path / "slack"
-    _write(mountpoint / "channels/general/channel.md", _frontmatter())
+def test_day_file_with_ts_returns_message_permalink(client_conn: Connection[TupleRow], tmp_path: Path) -> None:
+    _seed_channel(client_conn)
+    _write_frontmatter(tmp_path, "channels/general/2026-07/31/channel.md", {"channel_id": "C1"})
 
-    with pytest.raises(ValueError, match="SLACK_WORKSPACE_URL"):
-        resolve_path_to_permalink(
-            str(mountpoint / "channels/general/channel.md"),
-            str(mountpoint),
-            _client(_StubClient()),
-            _users(),
-            None,
+    url = resolve_path_to_permalink(
+        f"{tmp_path}/channels/general/2026-07/31/channel.md",
+        str(tmp_path),
+        client_conn,
+        _WORKSPACE,
+        ts="1785661200.000000",
+    )
+
+    assert url == f"{_WORKSPACE}/archives/C1/p1785661200000000"
+
+
+def test_thread_file_uses_frontmatter_thread_ts(client_conn: Connection[TupleRow], tmp_path: Path) -> None:
+    _seed_channel(client_conn)
+    _write_frontmatter(
+        tmp_path,
+        "channels/general/2026-07/31/topic/thread.md",
+        {"channel_id": "C1", "thread_ts": "1785661200.000000"},
+    )
+
+    url = resolve_path_to_permalink(
+        f"{tmp_path}/channels/general/2026-07/31/topic/thread.md",
+        str(tmp_path),
+        client_conn,
+        _WORKSPACE,
+    )
+
+    assert url == f"{_WORKSPACE}/archives/C1/p1785661200000000"
+
+
+def test_thread_reply_appends_thread_ts_query(client_conn: Connection[TupleRow], tmp_path: Path) -> None:
+    _seed_channel(client_conn)
+    _write_frontmatter(
+        tmp_path,
+        "channels/general/2026-07/31/topic/thread.md",
+        {"channel_id": "C1", "thread_ts": "1785660000.000000"},
+    )
+
+    url = resolve_path_to_permalink(
+        f"{tmp_path}/channels/general/2026-07/31/topic/thread.md",
+        str(tmp_path),
+        client_conn,
+        _WORKSPACE,
+        ts="1785661200.000000",
+    )
+
+    assert url == f"{_WORKSPACE}/archives/C1/p1785661200000000?thread_ts=1785660000.000000&cid=C1"
+
+
+def test_workspace_url_trailing_slash_stripped(client_conn: Connection[TupleRow], tmp_path: Path) -> None:
+    _seed_channel(client_conn)
+    _write_frontmatter(tmp_path, "channels/general/channel.md", {"channel_id": "C1"})
+
+    url = resolve_path_to_permalink(
+        f"{tmp_path}/channels/general",
+        str(tmp_path),
+        client_conn,
+        f"{_WORKSPACE}/",
+    )
+
+    assert url == f"{_WORKSPACE}/archives/C1"
+
+
+# ---------------------------------------------------------------------------
+# Slug → channel_id fallback (frontmatter missing or outdated)
+# ---------------------------------------------------------------------------
+
+
+def test_channel_id_falls_back_to_local_projection_when_frontmatter_missing(
+    client_conn: Connection[TupleRow], tmp_path: Path
+) -> None:
+    _seed_channel(client_conn)
+    # No frontmatter file on disk — resolver falls back to slug lookup.
+
+    url = resolve_path_to_permalink(
+        f"{tmp_path}/channels/general",
+        str(tmp_path),
+        client_conn,
+        _WORKSPACE,
+    )
+
+    assert url == f"{_WORKSPACE}/archives/C1"
+
+
+def test_unknown_channel_slug_raises_generation_error(client_conn: Connection[TupleRow], tmp_path: Path) -> None:
+    with pytest.raises(PermalinkGenerationError, match="ghost-channel"):
+        _ = resolve_path_to_permalink(
+            f"{tmp_path}/channels/ghost-channel",
+            str(tmp_path),
+            client_conn,
+            _WORKSPACE,
         )
 
 
-def test_get_permalink_called_with_expected_values(tmp_path: Path) -> None:
-    mountpoint = tmp_path / "slack"
-    _write(mountpoint / "channels/general/2026-04/09/channel.md", _frontmatter())
-    _write(
-        mountpoint / "channels/general/2026-04/09/thread-title/thread.md",
-        _frontmatter(thread_ts="1712649600.111111"),
-    )
-    stub = _StubClient()
+def test_slug_belonging_to_wrong_root_raises(client_conn: Connection[TupleRow], tmp_path: Path) -> None:
+    _seed_user(client_conn, "UALICE", "Alice")
+    _seed_channel(client_conn, "D1", "", im_user_id="UALICE")
+    # DM belongs under `dms/`; asking for it under `channels/` must be rejected
+    # (fetch_channel_by_slug scopes by conv-root, so this surfaces as
+    # "could not resolve" rather than a wrong-root diagnostic).
 
-    resolve_path_to_permalink(
-        str(mountpoint / "channels/general/2026-04/09/channel.md"),
-        str(mountpoint),
-        _client(stub),
-        _users(),
-        None,
-        ts="1712649600.222222",
-    )
-    resolve_path_to_permalink(
-        str(mountpoint / "channels/general/2026-04/09/thread-title/thread.md"),
-        str(mountpoint),
-        _client(stub),
-        _users(),
-        None,
-    )
-    resolve_path_to_permalink(
-        str(mountpoint / "channels/general/2026-04/09/thread-title/thread.md"),
-        str(mountpoint),
-        _client(stub),
-        _users(),
-        None,
-        ts="1712649600.333333",
-    )
-
-    assert stub.calls == [
-        ("C1", "1712649600.222222"),
-        ("C1", "1712649600.111111"),
-        ("C1", "1712649600.333333"),
-    ]
+    with pytest.raises(PermalinkGenerationError, match="could not resolve channel slug 'alice'"):
+        _ = resolve_path_to_permalink(
+            f"{tmp_path}/channels/alice",
+            str(tmp_path),
+            client_conn,
+            _WORKSPACE,
+        )
 
 
-def test_rejects_path_outside_mountpoint(tmp_path: Path) -> None:
+# ---------------------------------------------------------------------------
+# Thread slug → thread_ts reversal (v2 projection lookup)
+# ---------------------------------------------------------------------------
+
+
+def test_thread_slug_reverses_via_local_projection(client_conn: Connection[TupleRow], tmp_path: Path) -> None:
+    _seed_channel(client_conn)
+    parent_ts = _local_ts(2026, 7, 31, 10)
+    content_md = "## 10:00 <@U1>\n\nDeploy discussion\n\n> Thread: 1 replies\n"
+    _seed_chunk(client_conn, parent_ts, content_md, reply_count=1)
+    expected_slug = derive_thread_slug(content_md, parent_ts)
+    # No frontmatter on disk — resolver reverses slug via fetch_day_thread_parents.
+
+    url = resolve_path_to_permalink(
+        f"{tmp_path}/channels/general/2026-07/31/{expected_slug}/thread.md",
+        str(tmp_path),
+        client_conn,
+        _WORKSPACE,
+    )
+
+    assert url == f"{_WORKSPACE}/archives/C1/p{format(parent_ts, '.6f').replace('.', '')}"
+
+
+def test_thread_slug_reversal_fails_when_parent_missing(client_conn: Connection[TupleRow], tmp_path: Path) -> None:
+    _seed_channel(client_conn)
+
+    with pytest.raises(PermalinkGenerationError, match="could not resolve thread slug"):
+        _ = resolve_path_to_permalink(
+            f"{tmp_path}/channels/general/2026-07/31/deleted-thread/thread.md",
+            str(tmp_path),
+            client_conn,
+            _WORKSPACE,
+        )
+
+
+def test_dm_channel_slug_resolves_to_dm_archive(client_conn: Connection[TupleRow], tmp_path: Path) -> None:
+    _seed_user(client_conn, "UALICE", "Alice Smith")
+    _seed_channel(client_conn, "D1", "", im_user_id="UALICE")
+
+    url = resolve_path_to_permalink(
+        f"{tmp_path}/dms/alice-smith",
+        str(tmp_path),
+        client_conn,
+        _WORKSPACE,
+    )
+
+    assert url == f"{_WORKSPACE}/archives/D1"
+
+
+# ---------------------------------------------------------------------------
+# Path parsing edge cases
+# ---------------------------------------------------------------------------
+
+
+def test_rejects_path_outside_mountpoint(client_conn: Connection[TupleRow], tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="not under mountpoint"):
-        resolve_path_to_permalink(
-            str(tmp_path / "elsewhere" / "channels" / "general"),
-            str(tmp_path / "slack"),
-            _client(_StubClient()),
-            _users(),
-            "https://workspace.slack.com",
+        _ = resolve_path_to_permalink("/not/under/mount", str(tmp_path), client_conn, _WORKSPACE)
+
+
+def test_rejects_unknown_root(client_conn: Connection[TupleRow], tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="expected one of"):
+        _ = resolve_path_to_permalink(f"{tmp_path}/nonsense/foo", str(tmp_path), client_conn, _WORKSPACE)
+
+
+def test_rejects_bare_date_directory(client_conn: Connection[TupleRow], tmp_path: Path) -> None:
+    _seed_channel(client_conn)
+
+    with pytest.raises(ValueError, match="parsed date directory"):
+        _ = resolve_path_to_permalink(
+            f"{tmp_path}/channels/general/2026-07/31",
+            str(tmp_path),
+            client_conn,
+            _WORKSPACE,
+        )
+
+
+def test_rejects_invalid_date_components(client_conn: Connection[TupleRow], tmp_path: Path) -> None:
+    _seed_channel(client_conn)
+
+    with pytest.raises(ValueError, match="expected valid"):
+        _ = resolve_path_to_permalink(
+            f"{tmp_path}/channels/general/13-99/xx/channel.md",
+            str(tmp_path),
+            client_conn,
+            _WORKSPACE,
         )

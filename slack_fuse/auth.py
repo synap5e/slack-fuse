@@ -53,6 +53,25 @@ def load_mountpoint() -> str | None:
     return os.path.expanduser(raw)
 
 
+def load_workspace_url() -> str | None:
+    """Return the workspace archive URL (e.g. ``https://foo.slack.com``), or None.
+
+    Same precedence as :func:`load_tokens` (env → .env → config.json) but does
+    NOT require the Slack tokens to be present — the v2 mount doesn't hold
+    tokens locally, and some CLIs (``slack-fuse permalink``) only need the
+    workspace URL to synthesize archive links.
+    """
+    raw = os.environ.get("SLACK_WORKSPACE_URL")
+    if not raw:
+        raw = _parse_env_file(_ENV_PATH).get("SLACK_WORKSPACE_URL")
+    if not raw and _CONFIG_PATH.exists():
+        config = json.loads(_CONFIG_PATH.read_text())
+        raw = config.get("workspace_url") or config.get("SLACK_WORKSPACE_URL")
+    if not raw:
+        return None
+    return raw.rstrip("/")
+
+
 def load_tokens() -> SlackTokens:
     """Load Slack tokens from environment variables, falling back to .env or config file."""
     user_token = os.environ.get("SLACK_USER_TOKEN")
