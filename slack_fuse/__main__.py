@@ -308,10 +308,13 @@ def cmd_mount(args: argparse.Namespace) -> None:  # noqa: C901  (process-wiring 
     # Bounded pool for the FUSE read path. Each callback borrows a conn,
     # runs its SQL under PG ``statement_timeout``, returns it. Replaces the
     # single-conn-with-CapacityLimiter(1) bottleneck that could wedge the
-    # whole mount on any one slow callback. Pool size 4 fits comfortably
-    # under the local Postgres connection budget (default max_connections=100
-    # minus the projector pool of 8 + the four fixed conns above).
-    fuse_pool = ProjectorConnectionPool(_open_fuse_pool_conn, max_size=4)
+    # whole mount on any one slow callback. Bumped 2026-08-24 from 4 → 8:
+    # ``rg``'s default parallelism is ~num_cpus (16-32), so at 4 slots most
+    # threads spent their guard budget waiting on ``pool.acquire()`` rather
+    # than doing PG work. 8 halves the acquire wait; still comfortable under
+    # the flow-host Postgres budget (max_connections=200 after the 2026-08-24
+    # bump, minus projector pool of 8 + the four fixed conns above).
+    fuse_pool = ProjectorConnectionPool(_open_fuse_pool_conn, max_size=8)
 
     tz = _resolve_local_zoneinfo()
     store_limiter = trio.CapacityLimiter(1)

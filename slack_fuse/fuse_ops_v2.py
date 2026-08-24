@@ -132,7 +132,12 @@ if TYPE_CHECKING:
 #: cold data over WS (currently nothing does — the projector materialises
 #: everything locally), that path will need its own longer budget or a
 #: separate dispatcher.
-DEFAULT_CALLBACK_TIMEOUT_S: Final = 1.0
+#: Reduced 2026-08-24 from 1.0s: post-ledger reads are p50 <2ms and p99
+#: <10ms; 500ms covers the tail with comfortable margin while cutting the
+#: worst-case Ctrl-C on ``rg`` in half (each in-flight callback drains its
+#: guard before ``rg`` can exit — FUSE has no ``interrupt`` op to cancel
+#: in-flight ops).
+DEFAULT_CALLBACK_TIMEOUT_S: Final = 0.5
 
 #: Looser per-callback budget for ``_control/*`` paths. Operator triggers +
 #: liveness reads have expensive backing queries (e.g. ``/gap-candidates``
