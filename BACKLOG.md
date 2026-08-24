@@ -81,23 +81,6 @@ Investigation approach: 100 sequential /health timings correlated with `projecto
 
 Surfaced by sol during PR 2 review; pre-existing (not introduced by any recent architecture PR).
 
-## README rewrite around v2
-
-**Effort**: 4-6h. **Autonomous**: Yes after Simon confirms he wants v1 removed entirely rather than dual-documented.
-
-**Verified 2026-08-17**: every v1 marker is still present in `README.md`:
-
-- `SLACK_USER_TOKEN` listed as required (line 43)
-- `SLACK_APP_TOKEN` (line 44)
-- `SLACK_FUSE_BACKFILL` (line 47, plus §"Background backfill" 124-131)
-- `feed.md` (lines 93, 96)
-- `.cached-only/` (line 106, §"Offline mode" 116-122)
-- Socket Mode described v1-style (line 141)
-- TTL caching table (lines 163-170)
-- SIGUSR1 (lines 175-177)
-
-The "Filesystem layout", "Caching", "Live updates" sections all need rewriting around v2 (server URL + shared secret + local PG + `_control/` surface + workspace channels view + projection ledger). Half of DESIGN-2 (config drift) shipped in `9956f3f`; this is the README half.
-
 ## Trailer FP NULL-at-mount
 
 **Effort**: 30 min for option 1 (populate `last_frame_at` at mount start as implicit heartbeat). **Autonomous**: Yes.
@@ -159,6 +142,14 @@ _None currently._
 ---
 
 # Resolved
+
+## 2026-08-24
+
+### Docs rewrite — CLAUDE.md module map + README + watchdog README all rebuilt for v2
+
+Completes DESIGN-2 (README half). Old CLAUDE.md module map still referenced ~12 v1 modules (`store.py`, `api.py`, `disk_cache.py`, `renderer.py`, `fuse_ops.py`, `backfill.py`, `archive.py`, `socket_mode.py`, `canvas.py`, `transcript.py`, `events.py`, `_slug_helpers.py`) that were deleted in `3c7ef8b` on 2026-08-18. Old README described v1 flows: `SLACK_USER_TOKEN` client-side, `SLACK_FUSE_BACKFILL`, `feed.md`, `.cached-only/`, SIGUSR1 force-refresh, TTL caching table, Socket Mode as client-side. Watchdog README referenced the pre-rename `slack-fuse-split.service` + `/views/slack-split`.
+
+New CLAUDE.md documents the actual v2 module map (grouped by CLI, FUSE surface, projector, control+health, migrations), the wire protocol, `_control/` surface, health taxonomy, and things-not-to-do. New README describes the two-process split-mount architecture (server holds tokens + ingests; client mount subscribes over WS + serves), configuration via `SLACK_FUSE_*` env or `~/.config/slack-fuse/config.toml`, and the disk-projection escape hatch for grep-heavy work. Watchdog README updated to current unit + mount paths.
 
 ## 2026-08-18
 

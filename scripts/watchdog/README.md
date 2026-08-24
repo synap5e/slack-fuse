@@ -11,9 +11,9 @@ recovery shape is:
 1. Detect the daemon in D-state for longer than a threshold (read via
    `/proc/<pid>/stat`; never touch the FUSE path or the watchdog
    itself D-states).
-2. `fusermount3 -uz /views/slack-split` — detaches the mount without
+2. `fusermount3 -uz /views/slack` — detaches the mount without
    waiting for in-flight ops.
-3. `systemctl --user restart slack-fuse-split.service`. systemd starts a
+3. `systemctl --user restart slack-fuse.service`. systemd starts a
    fresh instance with a new PID. The old wedged daemon stays D-state
    as an orphan in the same control group (systemd logs "Found
    left-over process … Ignoring") but takes no FUSE traffic and is
@@ -50,8 +50,8 @@ should show the next firing within 30s.
 
 Env vars on the service (override in `~/.config/systemd/user/slack-fuse-watchdog.service.d/override.conf`):
 
-- `SLACK_FUSE_UNIT` — unit to monitor (default `slack-fuse-split.service`)
-- `SLACK_FUSE_MOUNT` — path to lazy-unmount on wedge (default `/views/slack-split`)
+- `SLACK_FUSE_UNIT` — unit to monitor (default `slack-fuse.service`)
+- `SLACK_FUSE_MOUNT` — path to lazy-unmount on wedge (default `/views/slack`)
 - `WEDGE_THRESHOLD_S` — consecutive D-state seconds before action (default `90`)
 
 ## How to tell the watchdog acted
@@ -66,7 +66,7 @@ A successful recovery looks like:
 [watchdog] PID 1234567 just entered D-state; tracker armed at 1718900000
 [watchdog] PID 1234567 in D-state for 30s (threshold 90s); continuing to wait
 [watchdog] PID 1234567 in D-state for 60s (threshold 90s); continuing to wait
-[watchdog] PID 1234567 in D-state for 90s — exceeding 90s. Force-unmounting /views/slack-split
+[watchdog] PID 1234567 in D-state for 90s — exceeding 90s. Force-unmounting /views/slack
 [watchdog]   fusermount3: (no output on success)
 [watchdog] fusermount3 -uz succeeded — daemon will exit on next write() and systemd will respawn
 ```
@@ -77,4 +77,4 @@ The host-level kernel/FUSE condition that triggers the wedge in the
 first place. Root cause is unidentified (see BACKLOG entry). This is a
 detect-and-recover band-aid, not a cure. Multiple unrelated FUSE
 filesystems on this host wedge with the same pattern; this watchdog
-only recovers slack-fuse-split.
+only recovers slack-fuse.

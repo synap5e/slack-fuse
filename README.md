@@ -1,27 +1,36 @@
 # slack-fuse
 
-Read-only FUSE filesystem that exposes a Slack workspace as browsable, grep-able markdown — channels, DMs, group DMs, threads, huddle notes, and huddle transcripts, all addressable as files under one mount point.
+Read-only FUSE filesystem exposing a Slack workspace as browsable, grep-able markdown — channels, DMs, group DMs, threads — all addressable as files under one mount point.
 
 ```
 ~/views/slack/channels/general/2026-04/09/standup-update/thread.md
-~/views/slack/huddles/2026-04/09/design-review/notes.md
 ~/views/slack/dms/alice/2026-03/15/channel.md
 ```
 
 Built for using Slack data with shell tools (`rg`, `bat`, `fd`) and as a stable filesystem surface for AI agents that prefer files over APIs.
 
+## Architecture
+
+slack-fuse runs as two processes with a wire protocol between them:
+
+- **Server** (`slack-fuse-server`, typically in a container) holds the Slack tokens, ingests events from Slack (Socket Mode + Events API webhooks), runs backfill, and persists the event log to PostgreSQL. Exposes a WebSocket for clients + HTTP snapshot redirects.
+- **Client mount** (`slack-fuse mount`) subscribes over the WebSocket, applies events into a local PostgreSQL, and materialises rendered markdown to a disk projection that FUSE serves. Client holds only a shared secret to talk to its server; no Slack tokens on the mount host.
+
+Splitting means multiple mount hosts can share one authoritative server and one Slack token, and the mount survives PG bounces, Slack outages, and server redeploys without kernel-space wedges.
+
 ## Why
 
-Slack's UI is fine for live use but bad for retrospection: search is mediocre, threads are hard to navigate, and there's no way to grep across everything you can read. slack-fuse mirrors what your user token can see into a file tree, caches it on disk, and gives you the full power of Unix tools over your workspace history.
+Slack's UI is fine for live use but bad for retrospection: search is mediocre, threads are hard to navigate, and there's no way to grep across everything you can read. slack-fuse mirrors what your user token can see into a file tree, materialises it to a local disk projection, and gives you the full power of Unix tools over your workspace history.
 
 ## Requirements
 
 - Linux with `fusermount3` (libfuse3)
 - Python 3.12+
 - [`uv`](https://github.com/astral-sh/uv) for dependency management
-- A Slack user token (`xoxc-…` or `xoxp-…`) — the mount sees what you see
+- PostgreSQL on the mount host (local projection store; ~150-500MB for a typical workspace)
+- A running `slack-fuse-server` reachable over the network (see below)
 
-## Install
+## Install (client mount)
 
 ```bash
 git clone https://github.com/synap5e/slack-fuse.git
@@ -31,38 +40,39 @@ uv sync
 
 ## Configuration
 
-Copy `.env.example` to `.env` and fill in your token:
+Client config lives in `~/.config/slack-fuse/config.toml` and/or `SLACK_FUSE_*` env vars (env wins; TOML falls through).
 
-```bash
-cp .env.example .env
-$EDITOR .env
+```toml
+# ~/.config/slack-fuse/config.toml
+server_url = "wss://slack-fuse.example.com/ws"
+shared_secret = "..."
+database_url = "postgresql:///slack_fuse?host=/run/user/1000/local-postgres&port=5433"
+mountpoint = "/views/slack"
+disk_projection_enabled = true
 ```
 
-| Variable | Required | Default | Purpose |
-|---|---|---|---|
-| `SLACK_USER_TOKEN` | yes | — | User token (`xoxc-`/`xoxp-`). Mount reads what you can read. |
-| `SLACK_APP_TOKEN` | no | — | App-level token (`xapp-…`, scope `connections:write`). Enables push liveness via Socket Mode — see "Live updates" below. Absent → mount runs polling-only. |
-| `SLACK_WORKSPACE_URL` | no | — | Workspace base URL (e.g. `https://comfy-org.slack.com`). Required only for channel-root permalinks via `slack-fuse permalink`. |
-| `SLACK_BOT_TOKEN` | no | — | Bot token (`xoxb-…`). Slack requires an app to have a bot user for Socket Mode, but every event slack-fuse subscribes to is user-scope, so the bot token's scopes don't matter. Any scope is fine. |
-| `SLACK_FUSE_BACKFILL` | no | `false` | Enable the background history backfill task. Accepts `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`. |
-| `SLACK_FUSE_MOUNTPOINT` | no | `~/views/slack` | Override the default mountpoint used by `slack-fuse mount`, `resolve`, `permalink`. Useful when the FUSE mount lives somewhere other than the user's home (e.g. a top-level `/views/slack`). |
+| Setting | Env var | Required | Default | Purpose |
+|---|---|---|---|---|
+| `server_url` | `SLACK_FUSE_SERVER_URL` | yes | — | WebSocket URL of the server (`ws://` or `wss://`). |
+| `shared_secret` | `SLACK_FUSE_SHARED_SECRET` | yes | — | Must match the server's. |
+| `database_url` | `SLACK_FUSE_DATABASE_URL` | yes | `postgresql:///slack_fuse` | Local PG for projections. |
+| `mountpoint` | `SLACK_FUSE_MOUNTPOINT` | no | `~/views/slack` | Absolute path. |
+| `disk_projection_enabled` | `SLACK_FUSE_DISK_PROJECTION_ENABLED` | no | `false` | Serve clean paths from disk (fast) vs JIT (slower). Enable in production. |
 
-`SLACK_USER_TOKEN` may also be supplied via `~/.config/slack-fuse/config.json` if you'd rather keep it out of `.env`.
-
-`.env` is gitignored. Don't commit it.
+`SLACK_WORKSPACE_URL` may additionally be set (env or `.env`) if you want `slack-fuse permalink` to synthesize archive URLs without a server round-trip.
 
 ## Run
 
 ### One-shot CLI
 
 ```bash
-uv run slack-fuse mount              # mounts at ~/views/slack
-uv run slack-fuse mount /tmp/slack   # custom mountpoint
-uv run slack-fuse mount --debug      # verbose logging + FUSE debug
+uv run slack-fuse mount              # mounts at the configured mountpoint
+uv run slack-fuse mount /tmp/slack   # override mountpoint
+uv run slack-fuse mount --debug      # verbose + FUSE debug
 uv run slack-fuse unmount            # fusermount3 -u
 ```
 
-The mount command auto-runs `fusermount3 -uz` against the mountpoint first, so a stale mount left over from a crash gets cleaned up before re-mounting.
+The mount command auto-runs `fusermount3 -uz` first, so a stale mount from a crash gets cleaned up before re-mounting.
 
 ### Systemd user service
 
@@ -74,7 +84,7 @@ systemctl --user daemon-reload
 systemctl --user enable --now slack-fuse
 ```
 
-Edit the `WorkingDirectory`, `EnvironmentFile`, and `ExecStart` paths in the service file to match where you cloned the repo. The defaults assume `~/agentic/slack-fuse`. The service restarts on failure with a 10s delay and unmounts cleanly on stop.
+Edit `ExecStart` and the `EnvironmentFile` path to match your checkout. Restarts on failure with a 10s delay; unmounts cleanly on stop.
 
 ```bash
 systemctl --user status slack-fuse
@@ -86,112 +96,80 @@ journalctl --user -u slack-fuse -n 30 --no-pager
 
 ```
 ~/views/slack/
-├── channels/<slug>/                # Channels you've joined
+├── channels/<slug>/                # Channels you're in
 │   ├── channel.md                  # Topic, purpose, member count
 │   └── <YYYY-MM>/<DD>/
-│       ├── channel.md              # Day's messages (snapshot)
-│       ├── feed.md                 # Day's messages (append-only timeline)
+│       ├── channel.md              # Day's messages
 │       └── <thread-slug>/
-│           ├── thread.md           # Thread snapshot
-│           ├── feed.md             # Thread feed
-│           └── huddles/<slug>/
-│               ├── notes.md        # AI huddle notes (canvas)
-│               ├── transcript.md   # Speaker-attributed transcript
-│               └── index           # symlink → /huddles/<YYYY-MM>/<DD>/<slug>
+│           └── thread.md           # Thread snapshot
 ├── dms/<username>/                 # Direct messages
 ├── group-dms/<participants>/       # Group DMs
-├── other-channels/<name>/          # Public channels you haven't joined
-├── huddles/<YYYY-MM>/<DD>/<slug>/  # Top-level index of all huddles
-├── _workspace/channels.md           # Channel sizes, ingest status, and metadata
-└── .cached-only/                   # Mirror of the whole tree, no API fetches
+├── other-channels/<slug>/          # Public channels you haven't joined
+├── _workspace/channels.md          # Inventory: sizes, ingest status, membership
+├── _control/                       # Plan-9-style operator surface (writable)
+│   ├── refresh_channels
+│   ├── refresh_channel
+│   ├── blocked_channels
+│   ├── backfill_channel
+│   ├── refill_gap
+│   ├── probe_sweep{,_job,_target}
+│   ├── rerender_channel
+│   ├── gaps                        # (read-only)
+│   ├── probes                      # (read-only)
+│   └── status                      # (read-only) — latest outcomes per action
+└── NO_POSTGRES                     # (appears only when local PG is unreachable)
 ```
 
 Channel directory names are slugified. Thread slugs come from the first message (with user mentions resolved into names) so a plain `ls` is often enough to find what you want.
 
-`uv run slack-fuse resolve <slack-url>` returns the FUSE path for a Slack message permalink.
-`uv run slack-fuse permalink <fuse-path>` returns the Slack permalink URL for a FUSE path. Pass `--ts <message_ts>` to permalink a specific message in a day or thread file.
+### Related CLIs
 
-`_workspace/channels.md` is backed by a six-hour server-side `search.messages` sweep and a background-warmed client cache, so reading it never waits on Slack. Run `uv run slack-fuse-server refresh-channel-totals` for an ad-hoc refresh.
+- `uv run slack-fuse resolve <slack-url>` → FUSE path for a Slack message permalink (fully local, no Slack API).
+- `uv run slack-fuse permalink <fuse-path>` → Slack permalink URL (requires `SLACK_WORKSPACE_URL`). Pass `--ts <message_ts>` to permalink a specific message in a day file.
+- `uv run slack-fuse-server refresh-channel-totals` (server-side) — one-shot totals sweep.
 
-## `.cached-only/` — offline mode
+## Freshness model
 
-`~/views/slack/.cached-only/` mirrors the entire tree but suppresses every Slack API call: listings and reads only return content already on disk. Useful for grepping the cache without triggering fetches, or for working when Slack is rate-limiting you. Empty listings just mean "not cached yet", not "doesn't exist".
+Every rendered file has a durable identity in a per-mount PostgreSQL **projection ledger** (`projection_targets`). Each row carries `target_generation`, `rendered_generation`, and `renderer_version`. Reads admit disk only when both the specific target row and the singleton layout row are clean at the current renderer version, else JIT-render from PG.
 
-```bash
-rg keyword ~/views/slack/.cached-only/channels/
-```
+Live events land as facts on the wire, apply into local PG and bump ledger targets in the same transaction; the coalescer atomically replaces the backing file and CAS-marks the target clean. Kernel-cache invalidation happens **before** the CAS so a mid-read that starts on old bytes can never observe them as clean afterward.
 
-## Background backfill
+Staleness is surfaced as an appended trailer inside file bytes (never as an out-of-band silent stale), classified from `slurper-health` (server-side), the WS connection state (client-side), and per-stream catch-up progress. Historical days are effectively immutable; today's channel/thread files rewrite on every affecting event.
 
-Disabled by default. Set `SLACK_FUSE_BACKFILL=true` to enable a background task that slowly walks every member channel and pulls its full history into the disk cache. Per channel, two phases:
+## Control surface
 
-1. **Day backfill** — paginate `conversations.history`, write each day's messages to `~/.cache/slack-fuse/messages/<channel_id>/<YYYY-MM-DD>.json`. Long random sleeps (30-180s) between pages and channels. Marker: `~/.cache/slack-fuse/backfill/<channel_id>.done`.
-2. **Thread backfill** — walk those cached day files, find every message with `reply_count > 0`, and fetch the replies via `conversations.replies`. Shorter sleeps (2-8s) since the calls are cheap. Skips threads already on disk so an interrupted run resumes cleanly. Marker: `~/.cache/slack-fuse/backfill/<channel_id>.threads.done`.
-
-After both phases run for a channel, `rg`-ing its `feed.md` and `thread.md` files becomes a pure disk walk.
-
-Other behavior:
-
-- Skips channels whose name contains `notification`, `alert`, or `prod-alerts`.
-- Rate-limit responses trigger a wait + jitter and the page is retried.
-- Re-day-backfill a channel by deleting its `.done` marker; re-thread-backfill by deleting its `.threads.done` marker.
-
-## Live updates (Socket Mode, optional)
-
-If `SLACK_APP_TOKEN` is set, slack-fuse opens a Slack Socket Mode websocket and merges push events into the in-memory caches on the fly — new messages, edits, deletes, threaded replies, and channel-list changes reflect in `cat` output within ~2 seconds of the post, no polling wait. Polling TTLs stay in place as the correctness floor.
-
-One-time app config (in the Slack app admin UI at `https://api.slack.com/apps`):
-
-1. **Socket Mode → Enable Socket Mode**.
-2. **Event Subscriptions → Enable Events**, then under **Subscribe to events on behalf of users** add:
-   - `message.channels`, `message.groups`, `message.im`, `message.mpim`
-   - `channel_created`, `channel_rename`, `channel_archive`, `channel_unarchive`
-   - `member_joined_channel`, `member_left_channel`
-   - `group_archive`, `group_unarchive`, `group_rename`, `group_deleted`
-   - `im_created`
-3. Generate an app-level token with `connections:write` and put it in `.env` as `SLACK_APP_TOKEN`.
-4. Required user-token scopes (`channels:history` / `groups:history` / `im:history` / `mpim:history` plus the matching `*:read` for structural events) are already standard `xoxp-…` scopes — if your user token can list channels and read history, you're done.
-
-**Coverage.** Public channels you've joined, private channels, DMs, group DMs. `other-channels/` (public channels you're *not* in) stays on TTL polling — Slack doesn't deliver events for channels the user isn't a member of.
-
-**Without the token.** If `SLACK_APP_TOKEN` is unset, the socket task doesn't start and the mount behaves exactly like a polling-only build: today's messages refresh every 5 minutes, channel list every 30.
-
-## Caching
-
-Disk cache lives at `~/.cache/slack-fuse/` and survives restarts. Channel list, huddle index, day messages, threads, known dates per channel, and backfill markers all persist there.
-
-In-memory TTLs (these are the polling floor; push events via Socket Mode beat them when configured):
-
-| Data | TTL |
-|---|---|
-| Channel list | 30 min |
-| Huddle index | 30 min |
-| Today's messages (system local date) | 5 min |
-| Active threads | 1 min → 10 min → proportional, based on last-reply age |
-| Any earlier local date | indefinite |
-
-Force refresh:
+Writes to `_control/*` fire an action on `release` (fh close). Bounded budget per action (default 15s). Verbs are stable — read them back via `_control/status`.
 
 ```bash
-systemctl --user kill -s USR1 slack-fuse   # service mode
-kill -USR1 $(pgrep -f 'slack-fuse mount')  # CLI mode
+# refresh workspace totals now
+echo now > /views/slack/_control/refresh_channels
+
+# block a channel
+echo '#sensitive-channel reason: leaking' > /views/slack/_control/blocked_channels
+
+# re-render one channel's rendered files with the current renderer code
+echo general > /views/slack/_control/rerender_channel
+
+# read the latest outcomes
+cat /views/slack/_control/status
 ```
 
 ## Searching
 
 ```bash
-rg keyword ~/views/slack/channels/        # all channels
-rg keyword ~/views/slack/huddles/         # all huddles (notes + transcripts)
-rg keyword ~/views/slack/.cached-only/    # offline grep, no API calls
+rg keyword /views/slack/channels/                    # everything, via FUSE
+rg keyword ~/.cache/slack-fuse/projection/channels/  # direct disk (much faster)
 ```
+
+`rg` via the FUSE mount pays a per-file syscall cost — ~15-25 files/sec typical. `rg` directly against the disk projection cache at `~/.cache/slack-fuse/projection/` is ~62,000 files/sec (the same rendered bytes, just skipping the FUSE layer). Prefer the cache path for wide grep sweeps.
 
 ## Limitations
 
-- Read-only. You can't post, react, or edit through the mount.
-- Reflects what the user token can see — private channels you're not in won't appear.
-- Initial fetches of large channels can be slow if not yet backfilled.
+- Read-only via the mount (except `_control/`). You can't post, react, or edit through the filesystem.
+- Reflects what the server's Slack token can see — private channels the token isn't in won't appear.
 - Linux only (depends on libfuse3).
 - Not all Slack message subtypes are rendered specially; exotic blocks may degrade to plain text.
+- New client on old server (or vice versa) mostly works via wire capability negotiation, but you'll want both current for the full feature set (unsubscribe frame, subscription-state tracking).
 
 ## Development
 
@@ -199,10 +177,10 @@ rg keyword ~/views/slack/.cached-only/    # offline grep, no API calls
 uv run ruff check .
 uv run ruff format .
 uv run basedpyright            # strict type checking
-uv run pytest
+uv run pytest                  # ~1100 tests; PG-backed, auto-provisioned temp cluster
 ```
 
-The project uses strict basedpyright, ruff (preview, with `E,F,W,I,UP,B,SIM,RUF` enabled), frozen dataclasses for domain models, and trio for async I/O. See `CLAUDE.md` for a module map.
+Strict basedpyright, ruff preview, frozen Pydantic at I/O boundaries, trio async everywhere (never asyncio). See `CLAUDE.md` for a module map, health taxonomy, and things-not-to-do.
 
 ## License
 
