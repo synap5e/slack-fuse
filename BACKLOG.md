@@ -112,6 +112,29 @@ Post-deploy evidence: no journal repro since 2026-08-16 restart, but the histori
 
 **Verified 2026-08-17**: `slack_fuse/projector/disk_projection.py:717-722` is literally `tmp.write_bytes(data); os.replace(tmp, path)` with no fsync of file or parent dir. Process-crash safe, host-crash unsafe. Sol flagged during PR 3 review; explicitly OK'd as out-of-scope for PR 3's process-crash-only durability contract, but worth hardening.
 
+## FUSE `interrupt()` blocked on pyfuse3 upgrade
+
+**Effort**: unknown until pyfuse3 upstream investigation. **Autonomous**: No — cross-project.
+
+**Verified 2026-08-23**: pyfuse3 3.4.2 (installed/locked) has no `Operations.interrupt` hook. `RequestContext` exposes only pid/uid/gid/umask (no request unique id). Its Cython bindings do not wire libfuse's `fuse_req_interrupt_func` / `fuse_req_interrupted`. Handler wrappers catch only `FUSEError` for reply cleanup — externally cancelling a trio coroutine would bypass the reply path.
+
+Consequence: FUSE `interrupt()` is not implementable at this pyfuse3 version. Investigated during the 2026-08-23 "Ctrl-C on `rg` in slack takes too long" work; deferred as fallback per the handoff brief (no hack). Ctrl-C UX partly mitigated by `8a3c2de` (halved callback budget + doubled pool) and `24de34c` (.ignore ghost so rg skips the 15s `_control/*` paths).
+
+Options:
+1. Upstream pyfuse3 PR to expose `Operations.interrupt` + wire `fuse_req_interrupt_func`.
+2. Fork pyfuse3 with the same shape.
+3. Wait for pyfuse3 to add it upstream.
+
+Meaningful ~50% UX gain when it lands (sub-second Ctrl-C instead of ~500ms worst case per in-flight callback), but the current fix set already handles the pathological cases.
+
+## 9 server tests fail under non-UTC host TZ (America/Los_Angeles specifically)
+
+**Effort**: 1-2h. **Autonomous**: Yes.
+
+**Verified 2026-08-23**: on flow (`America/Los_Angeles`), 9 pre-existing server-side gap/day-presence tests shift UTC Slack epochs back one day because their SQL uses `to_timestamp(...)::date` / `date_trunc(...)` without an explicit `AT TIME ZONE 'UTC'`. Full suite green under `TZ=UTC` (1107/1107, 132s), fails 9 tests under `TZ=America/Los_Angeles`.
+
+Bug is in the test SQL (or the code under test's SQL — needs a quick grep to distinguish), not test-only date arithmetic. Since flow is now the daily-driver host and is `America/Los_Angeles`, this breaks `uv run pytest` in the natural developer workflow. Fix: audit the affected SQL sites, add explicit `AT TIME ZONE 'UTC'` where the intent is "the calendar day of a Slack UTC timestamp." Adjacent WTF surfaced by `impl-fuse-int-ignore` codex handoff 2026-08-23.
+
 ## Malformed-frontmatter startup repair
 
 **Effort**: 2-4h. **Autonomous**: Yes.
@@ -144,6 +167,16 @@ _None currently._
 # Resolved
 
 ## 2026-08-24
+
+### `rg` Ctrl-C latency mitigated: budget halved, pool doubled, `.ignore` ghost skips `_control/*`
+
+Root cause of "Ctrl-C on `rg` in `/views/slack/` takes multi-seconds": FUSE has no `interrupt()` implemented, so each in-flight callback drains its `_callback_guard` budget before the syscall returns and `rg` can exit. `rg`'s default parallelism (~num_cpus) plus reads landing in `_control/blocked_channels` (15s sync-HTTP-GET budget) produced worst cases up to 15s.
+
+Three-part mitigation:
+- `8a3c2de` `perf(ctrl-c): halve default callback budget, double FUSE pool` — `DEFAULT_CALLBACK_TIMEOUT_S` 1.0s → 0.5s (post-ledger p99 is <10ms, budget was over-generous); FUSE conn pool 4 → 8 (halves acquire-wait for `rg`'s 16-32 threads; flow PG has max_connections=200 after 2026-08-24 bump).
+- `24de34c` `feat(fuse-ops): serve .ignore ghost at mount root` — always-present reserved-inode `.ignore` file with contents `_control/\nNO_POSTGRES\n` so `rg`/`fd`/anything respecting `.ignore` skips the operator-only trees. Mirrors the `NO_POSTGRES` ghost pattern (~7 special-case sites: readdir/lookup/getattr/open/read/release/inode-map). Immutable-attr, EROFS on write, always present regardless of PG health.
+
+Change 4 from the plan (implement `interrupt()`) deferred — pyfuse3 3.4.2 has no hook (see agent-raised entry "FUSE `interrupt()` blocked on pyfuse3 upgrade").
 
 ### Docs rewrite — CLAUDE.md module map + README + watchdog README all rebuilt for v2
 
