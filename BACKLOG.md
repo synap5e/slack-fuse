@@ -30,6 +30,27 @@ The proper fix is a maintained per-channel counter. Two candidates:
 
 Recommend #1: freshness matches the applier's own commit cadence, exactly the property the reverted metric loses. #2 would give a stale count between sweeps.
 
+## `slack-fuse-server` memory profile / root-cause the OOM cadence
+
+**Effort**: 4-8h investigation. **Autonomous**: Yes.
+
+**Verified 2026-08-27**: pod OOMKilled 1658 times in 10 days at the 1Gi limit (restart cadence ~every 8min at peak). Bumped 1Gi → 3Gi in emergency mitigation (`k8s-homelab@6e15f32`) after Simon lost inbound WS while trying to `cat` a fresh Slack message. The 1Gi limit was set 2026-07-03 and worked initially; the July→August comment in the deployment.yaml noted OOMs at 24h cadence *even then* but attributed to "no application-side leak visible" and pinned. Since then the cadence tightened dramatically — suggests real growth in the resident set (backfill/probe/rerender work-set, sweep intermediates, or an actual leak).
+
+Root-cause work:
+1. Enable memory stats endpoint or attach a Python memory profiler (`memray`, `pympler`) for a few hours during a normal load window.
+2. Identify the biggest allocators — likely candidates: the `chunk_mentions` cross-stream lookup buffer, `channel_totals` sweep working set, backfill page cache, or a slurper task holding state.
+3. If it's a real leak (unbounded growth) — fix. If it's a genuine working-set requirement — document + pick a limit that gives 24h+ soak margin.
+
+Emergency mitigation buys us time; the 1658 restarts / 10d cadence needs a proper answer. Also: the tight cadence meant Slack's Events API webhook retries had few good windows to land, so real messages likely dropped through the outage. Consider a scheduled `conversations.history` catchup that re-runs against a rolling window to backfill gaps.
+
+## Tailscale ingress "Port Unreachable" is not silence
+
+**Effort**: 15 min doc. **Autonomous**: Yes.
+
+**Verified 2026-08-27**: during the OOM incident, `ping 100.85.173.107` returned `From ... Destination Port Unreachable` — atypical for ping (echo/reply). This isn't network-level silence; it means the Tailscale operator proxy at that IP is answering ICMP itself with a Port Unreachable error because the backing k8s service has no ready pod to forward to. Ping-level 100% packet loss without the ICMP error would look identical to a shorter observer window, but the ICMP error is diagnostic — proxy alive, backend dead.
+
+Add to CLAUDE.md health notes or `~/docs/slack-fuse.md`: "when `svc-slack-fuse` returns ICMP Port Unreachable, the Tailscale layer is fine — check the k8s pod / service, not the tailnet."
+
 ## Primitives library extraction (slack-fuse-owned)
 
 **Effort**: **L** (1-2 months). **Autonomous**: No — needs Simon's decisions per session task #18 (repo location, versioning cadence, notion-fuse migration coord, handoff-to-platform criteria).
