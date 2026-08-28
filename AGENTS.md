@@ -51,7 +51,7 @@ docs/                  RFCs, plans, probe queries, HISTORY.md (mostly gitignored
 | client trailer `staleness_reason` | WS state + `last_frame_at` + per-stream `stream_caught_up` |
 | `cursors.applied_offset` | per-stream apply progress |
 | `PgHealth` / `NO_POSTGRES` | local projector PG reachability only |
-| `reconnect_recorded` | per-connection wedge/recovery. One PG bounce fans out to up to 7 events, one per durable conn wrapper. |
+| `reconnect_recorded` | per-connection wedge/recovery, named per conn. Seven names exist (`inode`, `projector_state`, `projector_sink`, `disk_projection`, `rerender_apply`, `rerender_sink`, `block_sync`) but only four are open at steady state — the rerender pair is opened per rerender and `block_sync`'s per cycle. A routine PG bounce fans out to 4, not 7. |
 
 When someone asks "is it healthy?", name the observable. "systemd active" has meant "silently projecting nothing for 3.7 days" here.
 

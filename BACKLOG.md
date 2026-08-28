@@ -206,6 +206,12 @@ Meaningful ~50% UX gain when it lands (sub-second Ctrl-C instead of ~500ms worst
 
 Bug is in the test SQL (or the code under test's SQL — needs a quick grep to distinguish), not test-only date arithmetic. Since flow is now the daily-driver host and is `America/Los_Angeles`, this breaks `uv run pytest` in the natural developer workflow. Fix: audit the affected SQL sites, add explicit `AT TIME ZONE 'UTC'` where the intent is "the calendar day of a Slack UTC timestamp." Adjacent WTF surfaced by `impl-fuse-int-ignore` codex handoff 2026-08-23.
 
+**Distinguished 2026-08-28 — it is the code under test, not the tests.** The two sites are `slack_fuse_server/gaps.py:64` and `:87`, both `date_trunc('day', to_timestamp(ts::numeric))`, plus `queries/gap_detection.sql:31` `to_timestamp(s.day_start_num)::date`. `to_timestamp()` returns `timestamptz`, so both `date_trunc` and `::date` bucket in the **PostgreSQL session** `TimeZone`. Under `America/Los_Angeles` every Slack message in the 00:00-07:00 UTC band falls back a calendar day, which moves the computed present-day set and therefore the gap boundaries. Observed shape on flow: `find_gaps_for_channel` returned `GapRange(2026-06-02, 2026-06-02)` where the true range is `GapRange(2026-06-02, 2026-06-03)` — gaps are reported **narrower than they are**. 8 of the 9 failures are in `tests/server/test_gaps.py`; re-measured 2026-08-28, `tests/server/` is 8 failed / 52 passed under PDT.
+
+Production is probably unaffected today only because the server container has no `/etc/localtime` and its PG session is UTC. The exposure is the documented operator path: the 51 gap refills in 2026-07 were run **locally against port-forwarded PG**, and a local session in PDT would have produced short windows. Since a refill window is chosen by a human reading these dates and then passing `<oldest_ts> <latest_ts>` to `_control/refill_gap`, an off-by-one date label becomes an off-by-one refill.
+
+This compounds with the catchup `MAX(ts)` entry above: catchup cannot heal an interior hole, so gap detection plus manual refill is the only path that can — and it under-reports the window it needs to repair. Fix both or neither.
+
 ## Malformed-frontmatter startup repair
 
 **Effort**: 2-4h. **Autonomous**: Yes.
