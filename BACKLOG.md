@@ -86,6 +86,56 @@ Cheapest first check: capture 100 sequential `/health` timings from the pod + co
 
 # Agent-raised (needs human review)
 
+_The four entries below were surfaced on 2026-08-28 by mining the full build session transcript (`docs/HISTORY.md`) for threads that were raised and never closed. Each was then re-checked against the current tree; the evidence label on each says what is code-confirmed and what is still transcript-sourced._
+
+## Catchup resumes from `MAX(ts)`, so a gap with any newer message is skipped forever
+
+**Effort**: 1-2 eng-days. **Autonomous**: Yes after a decision on window size.
+
+**Verified 2026-08-28 (code)**: `slurper/catchup.py::resolve_since_ts` resumes from `MAX(ts)` over the channel's message events (`:29-31`, batched at `:152-161`, `channel_ingest_head.latest_ts` at `:179`), and calls `conversations.history` with `oldest=<that>` and **no upper bound reaching backwards**. The module docstring asserts this "captures the whole gap no matter how long ago we last saw activity" — that holds only while no *newer* message has landed. If the live path delivers even one message after the outage before catchup resolves its anchor, `MAX(ts)` has already advanced past the outage window and the interior is never queried again by any automatic path. Both triggers are exposed: startup catchup races the socket coming up, and the in-process reconnect trigger fires *after* the connection re-establishes.
+
+Empirical confirmation is in the 2026-08-27 OOM outage: with ingestion apparently continuous afterwards, a real message in `simon-yells-at-bots/2026-08/27` was absent and only appeared after a manual channel-targeted backfill. Non-message metadata events had advanced the channel cursor without creating a day chunk, which masked the hole from cursor-based checks.
+
+Raised at transcript turns [3513], [3541], [3681]-[3683]; a rolling-window catchup was proposed at [6439] and never built.
+
+Proposed fix: a scheduled `conversations.history` sweep over a rolling window (e.g. last N days, re-run daily) that is *not* anchored on `MAX(ts)`, so interior holes are re-covered regardless of newer activity. Dedup on `(stream, ts)` already makes re-runs no-ops, so the cost is API budget, not correctness risk. Decision needed: window length and sweep cadence vs Tier-2 budget — note the pacer starvation history before choosing.
+
+This is the data-loss-class item of the four.
+
+## `parent_replied` may never be produced in production
+
+**Effort**: 30 min to confirm, then unknown. **Autonomous**: Yes for the confirmation.
+
+**Verified 2026-08-28 (code only — the production claim is transcript-sourced and unconfirmed)**: the implementation exists and is well covered. `slurper/socket.py::translate_message_event` handles the `message_replied` subtype and emits `parent_replied` (tests at `tests/slurper/test_socket.py:78,113,254`), with `events_parent_replied_dedup` and `events_parent_replied_target_idx` in `schema.sql:85,112` and the kind folded by `active_messages`.
+
+The transcript reports **zero observed `parent_replied` rows** and suspects a user-token Socket Mode limitation on that subtype ([3661]-[3662]), noting "bot-token or Events API work may be needed". Nobody checked again after the Events API cutover, which is exactly the change that could have fixed it.
+
+If the count is genuinely zero, parent `reply_count` / `latest_reply` are stale wherever no other event refreshed them, which shows up as wrong reply counts on thread parents in old threads.
+
+First step is one query against cluster PG: `SELECT count(*), max(ts) FROM events WHERE kind = 'parent_replied'`. If rows exist post-cutover, close this. If not, decide between accepting it (thread parents refresh via other paths) or a periodic parent refresh.
+
+## Operator SQL still folds `channel_added` instead of using the `channels` view
+
+**Effort**: 30-60 min. **Autonomous**: Yes.
+
+**Verified 2026-08-28 (code)**: `scripts/k8s/channel-volume.sh:88` and `:169` both resolve channel names with `AND kind IN ('channel_added','channel_renamed')` against raw event payloads. Migration `0004_channels_view.sql` — later replaced by `0013_channels_view_fold_drift.sql`, which folds column-wise across metadata *and* drift kinds — exists precisely so nothing has to do this by hand. The hand-rolled fold predates the view and misses every kind 0013 added.
+
+Raised at [1869]-[1873]; the server-side VIEW landed at [2069]-[2100] and the operator tooling was never revisited.
+
+Consequence is wrong or missing channel names in operator reports, not data loss. Fix is a rewrite of the two queries against `channels`.
+
+## Channels the token lost access to are dropped, not degraded
+
+**Effort**: 2-4h. **Autonomous**: Yes after a decision on the rendered shape.
+
+**Verified 2026-08-28 (code)**: `ChannelNotFoundError` is now handled everywhere it used to crash — `probes.py:462` evicts the target from the sweep, `slurper/__main__.py:1239` skips backfill cleanly. So the crash-loop half of this is resolved.
+
+What was never built is the other half: when `conversations.info` returns `channel_not_found` for a channel we already hold cached history for, nothing synthesizes minimal metadata from that cache, so the channel simply stops existing in the tree — including its historical messages, which are still in the event log and still readable. Proposed at [1840]-[1856] ("synthesize minimal metadata from cache"), filed, never implemented.
+
+The transcript cites four such channels; that count is from 2026-06 and unverified against the current workspace — confirm with a sweep before sizing.
+
+Decision needed: do these render as normal-but-frozen channels, as `hidden` tier, or with an explicit marker in `channel.md` saying the token lost access on date X. The tier machinery already supports the second option without new concepts.
+
 ## `/channel-stats` `/health` 1ms→2s alternation
 
 **Effort**: 30-60 min investigation, then depends on cause. **Autonomous**: Yes for the investigation.
