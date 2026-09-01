@@ -270,6 +270,18 @@ This compounds with the catchup `MAX(ts)` entry above: catchup cannot heal an in
 
 **Verified 2026-08-17**: today's actual fan-out is **7** durable conn wrappers (`inode`, `projector_state`, `projector_sink`, `disk_projection` (added PR 3), `rerender_apply`, `rerender_sink`, `block_sync`) — one PG bounce fans out to up to 7 wedge/recovery event pairs (archived count of 5-6 was slightly stale). `ControlState._record_health` already keeps `_client_wedged`/`_client_recovered` as singleton latest-outcome overwrites — every fan-out event clobbers the last one at the control surface. PR 1 followups added `connection_name` to `reconnect_recorded` so operators can attribute each of the 7 events. Recommendation: **option 1 (document)**. No code change needed. Add operator note: "a PG bounce produces up to 7 `reconnect_recorded` events named per-conn — `inode`, `projector_state`, `projector_sink`, `disk_projection`, `rerender_apply`, `rerender_sink`, `block_sync`. `_control/status` shows only the latest wedge/recovery outcome."
 
+## Pin Python interpreter version so `uv sync` doesn't drift
+
+**Effort**: 15 min. **Autonomous**: Yes.
+
+**Verified 2026-09-01** (medina-nats-shim handoff): child ran `uv sync` in a fresh worktree on flow-crastinator and uv picked **Python 3.14.6** despite `pyproject.toml` targeting 3.12. Tests still passed under 3.14 so nothing broke — but the interpreter is not pinned, so uv resolves the highest matching version on `PATH`, which on flow's NixOS pulls in whatever interpreters the nix python pool exposes. That's a real gap: fresh checkouts on any host with a newer Python installed silently drift off the declared version, which invalidates the `python = ">=3.12"` contract as a lower bound.
+
+Fix: one of
+- Add `[tool.uv] python = "3.12"` to `pyproject.toml`, OR
+- Write `3.12` into `.python-version` at the repo root (uv respects it).
+
+Second is simpler and matches wider Python-ecosystem convention. Test: `uv python find` in a fresh checkout should print a 3.12.x binary before and after any `uv sync`.
+
 ---
 
 # Agent-raised (unconfirmed origin)
