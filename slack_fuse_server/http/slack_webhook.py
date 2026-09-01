@@ -29,6 +29,7 @@ REQUEST_DEADLINE_S = 2.5
 _READ_CHUNK_SIZE = 16_384
 _JSON_CONTENT_TYPE = "application/json"
 _TEXT_CONTENT_TYPE = "text/plain; charset=utf-8"
+_MAX_SLACK_SIGNATURE_AGE_S = 300
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +51,29 @@ def _header(request: HttpRequest, name: bytes) -> bytes | None:
     return None
 
 
+def _valid_v0_signature_format(signature: str) -> bool:
+    if not signature.startswith("v0=") or len(signature) != 67:
+        return False
+    try:
+        bytes.fromhex(signature[3:])
+    except ValueError:
+        return False
+    return True
+
+
+def verify_hmac_v0(body: bytes, timestamp_text: str, signature: str, signing_secret: str) -> bool:
+    """Return True iff Slack's v0 HMAC matches; no freshness check."""
+    if not _valid_v0_signature_format(signature):
+        return False
+    try:
+        timestamp_bytes = timestamp_text.encode("ascii")
+    except UnicodeEncodeError:
+        return False
+    base = b"v0:" + timestamp_bytes + b":" + body
+    computed = "v0=" + hmac.new(signing_secret.encode("utf-8"), base, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(computed, signature)
+
+
 def verify_slack_signature(
     request: HttpRequest,
     signing_secret: str,
@@ -64,12 +88,7 @@ def verify_slack_signature(
         signature = signature_raw.decode("ascii")
     except UnicodeDecodeError:
         return 401
-    if not signature.startswith("v0=") or len(signature) != 67:
-        return 401
-    digest = signature[3:]
-    try:
-        bytes.fromhex(digest)
-    except ValueError:
+    if not _valid_v0_signature_format(signature):
         return 401
 
     timestamp_raw = _header(request, b"x-slack-request-timestamp")
@@ -80,12 +99,10 @@ def verify_slack_signature(
         timestamp = int(timestamp_text)
     except (UnicodeDecodeError, ValueError):
         return 400
-    if abs(now - timestamp) > 300:
+    if abs(now - timestamp) > _MAX_SLACK_SIGNATURE_AGE_S:
         return 400
 
-    base = b"v0:" + timestamp_text.encode("ascii") + b":" + request.body
-    computed = "v0=" + hmac.new(signing_secret.encode("utf-8"), base, hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(computed, signature):
+    if not verify_hmac_v0(request.body, timestamp_text, signature, signing_secret):
         return 401
     return None
 
@@ -254,5 +271,6 @@ __all__ = [
     "serve_slack_webhook",
     "serve_slack_webhook_connection",
     "serve_slack_webhook_on_listeners",
+    "verify_hmac_v0",
     "verify_slack_signature",
 ]

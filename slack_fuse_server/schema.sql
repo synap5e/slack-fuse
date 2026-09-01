@@ -51,6 +51,7 @@ CREATE UNIQUE INDEX events_slack_event_id_dedup
 CREATE TABLE slack_event_inbox (
     event_id         TEXT        PRIMARY KEY,
     envelope         JSONB       NOT NULL,
+    source_transport TEXT        NOT NULL DEFAULT 'http',
     received_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     processed_at     TIMESTAMPTZ,
     attempt_count    INTEGER     NOT NULL DEFAULT 0,

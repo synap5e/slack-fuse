@@ -58,6 +58,7 @@ class _RecordingHealth:
 class _StubDispatcher:
     failures: int = 0
     calls: list[str] = field(default_factory=list)
+    transports: list[str] = field(default_factory=list)
 
     async def dispatch(
         self,
@@ -68,6 +69,7 @@ class _StubDispatcher:
     ) -> None:
         del payload, raw_event, span
         self.calls.append(source_ctx.event_id)
+        self.transports.append(source_ctx.transport)
         if self.failures > 0:
             self.failures -= 1
             raise DispatchTransientError(DispatchErrorCode.PG_TIMEOUT)
@@ -101,6 +103,15 @@ def test_duplicate_enqueue_inserts_one_row(server_conn_factory: ServerConnFactor
     assert row is not None and row[0] == 1
 
 
+def test_enqueue_defaults_source_transport_to_http(server_conn_factory: ServerConnFactory) -> None:
+    conn = server_conn_factory()
+    assert enqueue(conn, "EvTransport", _envelope("EvTransport")) is True
+    with conn.cursor() as cur:
+        cur.execute("SELECT source_transport FROM slack_event_inbox WHERE event_id = 'EvTransport'")
+        row = cur.fetchone()
+    assert row == ("http",)
+
+
 @pytest.mark.trio
 async def test_concurrent_duplicate_enqueue_is_conflict_safe(server_conn_factory: ServerConnFactory) -> None:
     conn = server_conn_factory()
@@ -128,9 +139,7 @@ def test_notify_is_delivered_only_after_insert_commit(server_conn_factory: Serve
         cur.execute("LISTEN slack_event_inbox_new")
     with writer.cursor() as cur:
         cur.execute("BEGIN")
-        cur.execute(
-            "INSERT INTO slack_event_inbox (event_id, envelope) VALUES ('EvNotify', '{}'::jsonb)"
-        )
+        cur.execute("INSERT INTO slack_event_inbox (event_id, envelope) VALUES ('EvNotify', '{}'::jsonb)")
         cur.execute("SELECT pg_notify('slack_event_inbox_new', 'EvNotify')")
     assert next(listener.notifies(timeout=0.05, stop_after=1), None) is None
     with writer.cursor() as cur:
@@ -159,7 +168,25 @@ async def test_consumer_processes_committed_row(server_conn_factory: ServerConnF
         nursery.cancel_scope.cancel()
 
     assert dispatcher.calls == ["EvHappy"]
+    assert dispatcher.transports == ["http"]
     assert _row_state(query, "EvHappy")[3] is None
+
+
+@pytest.mark.trio
+async def test_consumer_stamps_stored_source_transport(server_conn_factory: ServerConnFactory) -> None:
+    writer = server_conn_factory()
+    consumer_conn = server_conn_factory()
+    query = server_conn_factory()
+    enqueue(writer, "EvNats", _envelope("EvNats"), source_transport="nats")
+    dispatcher = _StubDispatcher()
+
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(consume, consumer_conn, dispatcher, cast(HealthEmitter, _RecordingHealth()))
+        await _wait_until(lambda: _row_state(query, "EvNats")[0] is not None)
+        nursery.cancel_scope.cancel()
+
+    assert dispatcher.calls == ["EvNats"]
+    assert dispatcher.transports == ["nats"]
 
 
 @pytest.mark.trio
@@ -218,8 +245,7 @@ async def test_poison_row_backoff_does_not_starve_newer_rows(server_conn_factory
         def later_processed() -> bool:
             with query.cursor() as cur:
                 cur.execute(
-                    "SELECT COUNT(*) FROM slack_event_inbox "
-                    "WHERE event_id <> 'Ev1' AND processed_at IS NOT NULL"
+                    "SELECT COUNT(*) FROM slack_event_inbox WHERE event_id <> 'Ev1' AND processed_at IS NOT NULL"
                 )
                 row = cur.fetchone()
             return row is not None and row[0] == 4
@@ -264,9 +290,7 @@ def test_retention_deletes_old_processed_but_not_dead_letter(server_conn_factory
     enqueue(conn, "EvOld", _envelope("EvOld"))
     enqueue(conn, "EvDeadOld", _envelope("EvDeadOld"))
     with conn.transaction(), conn.cursor() as cur:
-        cur.execute(
-            "UPDATE slack_event_inbox SET processed_at = NOW() - INTERVAL '49 hours' WHERE event_id = 'EvOld'"
-        )
+        cur.execute("UPDATE slack_event_inbox SET processed_at = NOW() - INTERVAL '49 hours' WHERE event_id = 'EvOld'")
         cur.execute(
             "UPDATE slack_event_inbox SET processed_at = NOW() - INTERVAL '49 hours', "
             "dead_lettered_at = NOW() - INTERVAL '49 hours' WHERE event_id = 'EvDeadOld'"
@@ -284,8 +308,7 @@ def test_inbox_metrics_count_pending_and_oldest_age(server_conn_factory: ServerC
         enqueue(conn, f"EvMetric{index}", _envelope(f"EvMetric{index}"))
     with conn.transaction(), conn.cursor() as cur:
         cur.execute(
-            "UPDATE slack_event_inbox SET received_at = NOW() - INTERVAL '70 seconds' "
-            "WHERE event_id = 'EvMetric0'"
+            "UPDATE slack_event_inbox SET received_at = NOW() - INTERVAL '70 seconds' WHERE event_id = 'EvMetric0'"
         )
     metrics = read_inbox_metrics(conn)
     assert metrics.depth == 3
@@ -299,8 +322,7 @@ async def test_periodic_telemetry_emits_depth_age_and_liveness(server_conn_facto
         enqueue(conn, f"EvTelemetry{index}", _envelope(f"EvTelemetry{index}"))
     with conn.transaction(), conn.cursor() as cur:
         cur.execute(
-            "UPDATE slack_event_inbox SET received_at = NOW() - INTERVAL '65 seconds' "
-            "WHERE event_id = 'EvTelemetry0'"
+            "UPDATE slack_event_inbox SET received_at = NOW() - INTERVAL '65 seconds' WHERE event_id = 'EvTelemetry0'"
         )
     health = _RecordingHealth()
     writer = make_test_writer(conn)

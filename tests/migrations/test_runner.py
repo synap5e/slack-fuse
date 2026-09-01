@@ -58,14 +58,18 @@ def test_discover_server_migrations() -> None:
         "0013_channels_view_fold_drift.sql",
         "0014_channel_message_totals.sql",
         "0015_probe_fact_latest_idx.sql",
+        "0016_inbox_source_transport.sql",
     ]
 
 
-def test_schema_sql_mirrors_slack_event_inbox_migration() -> None:
+def test_schema_sql_covers_slack_event_inbox_migrations() -> None:
     migration = _normalize_ddl((_SERVER_DIR / "0012_slack_event_inbox.sql").read_text())
     schema = _normalize_ddl(_SERVER_SCHEMA.read_text())
 
     for statement in migration.split(";"):
+        if statement.startswith("CREATE TABLE slack_event_inbox"):
+            assert "source_transport TEXT NOT NULL DEFAULT 'http'" in schema
+            continue
         if statement:
             assert statement in schema
 
@@ -118,6 +122,7 @@ def test_apply_server_migrations_idempotent(pg_conn: psycopg.Connection[TupleRow
         "0013_channels_view_fold_drift.sql",
         "0014_channel_message_totals.sql",
         "0015_probe_fact_latest_idx.sql",
+        "0016_inbox_source_transport.sql",
     ]
     assert _table_exists(pg_conn, "events")
     assert _table_exists(pg_conn, "snapshots")
@@ -165,6 +170,14 @@ def test_apply_server_migrations_idempotent(pg_conn: psycopg.Connection[TupleRow
             cur.execute("SELECT to_regclass(%s)", (index,))
             row = cur.fetchone()
         assert row is not None and row[0] is not None
+    with pg_conn.cursor() as cur:
+        cur.execute(
+            "SELECT column_default, is_nullable FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND table_name = 'slack_event_inbox' "
+            "AND column_name = 'source_transport'"
+        )
+        row = cur.fetchone()
+    assert row == ("'http'::text", "NO")
     # Second run applies nothing.
     assert apply_migrations(pg_conn, _SERVER_DIR) == []
 

@@ -60,7 +60,7 @@ async def _dispatch(
     payload: EventsApiPayload,
     raw_event: JsonObject,
     *,
-    transport: Literal["socket", "http"] = "http",
+    transport: Literal["socket", "http", "nats"] = "http",
 ) -> None:
     source = SlackEventSource(
         transport=transport,
@@ -118,6 +118,13 @@ async def test_transport_label_stamped_per_dispatch(
         "event_ts": "1700000002.000002",
         "text": "via webhook",
     }
+    raw_nats: JsonObject = {
+        "type": "message",
+        "channel": "C1",
+        "ts": "1700000003.000001",
+        "event_ts": "1700000003.000002",
+        "text": "via nats",
+    }
     await _dispatch(
         dispatcher,
         EventsApiPayload(event_id="EvSocket1", event=SocketEventPayload.model_validate(raw_socket)),
@@ -130,14 +137,19 @@ async def test_transport_label_stamped_per_dispatch(
         raw_http,
         transport="http",
     )
+    await _dispatch(
+        dispatcher,
+        EventsApiPayload(event_id="EvNats1", event=SocketEventPayload.model_validate(raw_nats)),
+        raw_nats,
+        transport="nats",
+    )
 
     with server_conn.cursor() as cur:
         cur.execute(
-            "SELECT source->>'slack_event_id', source->>'transport' "
-            "FROM events WHERE stream = 'channel:C1' ORDER BY id"
+            "SELECT source->>'slack_event_id', source->>'transport' FROM events WHERE stream = 'channel:C1' ORDER BY id"
         )
         rows = cur.fetchall()
-    assert rows == [("EvSocket1", "socket"), ("EvHttp1", "http")]
+    assert rows == [("EvSocket1", "socket"), ("EvHttp1", "http"), ("EvNats1", "nats")]
 
 
 @pytest.mark.trio
@@ -200,8 +212,7 @@ async def test_webhook_self_join_seeds_channel_membership_and_backfill(
 
     with server_conn.cursor() as cur:
         cur.execute(
-            "SELECT kind, source->>'slack_event_id' FROM events "
-            "WHERE stream = 'channel-list' ORDER BY offset_in_stream"
+            "SELECT kind, source->>'slack_event_id' FROM events WHERE stream = 'channel-list' ORDER BY offset_in_stream"
         )
         rows = cur.fetchall()
     assert rows == [

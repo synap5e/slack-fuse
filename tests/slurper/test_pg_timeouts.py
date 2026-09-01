@@ -40,6 +40,7 @@ def test_connect_and_migrate_sets_runtime_timeouts_after_migrations(
         slack_user_token="xoxp-test",
         slack_app_token="xapp-test",
         shared_secret="secret",
+        socket_mode_enabled=True,
         database_url=database_url,
         slurper_lock_timeout_s=0.2,
         slurper_statement_timeout_s=0.35,

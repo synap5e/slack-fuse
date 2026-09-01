@@ -16,6 +16,8 @@ slack_user_token = "xoxp-user"
 slack_app_token = "xapp-app"
 slack_bot_token = "xoxb-bot"
 shared_secret = "topsecret"
+webhook_port = 18766
+signing_secret = "signing"
 database_url = "postgresql:///custom_server_db"
 listen_addr = "0.0.0.0:9999"
 snapshot_every_n_events = 1234
@@ -55,6 +57,9 @@ def test_server_config_from_toml(tmp_path: Path) -> None:
     assert cfg.slack_user_token == "xoxp-user"
     assert cfg.slack_app_token == "xapp-app"
     assert cfg.shared_secret == "topsecret"
+    assert cfg.socket_mode_enabled is False
+    assert cfg.webhook_port == 18766
+    assert cfg.signing_secret == "signing"
     assert cfg.database_url == "postgresql:///custom_server_db"
     assert cfg.listen_addr == "0.0.0.0:9999"
     assert cfg.snapshot_every_n_events == 1234
@@ -139,3 +144,43 @@ def test_http_only_config_does_not_require_app_token() -> None:
     )
     assert cfg.socket_mode_enabled is False
     assert cfg.slack_app_token == ""
+
+
+def test_nats_shim_requires_signing_secret() -> None:
+    with pytest.raises(ValidationError, match="signing_secret is required"):
+        _server_config(
+            nats_shim_enabled=True,
+            nats_url="tls://nats.example:4222",
+            nats_ca_path=Path("/secret/ca.crt"),
+            nats_cert_path=Path("/secret/tls.crt"),
+            nats_key_path=Path("/secret/tls.key"),
+            signing_secret="",
+        )
+
+
+def test_nats_shim_requires_mtls_paths() -> None:
+    with pytest.raises(ValidationError, match="nats_ca_path, nats_cert_path, and nats_key_path are required"):
+        _server_config(
+            nats_shim_enabled=True,
+            nats_url="tls://nats.example:4222",
+            signing_secret="signing",
+        )
+
+
+def test_nats_shim_counts_as_event_source() -> None:
+    cfg = _server_config(
+        slack_app_token="",
+        socket_mode_enabled=False,
+        webhook_port=0,
+        nats_shim_enabled=True,
+        nats_url="tls://nats.example:4222",
+        nats_ca_path=Path("/secret/ca.crt"),
+        nats_cert_path=Path("/secret/tls.crt"),
+        nats_key_path=Path("/secret/tls.key"),
+        signing_secret="signing",
+    )
+
+    assert cfg.nats_shim_enabled is True
+    assert cfg.nats_subject == "webhooks.slack.>"
+    assert cfg.nats_durable_name == "slack-fuse-webhooks-slack"
+    assert cfg.nats_stream_name == "webhooks"

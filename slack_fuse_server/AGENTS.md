@@ -6,7 +6,8 @@ Holds the Slack tokens. Ingests Slack into an append-only `events` table ordered
 
 ```
 Socket Mode   socket.SocketModeRunner._handle_event ─┐
-Events API    slack_webhook → inbox.enqueue          ├→ slack_events.dispatcher.SlackEventDispatcher.dispatch
+Events API    slack_webhook → inbox.enqueue          │
+NATS shim     nats_shim → inbox.enqueue              ├→ slack_events.dispatcher.SlackEventDispatcher.dispatch
                              → inbox.consume         │     → slurper.offsets.OffsetWriter.write_event
 backfill/refresh/probes ──────────────────────────────┘         → assign_offset → insert_event
                                                                 → INSERT events + pg_notify('new_event', stream)

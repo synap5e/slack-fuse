@@ -34,6 +34,7 @@ from slack_fuse_server.slack_events.types import (
     DispatchPermanentError,
     DispatchTransientError,
     SlackEventSource,
+    SlackEventTransport,
 )
 from slack_fuse_server.slurper.health import HealthEmitter, HealthKind
 from slack_fuse_server.slurper.offsets import OffsetWriter, WriterPoolExhausted
@@ -67,6 +68,7 @@ class InboxRow:
     event_id: str
     envelope: JsonObject
     attempt_count: int
+    source_transport: SlackEventTransport
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,22 +87,32 @@ class InboxWriter:
         self._conn = conn
         self._limiter = limiter or trio.CapacityLimiter(1)
 
-    async def enqueue(self, event_id: str, envelope: JsonObject) -> bool:
+    async def enqueue(
+        self,
+        event_id: str,
+        envelope: JsonObject,
+        source_transport: SlackEventTransport = "http",
+    ) -> bool:
         """Commit an envelope before ACK; return False for a Slack retry."""
         return await trio.to_thread.run_sync(
-            lambda: enqueue(self._conn, event_id, envelope),
+            lambda: enqueue(self._conn, event_id, envelope, source_transport=source_transport),
             limiter=self._limiter,
             abandon_on_cancel=True,
         )
 
 
-def enqueue(conn: Connection[TupleRow], event_id: str, envelope: JsonObject) -> bool:
+def enqueue(
+    conn: Connection[TupleRow],
+    event_id: str,
+    envelope: JsonObject,
+    source_transport: SlackEventTransport = "http",
+) -> bool:
     """Insert + notify atomically; duplicates neither insert nor notify."""
     with conn.transaction(), conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO slack_event_inbox (event_id, envelope) VALUES (%s, %s) "
+            "INSERT INTO slack_event_inbox (event_id, envelope, source_transport) VALUES (%s, %s, %s) "
             "ON CONFLICT (event_id) DO NOTHING RETURNING event_id",
-            (event_id, Jsonb(envelope)),
+            (event_id, Jsonb(envelope), source_transport),
         )
         inserted = cur.fetchone() is not None
         if inserted:
@@ -123,7 +135,7 @@ def _claim_pending(conn: Connection[TupleRow]) -> InboxRow | None:
     with conn.cursor() as cur:
         cur.execute("BEGIN")
         cur.execute(
-            "SELECT event_id, envelope, attempt_count "
+            "SELECT event_id, envelope, attempt_count, source_transport "
             "FROM slack_event_inbox "
             "WHERE processed_at IS NULL AND dead_lettered_at IS NULL AND next_attempt_at <= NOW() "
             "ORDER BY received_at, event_id "
@@ -140,7 +152,19 @@ def _claim_pending(conn: Connection[TupleRow]) -> InboxRow | None:
         envelope: JsonObject = {}
     else:
         envelope = cast(JsonObject, envelope_raw)
-    return InboxRow(event_id=str(row[0]), envelope=envelope, attempt_count=int(row[2]))
+    return InboxRow(
+        event_id=str(row[0]),
+        envelope=envelope,
+        attempt_count=int(row[2]),
+        source_transport=_coerce_source_transport(row[3], event_id=str(row[0])),
+    )
+
+
+def _coerce_source_transport(raw: object, *, event_id: str) -> SlackEventTransport:
+    if raw == "http" or raw == "socket" or raw == "nats":
+        return cast(SlackEventTransport, raw)
+    log.error("webhook inbox row has invalid source_transport event_id=%s value=%r", event_id, raw)
+    return "http"
 
 
 def _mark_processed(conn: Connection[TupleRow], event_id: str) -> None:
@@ -256,7 +280,7 @@ async def _dispatch_claimed(  # noqa: PLR0913, PLR0917 - queue state and transpo
                         await dispatcher.dispatch(
                             payload,
                             raw_event,
-                            SlackEventSource(transport="http", event_id=row.event_id),
+                            SlackEventSource(transport=row.source_transport, event_id=row.event_id),
                             span=recorder,
                         )
                 except DispatchPermanentError as exc:

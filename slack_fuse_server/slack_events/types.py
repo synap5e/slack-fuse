@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Literal
 
+type SlackEventTransport = Literal["socket", "http", "nats"]
+
 
 class DispatchErrorCode(StrEnum):
     PG_TIMEOUT = "pg_timeout"
@@ -32,6 +34,6 @@ class DispatchPermanentError(Exception):
 
 @dataclass(frozen=True, slots=True)
 class SlackEventSource:
-    transport: Literal["socket", "http"]
+    transport: SlackEventTransport
     event_id: str
     api_endpoint: str = "events_api"

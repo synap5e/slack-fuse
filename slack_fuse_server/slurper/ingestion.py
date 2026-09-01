@@ -103,10 +103,10 @@ CURRENT_SPAN_ID: ContextVar[str | None] = ContextVar("slack_fuse_current_span_id
 #: crash/retry-safe deduplication at ``insert_event``.
 slack_event_id: ContextVar[str | None] = ContextVar("slack_event_id", default=None)
 
-#: Which transport (``"socket"`` or ``"http"``) delivered the dispatch currently
+#: Which transport (``"socket"``, ``"http"``, or ``"nats"``) delivered the dispatch currently
 #: running on this task. Stamped into every emitted event's ``source`` via
 #: ``compose_source`` so post-hoc queries can distinguish socket-mode from
-#: webhook-derived rows (e.g. rollback validation, per-transport metrics).
+#: inbox-derived rows (e.g. rollback validation, per-transport metrics).
 slack_transport: ContextVar[str | None] = ContextVar("slack_transport", default=None)
 
 

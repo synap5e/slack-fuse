@@ -33,6 +33,7 @@ def _config(database_url: str) -> ServerConfig:
         slack_user_token="xoxp-test",
         slack_app_token="xapp-test",
         shared_secret="sek",
+        socket_mode_enabled=True,
         database_url=database_url,
     )
 

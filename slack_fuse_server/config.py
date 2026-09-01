@@ -38,11 +38,21 @@ class ServerConfig(BaseSettings):
     slack_app_token: str = ""
     slack_bot_token: str = ""
 
-    # Slack event sources. ``webhook_port=0`` is the sole disabled value;
-    # Socket Mode remains enabled by default for the staged cutover.
+    # Slack event sources. Socket Mode defaults off; Events API webhook and/or
+    # NATS shim carry ingestion in Phase 3+.
     webhook_port: int = Field(default=0, ge=0, le=65535)
     signing_secret: str = ""
-    socket_mode_enabled: bool = True
+    socket_mode_enabled: bool = False
+
+    # NATS JetStream shim (medina event-platform activation).
+    nats_shim_enabled: bool = False
+    nats_url: str = ""
+    nats_ca_path: Path | None = None
+    nats_cert_path: Path | None = None
+    nats_key_path: Path | None = None
+    nats_subject: str = "webhooks.slack.>"
+    nats_durable_name: str = "slack-fuse-webhooks-slack"
+    nats_stream_name: str = "webhooks"
 
     # Postgres.
     database_url: str = "postgresql:///slack_fuse_server"
@@ -118,7 +128,17 @@ class ServerConfig(BaseSettings):
         if self.socket_mode_enabled and not self.slack_app_token:
             msg = "slack_app_token is required when socket_mode_enabled is true"
             raise ValueError(msg)
-        if not self.socket_mode_enabled and self.webhook_port == 0:
+        if self.nats_shim_enabled:
+            if not self.signing_secret:
+                msg = "signing_secret is required when nats_shim_enabled is true"
+                raise ValueError(msg)
+            if not self.nats_url:
+                msg = "nats_url is required when nats_shim_enabled is true"
+                raise ValueError(msg)
+            if self.nats_ca_path is None or self.nats_cert_path is None or self.nats_key_path is None:
+                msg = "nats_ca_path, nats_cert_path, and nats_key_path are required when nats_shim_enabled is true"
+                raise ValueError(msg)
+        if not self.socket_mode_enabled and self.webhook_port == 0 and not self.nats_shim_enabled:
             msg = "no Slack event source enabled"
             raise ValueError(msg)
         return self

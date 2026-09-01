@@ -17,6 +17,7 @@ def _config() -> ServerConfig:
         slack_user_token="xoxp-test",
         slack_app_token="xapp-test",
         shared_secret="sek",
+        socket_mode_enabled=True,
     )
 
 

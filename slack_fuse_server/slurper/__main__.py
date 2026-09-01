@@ -98,6 +98,7 @@ from slack_fuse_server.slack_events.inbox import (
     ensure_consumer_never_returns,
     run_retention as run_inbox_retention,
 )
+from slack_fuse_server.slack_events.nats_shim import NatsShimConfig, NatsShimDeps, run_nats_shim
 from slack_fuse_server.slurper.api import ChannelNotFoundError, SlackAPIError, SlackClient, Validated
 from slack_fuse_server.slurper.catchup import (
     CatchupConfig,
@@ -422,6 +423,25 @@ def _log_slurper_started() -> None:
 class _EventSourcePlan:
     socket_mode: bool
     webhook: bool
+    nats_shim: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _NatsShimRuntime:
+    config: NatsShimConfig
+    deps: NatsShimDeps
+
+
+@dataclass(frozen=True, slots=True)
+class _InboxRuntime:
+    writer_conn: psycopg.Connection[TupleRow]
+    consumer_conn: psycopg.Connection[TupleRow]
+    webhook_deps: SlackWebhookDeps | None
+    nats_shim: _NatsShimRuntime | None
+
+    def close(self) -> None:
+        self.writer_conn.close()
+        self.consumer_conn.close()
 
 
 def _event_source_plan(config: ServerConfig) -> _EventSourcePlan:
@@ -429,7 +449,60 @@ def _event_source_plan(config: ServerConfig) -> _EventSourcePlan:
     return _EventSourcePlan(
         socket_mode=config.socket_mode_enabled,
         webhook=config.webhook_port > 0,
+        nats_shim=config.nats_shim_enabled,
     )
+
+
+def _make_nats_shim_config(config: ServerConfig) -> NatsShimConfig:
+    if config.nats_ca_path is None or config.nats_cert_path is None or config.nats_key_path is None:
+        msg = "nats mTLS paths must be validated before task wiring"
+        raise ValueError(msg)
+    return NatsShimConfig(
+        url=config.nats_url,
+        ca_path=config.nats_ca_path,
+        cert_path=config.nats_cert_path,
+        key_path=config.nats_key_path,
+        subject=config.nats_subject,
+        durable_name=config.nats_durable_name,
+        stream_name=config.nats_stream_name,
+    )
+
+
+def _make_inbox_runtime(config: ServerConfig, source_plan: _EventSourcePlan) -> _InboxRuntime | None:
+    if not source_plan.webhook and not source_plan.nats_shim:
+        return None
+    writer_conn = _connect_server_connection(config)
+    try:
+        _set_runtime_timeouts(writer_conn, config)
+        consumer_conn = _connect_server_connection(config)
+        try:
+            _set_runtime_timeouts(consumer_conn, config)
+            inbox_writer = InboxWriter(writer_conn)
+            webhook_deps = (
+                SlackWebhookDeps(signing_secret=config.signing_secret, inbox=inbox_writer)
+                if source_plan.webhook
+                else None
+            )
+            nats_shim = (
+                _NatsShimRuntime(
+                    config=_make_nats_shim_config(config),
+                    deps=NatsShimDeps(signing_secret=config.signing_secret, inbox=inbox_writer),
+                )
+                if source_plan.nats_shim
+                else None
+            )
+            return _InboxRuntime(
+                writer_conn=writer_conn,
+                consumer_conn=consumer_conn,
+                webhook_deps=webhook_deps,
+                nats_shim=nats_shim,
+            )
+        except Exception:
+            consumer_conn.close()
+            raise
+    except Exception:
+        writer_conn.close()
+        raise
 
 
 async def _serve(config: ServerConfig, boot: BootContext) -> None:
@@ -516,9 +589,7 @@ async def _serve(config: ServerConfig, boot: BootContext) -> None:
     )
     probe_trigger = ProbeTrigger(max_buffer_size=1)
     probe_deps = (
-        ProbeDeps(shared_secret=config.shared_secret, trigger=probe_trigger)
-        if config.probe_sweep_enabled
-        else None
+        ProbeDeps(shared_secret=config.shared_secret, trigger=probe_trigger) if config.probe_sweep_enabled else None
     )
     health = HealthEmitter(writer)
 
@@ -553,18 +624,7 @@ async def _serve(config: ServerConfig, boot: BootContext) -> None:
             triggered_by=BackfillRunTrigger.SELF_JOIN,
         ),
     )
-    inbox_writer_conn: psycopg.Connection[TupleRow] | None = None
-    inbox_consumer_conn: psycopg.Connection[TupleRow] | None = None
-    webhook_deps: SlackWebhookDeps | None = None
-    if source_plan.webhook:
-        inbox_writer_conn = _connect_server_connection(config)
-        _set_runtime_timeouts(inbox_writer_conn, config)
-        inbox_consumer_conn = _connect_server_connection(config)
-        _set_runtime_timeouts(inbox_consumer_conn, config)
-        webhook_deps = SlackWebhookDeps(
-            signing_secret=config.signing_secret,
-            inbox=InboxWriter(inbox_writer_conn),
-        )
+    inbox_runtime = _make_inbox_runtime(config, source_plan)
 
     try:
         async with trio.open_nursery() as nursery:
@@ -600,28 +660,17 @@ async def _serve(config: ServerConfig, boot: BootContext) -> None:
                     supervisor,
                 )
             )
-            if webhook_deps is not None and inbox_consumer_conn is not None:
-                nursery.start_soon(serve_slack_webhook, "0.0.0.0", config.webhook_port, webhook_deps)
-                nursery.start_soon(
-                    _ingesting_task(
-                        boot.task_context("webhook-events"),
-                        _run_inbox_consumer,
-                        inbox_consumer_conn,
-                        dispatcher,
-                        health,
-                        supervisor,
-                    )
-                )
-                nursery.start_soon(_run_inbox_retention_task, config)
-                nursery.start_soon(
-                    _ingesting_task(
-                        boot.task_context("webhook-telemetry"),
-                        emit_inbox_telemetry,
-                        writer,
-                        health,
-                        limiters.admin_read,
-                        supervisor,
-                    )
+            if inbox_runtime is not None:
+                _start_inbox_tasks(
+                    nursery,
+                    inbox_runtime,
+                    config,
+                    boot,
+                    writer,
+                    dispatcher,
+                    health,
+                    limiters,
+                    supervisor,
                 )
             nursery.start_soon(
                 _ingesting_task(
@@ -736,10 +785,8 @@ async def _serve(config: ServerConfig, boot: BootContext) -> None:
         client.close()
         writer.close()
         snapshot_conn.close()
-        if inbox_writer_conn is not None:
-            inbox_writer_conn.close()
-        if inbox_consumer_conn is not None:
-            inbox_consumer_conn.close()
+        if inbox_runtime is not None:
+            inbox_runtime.close()
 
 
 async def _run_socket_mode_with_users_task(  # noqa: PLR0913, PLR0917 - socket task needs its full dep set
@@ -769,6 +816,44 @@ async def _run_socket_mode_with_users_task(  # noqa: PLR0913, PLR0917 - socket t
         dispatcher=dispatcher,
         options=options,
         supervisor=supervisor,
+    )
+
+
+def _start_inbox_tasks(  # noqa: PLR0913, PLR0917 - supervisor wiring keeps task dependencies explicit.
+    nursery: trio.Nursery,
+    runtime: _InboxRuntime,
+    config: ServerConfig,
+    boot: BootContext,
+    writer: OffsetWriter,
+    dispatcher: SlackEventDispatcher,
+    health: HealthEmitter,
+    limiters: SlurperLimiters,
+    supervisor: TaskSupervisor,
+) -> None:
+    if runtime.webhook_deps is not None:
+        nursery.start_soon(serve_slack_webhook, "0.0.0.0", config.webhook_port, runtime.webhook_deps)
+    if runtime.nats_shim is not None:
+        nursery.start_soon(run_nats_shim, runtime.nats_shim.config, runtime.nats_shim.deps)
+    nursery.start_soon(
+        _ingesting_task(
+            boot.task_context("webhook-events"),
+            _run_inbox_consumer,
+            runtime.consumer_conn,
+            dispatcher,
+            health,
+            supervisor,
+        )
+    )
+    nursery.start_soon(_run_inbox_retention_task, config)
+    nursery.start_soon(
+        _ingesting_task(
+            boot.task_context("webhook-telemetry"),
+            emit_inbox_telemetry,
+            writer,
+            health,
+            limiters.admin_read,
+            supervisor,
+        )
     )
 
 
