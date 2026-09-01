@@ -7,6 +7,13 @@
   verified against the tree at `42b7a85`+; corpus numbers are measured from the live
   projection DB, not estimated.
 - **Date:** 2026-09-01
+- **Outcome (2026-09-01, from notion-fuse's reply draft):** full accept. View units ratified
+  as v1 (contents-map named as evolution; change matrix stays feed-local); their §12 resolved
+  — `page_with_comments` ships as a view unit; slack-fuse named on the spec crate and the
+  bridge-facing DB contract ("notion-fuse proposes, slack-fuse co-signs, fuse-rust approves");
+  Control/Trailer/Ghost folded into §13 engine requirements. Joint fuse-rust approach parked
+  by both owners; on unpark: one review pass on the amended RFC, then a co-signed cover.
+  Tracking: BACKLOG.md "Joint fuse-rust approach" + "Guard the live-apply upsert".
 
 ## Position in one paragraph
 

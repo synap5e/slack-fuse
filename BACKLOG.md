@@ -86,6 +86,43 @@ Cheapest first check: capture 100 sequential `/health` timings from the pod + co
 
 # Agent-raised (needs human review)
 
+## Guard the live-apply upsert against out-of-order overwrites
+
+**Effort**: 2-4h including tests. **Autonomous**: Yes.
+
+**Verified 2026-08-28 (code)**: `apply.py:361` `chunks` upsert is unconditional last-write-wins
+on `content_md` (`:389` same for `thread_chunks`). `reply_count` got a `GREATEST` guard after
+an incident; `content_md` never did. Safe today only because the wire guarantees per-stream
+apply order — a redelivered `message` applied after a `message_changed` silently restores the
+pre-edit body. Already happened once: event 405897 (later, lossy `message`) overwrote richer
+`message_changed` data at the same ts; repaired append-only by corrective event 407010.
+
+**Commitment status**: cited in outbound correspondence to notion-fuse
+(`docs/outbound/2026-09-01-response-notion-fuse-projections-rfc.md`, "we'll guard our upsert
+regardless of this RFC's fate") and quoted back in their 2026-09-01 reply as "yours to fix
+regardless". Also a hard precondition for both the platform `webhooks.slack.>` cutover (spec
+§3 refuses FIFO, firm per §16) and the projections-over-NATS feed (at-least-once, reordered).
+
+Fix shape: version-guard the upsert on a domain field (event kind precedence at equal ts:
+`message_changed` > `message`), or adopt the notion-RFC fold rule (reject where incoming seq ≤
+applied seq per unit). Small, local, must land before any flag flips.
+
+## Joint fuse-rust approach with notion-fuse (parked, do not lose)
+
+**Effort**: review pass + co-signed cover note when unparked. **Autonomous**: No — both owners
+parked it deliberately (their side: owner sequencing decision 2026-09-01; our side: ingest
+gating + OOM hunt have priority).
+
+**State**: notion-fuse ratified all three of our proposals (view units as v1 with
+`page_with_comments` as first instance; slack-fuse named on the spec crate and bridge-facing
+DB contract, `projection_targets` credited as predecessor; Control/Trailer/Ghost folded into
+their §13 engine requirements, including the no-`ro`-mount rule and budget classes). Agreed
+plan on unpark: one focused review pass on the amended RFC, then a jointly-signed cover to
+fuse-rust. Correspondence: our `docs/outbound/2026-09-01-response-notion-fuse-projections-rfc.md`,
+their `~/agentic/notion-fuse/docs/outbound/slack-fuse-reply-draft.md`. Neither message was
+formally delivered agent-to-agent — both drafts were ferried by Simon — so nothing fires on
+its own when either owner resumes. This entry is the tripwire.
+
 _The four entries below were surfaced on 2026-08-28 by mining the full build session transcript (`docs/HISTORY.md`) for threads that were raised and never closed. Each was then re-checked against the current tree; the evidence label on each says what is code-confirmed and what is still transcript-sourced._
 
 ## Catchup resumes from `MAX(ts)`, so a gap with any newer message is skipped forever
