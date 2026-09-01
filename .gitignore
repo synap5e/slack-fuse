@@ -10,3 +10,4 @@ docs/*
 !docs/rfcs/
 !docs/plans/
 !docs/HISTORY.md
+!docs/outbound/
