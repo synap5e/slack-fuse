@@ -32,6 +32,8 @@ log = logging.getLogger(__name__)
 NATS_TRIO_BUFFER_SIZE = 64
 _NATS_FETCH_TIMEOUT_S = 1.0
 _NATS_BACKPRESSURE_SLEEP_S = 0.05
+_NATS_RETRY_INITIAL_BACKOFF_S = 2.0
+_NATS_RETRY_MAX_BACKOFF_S = 60.0
 
 type NatsShimProcessStatus = Literal["ok", "hmac_reject", "malformed", "dberror", "ack_error"]
 type CoroutineFunction = Callable[[], Coroutine[object, object, None]]
@@ -124,7 +126,42 @@ class _AsyncioNatsMessage:
 
 
 async def run_nats_shim(config: NatsShimConfig, deps: NatsShimDeps) -> None:
-    """Run the asyncio NATS client in one thread and process messages in Trio."""
+    """Run the shim with never-fatal retry.
+
+    A shim iteration crash — TLS handshake failure, connect timeout, JetStream
+    subscription error, a nats-py bug — must not propagate to the supervisor's
+    nursery. If it did, the trio nursery cancellation semantics would also tear
+    down sibling tasks (WS gateway on :18765, webhook listener on :18766,
+    health emitter) and the pod would crash-loop with liveness failing. That
+    turns a "shim not working" degradation into a full outage — including
+    losing the webhook fallback path we deliberately keep wired.
+
+    So every iteration is wrapped: `trio.Cancelled` propagates (supervisor
+    shutdown), everything else is logged + backed off + retried.
+    """
+    backoff = _NATS_RETRY_INITIAL_BACKOFF_S
+    while True:
+        started_ns = time.monotonic_ns()
+        try:
+            await _run_shim_iteration(config, deps)
+        except BaseExceptionGroup as eg:
+            cancelled_part, other = eg.split(trio.Cancelled)
+            if cancelled_part is not None:
+                raise
+            log.exception("nats shim: iteration crashed; retry in %.1fs", backoff, exc_info=other)
+        except trio.Cancelled:
+            raise
+        except Exception:
+            log.exception("nats shim: iteration crashed; retry in %.1fs", backoff)
+        else:
+            log.warning("nats shim: iteration exited cleanly; restarting in %.1fs", backoff)
+        _emit_nats_span("nats_shim.iteration_restart", "fail", _duration_ms(started_ns))
+        await trio.sleep(backoff)
+        backoff = min(backoff * 2, _NATS_RETRY_MAX_BACKOFF_S)
+
+
+async def _run_shim_iteration(config: NatsShimConfig, deps: NatsShimDeps) -> None:
+    """One shim connect+consume attempt. Exceptions propagate to `run_nats_shim`."""
     send_ch, recv_ch = trio.open_memory_channel[NatsShimMessage](NATS_TRIO_BUFFER_SIZE)
     async with send_ch, recv_ch, trio.open_nursery() as nursery:
         nursery.start_soon(_run_asyncio_bridge, config, send_ch)

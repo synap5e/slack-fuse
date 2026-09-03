@@ -13,8 +13,10 @@ from typing import TYPE_CHECKING
 
 import psycopg
 import pytest
+import trio
 
 from slack_fuse_server._json import JsonObject
+from slack_fuse_server.slack_events import nats_shim
 from slack_fuse_server.slack_events.inbox import InboxWriter
 from slack_fuse_server.slack_events.nats_shim import NatsShimDeps, process_nats_message
 from slack_fuse_server.slack_events.types import SlackEventTransport
@@ -161,3 +163,55 @@ async def test_db_failure_leaves_message_unacked_and_untermed() -> None:
     assert status == "dberror"
     assert message.acked is False
     assert message.termed is False
+
+
+@pytest.mark.trio
+async def test_iteration_crash_does_not_kill_sibling_tasks(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A shim iteration crash must retry, not tear down the supervisor nursery.
+
+    Regression: 2026-09-02 the first prod enable took the whole server down
+    because a `nats_shim.connect` timeout propagated up to the supervisor
+    nursery, cancelling the WS listener + webhook listener too. Verifies here
+    that any exception from `_run_shim_iteration` is caught, retried with
+    backoff, and never reaches the caller's nursery.
+    """
+    monkeypatch.setattr(nats_shim, "_NATS_RETRY_INITIAL_BACKOFF_S", 0.01)
+    monkeypatch.setattr(nats_shim, "_NATS_RETRY_MAX_BACKOFF_S", 0.01)
+
+    iterations = 0
+
+    async def _boom(config: nats_shim.NatsShimConfig, deps: nats_shim.NatsShimDeps) -> None:
+        nonlocal iterations
+        del config, deps
+        iterations += 1
+        await trio.lowlevel.checkpoint()
+        raise TimeoutError("simulated connect timeout")
+
+    monkeypatch.setattr(nats_shim, "_run_shim_iteration", _boom)
+
+    sibling_ran = False
+
+    async def _sibling() -> None:
+        nonlocal sibling_ran
+        await trio.sleep(0.05)
+        sibling_ran = True
+
+    config = nats_shim.NatsShimConfig(
+        url="nats://ignored:4222",
+        ca_path=object(),  # pyright: ignore[reportArgumentType]
+        cert_path=object(),  # pyright: ignore[reportArgumentType]
+        key_path=object(),  # pyright: ignore[reportArgumentType]
+        subject="ignored",
+        durable_name="ignored",
+        stream_name="ignored",
+    )
+    deps = NatsShimDeps(signing_secret=_SECRET, inbox=_RecordingInbox())
+
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(nats_shim.run_nats_shim, config, deps)
+        nursery.start_soon(_sibling)
+        await trio.sleep(0.1)
+        nursery.cancel_scope.cancel()
+
+    assert iterations >= 2, "shim should have retried at least once after the first crash"
+    assert sibling_ran, "sibling task must not be cancelled by the shim crash"
