@@ -52,7 +52,7 @@ class ServerConfig(BaseSettings):
     nats_key_path: Path | None = None
     nats_subject: str = "webhooks.slack.>"
     nats_durable_name: str = "slack-fuse-webhooks-slack"
-    nats_stream_name: str = "webhooks"
+    nats_stream_name: str = "webhooks-slack"
 
     # Postgres.
     database_url: str = "postgresql:///slack_fuse_server"
