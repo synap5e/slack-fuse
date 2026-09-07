@@ -83,6 +83,15 @@ def _signature(body: bytes, timestamp: int) -> str:
 
 
 def _headers(body: bytes, timestamp: int) -> dict[str, str]:
+    """medina's envelope shape (lowercase, hyphenated, no X- prefix, no 'request')."""
+    return {
+        "slack-signature": _signature(body, timestamp),
+        "slack-timestamp": str(timestamp),
+    }
+
+
+def _http_headers(body: bytes, timestamp: int) -> dict[str, str]:
+    """Legacy raw HTTP header names — kept working as a fallback."""
     return {
         "X-Slack-Signature": _signature(body, timestamp),
         "X-Slack-Request-Timestamp": str(timestamp),
@@ -117,7 +126,7 @@ async def test_tampered_signature_or_body_is_termed_without_insert(case: str) ->
     delivered_body = _body("EvDelivered") if case == "body" else signed_body
     headers = _headers(signed_body, timestamp)
     if case == "signature":
-        headers["X-Slack-Signature"] = _flip_signature(headers["X-Slack-Signature"])
+        headers["slack-signature"] = _flip_signature(headers["slack-signature"])
     message = _FakeNatsMessage(body=delivered_body, headers=headers)
     inbox = _RecordingInbox()
 
@@ -150,6 +159,21 @@ async def test_duplicate_delivery_inserts_one_inbox_row(server_conn_factory: Ser
     assert second.acked is True
     assert first.termed is False
     assert second.termed is False
+
+
+@pytest.mark.trio
+async def test_raw_http_header_names_still_accepted() -> None:
+    """Legacy X-Slack-* header names must still verify (backward-compat / test-fixture path)."""
+    timestamp = int(time.time())
+    body = _body("EvHttpHeaders")
+    message = _FakeNatsMessage(body=body, headers=_http_headers(body, timestamp))
+    inbox = _RecordingInbox()
+
+    status = await process_nats_message(message, NatsShimDeps(signing_secret=_SECRET, inbox=inbox))
+
+    assert status == "ok"
+    assert [(event_id, transport) for event_id, _, transport in inbox.rows] == [("EvHttpHeaders", "nats")]
+    assert message.acked is True
 
 
 @pytest.mark.trio

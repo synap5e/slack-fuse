@@ -11,7 +11,7 @@ import time
 from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Protocol, cast
+from typing import Final, Literal, Protocol, cast
 
 import trio
 from nats.aio.client import Client as NatsClient
@@ -261,14 +261,23 @@ def _decode_event_callback(body: bytes) -> tuple[EventsApiPayload, JsonObject] |
     return (payload, envelope)
 
 
+_SIGNATURE_HEADER_CANDIDATES: Final = ("slack-signature", "x-slack-signature")
+_TIMESTAMP_HEADER_CANDIDATES: Final = ("slack-timestamp", "x-slack-request-timestamp")
+
+
 def _parse_slack_headers(headers: Mapping[str, str]) -> _SlackVerificationHeaders | _HeaderParseError:
-    signature = _case_insensitive_header(headers, "x-slack-signature")
-    timestamp = _case_insensitive_header(headers, "x-slack-request-timestamp")
+    """Look up Slack signature + timestamp under either the medina envelope names
+    (slack-signature / slack-timestamp) or the raw HTTP names (X-Slack-Signature /
+    X-Slack-Request-Timestamp). medina's edge renames the timestamp header —
+    "request-" is dropped — so this isn't just a prefix strip.
+    """
+    signature = _first_present_header(headers, _SIGNATURE_HEADER_CANDIDATES)
+    timestamp = _first_present_header(headers, _TIMESTAMP_HEADER_CANDIDATES)
     missing: list[str] = []
     if signature is None:
-        missing.append("X-Slack-Signature")
+        missing.append(_SIGNATURE_HEADER_CANDIDATES[0])
     if timestamp is None:
-        missing.append("X-Slack-Request-Timestamp")
+        missing.append(_TIMESTAMP_HEADER_CANDIDATES[0])
     if missing:
         return _HeaderParseError(
             status="malformed",
@@ -284,6 +293,14 @@ def _parse_slack_headers(headers: Mapping[str, str]) -> _SlackVerificationHeader
             observed=_observed_header_names(headers),
         )
     return _SlackVerificationHeaders(timestamp_text=timestamp, signature=signature or "")
+
+
+def _first_present_header(headers: Mapping[str, str], names: tuple[str, ...]) -> str | None:
+    for name in names:
+        value = _case_insensitive_header(headers, name)
+        if value is not None:
+            return value
+    return None
 
 
 def _case_insensitive_header(headers: Mapping[str, str], wanted: str) -> str | None:
