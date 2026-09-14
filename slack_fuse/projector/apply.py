@@ -25,7 +25,6 @@ the display name from the now-populated `users` table.
 from __future__ import annotations
 
 import logging
-import re
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Protocol, cast
@@ -44,9 +43,13 @@ from slack_fuse.projector.projection_ledger import (
 )
 from slack_fuse.projector.reconnecting_conn import TupleConnection
 from slack_fuse_render import (
+    LEGACY_THREAD_SUMMARY,
+    THREAD_SUMMARY,
     extract_mention_channel_ids,
     extract_mention_user_ids,
     render_message_structural,
+    strip_thread_summary,
+    thread_summary_marker,
 )
 from slack_fuse_server.wire.frames import EventFrame
 
@@ -431,13 +434,12 @@ def _refresh_parent_reply_count(
     """Recompute the parent chunk's `reply_count` from `thread_chunks`.
 
     Idempotent on replay: derived from `COUNT(*)`, not `+= 1`. The parent's
-    rendered `> Thread: N replies` indicator in `content_md` is NOT
-    re-rendered here — we don't have the parent `Message` to feed back into
-    `render_message_structural`. As a pragmatic v1 step, we *patch* the
-    indicator line via regex when present so the rendered count stays in sync
-    with the column; absent the indicator (parent rendered with reply_count=0
-    initially) we synthesize one. Returns whether the parent chunk row was
-    modified.
+    rendered thread-summary marker in `content_md` is NOT re-rendered here —
+    we don't have the parent `Message` to feed back into
+    `render_message_structural`. As a pragmatic v1 step, we *patch* the marker
+    via regex when present so the rendered count stays in sync with the
+    column; absent the marker (parent rendered with reply_count=0 initially)
+    we synthesize one. Returns whether the parent chunk row was modified.
 
     ``allow_downgrade`` (FINDING-15, 2026-07-17): default False protects an
     already-stored, Slack-authoritative ``reply_count`` from being clobbered
@@ -477,18 +479,21 @@ def _refresh_parent_reply_count(
     return True
 
 
-_THREAD_INDICATOR_RE = re.compile(r"> Thread: \d+ repl(?:y|ies)")
-
-
 def _patch_thread_indicator(content_md: str, new_count: int) -> str:
+    """Bring a stored parent chunk's thread-summary marker to ``new_count``.
+
+    Patches whichever form the chunk carries, always writing the marker back —
+    so a chunk still holding the pre-marker literal is upgraded in place the
+    first time its reply count moves, with no re-render.
+    """
     if new_count <= 0:
-        # Strip any existing indicator + the surrounding blank line(s).
-        return _THREAD_INDICATOR_RE.sub("", content_md).rstrip() + "\n"
-    indicator = f"> Thread: {new_count} {'reply' if new_count == 1 else 'replies'}"
-    if _THREAD_INDICATOR_RE.search(content_md):
-        return _THREAD_INDICATOR_RE.sub(indicator, content_md)
-    # Append a new indicator block.
-    return content_md.rstrip() + "\n\n" + indicator + "\n"
+        return strip_thread_summary(content_md)
+    marker = thread_summary_marker(new_count)
+    if THREAD_SUMMARY.search(content_md):
+        return THREAD_SUMMARY.sub(lambda _: marker, content_md)
+    if LEGACY_THREAD_SUMMARY.search(content_md):
+        return LEGACY_THREAD_SUMMARY.sub(lambda _: marker, content_md)
+    return content_md.rstrip() + "\n\n" + marker + "\n"
 
 
 def _insert_chunk_mentions(cur: Cursor[TupleRow], channel_id: str, message_ts: Decimal, structural_md: str) -> None:

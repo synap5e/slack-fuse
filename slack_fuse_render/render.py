@@ -34,6 +34,26 @@ from slack_fuse_render.resolvers import (
 # don't match, so they're emitted as literal `@<id>` and survive resolution.
 _BARE_USER_ID = re.compile(r"^U[A-Z0-9]+$")
 
+#: Marker the structural pass emits in place of a thread parent's summary line.
+#: It carries the only state the late pass needs — the reply count — because the
+#: assembler already knows which message it is reading. Resolution is deliberately
+#: late and file-context-dependent, the same shape as `resolve_mentions`: the day
+#: view rewrites it to a link into the thread directory, the thread view strips it.
+#: Kept HTML-tag-shaped so an unresolved chunk reaching a markdown viewer shows
+#: nothing rather than raw markup.
+THREAD_SUMMARY = re.compile(r'<thread-summary\s+reply_count="(\d+)"\s*/>')
+
+#: Chunks written before the marker existed carry a baked-in literal instead.
+#: Both late passes match it as a fallback so those chunks resolve identically
+#: without a re-render; they convert to the marker naturally as reply counts
+#: change (`projector.apply._patch_thread_indicator`).
+LEGACY_THREAD_SUMMARY = re.compile(r"^> Thread: (\d+) repl(?:y|ies)$", re.MULTILINE)
+
+#: Filename a thread renders into, relative to the day file that links it.
+#: Duplicated from `slack_fuse.fuse_v2_helpers.THREAD_MD` rather than imported:
+#: this package must not depend on the FUSE layer.
+_THREAD_MD = "thread.md"
+
 
 def render_message_structural(msg: Message) -> str:
     """Render a single message to markdown with unresolved `<@U…>`/`<#C…>`
@@ -79,10 +99,60 @@ def render_message_structural(msg: Message) -> str:
         lines.append("")
 
     if msg.reply_count > 0 and msg.thread_ts == msg.ts:
-        lines.append(f"> Thread: {msg.reply_count} replies")
+        lines.append(thread_summary_marker(msg.reply_count))
         lines.append("")
 
     return "\n".join(lines)
+
+
+def thread_summary_marker(reply_count: int) -> str:
+    """The stored, unresolved form of a thread parent's summary line."""
+    return f'<thread-summary reply_count="{reply_count}"/>'
+
+
+def thread_summary_label(reply_count: int) -> str:
+    """Human text for a thread summary — ``Thread: 1 reply`` / ``N replies``."""
+    return f"Thread: {reply_count} {'reply' if reply_count == 1 else 'replies'}"
+
+
+def has_thread_summary(chunk_md: str) -> bool:
+    """Whether a chunk carries a thread summary in either form."""
+    return bool(THREAD_SUMMARY.search(chunk_md) or LEGACY_THREAD_SUMMARY.search(chunk_md))
+
+
+def resolve_thread_summary_link(chunk_md: str, thread_slug: str | None) -> str:
+    """Rewrite one chunk's thread summary into a link to that thread's file.
+
+    ``thread_slug`` is the directory the thread materializes into under the
+    same day folder, so ``<slug>/thread.md`` resolves relative to the day file
+    doing the linking. ``None`` — a parent whose slug has not been derived, or
+    a read racing a rename — degrades to the plain-text summary the marker
+    replaced. Never emit a link we cannot resolve.
+    """
+
+    def _summary(match: re.Match[str]) -> str:
+        label = thread_summary_label(int(match.group(1)))
+        if thread_slug is None:
+            return f"> {label}"
+        return f"[{label}]({thread_slug}/{_THREAD_MD})"
+
+    if THREAD_SUMMARY.search(chunk_md):
+        return THREAD_SUMMARY.sub(_summary, chunk_md)
+    return LEGACY_THREAD_SUMMARY.sub(_summary, chunk_md)
+
+
+def strip_thread_summary(chunk_md: str) -> str:
+    """Drop one chunk's thread summary — used when assembling ``thread.md``.
+
+    Inside the thread, the summary is both redundant with the frontmatter and a
+    link to the file you are already reading. Trailing blank lines left by the
+    removal are normalised so a stripped chunk concatenates exactly like one
+    that never carried a summary.
+    """
+    stripped = LEGACY_THREAD_SUMMARY.sub("", THREAD_SUMMARY.sub("", chunk_md))
+    if stripped == chunk_md:
+        return chunk_md
+    return stripped.rstrip("\n") + "\n"
 
 
 def resolve_mentions(

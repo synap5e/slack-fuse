@@ -211,6 +211,23 @@ def test_derive_thread_slug_from_body() -> None:
     assert derive_thread_slug(content, Decimal("1700000000.000")).startswith("hello-world")
 
 
+def test_derive_thread_slug_ignores_thread_summary_marker() -> None:
+    """The marker terminates the body the same way the old literal did — if it
+    leaked through, every thread parent would slugify to
+    ``…-thread-summary-reply-count-2``.
+    """
+    content = (
+        "## 14:30 <@U999>\n"
+        "\n"
+        "Hello world, can someone help with the deploy?\n"
+        "\n"
+        '<thread-summary reply_count="2"/>\n'
+    )
+    slug = derive_thread_slug(content, Decimal("1700000000.000"))
+    assert slug.startswith("hello-world")
+    assert "thread-summary" not in slug
+
+
 def test_derive_thread_slug_fallback_for_empty_body() -> None:
     content = "## 14:30 <@U999>\n\n\n"
     out = derive_thread_slug(content, Decimal("1700000000.000"))

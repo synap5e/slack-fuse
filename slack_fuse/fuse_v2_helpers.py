@@ -308,7 +308,7 @@ def _strip_structural_header(content_md: str) -> str:
 
         :paperclip: [file](attachments/file)
 
-        > Thread: N replies
+        <thread-summary reply_count="N"/>
 
     For slug derivation we want the first chunk of message text — the bit
     that says what the thread is about.
@@ -324,7 +324,9 @@ def _strip_structural_header(content_md: str) -> str:
             continue
         if line.startswith("[Huddle Notes]"):
             continue
-        if line.startswith("> Thread:"):
+        # The thread summary is always last. Both forms terminate the body:
+        # the marker (current) and the literal (chunks written before it).
+        if line.startswith(("<thread-summary", "> Thread:")):
             break
         body_lines.append(line)
     return "\n".join(body_lines).strip()

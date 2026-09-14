@@ -252,8 +252,8 @@ def test_reply_writes_thread_chunk_and_bumps_parent_count(client_conn: psycopg.C
     # Parent chunk's reply_count column == COUNT(replies).
     [(_, _, content_md, reply_count)] = _chunks(client_conn)
     assert reply_count == 3
-    # Indicator patched into content_md (v1 regex patch keeps rendered text consistent).
-    assert "> Thread: 3 replies" in content_md
+    # Marker patched into content_md (regex patch keeps the stored count consistent).
+    assert '<thread-summary reply_count="3"/>' in content_md
 
 
 def test_reply_count_is_idempotent_on_replay(client_conn: psycopg.Connection[TupleRow]) -> None:

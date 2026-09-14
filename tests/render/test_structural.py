@@ -238,16 +238,18 @@ def test_edited_suffix_in_header() -> None:
 
 
 def test_thread_indicator_for_parent() -> None:
+    # Stored unresolved — the day view links it, the thread view drops it.
+    # Presentation is pinned in tests/render/test_thread_summary.py.
     msg = Message(ts=_TS, user="U1", text="root", thread_ts=_TS, reply_count=4)
     md = render_message_structural(msg)
-    assert "> Thread: 4 replies" in md
+    assert '<thread-summary reply_count="4"/>' in md
 
 
 def test_no_thread_indicator_for_reply() -> None:
     # A reply (thread_ts != ts) carries no thread indicator.
     msg = Message(ts="1700000500.000300", user="U1", text="reply", thread_ts=_TS, reply_count=4)
     md = render_message_structural(msg)
-    assert "> Thread:" not in md
+    assert "<thread-summary" not in md
 
 
 def test_empty_text_omits_body() -> None:
