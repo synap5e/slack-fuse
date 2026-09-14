@@ -134,7 +134,7 @@ def resolve_thread_summary_link(chunk_md: str, thread_slug: str | None) -> str:
         label = thread_summary_label(int(match.group(1)))
         if thread_slug is None:
             return f"> {label}"
-        return f"[{label}]({thread_slug}/{_THREAD_MD})"
+        return f"> [{label}]({thread_slug}/{_THREAD_MD})"
 
     if THREAD_SUMMARY.search(chunk_md):
         return THREAD_SUMMARY.sub(_summary, chunk_md)

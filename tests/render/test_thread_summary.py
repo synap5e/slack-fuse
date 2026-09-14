@@ -78,7 +78,7 @@ def test_day_view_pluralises_a_single_reply() -> None:
     now happens once, at resolution.
     """
     resolved = resolve_thread_summary_link(_parent_chunk(1), "flaky-asset-test")
-    assert "[Thread: 1 reply](flaky-asset-test/thread.md)" in resolved
+    assert "> [Thread: 1 reply](flaky-asset-test/thread.md)" in resolved
 
 
 # === day view: marker becomes a link ===
@@ -86,7 +86,7 @@ def test_day_view_pluralises_a_single_reply() -> None:
 
 def test_day_view_links_marker_to_thread_file() -> None:
     resolved = resolve_thread_summary_link(_parent_chunk(3), "flaky-asset-test")
-    assert "[Thread: 3 replies](flaky-asset-test/thread.md)" in resolved
+    assert "> [Thread: 3 replies](flaky-asset-test/thread.md)" in resolved
     assert "<thread-summary" not in resolved
 
 
@@ -118,7 +118,7 @@ def test_day_view_leaves_a_chunk_with_no_summary_alone() -> None:
 
 def test_day_view_links_legacy_literal() -> None:
     resolved = resolve_thread_summary_link(_LEGACY_CHUNK, "flaky-asset-test")
-    assert "[Thread: 3 replies](flaky-asset-test/thread.md)" in resolved
+    assert "> [Thread: 3 replies](flaky-asset-test/thread.md)" in resolved
     assert "> Thread:" not in resolved
 
 
@@ -131,7 +131,7 @@ def test_day_view_pluralises_legacy_one_replies() -> None:
     is regenerated from the count, so the link reads correctly either way.
     """
     legacy = "## 10:00 <@U1>\n\nFlaky asset test\n\n> Thread: 1 replies\n"
-    assert "[Thread: 1 reply](slug/thread.md)" in resolve_thread_summary_link(legacy, "slug")
+    assert "> [Thread: 1 reply](slug/thread.md)" in resolve_thread_summary_link(legacy, "slug")
 
 
 # === thread view: marker disappears ===
@@ -172,5 +172,5 @@ def test_thread_view_preserves_trailing_content_of_untouched_chunks() -> None:
 def test_marker_round_trips_through_both_resolutions() -> None:
     chunk = _parent_chunk(7)
     assert thread_summary_marker(7) in chunk
-    assert "[Thread: 7 replies](s/thread.md)" in resolve_thread_summary_link(chunk, "s")
+    assert "> [Thread: 7 replies](s/thread.md)" in resolve_thread_summary_link(chunk, "s")
     assert not has_thread_summary(strip_thread_summary(chunk))

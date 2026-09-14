@@ -171,7 +171,7 @@ def test_smoke_channel_md_links_thread_summary(populated_ops: SlackFuseOpsV2) ->
     resolved = populated_ops.resolve_content_for_test("/channels/general/2026-06/08/channel.md")
     assert resolved is not None
     text = resolved[0].decode()
-    assert f"[Thread: 1 reply]({thread_dir}/thread.md)" in text
+    assert f"> [Thread: 1 reply]({thread_dir}/thread.md)" in text
     assert "> Thread:" not in text
     assert "<thread-summary" not in text
 
@@ -201,7 +201,7 @@ def test_smoke_channel_md_links_marker_form(
     resolved = ops.resolve_content_for_test("/channels/general/2026-06/08/channel.md")
     assert resolved is not None
     text = resolved[0].decode()
-    assert "[Thread: 2 replies](release-checklist/thread.md)" in text
+    assert "> [Thread: 2 replies](release-checklist/thread.md)" in text
     assert "<thread-summary" not in text
 
 
