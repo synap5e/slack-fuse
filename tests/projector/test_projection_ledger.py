@@ -23,7 +23,7 @@ from slack_fuse.migrations.runner import apply_migrations
 from slack_fuse.projector.apply import apply_event
 from slack_fuse.projector.block_sync import apply_blocked_channel_sync
 from slack_fuse.projector.cursor import advance_cursor
-from slack_fuse.projector.projection_ledger import TargetKey
+from slack_fuse.projector.projection_ledger import RENDERER_VERSION, TargetKey
 from slack_fuse.projector.rerender import rerender_channel
 from slack_fuse.projector.snapshot_fetch import SnapshotRedirect, fetch_and_apply_snapshot
 from slack_fuse_server.wire.frames import EventFrame
@@ -129,7 +129,7 @@ def test_apply_event_writes_ledger_targets_in_same_transaction(
     assert _target_row(
         client_conn,
         TargetKey("day", channel_id, date(2026, 8, 4), None),
-    ) == (2, 0, "v1")
+    ) == (2, 0, RENDERER_VERSION)
 
 
 def test_snapshot_replacement_bumps_targets_for_all_touched_rows(
@@ -252,11 +252,11 @@ def test_rerender_bumps_day_and_thread_targets_without_advancing_cursor(
     assert _target_row(
         conn,
         TargetKey("day", channel_id, date(2026, 8, 4), None),
-    ) == (2, 0, "v1")
+    ) == (2, 0, RENDERER_VERSION)
     assert _target_row(
         conn,
         TargetKey("thread", channel_id, date(2026, 8, 4), timestamp),
-    ) == (2, 0, "v1")
+    ) == (2, 0, RENDERER_VERSION)
 
 
 def test_block_sync_bumps_channel_meta_target_on_block_and_unblock(
@@ -268,12 +268,12 @@ def test_block_sync_bumps_channel_meta_target_on_block_and_unblock(
     layout = TargetKey("layout", None, None, None)
 
     apply_blocked_channel_sync(client_conn, {channel_id})
-    assert _target_row(client_conn, target) == (2, 0, "v1")
-    assert _target_row(client_conn, layout) == (2, 0, "v1")
+    assert _target_row(client_conn, target) == (2, 0, RENDERER_VERSION)
+    assert _target_row(client_conn, layout) == (2, 0, RENDERER_VERSION)
 
     apply_blocked_channel_sync(client_conn, set())
-    assert _target_row(client_conn, target) == (3, 0, "v1")
-    assert _target_row(client_conn, layout) == (3, 0, "v1")
+    assert _target_row(client_conn, target) == (3, 0, RENDERER_VERSION)
+    assert _target_row(client_conn, layout) == (3, 0, RENDERER_VERSION)
 
 
 def test_block_bumps_layout_singleton(
@@ -285,7 +285,7 @@ def test_block_bumps_layout_singleton(
 
     assert _target_row(client_conn, layout) == (1, 0, "pre-ledger")
     apply_blocked_channel_sync(client_conn, {channel_id})
-    assert _target_row(client_conn, layout) == (2, 0, "v1")
+    assert _target_row(client_conn, layout) == (2, 0, RENDERER_VERSION)
 
 
 def test_unblock_bumps_layout_singleton(
@@ -296,9 +296,9 @@ def test_unblock_bumps_layout_singleton(
     _seed_channel(client_conn, channel_id)
     apply_blocked_channel_sync(client_conn, {channel_id})
 
-    assert _target_row(client_conn, layout) == (2, 0, "v1")
+    assert _target_row(client_conn, layout) == (2, 0, RENDERER_VERSION)
     apply_blocked_channel_sync(client_conn, set())
-    assert _target_row(client_conn, layout) == (3, 0, "v1")
+    assert _target_row(client_conn, layout) == (3, 0, RENDERER_VERSION)
 
 
 def test_channel_list_change_bumps_layout_singleton_target(
@@ -313,7 +313,7 @@ def test_channel_list_change_bumps_layout_singleton_target(
 
     apply_event(client_conn, frame, tz=_UTC)
 
-    assert _target_row(client_conn, TargetKey("layout", None, None, None)) == (2, 0, "v1")
+    assert _target_row(client_conn, TargetKey("layout", None, None, None)) == (2, 0, RENDERER_VERSION)
 
 
 def test_layout_singleton_row_exists_after_migration(

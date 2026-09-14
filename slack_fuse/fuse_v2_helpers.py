@@ -31,7 +31,16 @@ from slack_fuse.projector.trailer import (
     staleness_reason,
 )
 from slack_fuse.slug import slugify
-from slack_fuse_render import ChannelId, ChannelView, UserId, UserResolver, UserView, resolve_mentions
+from slack_fuse_render import (
+    ChannelId,
+    ChannelView,
+    UserId,
+    UserResolver,
+    UserView,
+    has_thread_summary,
+    resolve_mentions,
+    resolve_thread_summary_link,
+)
 from slack_fuse_render.resolvers import ChannelResolver
 
 # Re-exported from ``slack_fuse.projector.trailer`` (Sprint 3C extraction) so the
@@ -620,17 +629,21 @@ def fetch_day_chunks(
     channel_id: str,
     day: date,
     tz: ZoneInfo,
-) -> list[str]:
-    """Return ``content_md`` rows for the channel-day, in ts-ascending order."""
+) -> list[tuple[Decimal, str]]:
+    """Return ``(message_ts, content_md)`` for the channel-day, ts-ascending.
+
+    The ts rides along because the day assembler needs to match each thread
+    parent's chunk to its thread slug (:func:`render_day_body`).
+    """
     start, end = local_day_utc_range(day, tz)
     with conn.cursor() as cur:
         _ = cur.execute(
-            "SELECT content_md FROM chunks "
+            "SELECT message_ts, content_md FROM chunks "
             "WHERE channel_id = %s AND message_ts >= %s AND message_ts < %s "
             "ORDER BY message_ts",
             (channel_id, start, end),
         )
-        return [str(r[0]) for r in cur.fetchall()]
+        return [(Decimal(str(ts)), str(md)) for ts, md in cur.fetchall()]
 
 
 def fetch_day_thread_parents(
@@ -689,6 +702,39 @@ def fetch_thread_chunks(
     contents.extend(replies)
     reply_count = int(parent_row[1]) if parent_row is not None else 0
     return contents, reply_count
+
+
+# ============================================================================
+# Body assembly — the file-context-dependent half of rendering
+# ============================================================================
+#
+# One stored chunk serves two files. A thread parent's summary is a link to
+# its thread from the day view and nothing at all from inside the thread, so
+# the choice is made here, at assembly, not baked into ``content_md``. Both
+# the disk projection and the JIT mount call these, so the two paths cannot
+# drift apart.
+
+
+def render_day_body(
+    conn: Connection[TupleRow],
+    channel_id: str,
+    day: date,
+    tz: ZoneInfo,
+    chunks: list[tuple[Decimal, str]],
+) -> str:
+    """Concatenate a day's chunks, linking each thread parent to its thread.
+
+    Thread slugs come from the same :func:`dedup_thread_slug_map` pass that
+    names the directories, so the links and the directories agree by
+    construction. A parent with no slug degrades to plain text rather than a
+    dangling link. The slug query only runs when a chunk actually carries a
+    summary, so a day without threads costs nothing extra.
+    """
+    if not any(has_thread_summary(md) for _, md in chunks):
+        return "\n".join(md for _, md in chunks)
+    parents = fetch_day_thread_parents(conn, channel_id, day, tz)
+    slug_by_ts = {ts: slug for slug, ts in dedup_thread_slug_map(parents, conn).items()}
+    return "\n".join(resolve_thread_summary_link(md, slug_by_ts.get(ts)) for ts, md in chunks)
 
 
 # ============================================================================

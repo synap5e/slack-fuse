@@ -87,6 +87,7 @@ from slack_fuse.fuse_v2_helpers import (
     is_valid_month,
     parse_day_date,
     parse_path,
+    render_day_body,
     resolve_with_miss_tracking,
     sql_resolvers_for,
     thread_frontmatter,
@@ -489,10 +490,10 @@ def _assemble_channel_day(
     Returns ``(bytes, had_trailer, had_unresolved_fallback, decision)``.
     ``None`` if the day has no chunks.
     """
-    contents = fetch_day_chunks(conn, row.channel_id, day, tz)
-    if not contents:
+    chunks = fetch_day_chunks(conn, row.channel_id, day, tz)
+    if not chunks:
         return None
-    body = "\n".join(contents)
+    body = render_day_body(conn, row.channel_id, day, tz, chunks)
     users, channels = sql_resolvers_for(conn)
     resolved, fallback_reasons = resolve_with_miss_tracking(body, users, channels)
     base = day_channel_frontmatter(row, day) + resolved

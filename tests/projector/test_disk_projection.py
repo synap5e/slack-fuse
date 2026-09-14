@@ -150,6 +150,13 @@ def test_bootstrap_marks_thread_paths_with_canonical_dedup_slug(
         b"## 10:00 @bot\n\nProjection design\n\n> Thread: 1 replies\n\n"
         b"## 10:01 @bot\n\nReply\n"
     )
+    # The day file links to the thread, with the same slug the directory uses.
+    day_path = "/channels/threads/2026-08/02/channel.md"
+    assert projection.path_for(day_path).read_bytes() == (
+        b"---\nchannel: threads\nchannel_id: CTHREAD\ndate: 2026-08-02\n---\n"
+        b"## 10:00 @bot\n\nProjection design\n\n"
+        b"[Thread: 1 reply](projection-design/thread.md)\n"
+    )
 
 
 def test_apply_event_marks_corresponding_day_dirty_after_commit(

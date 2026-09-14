@@ -38,6 +38,7 @@ from slack_fuse.fuse_v2_helpers import (
     fetch_day_chunks,
     fetch_day_thread_parents,
     fetch_thread_chunks,
+    render_day_body,
     sql_resolvers_for,
     thread_frontmatter,
 )
@@ -186,8 +187,7 @@ class DiskProjection:
                         continue
                     targets.append(TargetKey("channel-meta", row.channel_id, None, None))
                     paths.append(f"/{conv_root}/{slug}/{CHANNEL_MD}")
-                    contents = fetch_day_chunks(bootstrap_conn, row.channel_id, bootstrap_day, self._tz)
-                    if not contents:
+                    if not fetch_day_chunks(bootstrap_conn, row.channel_id, bootstrap_day, self._tz):
                         continue
                     targets.append(TargetKey("day", row.channel_id, bootstrap_day, None))
                     day_root = f"/{conv_root}/{slug}/{bootstrap_day:%Y-%m}/{bootstrap_day:%d}"
@@ -272,8 +272,7 @@ class DiskProjection:
                 today_targets: list[TargetKey] = []
                 for target in channel_meta_targets:
                     assert target.channel_id is not None
-                    contents = fetch_day_chunks(reconcile_conn, target.channel_id, bootstrap_day, self._tz)
-                    if not contents:
+                    if not fetch_day_chunks(reconcile_conn, target.channel_id, bootstrap_day, self._tz):
                         continue
                     today_targets.append(TargetKey("day", target.channel_id, bootstrap_day, None))
                     parents = fetch_day_thread_parents(
@@ -636,11 +635,12 @@ class DiskProjection:
         return None if thread_slug is None else f"{day_root}/{thread_slug}/{THREAD_MD}"
 
     def _render_day(self, row: ChannelRow, day: date) -> bytes | None:
-        contents = fetch_day_chunks(self._conn, row.channel_id, day, self._tz)
-        if not contents:
+        chunks = fetch_day_chunks(self._conn, row.channel_id, day, self._tz)
+        if not chunks:
             return None
+        body = render_day_body(self._conn, row.channel_id, day, self._tz, chunks)
         users, channels = sql_resolvers_for(self._conn)
-        resolved = resolve_mentions("\n".join(contents), users, channels)
+        resolved = resolve_mentions(body, users, channels)
         return (day_channel_frontmatter(row, day) + resolved).encode()
 
     def _render_thread(self, row: ChannelRow, thread_ts: Decimal) -> bytes | None:

@@ -41,7 +41,13 @@ type TargetCleanResult = Literal["clean", "dirty", "missing"]
 
 #: Manual renderer/schema epoch. Bump this stable value whenever the bytes a
 #: projection target produces change structurally.
-RENDERER_VERSION: Final = "v1"
+#:
+#: v2 (2026-09-14): a thread parent's summary line became a link into the
+#: thread directory in the day view and disappeared inside ``thread.md``.
+#: Re-dirties projection targets so materialized files pick it up; it does not
+#: re-render ``chunks.content_md``, which the new assembly step reads either
+#: form of.
+RENDERER_VERSION: Final = "v2"
 
 
 @dataclass(frozen=True, slots=True)

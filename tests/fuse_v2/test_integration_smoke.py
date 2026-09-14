@@ -161,6 +161,50 @@ def test_smoke_channel_md_bytes(populated_ops: SlackFuseOpsV2) -> None:
     assert text.index("Morning standup time") < text.index("double check the deploy") < text.index("End of day")
 
 
+def test_smoke_channel_md_links_thread_summary(populated_ops: SlackFuseOpsV2) -> None:
+    """The day view turns a thread parent's summary into a link to the thread
+    directory it actually materializes into. The seeded chunk carries the
+    pre-marker literal, so this pins the legacy path through the JIT assembler.
+    """
+    entries = populated_ops.list_dir_for_test("/channels/general/2026-06/08")
+    thread_dir = next(name for name, is_dir in entries if is_dir)
+    resolved = populated_ops.resolve_content_for_test("/channels/general/2026-06/08/channel.md")
+    assert resolved is not None
+    text = resolved[0].decode()
+    assert f"[Thread: 1 reply]({thread_dir}/thread.md)" in text
+    assert "> Thread:" not in text
+    assert "<thread-summary" not in text
+
+
+def test_smoke_channel_md_links_marker_form(
+    client_conn: Connection[TupleRow],
+    fake_pyfuse3: FakePyfuse3,
+) -> None:
+    """Same link, from a chunk written with the current marker."""
+    _seed_populated_day(client_conn)
+    marker_ts = _ts(datetime(2026, 6, 8, 11, 0, tzinfo=UTC))
+    seed_chunk(
+        client_conn,
+        "C-GEN",
+        marker_ts,
+        '## 11:00 <@UALICE>\n\nRelease checklist\n\n<thread-summary reply_count="2"/>\n',
+        reply_count=2,
+        mentioned_user_ids=["UALICE"],
+    )
+    ops = SlackFuseOpsV2(
+        conn=client_conn,
+        local_tz=ZoneInfo("UTC"),
+        limiter=trio.CapacityLimiter(1),
+        notify_store=fake_pyfuse3.notify_store,
+        invalidate_inode=fake_pyfuse3.invalidate_inode,
+    )
+    resolved = ops.resolve_content_for_test("/channels/general/2026-06/08/channel.md")
+    assert resolved is not None
+    text = resolved[0].decode()
+    assert "[Thread: 2 replies](release-checklist/thread.md)" in text
+    assert "<thread-summary" not in text
+
+
 def test_smoke_thread_md_bytes(populated_ops: SlackFuseOpsV2) -> None:
     entries = populated_ops.list_dir_for_test("/channels/general/2026-06/08")
     thread_dir = next(name for name, is_dir in entries if is_dir)

@@ -35,7 +35,7 @@ from slack_fuse.cli.tier import (
 )
 from slack_fuse.fuse_v2_helpers import fetch_channel_by_slug
 from slack_fuse.migrations.runner import apply_migrations
-from slack_fuse.projector.projection_ledger import TargetKey
+from slack_fuse.projector.projection_ledger import RENDERER_VERSION, TargetKey
 
 _CLIENT_MIGRATIONS_DIR = Path(client_migrations.__file__).parent
 
@@ -332,8 +332,8 @@ def test_tier_cli_set_hot_to_blocked_bumps_channel_meta_and_layout(
         cmd_tier(argparse.Namespace(slug_or_channel_id=channel_id, tier="blocked", reset_to_auto=False))
 
         assert _channel_row(conn, channel_id)[:3] == ("blocked", "manual", False)
-        assert _target_row(conn, TargetKey("channel-meta", channel_id, None, None)) == (2, 0, "v1")
-        assert _target_row(conn, TargetKey("layout", None, None, None)) == (2, 0, "v1")
+        assert _target_row(conn, TargetKey("channel-meta", channel_id, None, None)) == (2, 0, RENDERER_VERSION)
+        assert _target_row(conn, TargetKey("layout", None, None, None)) == (2, 0, RENDERER_VERSION)
         assert "tier set to blocked" in capsys.readouterr().out
     finally:
         conn.close()
@@ -478,8 +478,8 @@ def test_tier_cli_reset_bumps_channel_meta_and_layout(
         cmd_tier(argparse.Namespace(slug_or_channel_id=channel_id, tier=None, reset_to_auto=True))
 
         assert _channel_row(conn, channel_id)[:3] == ("hot", "auto", True)
-        assert _target_row(conn, TargetKey("channel-meta", channel_id, None, None)) == (2, 0, "v1")
-        assert _target_row(conn, TargetKey("layout", None, None, None)) == (2, 0, "v1")
+        assert _target_row(conn, TargetKey("channel-meta", channel_id, None, None)) == (2, 0, RENDERER_VERSION)
+        assert _target_row(conn, TargetKey("layout", None, None, None)) == (2, 0, RENDERER_VERSION)
         assert "tier set to hot" in capsys.readouterr().out
     finally:
         conn.close()
