@@ -183,4 +183,4 @@ def test_nats_shim_counts_as_event_source() -> None:
     assert cfg.nats_shim_enabled is True
     assert cfg.nats_subject == "webhooks.slack.>"
     assert cfg.nats_durable_name == "slack-fuse-webhooks-slack"
-    assert cfg.nats_stream_name == "webhooks"
+    assert cfg.nats_stream_name == "webhooks-slack"
