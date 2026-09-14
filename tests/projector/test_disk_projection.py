@@ -144,13 +144,17 @@ def test_bootstrap_marks_thread_paths_with_canonical_dedup_slug(
     thread_path = "/channels/threads/2026-08/02/projection-design/thread.md"
     assert thread_path in marked
     assert len(projection.flush_dirty(10)) == 3
+    # The parent's thread summary is stripped inside thread.md — the frontmatter
+    # already carries reply_count and a link here would point at this file. The
+    # seeded chunk holds the pre-marker literal, so this also pins that legacy
+    # chunks are handled without a re-render.
     assert projection.path_for(thread_path).read_bytes() == (
         b"---\nchannel: threads\nchannel_id: CTHREAD\n"
         b'thread_ts: "1785664800.000000"\nreply_count: 1\ndate: 2026-08-02\n---\n'
-        b"## 10:00 @bot\n\nProjection design\n\n> Thread: 1 replies\n\n"
+        b"## 10:00 @bot\n\nProjection design\n\n"
         b"## 10:01 @bot\n\nReply\n"
     )
-    # The day file links to the thread, with the same slug the directory uses.
+    # …and the day file links to it, with the same slug the directory uses.
     day_path = "/channels/threads/2026-08/02/channel.md"
     assert projection.path_for(day_path).read_bytes() == (
         b"---\nchannel: threads\nchannel_id: CTHREAD\ndate: 2026-08-02\n---\n"

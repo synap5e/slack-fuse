@@ -88,6 +88,7 @@ from slack_fuse.fuse_v2_helpers import (
     parse_day_date,
     parse_path,
     render_day_body,
+    render_thread_body,
     resolve_with_miss_tracking,
     sql_resolvers_for,
     thread_frontmatter,
@@ -533,7 +534,7 @@ def _assemble_thread(
     contents, reply_count = fetch_thread_chunks(conn, row.channel_id, thread_ts)
     if not contents:
         return None
-    body = "\n".join(contents)
+    body = render_thread_body(contents)
     users, channels = sql_resolvers_for(conn)
     resolved, fallback_reasons = resolve_with_miss_tracking(body, users, channels)
     base = thread_frontmatter(row, thread_ts, reply_count, tz) + resolved

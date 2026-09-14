@@ -40,6 +40,7 @@ from slack_fuse_render import (
     has_thread_summary,
     resolve_mentions,
     resolve_thread_summary_link,
+    strip_thread_summary,
 )
 from slack_fuse_render.resolvers import ChannelResolver
 
@@ -735,6 +736,13 @@ def render_day_body(
     parents = fetch_day_thread_parents(conn, channel_id, day, tz)
     slug_by_ts = {ts: slug for slug, ts in dedup_thread_slug_map(parents, conn).items()}
     return "\n".join(resolve_thread_summary_link(md, slug_by_ts.get(ts)) for ts, md in chunks)
+
+
+def render_thread_body(contents: list[str]) -> str:
+    """Concatenate a thread's chunks, dropping the parent's self-referential
+    summary — ``thread.md`` already states its reply count in frontmatter.
+    """
+    return "\n".join(strip_thread_summary(md) for md in contents)
 
 
 # ============================================================================

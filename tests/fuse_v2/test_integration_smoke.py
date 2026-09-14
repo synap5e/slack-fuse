@@ -224,6 +224,9 @@ def test_smoke_thread_md_bytes(populated_ops: SlackFuseOpsV2) -> None:
     assert "On it now" in text
     assert "@alice" in text
     assert "@bob" in text
+    # No self-link, and no leftover summary line — reply_count is in frontmatter.
+    assert "Thread: 1 reply" not in text
+    assert "<thread-summary" not in text
 
 
 def test_thread_md_renders_parent_when_thread_chunks_has_only_replies(

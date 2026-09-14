@@ -39,6 +39,7 @@ from slack_fuse.fuse_v2_helpers import (
     fetch_day_thread_parents,
     fetch_thread_chunks,
     render_day_body,
+    render_thread_body,
     sql_resolvers_for,
     thread_frontmatter,
 )
@@ -648,7 +649,7 @@ class DiskProjection:
         if not contents:
             return None
         users, channels = sql_resolvers_for(self._conn)
-        resolved = resolve_mentions("\n".join(contents), users, channels)
+        resolved = resolve_mentions(render_thread_body(contents), users, channels)
         return (thread_frontmatter(row, thread_ts, reply_count, self._tz) + resolved).encode()
 
 
