@@ -180,7 +180,7 @@ uv run basedpyright            # strict type checking
 uv run pytest                  # ~1100 tests; PG-backed, auto-provisioned temp cluster
 ```
 
-Strict basedpyright, ruff preview, frozen Pydantic at I/O boundaries, trio async everywhere (never asyncio). See `CLAUDE.md` for a module map, health taxonomy, and things-not-to-do.
+Strict basedpyright, ruff preview, frozen Pydantic at I/O boundaries, trio async everywhere (never asyncio). See `AGENTS.md` for the module map, health taxonomy, and things-not-to-do — it is hierarchical, with a file beside each package.
 
 ## License
 
