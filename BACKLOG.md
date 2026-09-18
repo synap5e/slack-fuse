@@ -137,8 +137,29 @@ Asked for an explicit reservation in the platform ask: `v{N}` means contract maj
 epochs ride `lineage_id`/`declaration_digest` + lane rotation, never the subject. Also asked
 them to confirm provenance of "the collision ordering key", which we do not recognise as ours.
 
+**Cutover constraint, decided 2026-09-18 — slugify stays bridge-side through the parity run.**
+`slack_fuse/slug.py::slugify` is lossy in three ways at once: it deletes non-ASCII, lowercases,
+and collapses `[^a-z0-9]+` to `-`. So if the engine ever derives names from raw Slack text,
+essentially every thread and channel directory changes path. Measured against the live
+projection DB: 822 channels (0 with non-ASCII names), 18 users with non-ASCII display names,
+38,705 thread parents of which 9,859 (25%) carry non-ASCII in the slug source — but the
+relevant number is ~38.7k + 822, because the case/punctuation folding alone changes the rest.
+
+`record.name` is bridge-set, so none of this is forced. Keep emitting slugified names through
+the parity run and the allowlist is empty, meeting the same bar RFC §14 sets for notion
+("reproduce the current mapping exactly before any declaration-level improvements are turned
+on"). Unicode-preserving names are a **separate, later, allowlisted** declaration change.
+Rationale: fusing a cosmetic improvement into a transport migration destroys the ability to
+attribute a parity diff to either.
+
+Related small item: 78 of 822 channels have empty-string names (not NULL) and fall back to
+`channel_id[:12]`. Any successor engine needs a never-empty rule that agrees with ours on the
+*value*, not merely on validity, or those 78 paths move.
+
 **Correspondence**: `docs/outbound/2026-09-01-response-notion-fuse-projections-rfc.md` (our
-RFC response), `docs/outbound/2026-09-18-reply-fuse-rust-adr-0029.md` (this reply),
+RFC response), `docs/outbound/2026-09-18-reply-fuse-rust-adr-0029.md`,
+`docs/outbound/2026-09-18-reply-fuse-rust-naming-retraction.md`,
+`docs/outbound/2026-09-18-reply-fuse-rust-parity-allowlist.md`,
 `~/agentic/notion-fuse/docs/outbound/slack-fuse-reply-draft.md` (their accept — drafted, never
 formally delivered). This entry is the tripwire: nothing fires on its own if an owner resumes.
 
