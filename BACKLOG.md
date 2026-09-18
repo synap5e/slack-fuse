@@ -107,21 +107,40 @@ Fix shape: version-guard the upsert on a domain field (event kind precedence at 
 `message_changed` > `message`), or adopt the notion-RFC fold rule (reject where incoming seq ≤
 applied seq per unit). Small, local, must land before any flag flips.
 
-## Joint fuse-rust approach with notion-fuse (parked, do not lose)
+## illus spec-crate review — our co-signature is a hard gate
 
-**Effort**: review pass + co-signed cover note when unparked. **Autonomous**: No — both owners
-parked it deliberately (their side: owner sequencing decision 2026-09-01; our side: ingest
-gating + OOM hunt have priority).
+**Effort**: one focused review pass when called. **Autonomous**: No — we are consulted, not
+driving; re-opening planning now would re-ask what RFC v3 already answered.
 
-**State**: notion-fuse ratified all three of our proposals (view units as v1 with
-`page_with_comments` as first instance; slack-fuse named on the spec crate and bridge-facing
-DB contract, `projection_targets` credited as predecessor; Control/Trailer/Ghost folded into
-their §13 engine requirements, including the no-`ro`-mount rule and budget classes). Agreed
-plan on unpark: one focused review pass on the amended RFC, then a jointly-signed cover to
-fuse-rust. Correspondence: our `docs/outbound/2026-09-01-response-notion-fuse-projections-rfc.md`,
-their `~/agentic/notion-fuse/docs/outbound/slack-fuse-reply-draft.md`. Neither message was
-formally delivered agent-to-agent — both drafts were ferried by Simon — so nothing fires on
-its own when either owner resumes. This entry is the tripwire.
+**Superseded 2026-09-18 by fuse-rust ADR-0029.** The earlier plan (joint cover note to
+fuse-rust, co-signed with notion-fuse) is dead: fuse-rust/vfsd v1 is terminal — maintenance
+only, no new producers — so the slack migration onto vfsd/vfswire will not happen. The
+successor is **`illus`** (`~/agentic/illus`), built on projections-over-NATS v3 from commit
+one, with notion as reference tenant and our feed sketch as one of two genericity proofs.
+
+**What we hold**: co-signer on the spec crate and on the bridge-facing DB contract
+("notion-fuse proposes, slack-fuse co-signs, fuse-rust approves"), with `projection_targets`
+credited as the `unit_latest` seam's predecessor. Spec-crate review is a real gate — the spec
+does not freeze without our sign-off. Our Control/Trailer/Ghost requirements are already
+folded into the engine requirements (control nodes forbid `ro` mounts and get a longer budget
+class; trailer presentation over derived readiness with `st_size` inclusive; ghost entries
+never reachable by recursive walk).
+
+**Outstanding with them** (raised 2026-09-18, `am_01M2SH144CS8J0G6EW8DT3AGJ8`, unanswered):
+`v{N}` is double-booked. RFC §11a defines `<v>` as the *contract major version*; platform spec
+§7 defines `projections.{tenant}.v{N}` as the *projection epoch* ("bumping N is a rebuild; old
+cursors invalidate naturally because they point at old subjects"). illus's reconciliation doc
+row 22 treats the switch to `v{N}` as a format correction and is silent on the semantics. If
+platform later builds §7 as written, a rebuild bumps the subject root and breaks every mirror's
+standing subscription filter — exactly the "incarnation token in the subject" RFC §6 rejected.
+Asked for an explicit reservation in the platform ask: `v{N}` means contract major version;
+epochs ride `lineage_id`/`declaration_digest` + lane rotation, never the subject. Also asked
+them to confirm provenance of "the collision ordering key", which we do not recognise as ours.
+
+**Correspondence**: `docs/outbound/2026-09-01-response-notion-fuse-projections-rfc.md` (our
+RFC response), `docs/outbound/2026-09-18-reply-fuse-rust-adr-0029.md` (this reply),
+`~/agentic/notion-fuse/docs/outbound/slack-fuse-reply-draft.md` (their accept — drafted, never
+formally delivered). This entry is the tripwire: nothing fires on its own if an owner resumes.
 
 _The four entries below were surfaced on 2026-08-28 by mining the full build session transcript (`docs/HISTORY.md`) for threads that were raised and never closed. Each was then re-checked against the current tree; the evidence label on each says what is code-confirmed and what is still transcript-sourced._
 
