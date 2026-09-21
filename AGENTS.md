@@ -55,6 +55,8 @@ docs/                  RFCs, plans, probe queries, HISTORY.md (mostly gitignored
 
 When someone asks "is it healthy?", name the observable. "systemd active" has meant "silently projecting nothing for 3.7 days" here.
 
+Gap this taxonomy does not cover: an expiring NATS shim credential silently kills the medina ingest lane with every signal above staying green. See "NATS shim credential" in `slack_fuse_server/AGENTS.md` for the operational dependency and its only observable (`nats_shim.iteration_restart` spans).
+
 ## Events vs operator policy
 
 `events` holds facts that happened upstream in Slack. Operator intent is mutable policy and does not belong in a replayable stream — channel blocks live in the server's `blocked_channels` table and reach clients by periodic block sync. Query-derived facts (`search.messages` totals) are a third category in `channel_message_totals`. Detail and rationale: `slack_fuse_server/AGENTS.md`, `docs/HISTORY.md`.

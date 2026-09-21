@@ -15,6 +15,10 @@ backfill/refresh/probes ──────────────────�
 
 Everything writes through `offsets.write_event`. There is no second insert path.
 
+### NATS shim credential
+
+The shim reaches medina over mTLS using an exported copy of medina's `apps/slack-fuse-client-tls`. The PEMs live in the k8s-homelab SOPS secret `apps/slack-fuse-env` (keys `NATS_CA_CRT` / `NATS_TLS_CRT` / `NATS_TLS_KEY`), mounted read-only at `/etc/nats/` with `defaultMode: 0440` (server runs as uid=10001 gid=0; 0400 is unreadable). Rotation is manual — the copy does not follow the source — and is triggered by an alert on the medina side (`~/agentic/gcp-k8s/docs/runbooks.md`). **No slack-fuse health signal observes this credential's expiry.** `/health`, `/livez`, `slurper-health` and the client trailer all stay green while the shim cannot connect; the only path failure is `nats_shim.iteration_restart` spans in the slurper log. Every other ingest transport (webhook, Socket Mode) keeps working independently, so ingest half-death is the failure mode, not silence.
+
 ## Serving
 
 ```
