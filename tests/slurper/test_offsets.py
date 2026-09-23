@@ -383,3 +383,47 @@ def test_writer_methods_preserve_span_none_behavior(
         return read_value, offset
 
     assert trio.run(body) == (5, 1)
+
+
+def test_run_transaction_does_not_hold_row_lock_while_waiting_for_limiter(
+    server_conn_factory: ServerConnFactory,
+) -> None:
+    """Same-stream writers must not deadlock when limiter slots are scarcer than connections.
+
+    The production writer limiter is shared with other thread work, so a body
+    that took the `stream_heads` row lock cannot count on a free slot to commit.
+    """
+    conns = [server_conn_factory() for _ in range(3)]
+    for conn in conns:
+        conn.execute("SET lock_timeout = '1s'")
+    limiter = trio.CapacityLimiter(3)
+    writer = OffsetWriter(conns, limiter=limiter, acquire_timeout_s=5.0)
+
+    def _append(conn: psycopg.Connection[TupleRow]) -> int:
+        record = EventRecord(stream="slurper-health", kind="webhook_consumer_alive", ts=None, payload={})
+        offset = write_event(conn, record)
+        time.sleep(0.05)
+        assert offset is not None
+        return offset
+
+    async def body() -> list[int]:
+        offsets: list[int] = []
+
+        async def one() -> None:
+            offsets.append(await writer.run_transaction(_append))
+
+        # Two slots held by work that owns no pool connection, as the shared
+        # production limiter allows: the writers are left one slot among them.
+        holders = [object(), object()]
+        for holder in holders:
+            await limiter.acquire_on_behalf_of(holder)
+        try:
+            async with trio.open_nursery() as nursery:
+                for _ in range(3):
+                    nursery.start_soon(one)
+        finally:
+            for holder in holders:
+                limiter.release_on_behalf_of(holder)
+        return offsets
+
+    assert sorted(trio.run(body)) == [1, 2, 3]

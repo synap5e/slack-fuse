@@ -346,8 +346,9 @@ class OffsetWriter:
         """Acquire a pooled connection inside an open transaction.
 
         The transaction commits on normal exit and rolls back when the body
-        raises. Use `run_transaction()` when possible so the synchronous body
-        runs on a worker thread under the writer limiter.
+        raises. Begin and commit each take their own limiter slot, so never
+        take a row lock inside this context: the commit can queue behind the
+        writers blocked on that lock. Use `run_transaction()` for writes.
         """
         async with self._borrow_connection(span=span) as conn:
             tx = conn.transaction()
@@ -388,9 +389,23 @@ class OffsetWriter:
         *,
         span: SpanRecorder | None = None,
     ) -> T:
-        """Run a synchronous DB body inside one pooled transaction."""
-        async with self.acquire_transaction(span=span) as conn:
-            return await _run_sync_recorded(lambda: func(conn), limiter=self._limiter, span=span)
+        """Run a synchronous DB body inside one pooled transaction.
+
+        Begin, body and commit run in a single worker-thread hop under one
+        limiter slot. Splitting them (as `acquire_transaction` does) lets a
+        body that took a `stream_heads` row lock give up its slot and queue
+        again to commit while still holding the lock; same-stream writers then
+        fill the limiter blocking on that lock and nobody can commit until
+        `lock_timeout` fires.
+        """
+
+        async with self._borrow_connection(span=span) as conn:
+
+            def _in_transaction() -> T:
+                with conn.transaction():
+                    return func(conn)
+
+            return await _run_sync_recorded(_in_transaction, limiter=self._limiter, span=span)
 
     async def _run_pooled_write(
         self,

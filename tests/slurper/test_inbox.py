@@ -361,3 +361,35 @@ async def test_consumer_infrastructure_failure_propagates(server_conn_factory: S
 
     with pytest.raises(psycopg.Error):
         await consume(conn, _StubDispatcher(), cast(HealthEmitter, _RecordingHealth()))
+
+
+@dataclass(slots=True)
+class _FlakyHealth:
+    """Raises a lock timeout on the first emit, then records."""
+
+    events: list[tuple[HealthKind, JsonObject | None]] = field(default_factory=list)
+    failed: bool = False
+
+    async def emit(self, kind: HealthKind, payload: JsonObject | None = None) -> int:
+        await trio.lowlevel.checkpoint()
+        if not self.failed:
+            self.failed = True
+            raise psycopg.errors.LockNotAvailable("canceling statement due to lock timeout")
+        self.events.append((kind, payload))
+        return len(self.events)
+
+
+@pytest.mark.trio
+async def test_telemetry_survives_health_write_failure(server_conn_factory: ServerConnFactory) -> None:
+    """A DB error in one tick must skip that tick, not escape into the supervisor nursery."""
+    health = _FlakyHealth()
+    writer = make_test_writer(server_conn_factory())
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(
+            lambda: emit_telemetry(writer, cast(HealthEmitter, health), trio.CapacityLimiter(1), interval_s=0.01)
+        )
+        await _wait_until(lambda: (HealthKind.WEBHOOK_CONSUMER_ALIVE, {"counter": 2}) in health.events)
+        nursery.cancel_scope.cancel()
+
+    assert health.failed
+    assert (HealthKind.WEBHOOK_CONSUMER_ALIVE, {"counter": 1}) not in health.events

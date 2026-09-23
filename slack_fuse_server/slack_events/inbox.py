@@ -409,14 +409,19 @@ async def emit_telemetry(
     """Publish queue pressure and a monotonically increasing liveness pulse."""
     counter = 0
     while True:
-        metrics = await writer.run_read(read_inbox_metrics, limiter=read_limiter)
         counter += 1
-        await health.emit(HealthKind.WEBHOOK_INBOX_DEPTH, {"value": metrics.depth})
-        await health.emit(
-            HealthKind.WEBHOOK_INBOX_OLDEST_PENDING_AGE_S,
-            {"value": round(metrics.oldest_pending_age_s, 3)},
-        )
-        await health.emit(HealthKind.WEBHOOK_CONSUMER_ALIVE, {"counter": counter})
+        try:
+            metrics = await writer.run_read(read_inbox_metrics, limiter=read_limiter)
+            await health.emit(HealthKind.WEBHOOK_INBOX_DEPTH, {"value": metrics.depth})
+            await health.emit(
+                HealthKind.WEBHOOK_INBOX_OLDEST_PENDING_AGE_S,
+                {"value": round(metrics.oldest_pending_age_s, 3)},
+            )
+            await health.emit(HealthKind.WEBHOOK_CONSUMER_ALIVE, {"counter": counter})
+        except (psycopg.Error, WriterPoolExhausted) as exc:
+            # Runs in the supervisor nursery, so an escaping DB error would
+            # take down the whole server. Telemetry is best-effort: skip the tick.
+            log.error("webhook inbox telemetry failed exception_type=%s", type(exc).__name__)
         if supervisor is not None:
             supervisor.declare(
                 "webhook-telemetry",
