@@ -159,7 +159,7 @@ def test_bootstrap_marks_thread_paths_with_canonical_dedup_slug(
     assert projection.path_for(day_path).read_bytes() == (
         b"---\nchannel: threads\nchannel_id: CTHREAD\ndate: 2026-08-02\n---\n"
         b"## 10:00 @bot\n\nProjection design\n\n"
-        b"[Thread: 1 reply](projection-design/thread.md)\n"
+        b"> [Thread: 1 reply](projection-design/thread.md)\n"
     )
 
 
