@@ -5,6 +5,7 @@ from __future__ import annotations
 import psycopg
 from psycopg.rows import TupleRow
 
+from slack_fuse_server.slurper import catchup
 from slack_fuse_server.slurper.offsets import EventRecord, write_event
 
 
@@ -79,3 +80,52 @@ def test_channel_ingest_head_folds_message_ts(server_conn: psycopg.Connection[Tu
         row = cur.fetchone()
 
     assert row == ("1700000100.000001",)
+
+
+def test_catchup_ingest_head_matches_the_view_without_scanning_it(server_conn: psycopg.Connection[TupleRow]) -> None:
+    # The view is the reference semantics; catchup must agree with it while using the index.
+    fixtures = {
+        "channel:CA": ["1700000000.000001", "1700000100.000001", "not-a-ts"],
+        "channel:CB": ["1700000050.000001"],
+        "channel:CC": ["bogus"],
+        "backfill-run:CA": [],
+    }
+    for stream, stamps in fixtures.items():
+        for ts in stamps:
+            assert (
+                write_event(
+                    server_conn,
+                    EventRecord(stream=stream, kind="message", ts=None, payload={"ts": ts}, dedup=True),
+                )
+                is not None
+            )
+    assert (
+        write_event(
+            server_conn,
+            EventRecord(stream="channel:CD", kind="message_changed", ts=None, payload={"ts": "1800000000.000001"}),
+        )
+        is not None
+    )
+
+    with server_conn.cursor() as cur:
+        cur.execute("SELECT channel_id, latest_ts::float FROM channel_ingest_head")
+        from_view = {str(c): float(t) for c, t in cur.fetchall()}
+
+    assert (
+        catchup.latest_ingest_head_by_channel(server_conn)
+        == from_view
+        == {
+            "CA": 1700000100.000001,
+            "CB": 1700000050.000001,
+        }
+    ), "invalid ts ignored; channels with no valid ts and non-message kinds omitted"
+
+
+def test_catchup_ingest_head_uses_the_index(server_conn: psycopg.Connection[TupleRow]) -> None:
+    with server_conn.cursor() as cur:
+        cur.execute("SET enable_seqscan = off")
+        cur.execute("EXPLAIN " + catchup._INGEST_HEAD_SQL)  # pyright: ignore[reportPrivateUsage]
+        plan = "\n".join(str(r[0]) for r in cur.fetchall())
+        cur.execute("RESET enable_seqscan")
+    assert "events_message_dedup" in plan, "a full scan of events is what OOMed postgres"
+    assert "HashAggregate" not in plan and "GroupAggregate" not in plan
