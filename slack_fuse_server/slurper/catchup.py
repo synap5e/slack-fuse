@@ -173,10 +173,33 @@ def last_seen_ts_by_stream(conn: psycopg.Connection[TupleRow]) -> dict[str, floa
         return result
 
 
+# WHY a loose index scan instead of the channel_ingest_head view: the view GROUPs every message event and filters with
+# is_valid_slack_ts(), which no index covers, so it reads all of `events` (2.9 GB at 1.47M rows) -- it OOMKilled
+# postgres at 2Gi into a server crash loop on 2026-09-30. This walks events_message_dedup (stream, kind, ts) one
+# stream at a time and reads each stream's newest ts off the index tail. Valid Slack ts are fixed-width
+# (10 digits . 6 digits), so text order equals numeric order and the tail is the max. No range bound on the stream
+# prefix: under a locale collation 'channel:' .. 'channel;' is not a byte range and selects nothing.
+_INGEST_HEAD_SQL = """
+WITH RECURSIVE streams(stream) AS (
+    (SELECT stream FROM events WHERE kind = 'message' ORDER BY stream LIMIT 1)
+  UNION ALL
+    SELECT (SELECT e.stream FROM events e
+             WHERE e.kind = 'message' AND e.stream > s.stream
+             ORDER BY e.stream LIMIT 1)
+    FROM streams s WHERE s.stream IS NOT NULL
+)
+SELECT substr(stream, length('channel:') + 1) AS channel_id,
+       (SELECT e.payload->>'ts' FROM events e
+         WHERE e.kind = 'message' AND e.stream = streams.stream AND is_valid_slack_ts(e.payload->>'ts')
+         ORDER BY e.stream DESC, e.kind DESC, (e.payload->>'ts') DESC LIMIT 1) AS latest_ts
+FROM streams WHERE stream LIKE 'channel:%'
+"""
+
+
 def latest_ingest_head_by_channel(conn: psycopg.Connection[TupleRow]) -> dict[str, float]:
-    """Read the derived ingest-head view used by startup catchup."""
+    """Newest valid message ts per channel stream, for startup catchup."""
     with conn.cursor() as cur:
-        cur.execute("SELECT channel_id, latest_ts FROM channel_ingest_head")
+        cur.execute(_INGEST_HEAD_SQL)
         result: dict[str, float] = {}
         for channel_id_raw, latest_ts_raw in cur.fetchall():
             if latest_ts_raw is not None:
