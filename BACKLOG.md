@@ -43,6 +43,32 @@ Root-cause work:
 
 Emergency mitigation buys us time; the 1658 restarts / 10d cadence needs a proper answer. Also: the tight cadence meant Slack's Events API webhook retries had few good windows to land, so real messages likely dropped through the outage. Consider a scheduled `conversations.history` catchup that re-runs against a rolling window to backfill gaps.
 
+**Diagnosed 2026-09-30 (probable cause).** Snapshot generation. `snapshot/generator.py` builds each snapshot in
+one shot: it `fetchall()`s every event in the stream, projects it, serialises it once to count bytes and again
+as a single `Jsonb` parameter, and keeps the lines in memory in its result. Postgres then parses the whole value
+into `jsonb`. Measured live: one backend at **1,738 MB RssAnon** inserting a **152 MB** payload. That took postgres
+down 61 times at 2Gi on 2026-09-30, after downtime made every stream due for its time trigger at once. The server
+holds several copies of the same payload, which fits this entry's original server OOMs at 1Gi. Not yet confirmed
+on the server side with a profiler.
+
+- **Growth.** Max payload by month, measured by k8s-homelab-owner: Jun 24 MB, Jul 59, Aug 109, Sep 174 (~1.6x a
+  month), at roughly 10x that in postgres memory. **4Gi runs out around November.** Their earlier report gave the
+  *mean* (3.2 → 7.2 MB), which hid this completely: for OOM prediction use the max, never the average.
+- **Mitigated** (k8s-homelab 6ae9e47): `SLACK_FUSE_SERVER_SNAPSHOT_MAX_AGE_HOURS=87600` disables the 24h time
+  trigger. It caused 170 of 171 snapshots in the prior 24h (99.4%), none needed: the 5000-event trigger alone
+  guarantees a far-behind client finds a snapshot (`snapshot_every_n_events` == `DEFAULT_MAX_REPLAY_EVENTS` ==
+  5000). Postgres limit raised to 4Gi (k8s-homelab 6bed0bd), stopgap. Neither reduces the peak.
+- **Fix, before November.** Build snapshots without holding a whole stream: stream the rows, and store them
+  gzip-compressed rather than as `jsonb` (an added nullable column needs no table rewrite).
+- **Retention, needs Simon.** `snapshots` is 22 GB (events 2.9 GB): 11,103 rows, no pruning, ~89 per busy channel,
+  almost all of them unused time-triggered rebuilds. Readers only use the newest at or below a given offset.
+  Deleting is data, and reclaiming needs VACUUM FULL, a long exclusive lock, so schedule it separately from any
+  code deploy.
+- **Consequence to fix: `rerender` coverage.** `projector/rerender.py` re-renders from the newest snapshot at or
+  below the channel's cursor and deliberately leaves newer chunks alone. With the time trigger gone, a quiet
+  channel's newest snapshot can be weeks old, so a rerender after a renderer fix silently covers only up to it
+  and still reports success. rerender should also replay events after the snapshot.
+
 ## Tailscale ingress "Port Unreachable" is not silence
 
 **Effort**: 15 min doc. **Autonomous**: Yes.
