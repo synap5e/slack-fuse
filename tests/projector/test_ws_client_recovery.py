@@ -10,6 +10,7 @@ import httpx
 import psycopg
 import pytest
 import trio
+import trio.testing
 
 import slack_fuse.projector.ws_client as ws_client_module
 from slack_fuse.projector.per_stream import StreamApplier
@@ -377,3 +378,62 @@ async def test_subscribe_send_failure_marks_state_failed(
         await client._subscribe_stream(stream, since=0)
 
     assert client._subscription_state[stream] is SubscriptionState.FAILED
+
+
+class _SilentSocket:
+    """A half-open connection: never delivers a frame and never raises ConnectionClosed."""
+
+    def __init__(self, *, close_hangs: bool = False) -> None:
+        self.close_codes: list[int] = []
+        self._close_hangs = close_hangs
+
+    async def get_message(self) -> str:
+        await trio.sleep_forever()
+        raise AssertionError("unreachable")
+
+    async def aclose(self, code: int = 1000, reason: str | None = None) -> None:
+        _ = reason
+        self.close_codes.append(code)
+        if self._close_hangs:
+            await trio.sleep_forever()
+
+
+def _silent_client(client_conn_factory: ClientConnFactory, sock: _SilentSocket) -> WSClient:
+    client = WSClient(
+        WSClientOptions(server_url="ws://server.invalid"),
+        client_conn_factory,
+        client_conn_factory(),
+        tz=ZoneInfo("UTC"),
+    )
+    client._ws = cast("WebSocketConnection", sock)
+    return client
+
+
+@pytest.mark.trio
+async def test_receive_loop_gives_up_on_a_silent_socket(
+    client_conn_factory: ClientConnFactory, autojump_clock: trio.testing.MockClock
+) -> None:
+    _ = autojump_clock
+    sock = _SilentSocket()
+    client = _silent_client(client_conn_factory, sock)
+
+    with trio.fail_after(ws_client_module._CONNECTION_TIMEOUT_S + 10):
+        await client._receive_loop()
+
+    assert sock.close_codes == [1001], (
+        "a half-open socket must end the receive loop, or the mount never reconnects (4h on 2026-10-01)"
+    )
+
+
+@pytest.mark.trio
+async def test_receive_timeout_does_not_hang_on_a_dead_close(
+    client_conn_factory: ClientConnFactory, autojump_clock: trio.testing.MockClock
+) -> None:
+    _ = autojump_clock
+    sock = _SilentSocket(close_hangs=True)
+    client = _silent_client(client_conn_factory, sock)
+
+    with trio.fail_after(ws_client_module._CONNECTION_TIMEOUT_S + 30):
+        await client._receive_loop()
+
+    assert sock.close_codes == [1001], "closing a dead socket can block too; it is bounded"
