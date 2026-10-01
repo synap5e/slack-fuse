@@ -263,9 +263,20 @@ class WSClient:
         if ws is None:  # pragma: no cover - run() sets this before calling
             return
         while True:
-            try:
-                message = await ws.get_message()
-            except trio_websocket.ConnectionClosed:
+            # WHY a receive deadline: the server pings every 30s, so a live connection always delivers a frame well
+            # inside 90s. Without one, a half-open socket (path dropped, no FIN/RST ever arrives) blocks
+            # get_message() forever while the heartbeat's sends just queue in the kernel -- the mount went 4h
+            # without reconnecting on 2026-10-01. Returning here takes the same reconnect path as ConnectionClosed.
+            message: str | bytes | None = None
+            with trio.move_on_after(_CONNECTION_TIMEOUT_S):
+                try:
+                    message = await ws.get_message()
+                except trio_websocket.ConnectionClosed:
+                    return
+            if message is None:
+                log.warning("ws: no frame for %.0fs; treating the connection as dead", _CONNECTION_TIMEOUT_S)
+                with trio.move_on_after(5):
+                    await ws.aclose(1001, "receive timeout")
                 return
             await trio.to_thread.run_sync(self._bump_last_frame_sync)
             try:
@@ -547,8 +558,3 @@ def _frame_to_json(frame: object) -> str:
         return frame.model_dump_json()  # type: ignore[no-any-return,attr-defined]
     msg = f"cannot serialise frame of type {type(frame).__name__}"
     raise TypeError(msg)
-
-
-# Keep `_CONNECTION_TIMEOUT_S` referenced so flake8 doesn't flag it; reserved
-# for a future receive-timeout patch (the server already enforces 90s silent).
-_ = _CONNECTION_TIMEOUT_S
