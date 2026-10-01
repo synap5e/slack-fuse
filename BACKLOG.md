@@ -69,6 +69,16 @@ on the server side with a profiler.
   channel's newest snapshot can be weeks old, so a rerender after a renderer fix silently covers only up to it
   and still reports success. rerender should also replay events after the snapshot.
 
+## Flaky timing test: `test_reader_clean_check_median_latency_under_five_ms_for_100_channels`
+
+**Effort**: 1h. **Autonomous**: Yes.
+
+**Verified 2026-10-01**: fails intermittently in `tests/projector` (2 of 3 full-suite runs), and fails 3 of 3 in
+isolation on the commit *before* the ws_client receive-timeout fix, so it predates that change. It asserts a
+wall-clock median under 5 ms on a shared desktop running a temp postgres, so its result depends on host load,
+not code. Either make it measure something load-independent (rows touched, or the plan shape) or mark it as a
+benchmark excluded from the default run. It currently teaches people to ignore a red suite.
+
 ## Tailscale ingress "Port Unreachable" is not silence
 
 **Effort**: 15 min doc. **Autonomous**: Yes.
