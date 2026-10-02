@@ -124,7 +124,7 @@ Channel directory names are slugified. Thread slugs come from the first message 
 
 ### Related CLIs
 
-- `uv run slack-fuse resolve <slack-url>` → FUSE path for a Slack message permalink (fully local, no Slack API).
+- `uv run slack-fuse resolve <slack-url>` → FUSE path for a Slack message permalink (fully local, no Slack API). Also takes `<channel_id>:<ts>` (a thread parent's ts gives its `thread.md`) or a bare `<channel_id>`; the shorthand is local-only, not accepted with `--server-url`.
 - `uv run slack-fuse permalink <fuse-path>` → Slack permalink URL (requires `SLACK_WORKSPACE_URL`). Pass `--ts <message_ts>` to permalink a specific message in a day file.
 - `uv run slack-fuse-server refresh-channel-totals` (server-side) — one-shot totals sweep.
 
