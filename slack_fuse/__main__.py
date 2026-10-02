@@ -948,7 +948,9 @@ def build_parser() -> argparse.ArgumentParser:
     unmount_parser.set_defaults(func=cmd_unmount)
 
     resolve_parser = sub.add_parser("resolve", help="Resolve a Slack permalink to a FUSE path")
-    resolve_parser.add_argument("url", help="Slack permalink URL")
+    resolve_parser.add_argument(
+        "url", help="Slack permalink URL, or <channel_id>[:<ts>] (a thread parent's ts gives its thread.md)"
+    )
     resolve_parser.add_argument(
         "--mountpoint",
         default=None,

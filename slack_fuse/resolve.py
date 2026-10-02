@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import date
 from decimal import Decimal
 from typing import TYPE_CHECKING
@@ -35,13 +36,19 @@ class PermalinkResolutionError(LookupError):
     """
 
 
+_CHANNEL_TS_RE = re.compile(r"^(?P<channel>[CDG][A-Z0-9]+)(?::(?P<ts>\d{10}\.\d{1,6}))?$")
+
+
 def parse_permalink(url: str) -> tuple[str, str | None, str | None]:
-    """Parse a Slack permalink URL.
+    """Parse a Slack permalink URL, or the `<channel>[:<ts>]` shorthand slackwatch uses.
 
     Returns (channel_id, message_ts or None, thread_ts or None).
     `message_ts` is None for channel-only URLs (`/archives/<C>` with no `/p<ts>`).
     Raises ValueError if the URL format is unrecognized.
     """
+    if (m := _CHANNEL_TS_RE.match(url)) is not None:
+        return m["channel"], m["ts"], None
+
     parsed = urlparse(url)
     parts = parsed.path.strip("/").split("/")
 

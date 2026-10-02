@@ -135,6 +135,16 @@ class TestParsePermalink:
         assert ts is None
         assert thread_ts is None
 
+    def test_channel_ts_shorthand(self) -> None:
+        assert parse_permalink("C09LDUKDQ1K:1775493247.936389") == ("C09LDUKDQ1K", "1775493247.936389", None)
+
+    def test_channel_only_shorthand(self) -> None:
+        assert parse_permalink("D0C2K60M9CL") == ("D0C2K60M9CL", None, None)
+
+    def test_shorthand_with_malformed_ts_is_not_accepted(self) -> None:
+        with pytest.raises(ValueError, match="Not a Slack archives URL"):
+            parse_permalink("C09LDUKDQ1K:12345")
+
     def test_rejects_non_archives_path(self) -> None:
         with pytest.raises(ValueError, match="Not a Slack archives URL"):
             parse_permalink("https://workspace.slack.com/messages/C123")
@@ -190,6 +200,18 @@ def test_thread_parent_message_returns_derived_thread_file(client_conn: Connecti
     path = resolve_permalink(_permalink("C1", parent_ts), _MOUNTPOINT, client_conn)
 
     assert path == f"/mnt/slack/channels/general/2026-07/31/{expected_slug}/thread.md"
+
+
+def test_channel_ts_shorthand_resolves_like_the_permalink(client_conn: Connection[TupleRow]) -> None:
+    _seed_channel(client_conn)
+    parent_ts = _local_ts(2026, 7, 31, 10)
+    content_md = "## 10:00 <@U1>\n\nThread topic\n\n> Thread: 1 replies\n"
+    _seed_chunk(client_conn, parent_ts, content_md, reply_count=1)
+
+    via_shorthand = resolve_permalink(f"C1:{parent_ts}", _MOUNTPOINT, client_conn)
+
+    assert via_shorthand == resolve_permalink(_permalink("C1", parent_ts), _MOUNTPOINT, client_conn)
+    assert via_shorthand.endswith("/thread.md")
 
 
 def test_thread_reply_uses_parent_date_and_slug(client_conn: Connection[TupleRow]) -> None:
