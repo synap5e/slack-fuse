@@ -120,6 +120,7 @@ Cross-cutting ones. Module-specific hazards live in the child AGENTS.md files, a
 - `.env.example` is **stale**: it lists v1's `SLACK_USER_TOKEN` / `SLACK_FUSE_BACKFILL`. Real client config is `SLACK_FUSE_*` env or `~/.config/slack-fuse/config.toml`; the server uses `SLACK_FUSE_SERVER_*`. The mount holds no Slack token, only a shared secret.
 - No `.cached-only/` prefix in v2 — it was a v1 mechanism to suppress read-time Slack calls, and v2 has no direct-API path from the mount.
 - For wide greps, read `~/.cache/slack-fuse/projection/` directly (~62,000 files/s) rather than the mount (~15-25 files/s). A `.ignore` ghost at the mount root keeps `rg`/`fd` out of `_control/`.
+- **The mount reaches the server via tailnet `svc-slack-fuse` (100.85.173.107), relayed by the homelab peer relay** (10.0.0.51, `118.67.196.135:41644`). That site is symmetric NAT, so there is no direct path. If the homelab WAN IP moves, the relay's hardcoded static endpoint breaks silently and traffic falls back to DERP Sydney: about +20 ms, nothing errors. Check with `tailscale status | grep svc-slack-fuse` (want `peer-relay`, not `relay "syd"`). The client reconnects after 90s of silence (551c24a); before that, a dead path left the mount stale for hours while systemd showed it active.
 - `git wt <branch>` for worktrees; don't `git switch` (the agent guard blocks it).
 
 ## Notes
