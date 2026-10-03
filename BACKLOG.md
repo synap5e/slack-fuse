@@ -79,6 +79,21 @@ wall-clock median under 5 ms on a shared desktop running a temp postgres, so its
 not code. Either make it measure something load-independent (rows touched, or the plan shape) or mark it as a
 benchmark excluded from the default run. It currently teaches people to ignore a red suite.
 
+## Block sync fails most cycles: 5s read timeout vs a slow server
+
+**Effort**: 1-2h. **Autonomous**: Yes (client side); server latency is the OOM item above.
+
+**Verified 2026-10-03**: the client logs `block-sync: GET /blocked-channels returned 0` 570-1,300 times a day, every
+day back to the start of the journal (29 Sep). Status 0 is a transport error. The client's httpx timeout is `read=5.0`
+(`slack_fuse/__main__.py`, `_make_http_client`), and with the secret the same GET took 0.96s, 0.59s and 7.58s in three
+consecutive tries. So some cycles succeed and blocks still land eventually, but a newly blocked channel can stay
+visible on the mount for an unbounded number of cycles. Fix the client (longer read timeout for this one call, and log
+the exception class instead of `0`), and treat the 7s outlier as more evidence for the server latency problem.
+
+**Also seen the same day**: FUSE metadata callbacks returning EIO on the 0.5s budget (83 between 16:00 and 16:09, 18
+between 16:46 and 16:50) while host load was 41-55 on 24 cores. That is the budget working as designed. No action
+beyond pointing heavy readers at `~/.cache/slack-fuse/projection/`.
+
 ## Tailscale ingress "Port Unreachable" is not silence
 
 **Effort**: 15 min doc. **Autonomous**: Yes.
