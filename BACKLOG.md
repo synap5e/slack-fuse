@@ -79,6 +79,23 @@ wall-clock median under 5 ms on a shared desktop running a temp postgres, so its
 not code. Either make it measure something load-independent (rows touched, or the plan shape) or mark it as a
 benchmark excluded from the default run. It currently teaches people to ignore a red suite.
 
+## NATS shim hangs on retry; and the reader-visible trailer can't see an ingest stop
+
+**Effort**: shim fix 2-3h + image roll; trailer signal 2-4h. **Autonomous**: Yes (image roll via k8s-homelab owner).
+
+**Seen 2026-10-06 00:27-00:50Z**: `nats_shim` fetch raised `TimeoutError`, the iteration restarted, logged one
+`client error exception_type=TimeoutError` at 00:28:07, then went silent until a pod delete at 00:50. No ingest for
+23 min, and `/views/slack` was frozen for every reader. No data was lost: the durable `slack-fuse-webhooks-slack`
+retained everything and drained after the restart. Same shape as the 2026-10-01 ws_client wedge (alive, healthy,
+idle, never recovers): give each shim iteration a progress deadline that forces a reconnect, with a regression test
+in the 551c24a style.
+
+Second half: the client trailer stayed clean throughout, because it is built from WS state plus `slurper-health`,
+and the server keeps reporting healthy while the shim is wedged. A reader grepping the mount can't tell a frozen
+mount from a quiet Slack. Expose newest-ingested-event age (server-side, per workspace) and let the trailer flag it
+past ~60 min. Detection for operators exists now (`scripts/liveness-watch.py` under cmdwatch); this is the
+reader-facing half. Raised by medina-gcp-k8s-lab-owner.
+
 ## Block sync fails most cycles: 5s read timeout vs a slow server
 
 **Effort**: 1-2h. **Autonomous**: Yes (client side); server latency is the OOM item above.
