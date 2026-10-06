@@ -534,7 +534,7 @@ def _assemble_thread(
     contents, reply_count = fetch_thread_chunks(conn, row.channel_id, thread_ts)
     if not contents:
         return None
-    body = render_thread_body(contents)
+    body = render_thread_body(contents, tz)
     users, channels = sql_resolvers_for(conn)
     resolved, fallback_reasons = resolve_with_miss_tracking(body, users, channels)
     base = thread_frontmatter(row, thread_ts, reply_count, tz) + resolved

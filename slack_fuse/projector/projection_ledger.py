@@ -47,7 +47,9 @@ type TargetCleanResult = Literal["clean", "dirty", "missing"]
 #: Re-dirties projection targets so materialized files pick it up; it does not
 #: re-render ``chunks.content_md``, which the new assembly step reads either
 #: form of.
-RENDERER_VERSION: Final = "v2"
+#: v3 (2026-10-06): a thread spanning more than one local date carries the date in
+#: every message header (``## YYYY-MM-DD HH:MM``). Assembly-only, like v2.
+RENDERER_VERSION: Final = "v3"
 
 
 @dataclass(frozen=True, slots=True)
