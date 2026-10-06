@@ -649,7 +649,7 @@ class DiskProjection:
         if not contents:
             return None
         users, channels = sql_resolvers_for(self._conn)
-        resolved = resolve_mentions(render_thread_body(contents), users, channels)
+        resolved = resolve_mentions(render_thread_body(contents, self._tz), users, channels)
         return (thread_frontmatter(row, thread_ts, reply_count, self._tz) + resolved).encode()
 
 

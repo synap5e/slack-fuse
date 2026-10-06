@@ -11,6 +11,7 @@ Per RFC §FUSE read path and §Three-tier visibility model.
 
 from __future__ import annotations
 
+import re
 import threading
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -672,12 +673,12 @@ def fetch_thread_chunks(
     conn: Connection[TupleRow],
     channel_id: str,
     thread_ts: Decimal,
-) -> tuple[list[str], int]:
-    """Return ``(content_mds, reply_count)`` for a thread.
+) -> tuple[list[tuple[Decimal, str]], int]:
+    """Return ``([(ts, content_md), ...], reply_count)`` for a thread.
 
-    The ``content_md`` list contains the parent first then replies ordered by
-    ``reply_ts``. ``reply_count`` is read off the parent ``chunks`` row so the
-    frontmatter agrees with how the day file rendered the parent.
+    The list contains the parent first then replies ordered by ``reply_ts``.
+    ``reply_count`` is read off the parent ``chunks`` row so the frontmatter
+    agrees with how the day file rendered the parent.
 
     Parent rendering: the ``thread_chunks`` schema allows ``role='parent'``
     rows, but the current projector only writes replies. Read the parent
@@ -691,15 +692,15 @@ def fetch_thread_chunks(
         )
         parent_row = cur.fetchone()
         _ = cur.execute(
-            "SELECT content_md FROM thread_chunks "
+            "SELECT reply_ts, content_md FROM thread_chunks "
             "WHERE channel_id = %s AND thread_ts = %s AND reply_ts <> thread_ts "
             "ORDER BY reply_ts",
             (channel_id, thread_ts),
         )
-        replies = [str(r[0]) for r in cur.fetchall()]
-    contents: list[str] = []
+        replies = [(Decimal(str(r[0])), str(r[1])) for r in cur.fetchall()]
+    contents: list[tuple[Decimal, str]] = []
     if parent_row is not None:
-        contents.append(str(parent_row[0]))
+        contents.append((thread_ts, str(parent_row[0])))
     contents.extend(replies)
     reply_count = int(parent_row[1]) if parent_row is not None else 0
     return contents, reply_count
@@ -738,11 +739,26 @@ def render_day_body(
     return "\n".join(resolve_thread_summary_link(md, slug_by_ts.get(ts)) for ts, md in chunks)
 
 
-def render_thread_body(contents: list[str]) -> str:
+_CHUNK_TIME_HEADER = re.compile(r"\A## (\d{2}:\d{2}) ")
+
+
+def render_thread_body(contents: list[tuple[Decimal, str]], tz: ZoneInfo) -> str:
     """Concatenate a thread's chunks, dropping the parent's self-referential
     summary — ``thread.md`` already states its reply count in frontmatter.
+
+    A chunk's header carries only ``HH:MM``, which is enough in a day file but
+    ambiguous in a thread that runs past midnight. When the thread's messages
+    span more than one local date, every header gets its date
+    (``## YYYY-MM-DD HH:MM``); a single-day thread is left byte-identical.
     """
-    return "\n".join(strip_thread_summary(md) for md in contents)
+    days = [ts_to_local_date(ts, tz) for ts, _ in contents]
+    stripped = [strip_thread_summary(md) for _, md in contents]
+    if len(set(days)) > 1:
+        stripped = [
+            _CHUNK_TIME_HEADER.sub(f"## {day.isoformat()} \\1 ", md, count=1)
+            for day, md in zip(days, stripped, strict=True)
+        ]
+    return "\n".join(stripped)
 
 
 # ============================================================================

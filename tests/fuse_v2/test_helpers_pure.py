@@ -26,6 +26,7 @@ from slack_fuse.fuse_v2_helpers import (
     local_month_utc_range,
     parse_day_date,
     parse_path,
+    render_thread_body,
     slug_map_for,
     staleness_reason,
     ts_to_local_date,
@@ -341,3 +342,38 @@ def test_format_trailer_includes_timestamp() -> None:
     assert "2026-06-08 09:42:11 UTC" in out
     assert "Reason: server unreachable" in out
     assert out.startswith("\n---\n\n")
+
+
+# ============================================================================
+# Thread body: dates on a thread that crosses midnight
+# ============================================================================
+
+_LA = ZoneInfo("America/Los_Angeles")
+
+
+def _la_ts(year: int, month: int, day: int, hour: int, minute: int) -> Decimal:
+    return Decimal(datetime(year, month, day, hour, minute, tzinfo=_LA).timestamp())
+
+
+def test_thread_body_single_day_is_unchanged() -> None:
+    contents = [
+        (_la_ts(2026, 10, 5, 22, 0), "## 22:00 <@U1>\n\nparent\n"),
+        (_la_ts(2026, 10, 5, 23, 59), "## 23:59 <@U2>\n\nreply\n"),
+    ]
+    assert render_thread_body(contents, _LA) == "## 22:00 <@U1>\n\nparent\n\n## 23:59 <@U2>\n\nreply\n"
+
+
+def test_thread_body_spanning_days_dates_every_header() -> None:
+    contents = [
+        (_la_ts(2026, 10, 5, 23, 50), "## 23:50 <@U1> *(edited 23:55)*\n\nparent mentions ## 10:00 inline\n"),
+        (_la_ts(2026, 10, 6, 0, 5), "## 00:05 <@U2>\n\nnext day\n"),
+        (_la_ts(2026, 10, 8, 9, 30), "## 09:30 @B0BOT\n\ntwo days later\n"),
+    ]
+    body = render_thread_body(contents, _LA)
+    headers = [line for line in body.splitlines() if line.startswith("## ")]
+    assert headers == [
+        "## 2026-10-05 23:50 <@U1> *(edited 23:55)*",
+        "## 2026-10-06 00:05 <@U2>",
+        "## 2026-10-08 09:30 @B0BOT",
+    ]
+    assert "parent mentions ## 10:00 inline" in body, "only the leading header is rewritten"
