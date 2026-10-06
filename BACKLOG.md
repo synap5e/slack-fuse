@@ -81,7 +81,7 @@ benchmark excluded from the default run. It currently teaches people to ignore a
 
 ## NATS shim hangs on retry; and the reader-visible trailer can't see an ingest stop
 
-**Effort**: shim fix 2-3h + image roll; trailer signal 2-4h. **Autonomous**: Yes (image roll via k8s-homelab owner).
+**Effort**: shim fix 2-3h + image roll; trailer signal 2-4h. **Decision (Simon, 2026-10-06): not fixing in v2.** It recovers with a pod delete, and the illus-backed rewrite replaces this path. Revisit only if it starts recurring.
 
 **Seen 2026-10-06 00:27-00:50Z**: `nats_shim` fetch raised `TimeoutError`, the iteration restarted, logged one
 `client error exception_type=TimeoutError` at 00:28:07, then went silent until a pod delete at 00:50. No ingest for
