@@ -382,16 +382,24 @@ def dedup_thread_slug_map(
         users_resolver = None
         channels_resolver = None
 
-    counts: dict[str, int] = {}
-    out: dict[str, Decimal] = {}
+    bases: list[tuple[Decimal, str]] = []
     for ts, content_md in parents:
         body = content_md
         if users_resolver is not None and channels_resolver is not None:
             body = resolve_mentions(content_md, users_resolver, channels_resolver)
-        base = derive_thread_slug(body, ts)
-        count = counts.get(base, 0)
-        counts[base] = count + 1
-        slug = base if count == 0 else f"{base}-{count + 1}"
+        bases.append((ts, derive_thread_slug(body, ts)))
+
+    # WHY reserve every natural slug before suffixing: a suffix must never land on a name some parent derives on its
+    # own. Counting per base alone gave "foo", "foo", "foo 2" two "foo-2"s, and the dict silently dropped a thread.
+    natural = {base for _, base in bases}
+    out: dict[str, Decimal] = {}
+    for ts, base in bases:
+        slug = base
+        if slug in out:
+            n = 2
+            while f"{base}-{n}" in out or f"{base}-{n}" in natural:
+                n += 1
+            slug = f"{base}-{n}"
         out[slug] = ts
     return out
 

@@ -268,6 +268,29 @@ def test_dedup_thread_slug_map_orders_by_ts() -> None:
     assert m["deploy-update-2"] == Decimal("1700000100")
 
 
+def test_dedup_thread_slug_map_never_suffixes_onto_a_natural_slug() -> None:
+    """Titles foo, foo, foo 2: the duplicate must not take foo-2, which the third parent derives on its own.
+
+    Counting per base used to give two foo-2s and silently drop a thread from the listing.
+    """
+    parents = [
+        (Decimal("1700000000"), "## 10:00 <@U1>\n\nfoo\n"),
+        (Decimal("1700000100"), "## 10:01 <@U1>\n\nfoo\n"),
+        (Decimal("1700000200"), "## 10:02 <@U1>\n\nfoo 2\n"),
+    ]
+    m = dedup_thread_slug_map(parents)
+    assert m == {
+        "foo": Decimal("1700000000"),
+        "foo-3": Decimal("1700000100"),
+        "foo-2": Decimal("1700000200"),
+    }
+
+
+def test_dedup_thread_slug_map_without_natural_collisions_is_unchanged() -> None:
+    parents = [(Decimal(f"17000000{i:02d}"), "## 10:00 <@U1>\n\nsame\n") for i in range(3)]
+    assert list(dedup_thread_slug_map(parents)) == ["same", "same-2", "same-3"]
+
+
 # ============================================================================
 # Frontmatter
 # ============================================================================
