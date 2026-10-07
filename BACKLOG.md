@@ -79,9 +79,24 @@ wall-clock median under 5 ms on a shared desktop running a temp postgres, so its
 not code. Either make it measure something load-independent (rows touched, or the plan shape) or mark it as a
 benchmark excluded from the default run. It currently teaches people to ignore a red suite.
 
+## Snapshot builds OOM the server from ~2026-10-28 — decided: ride it out
+
+**Decision (Simon, 2026-10-07): no rewrite.** illus replaces v2 by late October, so the server is run on manual
+recovery until then. Revisit only if illus slips past ~2026-10-28.
+
+**Measured 2026-10-07** (k8s-homelab owner + `snapshot/generator.py`): `generate_snapshot` fetchall()s a channel's
+ENTIRE event history and folds it in memory, so peak RSS ~= 10x stored history + ~380 MiB, regardless of snapshot
+size. Worst stream `channel:C0AQ646ELUR`: 139k events, 243 MB (81% `message_changed`) -> 2,840 MiB peak. 5 of the 8
+largest streams are 39-90% edits. Server limit raised 3Gi -> 4Gi (k8s-homelab 04e5f2d), which holds ~371 MB of
+history. At 30-44 MB/week the worst stream crosses that ~2026-10-28 to ~2026-11-04. No config lever is safe:
+`SNAPSHOT_EVERY_N_EVENTS` must stay at 5000 to match `DEFAULT_MAX_REPLAY_EVENTS`, and the candidate gate can't
+exclude one stream. Expected failure: OOM, restart, sometimes a shim wedge needing a pod delete. No data loss
+(JetStream replays). If the rewrite is ever needed: fold incrementally from the previous snapshot plus events since,
+reading in batches with a server-side cursor; never delete history (append-only).
+
 ## NATS shim hangs on retry; and the reader-visible trailer can't see an ingest stop
 
-**Effort**: shim fix 2-3h + image roll; trailer signal 2-4h. **Decision (Simon, 2026-10-06): not fixing in v2.** It recovers with a pod delete, and the illus-backed rewrite replaces this path. Revisit only if it starts recurring.
+**Effort**: shim fix 2-3h + image roll; trailer signal 2-4h. **Decision (Simon, 2026-10-06, reaffirmed 2026-10-07 after a second wedge): not fixing in v2.** Recover with a pod delete; `scripts/liveness-watch.py` under cmdwatch detects it. illus replaces v2 by late October.
 
 **Seen 2026-10-06 00:27-00:50Z**: `nats_shim` fetch raised `TimeoutError`, the iteration restarted, logged one
 `client error exception_type=TimeoutError` at 00:28:07, then went silent until a pod delete at 00:50. No ingest for
