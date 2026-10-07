@@ -91,7 +91,8 @@ largest streams are 39-90% edits. Server limit raised 3Gi -> 4Gi (k8s-homelab 04
 history. At 30-44 MB/week the worst stream crosses that ~2026-10-28 to ~2026-11-04. No config lever is safe:
 `SNAPSHOT_EVERY_N_EVENTS` must stay at 5000 to match `DEFAULT_MAX_REPLAY_EVENTS`, and the candidate gate can't
 exclude one stream. Expected failure: OOM, restart, sometimes a shim wedge needing a pod delete. No data loss
-(JetStream replays). If the rewrite is ever needed: fold incrementally from the previous snapshot plus events since,
+(JetStream replays). OOM detection survives any agent session: k8s-homelab CronJob `infrastructure/oom-check/`
+(dbebb9d), every 15 min, cluster-wide, to Loki as `{app="oom-check"} |= "OOM_ALERT"`. If the rewrite is ever needed: fold incrementally from the previous snapshot plus events since,
 reading in batches with a server-side cursor; never delete history (append-only).
 
 ## NATS shim hangs on retry; and the reader-visible trailer can't see an ingest stop
