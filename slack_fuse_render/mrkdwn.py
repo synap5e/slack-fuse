@@ -28,7 +28,10 @@ _SUBTEAM_LABELED = re.compile(r"<!subteam\^[A-Z0-9]+\|(@[^>]+)>")
 _SUBTEAM = re.compile(r"<!subteam\^([A-Z0-9]+)>")
 _BOLD = re.compile(r"(?<!\*)\*([^*\n]+)\*(?!\*)")
 _ITALIC = re.compile(r"(?<!_)_([^_\n]+)_(?!_)")
-_STRIKE = re.compile(r"(?<!~)~([^~\n]+)~(?!~)")
+# WHY the boundary rules: Slack only renders ~x~ as strikethrough when the opening ~ is not glued to a preceding word
+# and is followed by non-space, and the closing ~ follows non-space and is not glued to a following word. Without them
+# two approximation tildes on one line ("~54k by day 7, ~127k") became a strike span that Slack never showed.
+_STRIKE = re.compile(r"(?<![~\w])~(?=\S)([^~\n]*?\S)~(?![~\w])")
 
 
 def convert_structural(text: str) -> str:

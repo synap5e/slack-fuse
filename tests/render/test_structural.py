@@ -262,3 +262,18 @@ def test_structural_pass_is_idempotent() -> None:
     # Running the structural body transform twice is a no-op on its own output.
     once = convert_structural("*b* <@U1|x> <#C1|y> <https://e.com|e>")
     assert convert_structural(once) == once
+
+
+def test_lone_approximation_tildes_are_not_strikethrough() -> None:
+    text = "~54k people by day 7, ~127k still running it in week 4"
+    assert convert_structural(text) == text
+
+
+def test_real_strikethrough_still_converts() -> None:
+    assert convert_structural("was ~wrong~ now right") == "was ~~wrong~~ now right"
+    assert convert_structural("~a~") == "~~a~~"
+    assert convert_structural("(~gone~)") == "(~~gone~~)"
+
+
+def test_tilde_glued_to_words_is_left_alone() -> None:
+    assert convert_structural("path a~b~c and ~ spaced ~") == "path a~b~c and ~ spaced ~"
